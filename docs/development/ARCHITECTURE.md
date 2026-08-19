@@ -122,7 +122,7 @@ Codex or ChatGPT-backed request flow
 | Auth flow | `lib/auth/auth.ts`, `lib/auth/server.ts`, `lib/auth/browser.ts` | PKCE OAuth flow, callback handling, browser/manual/device auth path |
 | Account manager | `lib/codex-manager.ts`, `lib/codex-manager/commands/`, `lib/accounts.ts` | Dashboard actions, account selection, health operations, repair commands |
 | Manager command surface | `lib/codex-manager/commands/*` | Focused modules: `account`, `best`, `bridge`, `budget`, `check`, `config-explain`, `debug-bundle`, `forecast`, `history`, `init-config`, `integrations`, `models`, `monitor`, `report`, `rotation`, `status`, `switch`, `uninstall`, `unpin`, `usage`, `verify`, `why-selected`, `workspace` (plus repair helpers in `repair-commands.ts`) |
-| Runtime rotation proxy | `lib/runtime-rotation-proxy.ts`, `lib/runtime-constants.ts`, `lib/runtime/config-toml.ts` | Loopback Responses/model proxy, provider config rewrite, local client auth, rotation/failover |
+| Runtime rotation proxy | `lib/runtime-rotation-proxy.ts`, `lib/runtime-constants.ts`, `lib/runtime/config-toml.ts` | Loopback HTTP/SSE and persistent WebSocket Responses proxy, provider config rewrite, local client auth, rotation/failover |
 | Account selection runtime | `lib/runtime/rotation-account-selection.ts`, `lib/rotation.ts`, `lib/accounts.ts` | Pin → sequential/affinity → hybrid → scan selection order |
 | Shadow Codex home | `scripts/codex.js` | Temporary provider config, state copy, sync-back, stale lock cleanup |
 | Codex app bind | `lib/runtime/app-bind.ts`, `scripts/codex-app-router.js` | Persistent localhost router, config backup/restore, startup entry |

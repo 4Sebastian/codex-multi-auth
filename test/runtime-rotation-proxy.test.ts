@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { request } from "node:http";
+import { createServer as createHttpServer, request } from "node:http";
+import WebSocket, { WebSocketServer } from "ws";
 import { AccountManager } from "../lib/accounts.js";
 import { CodexValidationError } from "../lib/errors.js";
 import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
@@ -249,6 +250,50 @@ async function postResponsesWithHttp(
 	});
 }
 
+async function startTestWebSocketUpstream(params: {
+	onConnection: (socket: WebSocket, request: import("node:http").IncomingMessage) => void;
+}): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+	const server = createHttpServer();
+	const webSocketServer = new WebSocketServer({ server, perMessageDeflate: false });
+	webSocketServer.on("connection", params.onConnection);
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("Missing test server address");
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}/backend-api`,
+		close: async () => {
+			for (const client of webSocketServer.clients) client.terminate();
+			await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+		},
+	};
+}
+
+function connectWebSocket(url: string, apiKey = DEFAULT_CLIENT_API_KEY): Promise<WebSocket> {
+	return new Promise((resolve, reject) => {
+		const socket = new WebSocket(url, {
+			headers: { authorization: `Bearer ${apiKey}` },
+		});
+		socket.once("open", () => resolve(socket));
+		socket.once("error", reject);
+	});
+}
+
+function nextWebSocketMessage(socket: WebSocket): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket message")), 2_000);
+		socket.once("message", (data) => {
+			clearTimeout(timeout);
+			resolve(data.toString());
+		});
+	});
+}
+
 interface ActiveHandleProcess {
 	_getActiveHandles?: () => unknown[];
 }
@@ -345,6 +390,91 @@ describe("normalizeForcedAccountIndex (#623)", () => {
 });
 
 describe("runtime rotation proxy", () => {
+	it("forwards persistent Codex WebSocket connections with managed OAuth headers", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const receivedFrames: string[] = [];
+		let connectionCount = 0;
+		let upstreamAuthorization: string | undefined;
+		let upstreamAccountId: string | undefined;
+		let upstreamBeta: string | undefined;
+		let upstreamPath: string | undefined;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				connectionCount += 1;
+				upstreamAuthorization = request.headers.authorization;
+				upstreamAccountId = request.headers[OPENAI_HEADERS.ACCOUNT_ID];
+				upstreamBeta = request.headers[OPENAI_HEADERS.BETA.toLowerCase()];
+				upstreamPath = request.url;
+				socket.on("message", (data) => {
+					receivedFrames.push(data.toString());
+					socket.send(JSON.stringify({ type: "response.completed", response: { id: `response-${receivedFrames.length}` } }));
+				});
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "session-1",
+				input: [],
+			}));
+			expect(JSON.parse(await firstResponse)).toMatchObject({ type: "response.completed" });
+
+			const secondResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				previous_response_id: "response-1",
+				input: [],
+			}));
+			expect(JSON.parse(await secondResponse)).toMatchObject({ type: "response.completed" });
+
+			expect(connectionCount).toBe(1);
+			expect(receivedFrames).toHaveLength(2);
+			expect(upstreamAuthorization).toBe("Bearer access-1");
+			expect(upstreamAccountId).toBe("acc_1");
+			expect(upstreamBeta).toBe("responses_websockets=2026-02-06");
+			expect(upstreamPath).toBe("/backend-api/codex/responses");
+			expect(proxy.getStatus()).toMatchObject({
+				upstreamRequests: 1,
+				streamsStarted: 1,
+				lastAccountIndex: 0,
+			});
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("rejects unauthenticated WebSocket upgrades before accepting a client", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const status = await new Promise<number>((resolve, reject) => {
+			const socket = new WebSocket(
+				proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+			);
+			socket.once("unexpected-response", (_request, response) => {
+				response.resume();
+				resolve(response.statusCode ?? 0);
+			});
+			socket.once("error", reject);
+		});
+		expect(status).toBe(HTTP_STATUS.UNAUTHORIZED);
+	});
+
 	it("requires a client API key at startup", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));

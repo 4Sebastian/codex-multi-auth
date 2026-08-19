@@ -1,6 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
+import WebSocket, { WebSocketServer, type RawData } from "ws";
 import {
 	AccountManager,
 	AUTH_INVALIDATION_MARKER,
@@ -656,6 +658,404 @@ function writePoolExhausted(params: {
 	});
 }
 
+const CODEX_RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
+const WEBSOCKET_CLOSE_POLICY_VIOLATION = 1008;
+const WEBSOCKET_CLOSE_TRY_AGAIN_LATER = 1013;
+
+interface PendingWebSocketFrame {
+	data: RawData;
+	isBinary: boolean;
+}
+
+interface PreparedWebSocketAccount {
+	accountManager: AccountManager;
+	account: ManagedAccount;
+	accessToken: string;
+	accountId: string;
+	context: RequestContext;
+	isPinned: boolean;
+}
+
+class WebSocketHandshakeError extends Error {
+	readonly statusCode: number | null;
+
+	constructor(message: string, statusCode: number | null = null) {
+		super(message);
+		this.name = "WebSocketHandshakeError";
+		this.statusCode = statusCode;
+	}
+}
+
+function rawDataToBuffer(data: RawData): Buffer {
+	if (Array.isArray(data)) return Buffer.concat(data);
+	if (data instanceof ArrayBuffer) return Buffer.from(data);
+	return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function buildWebSocketRequestContext(
+	req: IncomingMessage,
+	firstFrame: RawData,
+): RequestContext | null {
+	const body = rawDataToBuffer(firstFrame);
+	const parsedBody = parseRequestBody(body);
+	if (!parsedBody || readStringRecordValue(parsedBody, "type") !== "response.create") {
+		return null;
+	}
+	const model = readStringRecordValue(parsedBody, "model");
+	const headers = headersFromIncoming(req);
+	return {
+		body,
+		headers,
+		method: "POST",
+		upstreamPath: URL_PATHS.CODEX_RESPONSES,
+		model,
+		family: getModelFamily(model ?? CURRENT_CODEX_MODEL),
+		stream: true,
+		sessionKey: resolveSessionKey(headers, parsedBody),
+	};
+}
+
+function buildWebSocketUpstreamUrl(req: IncomingMessage, upstreamBaseUrl: string): string {
+	const upstream = new URL(
+		buildUpstreamUrl(req, upstreamBaseUrl, URL_PATHS.CODEX_RESPONSES),
+	);
+	upstream.protocol = upstream.protocol === "https:" ? "wss:" : "ws:";
+	return upstream.toString();
+}
+
+function createWebSocketOutboundHeaders(
+	incoming: Headers,
+	account: ManagedAccount,
+	accessToken: string,
+	accountId: string,
+): Record<string, string> {
+	const headers = createOutboundHeaders(incoming, account, accessToken, accountId);
+	for (const name of [
+		"accept",
+		"content-encoding",
+		"content-length",
+		"content-type",
+		"sec-websocket-extensions",
+		"sec-websocket-key",
+		"sec-websocket-protocol",
+		"sec-websocket-version",
+	]) {
+		headers.delete(name);
+	}
+	headers.set(OPENAI_HEADERS.BETA, CODEX_RESPONSES_WEBSOCKET_BETA);
+	return Object.fromEntries(headers.entries());
+}
+
+function rejectWebSocketUpgrade(
+	socket: Duplex,
+	statusCode: number,
+	statusText: string,
+): void {
+	const body = `${statusText}\n`;
+	socket.end(
+		`HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+			"Connection: close\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n" +
+			`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+	);
+}
+
+function openUpstreamWebSocket(
+	url: string,
+	headers: Record<string, string>,
+	timeoutMs: number,
+): Promise<WebSocket> {
+	return new Promise((resolve, reject) => {
+		const upstream = new WebSocket(url, {
+		headers,
+		handshakeTimeout: timeoutMs,
+		perMessageDeflate: false,
+	});
+		let settled = false;
+		const finish = (error?: Error): void => {
+			if (settled) return;
+			settled = true;
+			upstream.off("open", onOpen);
+			upstream.off("error", onError);
+			upstream.off("unexpected-response", onUnexpectedResponse);
+			if (error) reject(error);
+			else resolve(upstream);
+		};
+		const onOpen = (): void => finish();
+		const onError = (error: Error): void => finish(error);
+		const onUnexpectedResponse = (
+			_request: IncomingMessage,
+			response: IncomingMessage,
+		): void => {
+			response.resume();
+			finish(
+				new WebSocketHandshakeError(
+					`Upstream WebSocket handshake returned HTTP ${response.statusCode ?? 0}`,
+					response.statusCode ?? null,
+				),
+			);
+		};
+		upstream.once("open", onOpen);
+		upstream.once("error", onError);
+		upstream.once("unexpected-response", onUnexpectedResponse);
+	});
+}
+
+async function prepareWebSocketAccount(
+	state: RotationProxyState,
+	req: IncomingMessage,
+	firstFrame: RawData,
+): Promise<PreparedWebSocketAccount | null> {
+	const context = buildWebSocketRequestContext(req, firstFrame);
+	if (!context) {
+		throw new CodexValidationError("First WebSocket message must be response.create.");
+	}
+	const policyState = await loadRuntimePolicyState();
+	const policyDecision = await evaluateRuntimePolicy({
+		state: policyState,
+		accounts: state.activeAccountManager.getAccountsSnapshot(),
+		model: context.model,
+		now: state.now(),
+	});
+	if (!policyDecision.allowed) {
+		throw createRuntimeProxyHttpError(
+			"Runtime policy blocked this WebSocket request.",
+			policyDecision.statusCode,
+			policyDecision.errorCode ?? "policy_blocked",
+		);
+	}
+	let accountManager = state.activeAccountManager;
+	const attemptedIndexes = new Set<number>();
+	const skipReasons = new Map<number, string>();
+	const storageMeta = readStorageMetaFromDisk();
+	const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
+	const isPinned = typeof pinnedIndex === "number";
+	if (storageMeta.affinityGeneration > state.lastObservedAffinityGeneration) {
+		state.sessionAffinityStore?.clearAll();
+		state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
+	}
+	let reloaded = false;
+	while (attemptedIndexes.size < accountManager.getAccountCount()) {
+		const selected = chooseAccount({
+			accountManager,
+			sessionAffinityStore: state.sessionAffinityStore,
+			sessionKey: context.sessionKey,
+			family: context.family,
+			model: context.model,
+			attemptedIndexes,
+			now: state.now(),
+			policy: policyDecision,
+			pinnedIndex,
+			skipReasons,
+			pidOffsetEnabled: state.pidOffsetEnabled,
+			schedulingStrategy: state.schedulingStrategy,
+		});
+		if (!selected) {
+			if (!reloaded && !isPinned && accountManager.getAccountCount() > 0) {
+				reloaded = true;
+				const recovered = await recoverStaleRuntimeState(state);
+				if (recovered) {
+					accountManager = recovered;
+					attemptedIndexes.clear();
+					skipReasons.clear();
+					continue;
+				}
+			}
+			break;
+		}
+		attemptedIndexes.add(selected.index);
+		if (!accountManager.consumeToken(selected, context.family, context.model)) {
+			skipReasons.set(selected.index, "token-exhausted");
+			continue;
+		}
+		const refreshed = await ensureFreshAccessToken({
+			accountManager,
+			account: selected,
+			family: context.family,
+			model: context.model,
+			now: state.now(),
+			tokenRefreshSkewMs: state.tokenRefreshSkewMs,
+			tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs,
+		});
+		if (!refreshed.ok) {
+			accountManager.refundToken(selected, context.family, context.model);
+			skipReasons.set(selected.index, "auth-failure");
+			continue;
+		}
+		const accountId = resolveAccountId(refreshed.account, refreshed.accessToken);
+		if (!accountId) {
+			accountManager.refundToken(refreshed.account, context.family, context.model);
+			accountManager.recordFailure(refreshed.account, context.family, context.model);
+			accountManager.markAccountCoolingDown(
+				refreshed.account,
+				DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+				"auth-failure",
+			);
+			accountManager.saveToDiskDebounced();
+			skipReasons.set(refreshed.account.index, "auth-failure");
+			continue;
+		}
+		return {
+			accountManager,
+			account: refreshed.account,
+			accessToken: refreshed.accessToken,
+			accountId,
+			context,
+			isPinned,
+		};
+	}
+	return null;
+}
+
+async function connectManagedWebSocket(
+	state: RotationProxyState,
+	req: IncomingMessage,
+	firstFrame: RawData,
+): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount } | null> {
+	const accountCount = state.activeAccountManager.getAccountCount();
+	for (let attempt = 0; attempt < Math.max(1, accountCount); attempt += 1) {
+		const prepared = await prepareWebSocketAccount(state, req, firstFrame);
+		if (!prepared) return null;
+		const { accountManager, account, accessToken, accountId, context, isPinned } = prepared;
+		try {
+			state.status.upstreamRequests += 1;
+			const upstream = await openUpstreamWebSocket(
+				buildWebSocketUpstreamUrl(req, state.upstreamBaseUrl),
+				createWebSocketOutboundHeaders(context.headers, account, accessToken, accountId),
+				state.fetchTimeoutMs,
+			);
+			accountManager.recordSuccess(account, context.family, context.model);
+			recordRuntimeAccountRecovery(account.index);
+			recordLastRuntimeAccount(
+				state.status,
+				accountIdentityFromAccount(account, state.now()),
+			);
+			state.sessionAffinityStore?.remember(context.sessionKey, account.index, state.now());
+			await persistRuntimeActiveAccount(
+				accountManager,
+				account,
+				context.family,
+				isPinned,
+				state.schedulingStrategy,
+			);
+			return { upstream, prepared };
+		} catch (error) {
+			state.status.lastError = error instanceof Error ? error.message : String(error);
+			accountManager.refundToken(account, context.family, context.model);
+			accountManager.recordFailure(account, context.family, context.model);
+			const statusCode = error instanceof WebSocketHandshakeError ? error.statusCode : null;
+			if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
+				applyMonotonicAuthCooldown(
+					accountManager,
+					account,
+					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+				);
+			} else if (statusCode === HTTP_STATUS.TOO_MANY_REQUESTS) {
+				accountManager.markRateLimitedWithReason(
+					account,
+					60_000,
+					context.family,
+					"quota",
+					context.model,
+				);
+			} else {
+				accountManager.markAccountCoolingDown(
+					account,
+					statusCode !== null && statusCode >= 500
+						? state.serverErrorCooldownMs
+						: state.networkErrorCooldownMs,
+					statusCode !== null && statusCode >= 500 ? "server-error" : "network-error",
+				);
+			}
+			accountManager.saveToDiskDebounced();
+			if (isPinned) return null;
+			state.status.retries += 1;
+			state.status.rotations += 1;
+		}
+	}
+	return null;
+}
+
+function bridgeWebSocketConnection(
+	state: RotationProxyState,
+	req: IncomingMessage,
+	client: WebSocket,
+): void {
+	const pending: PendingWebSocketFrame[] = [];
+	let upstream: WebSocket | null = null;
+	let connecting = false;
+	let closed = false;
+	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
+		if (closed) return;
+		closed = true;
+		if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+		if (upstream?.readyState === WebSocket.OPEN) upstream.close(code, reason);
+	};
+	const initialize = async (): Promise<void> => {
+		if (connecting || upstream || pending.length === 0) return;
+		connecting = true;
+		try {
+			const firstFrame = pending[0];
+			if (!firstFrame) return;
+			const connected = await connectManagedWebSocket(state, req, firstFrame.data);
+			if (!connected) {
+				closeBoth(
+					WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
+					"All managed Codex accounts are temporarily unavailable",
+				);
+				return;
+			}
+			upstream = connected.upstream;
+			if (closed || client.readyState !== WebSocket.OPEN) {
+				upstream.close(1000, "Local client closed");
+				return;
+			}
+			state.status.streamsStarted += 1;
+			upstream.on("message", (data, isBinary) => {
+				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+			});
+			upstream.on("close", (code, reason) => {
+				if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+			});
+			upstream.on("error", (error) => {
+				state.status.lastError = error.message;
+				closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Upstream WebSocket error");
+			});
+			for (const frame of pending.splice(0)) {
+				upstream.send(frame.data, { binary: frame.isBinary });
+			}
+		} catch (error) {
+			state.status.lastError = error instanceof Error ? error.message : String(error);
+			const policyViolation =
+				error instanceof CodexValidationError || isRuntimeProxyHttpError(error);
+			closeBoth(
+				policyViolation
+					? WEBSOCKET_CLOSE_POLICY_VIOLATION
+					: WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
+				policyViolation ? "WebSocket request rejected" : "WebSocket proxy failed",
+			);
+		} finally {
+			connecting = false;
+		}
+	};
+	client.on("message", (data, isBinary) => {
+		if (upstream?.readyState === WebSocket.OPEN) {
+			upstream.send(data, { binary: isBinary });
+			return;
+		}
+		pending.push({ data, isBinary });
+		void initialize();
+	});
+	client.on("close", (code, reason) => {
+		closed = true;
+		if (upstream?.readyState === WebSocket.OPEN) upstream.close(code, reason);
+	});
+	client.on("error", (error) => {
+		state.status.lastError = error.message;
+		closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Local WebSocket error");
+	});
+}
+
 /**
  * Coerce a forced-account pin from an option (number) or the launcher's env
  * string into a normalized 0-based index, or null when absent/invalid. Invalid
@@ -803,11 +1203,31 @@ export async function startRuntimeRotationProxy(
 	const server = createServer((req, res) => {
 		void handleRequest(state, req, res);
 	});
+	const webSocketServer = new WebSocketServer({
+		noServer: true,
+		maxPayload: maxRequestBodyBytes,
+		perMessageDeflate: false,
+	});
 	const sockets = new Set<Socket>();
 	server.on("connection", (socket) => {
 		sockets.add(socket);
 		socket.once("close", () => {
 			sockets.delete(socket);
+		});
+	});
+	server.on("upgrade", (req, socket, head) => {
+		const incomingUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+		if (!isResponsesPath(incomingUrl.pathname)) {
+			rejectWebSocketUpgrade(socket, 404, "Not Found");
+			return;
+		}
+		if (!isAuthorizedClient(headersFromIncoming(req), clientApiKey)) {
+			rejectWebSocketUpgrade(socket, HTTP_STATUS.UNAUTHORIZED, "Unauthorized");
+			return;
+		}
+		webSocketServer.handleUpgrade(req, socket, head, (client) => {
+			state.status.totalRequests += 1;
+			bridgeWebSocketConnection(state, req, client);
 		});
 	});
 	const onPostStartupServerError = (error: Error): void => {
@@ -838,6 +1258,8 @@ export async function startRuntimeRotationProxy(
 		port: resolvedPort,
 		baseUrl: `http://${urlHost}:${resolvedPort}`,
 		close: async () => {
+			for (const client of webSocketServer.clients) client.terminate();
+			webSocketServer.close();
 			await closeServer(server, sockets);
 			await state.activeAccountManager.flushPendingSave();
 		},
