@@ -294,6 +294,16 @@ function nextWebSocketMessage(socket: WebSocket): Promise<string> {
 	});
 }
 
+function nextWebSocketClose(socket: WebSocket): Promise<{ code: number; reason: string }> {
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket close")), 2_000);
+		socket.once("close", (code, reason) => {
+			clearTimeout(timeout);
+			resolve({ code, reason: reason.toString() });
+		});
+	});
+}
+
 interface ActiveHandleProcess {
 	_getActiveHandles?: () => unknown[];
 }
@@ -393,6 +403,21 @@ describe("runtime rotation proxy", () => {
 	it("forwards persistent Codex WebSocket connections with managed OAuth headers", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const consumed = vi.spyOn(accountManager, "consumeToken");
+		const usageRecords: unknown[] = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input);
+					},
+				};
+			});
 		const receivedFrames: string[] = [];
 		let connectionCount = 0;
 		let upstreamAuthorization: string | undefined;
@@ -408,7 +433,17 @@ describe("runtime rotation proxy", () => {
 				upstreamPath = request.url;
 				socket.on("message", (data) => {
 					receivedFrames.push(data.toString());
-					socket.send(JSON.stringify({ type: "response.completed", response: { id: `response-${receivedFrames.length}` } }));
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: {
+							id: `response-${receivedFrames.length}`,
+							usage: {
+								input_tokens: receivedFrames.length,
+								output_tokens: 2,
+								total_tokens: receivedFrames.length + 2,
+							},
+						},
+					}));
 				});
 			},
 		});
@@ -442,6 +477,13 @@ describe("runtime rotation proxy", () => {
 
 			expect(connectionCount).toBe(1);
 			expect(receivedFrames).toHaveLength(2);
+			expect(consumed).toHaveBeenCalledTimes(2);
+			expect(usageRecorder).toHaveBeenCalledTimes(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords).toEqual([
+				expect.objectContaining({ outcome: "success", inputTokens: 1, totalTokens: 3 }),
+				expect.objectContaining({ outcome: "success", inputTokens: 2, totalTokens: 4 }),
+			]);
 			expect(upstreamAuthorization).toBe("Bearer access-1");
 			expect(upstreamAccountId).toBe("acc_1");
 			expect(upstreamBeta).toBe("responses_websockets=2026-02-06");
@@ -453,6 +495,192 @@ describe("runtime rotation proxy", () => {
 			});
 		} finally {
 			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+			consumed.mockRestore();
+		}
+	});
+
+	it("re-evaluates policy before every response.create on a persistent connection", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const policyDecision = {
+			allowed: true,
+			statusCode: HTTP_STATUS.FORBIDDEN,
+			errorCode: null,
+			reasons: [],
+			projectKey: null,
+			blockedAccountIndexes: new Set<number>(),
+			blockedAccountReasons: {},
+			scoreBoostByAccount: {},
+			budgetEvaluations: [],
+		};
+		const evaluate = vi
+			.spyOn(runtimePolicy, "evaluateRuntimePolicy")
+			.mockResolvedValueOnce(policyDecision)
+			.mockResolvedValueOnce({
+				...policyDecision,
+				allowed: false,
+				statusCode: HTTP_STATUS.TOO_MANY_REQUESTS,
+				errorCode: "budget_blocked",
+				reasons: ["request budget exhausted"],
+			});
+		const upstreamFrames: string[] = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", (data) => {
+					upstreamFrames.push(data.toString());
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [],
+			}));
+			await firstResponse;
+
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				previous_response_id: "response-1",
+				input: [],
+			}));
+
+			expect(await closed).toMatchObject({ code: 1008 });
+			expect(evaluate).toHaveBeenCalledTimes(2);
+			expect(upstreamFrames).toHaveLength(1);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			evaluate.mockRestore();
+		}
+	});
+
+	it("does not retry a failed WebSocket handshake with the same account", async () => {
+		const previousCooldown = process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
+		const previousScheduling = process.env.CODEX_AUTH_SCHEDULING_STRATEGY;
+		process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS = "0";
+		process.env.CODEX_AUTH_SCHEDULING_STRATEGY = "sequential";
+		const server = createHttpServer();
+		const webSocketServer = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+		const authorizationAttempts: Array<string | undefined> = [];
+		server.on("upgrade", (request, socket, head) => {
+			authorizationAttempts.push(request.headers.authorization);
+			if (request.headers.authorization === "Bearer access-1") {
+				socket.end(
+					"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+				);
+				return;
+			}
+			webSocketServer.handleUpgrade(request, socket, head, (upstreamSocket) => {
+				webSocketServer.emit("connection", upstreamSocket, request);
+			});
+		});
+		webSocketServer.on("connection", (socket) => {
+			socket.on("message", () => {
+				socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing test server address");
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api` },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [],
+			}));
+			expect(JSON.parse(await response)).toMatchObject({ type: "response.completed" });
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			socket.terminate();
+			for (const client of webSocketServer.clients) client.terminate();
+			await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+			if (previousCooldown === undefined) delete process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
+			else process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS = previousCooldown;
+			if (previousScheduling === undefined) delete process.env.CODEX_AUTH_SCHEDULING_STRATEGY;
+			else process.env.CODEX_AUTH_SCHEDULING_STRATEGY = previousScheduling;
+		}
+	});
+
+	it("terminates peers when abnormal WebSocket close codes are mirrored", async () => {
+		let connectionCount = 0;
+		let resolveFirstUpstreamClose: ((code: number) => void) | null = null;
+		const firstUpstreamClose = new Promise<number>((resolve) => {
+			resolveFirstUpstreamClose = resolve;
+		});
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				if (connectionCount === 1) {
+					socket.once("close", (code) => resolveFirstUpstreamClose?.(code));
+					socket.on("message", () => {
+						socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+					});
+					return;
+				}
+				socket.once("message", () => socket.terminate());
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const firstClient = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(firstClient);
+			firstClient.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			await firstResponse;
+			firstClient.terminate();
+			expect(await firstUpstreamClose).toBe(1006);
+
+			const secondClient = await connectWebSocket(
+				proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+			);
+			const secondClosed = nextWebSocketClose(secondClient);
+			secondClient.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await secondClosed).toMatchObject({ code: 1006 });
+		} finally {
+			firstClient.terminate();
 			await upstream.close();
 		}
 	});

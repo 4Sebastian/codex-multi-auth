@@ -295,6 +295,7 @@ function createRuntimeConfigTomlFixtureModule(fixtureRoot: string): string {
 			"    'requires_openai_auth = false',",
 			"    `experimental_bearer_token = ${tomlStringLiteral(clientApiKey)}`,",
 			"    'wire_api = \"responses\"',",
+			"    'supports_websockets = true',",
 			"  ];",
 			"  return `${withModelProvider}${lineEnding}${lineEnding}${providerBlock.join(lineEnding)}${lineEnding}`;",
 			"}",
@@ -1793,6 +1794,7 @@ describe("codex bin wrapper", () => {
 			`experimental_bearer_token = "${apiKeyMatch?.[1]}"`,
 		);
 		expect(output).toContain('wire_api = "responses"');
+		expect(output).toContain("supports_websockets = true");
 		expect(output).not.toContain("env_key");
 		expect(output).not.toContain('base_url = "http://127.0.0.1:1"');
 		expect((output.match(/\[model_providers\.codex-multi-auth-runtime-proxy\]/g) ?? []).length).toBe(1);
@@ -2285,6 +2287,9 @@ describe("codex bin wrapper", () => {
 		);
 		expect(output).toContain(
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.supports_websockets=true`,
 		);
 		expect(output).toContain("disable_response_storage=false");
 		expect(output).toContain(

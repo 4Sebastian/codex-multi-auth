@@ -1,10 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
 	configHasRuntimeRotationProvider,
+	rewriteConfigTomlForRuntimeRotationProvider,
 	restoreConfigTomlFromRuntimeRotationProviderWithoutBackup,
 	restoreTopLevelModelProvider,
 	restoreTopLevelResponseStorage,
 } from "../lib/runtime/config-toml.js";
+
+describe("rewriteConfigTomlForRuntimeRotationProvider", () => {
+	it("enables the persistent Responses WebSocket transport", () => {
+		const rewritten = rewriteConfigTomlForRuntimeRotationProvider(
+			'model_provider = "openai"\n',
+			"http://127.0.0.1:32123",
+			"runtime-secret",
+		);
+
+		expect(rewritten).toContain("supports_websockets = true");
+	});
+});
 
 describe("restoreTopLevelModelProvider", () => {
 	it("rewrites the runtime rotation provider line back to the original", () => {

@@ -50,6 +50,7 @@ import {
 	evaluateRuntimePolicy,
 	loadRuntimePolicyState,
 	type RuntimePolicyDecision,
+	type RuntimeUsageRecorder,
 } from "./policy/runtime-policy.js";
 import { isWorkspaceDisabledError } from "./request/fetch-helpers.js";
 import {
@@ -672,8 +673,19 @@ interface PreparedWebSocketAccount {
 	account: ManagedAccount;
 	accessToken: string;
 	accountId: string;
-	context: RequestContext;
+	request: PreparedWebSocketRequest;
 	isPinned: boolean;
+}
+
+interface PreparedWebSocketRequest {
+	context: RequestContext;
+	policyDecision: RuntimePolicyDecision;
+	usageRecorder: RuntimeUsageRecorder;
+}
+
+interface ActiveWebSocketRequest {
+	request: PreparedWebSocketRequest;
+	account: ManagedAccount;
 }
 
 class WebSocketHandshakeError extends Error {
@@ -690,6 +702,13 @@ function rawDataToBuffer(data: RawData): Buffer {
 	if (Array.isArray(data)) return Buffer.concat(data);
 	if (data instanceof ArrayBuffer) return Buffer.from(data);
 	return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function readFiniteNumber(record: Record<string, unknown> | null, key: string): number | null {
+	const value = record?.[key];
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: null;
 }
 
 function buildWebSocketRequestContext(
@@ -721,6 +740,175 @@ function buildWebSocketUpstreamUrl(req: IncomingMessage, upstreamBaseUrl: string
 	);
 	upstream.protocol = upstream.protocol === "https:" ? "wss:" : "ws:";
 	return upstream.toString();
+}
+
+async function prepareWebSocketRequest(
+	state: RotationProxyState,
+	req: IncomingMessage,
+	frame: RawData,
+): Promise<PreparedWebSocketRequest> {
+	const context = buildWebSocketRequestContext(req, frame);
+	if (!context) {
+		throw new CodexValidationError("WebSocket message must be response.create.");
+	}
+	state.status.totalRequests += 1;
+	const startedAt = state.now();
+	const requestId = randomUUID();
+	let projectKey: string | null = null;
+	let policyDecision: RuntimePolicyDecision;
+	try {
+		const policyState = await loadRuntimePolicyState();
+		projectKey = policyState.project.projectKey;
+		policyDecision = await evaluateRuntimePolicy({
+			state: policyState,
+			accounts: state.activeAccountManager.getAccountsSnapshot(),
+			model: context.model,
+			now: startedAt,
+		});
+		mutateRuntimeObservabilitySnapshot((snapshot) => {
+			snapshot.policyBlockedIndexes = [...policyDecision.blockedAccountIndexes];
+			snapshot.policyBlockedReasons = Object.fromEntries(
+				[...policyDecision.blockedAccountIndexes].map((index) => [
+					String(index),
+					"policy-blocked",
+				]),
+			);
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		state.status.lastError = message;
+		const usageRecorder = createRuntimeUsageRecorder({
+			source: "runtime-proxy",
+			operation: "responses",
+			model: context.model,
+			projectKey,
+			requestId,
+			startedAt,
+		});
+		await usageRecorder.record({
+			outcome: "failure",
+			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+			errorCode: "runtime_policy_unavailable",
+		});
+		throw createRuntimeProxyHttpError(
+			"Runtime policy could not be loaded for this WebSocket request.",
+			HTTP_STATUS.SERVICE_UNAVAILABLE,
+			"runtime_policy_unavailable",
+		);
+	}
+	const usageRecorder = createRuntimeUsageRecorder({
+		source: "runtime-proxy",
+		operation: "responses",
+		model: context.model,
+		projectKey,
+		requestId,
+		startedAt,
+	});
+	if (!policyDecision.allowed) {
+		await usageRecorder.record({
+			outcome: "blocked",
+			statusCode: policyDecision.statusCode,
+			errorCode: policyDecision.errorCode,
+		});
+		throw createRuntimeProxyHttpError(
+			"Runtime policy blocked this WebSocket request.",
+			policyDecision.statusCode,
+			policyDecision.errorCode ?? "policy_blocked",
+		);
+	}
+	return { context, policyDecision, usageRecorder };
+}
+
+async function consumeWebSocketRequestForAccount(
+	request: PreparedWebSocketRequest,
+	accountManager: AccountManager,
+	account: ManagedAccount,
+): Promise<void> {
+	if (request.policyDecision.blockedAccountIndexes.has(account.index)) {
+		await request.usageRecorder.record({
+			outcome: "blocked",
+			statusCode: HTTP_STATUS.FORBIDDEN,
+			errorCode: "policy_blocked",
+			account,
+		});
+		throw createRuntimeProxyHttpError(
+			"Runtime policy blocked the account bound to this WebSocket connection.",
+			HTTP_STATUS.FORBIDDEN,
+			"policy_blocked",
+		);
+	}
+	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {
+		await request.usageRecorder.record({
+			outcome: "failure",
+			statusCode: HTTP_STATUS.TOO_MANY_REQUESTS,
+			errorCode: "token_exhausted",
+			account,
+		});
+		throw createRuntimeProxyHttpError(
+			"The account bound to this WebSocket connection has no request tokens available.",
+			HTTP_STATUS.TOO_MANY_REQUESTS,
+			"token_exhausted",
+		);
+	}
+}
+
+function websocketTerminalUsage(
+	data: RawData,
+): Parameters<RuntimeUsageRecorder["record"]>[0] | null {
+	const parsed = parseRequestBody(rawDataToBuffer(data));
+	if (!parsed) return null;
+	const type = readStringRecordValue(parsed, "type");
+	let outcome: "success" | "failure" | "cancelled";
+	if (type === "response.completed") outcome = "success";
+	else if (type === "response.cancelled") outcome = "cancelled";
+	else if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+		outcome = "failure";
+	} else {
+		return null;
+	}
+	const response = isRecord(parsed.response) ? parsed.response : null;
+	const usage = response && isRecord(response.usage) ? response.usage : null;
+	const inputDetails = usage && isRecord(usage.input_tokens_details)
+		? usage.input_tokens_details
+		: null;
+	const outputDetails = usage && isRecord(usage.output_tokens_details)
+		? usage.output_tokens_details
+		: null;
+	const error = response && isRecord(response.error) ? response.error : null;
+	return {
+		outcome,
+		statusCode: outcome === "success" ? HTTP_STATUS.OK : null,
+		errorCode: readStringRecordValue(error ?? {}, "code"),
+		inputTokens: readFiniteNumber(usage, "input_tokens"),
+		outputTokens: readFiniteNumber(usage, "output_tokens"),
+		cachedInputTokens: readFiniteNumber(inputDetails, "cached_tokens"),
+		reasoningTokens: readFiniteNumber(outputDetails, "reasoning_tokens"),
+		totalTokens: readFiniteNumber(usage, "total_tokens"),
+	};
+}
+
+function isSendableWebSocketCloseCode(code: number): boolean {
+	return (
+		(code >= 1000 &&
+			code <= 1014 &&
+			code !== 1004 &&
+			code !== 1005 &&
+			code !== 1006) ||
+		(code >= 3000 && code <= 4999)
+	);
+}
+
+function mirrorWebSocketClose(
+	target: WebSocket,
+	code: number,
+	reason: Buffer | string,
+): void {
+	if (target.readyState !== WebSocket.OPEN) return;
+	if (isSendableWebSocketCloseCode(code)) {
+		target.close(code, reason);
+		return;
+	}
+	target.terminate();
 }
 
 function createWebSocketOutboundHeaders(
@@ -803,30 +991,12 @@ function openUpstreamWebSocket(
 
 async function prepareWebSocketAccount(
 	state: RotationProxyState,
-	req: IncomingMessage,
-	firstFrame: RawData,
+	request: PreparedWebSocketRequest,
+	attemptedIndexes: Set<number>,
+	skipReasons: Map<number, string>,
 ): Promise<PreparedWebSocketAccount | null> {
-	const context = buildWebSocketRequestContext(req, firstFrame);
-	if (!context) {
-		throw new CodexValidationError("First WebSocket message must be response.create.");
-	}
-	const policyState = await loadRuntimePolicyState();
-	const policyDecision = await evaluateRuntimePolicy({
-		state: policyState,
-		accounts: state.activeAccountManager.getAccountsSnapshot(),
-		model: context.model,
-		now: state.now(),
-	});
-	if (!policyDecision.allowed) {
-		throw createRuntimeProxyHttpError(
-			"Runtime policy blocked this WebSocket request.",
-			policyDecision.statusCode,
-			policyDecision.errorCode ?? "policy_blocked",
-		);
-	}
+	const { context, policyDecision } = request;
 	let accountManager = state.activeAccountManager;
-	const attemptedIndexes = new Set<number>();
-	const skipReasons = new Map<number, string>();
 	const storageMeta = readStorageMetaFromDisk();
 	const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
 	const isPinned = typeof pinnedIndex === "number";
@@ -856,7 +1026,6 @@ async function prepareWebSocketAccount(
 				const recovered = await recoverStaleRuntimeState(state);
 				if (recovered) {
 					accountManager = recovered;
-					attemptedIndexes.clear();
 					skipReasons.clear();
 					continue;
 				}
@@ -900,7 +1069,7 @@ async function prepareWebSocketAccount(
 			account: refreshed.account,
 			accessToken: refreshed.accessToken,
 			accountId,
-			context,
+			request,
 			isPinned,
 		};
 	}
@@ -910,13 +1079,20 @@ async function prepareWebSocketAccount(
 async function connectManagedWebSocket(
 	state: RotationProxyState,
 	req: IncomingMessage,
-	firstFrame: RawData,
+	request: PreparedWebSocketRequest,
 ): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount } | null> {
-	const accountCount = state.activeAccountManager.getAccountCount();
-	for (let attempt = 0; attempt < Math.max(1, accountCount); attempt += 1) {
-		const prepared = await prepareWebSocketAccount(state, req, firstFrame);
-		if (!prepared) return null;
-		const { accountManager, account, accessToken, accountId, context, isPinned } = prepared;
+	const attemptedIndexes = new Set<number>();
+	const skipReasons = new Map<number, string>();
+	while (attemptedIndexes.size < state.activeAccountManager.getAccountCount()) {
+		const prepared = await prepareWebSocketAccount(
+			state,
+			request,
+			attemptedIndexes,
+			skipReasons,
+		);
+		if (!prepared) break;
+		const { accountManager, account, accessToken, accountId, isPinned } = prepared;
+		const { context } = request;
 		try {
 			state.status.upstreamRequests += 1;
 			const upstream = await openUpstreamWebSocket(
@@ -968,11 +1144,16 @@ async function connectManagedWebSocket(
 				);
 			}
 			accountManager.saveToDiskDebounced();
-			if (isPinned) return null;
+			if (isPinned) break;
 			state.status.retries += 1;
 			state.status.rotations += 1;
 		}
 	}
+	await request.usageRecorder.record({
+		outcome: "failure",
+		statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+		errorCode: "codex_runtime_rotation_pool_exhausted",
+	});
 	return null;
 }
 
@@ -982,14 +1163,89 @@ function bridgeWebSocketConnection(
 	client: WebSocket,
 ): void {
 	const pending: PendingWebSocketFrame[] = [];
+	const activeRequests: ActiveWebSocketRequest[] = [];
 	let upstream: WebSocket | null = null;
+	let boundAccountManager: AccountManager | null = null;
+	let boundAccount: ManagedAccount | null = null;
 	let connecting = false;
 	let closed = false;
+	let clientFrameQueue = Promise.resolve();
+	const settleAll = (
+		outcome: "failure" | "cancelled",
+		errorCode: string,
+	): void => {
+		for (const active of activeRequests.splice(0)) {
+			void active.request.usageRecorder.record({
+				outcome,
+				statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
+				errorCode,
+				account: active.account,
+			});
+		}
+	};
 	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
 		if (closed) return;
 		closed = true;
-		if (client.readyState === WebSocket.OPEN) client.close(code, reason);
-		if (upstream?.readyState === WebSocket.OPEN) upstream.close(code, reason);
+		mirrorWebSocketClose(client, code, reason);
+		if (upstream) mirrorWebSocketClose(upstream, code, reason);
+	};
+	const rejectConnection = (error: unknown): void => {
+		state.status.lastError = error instanceof Error ? error.message : String(error);
+		settleAll("failure", "websocket_proxy_failed");
+		const policyViolation =
+			error instanceof CodexValidationError || isRuntimeProxyHttpError(error);
+		closeBoth(
+			policyViolation
+				? WEBSOCKET_CLOSE_POLICY_VIOLATION
+				: WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
+			policyViolation ? "WebSocket request rejected" : "WebSocket proxy failed",
+		);
+	};
+	const forwardClientFrame = async (
+		frame: PendingWebSocketFrame,
+		preparedRequest?: PreparedWebSocketRequest,
+	): Promise<void> => {
+		if (closed || upstream?.readyState !== WebSocket.OPEN) return;
+		let request = preparedRequest;
+		if (!request) {
+			const parsed = parseRequestBody(rawDataToBuffer(frame.data));
+			if (readStringRecordValue(parsed ?? {}, "type") !== "response.create") {
+				upstream.send(frame.data, { binary: frame.isBinary });
+				return;
+			}
+			request = await prepareWebSocketRequest(state, req, frame.data);
+			if (!boundAccountManager || !boundAccount) {
+				throw createRuntimeProxyHttpError(
+					"The account bound to this WebSocket connection is unavailable.",
+					HTTP_STATUS.SERVICE_UNAVAILABLE,
+					"websocket_account_unavailable",
+				);
+			}
+			await consumeWebSocketRequestForAccount(
+				request,
+				boundAccountManager,
+				boundAccount,
+			);
+			activeRequests.push({ request, account: boundAccount });
+		} else {
+			if (!boundAccount) {
+				throw createRuntimeProxyHttpError(
+					"The account bound to this WebSocket connection is unavailable.",
+					HTTP_STATUS.SERVICE_UNAVAILABLE,
+					"websocket_account_unavailable",
+				);
+			}
+			activeRequests.push({ request, account: boundAccount });
+		}
+		upstream.send(frame.data, { binary: frame.isBinary });
+	};
+	const enqueueClientFrame = (
+		frame: PendingWebSocketFrame,
+		preparedRequest?: PreparedWebSocketRequest,
+	): void => {
+		clientFrameQueue = clientFrameQueue
+			.then(() => forwardClientFrame(frame, preparedRequest))
+			.catch(rejectConnection);
 	};
 	const initialize = async (): Promise<void> => {
 		if (connecting || upstream || pending.length === 0) return;
@@ -997,7 +1253,8 @@ function bridgeWebSocketConnection(
 		try {
 			const firstFrame = pending[0];
 			if (!firstFrame) return;
-			const connected = await connectManagedWebSocket(state, req, firstFrame.data);
+			const firstRequest = await prepareWebSocketRequest(state, req, firstFrame.data);
+			const connected = await connectManagedWebSocket(state, req, firstRequest);
 			if (!connected) {
 				closeBoth(
 					WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
@@ -1006,52 +1263,64 @@ function bridgeWebSocketConnection(
 				return;
 			}
 			upstream = connected.upstream;
+			boundAccountManager = connected.prepared.accountManager;
+			boundAccount = connected.prepared.account;
 			if (closed || client.readyState !== WebSocket.OPEN) {
-				upstream.close(1000, "Local client closed");
+				mirrorWebSocketClose(upstream, 1000, "Local client closed");
 				return;
 			}
 			state.status.streamsStarted += 1;
 			upstream.on("message", (data, isBinary) => {
+				const terminal = websocketTerminalUsage(data);
+				if (terminal) {
+					const active = activeRequests.shift();
+					if (active) {
+						void active.request.usageRecorder.record({
+							...terminal,
+							account: active.account,
+						});
+					}
+				}
 				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
 			});
 			upstream.on("close", (code, reason) => {
-				if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+				settleAll("failure", "upstream_websocket_closed");
+				closed = true;
+				mirrorWebSocketClose(client, code, reason);
 			});
 			upstream.on("error", (error) => {
 				state.status.lastError = error.message;
+				settleAll("failure", "upstream_websocket_error");
 				closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Upstream WebSocket error");
 			});
-			for (const frame of pending.splice(0)) {
-				upstream.send(frame.data, { binary: frame.isBinary });
+			const queued = pending.splice(0);
+			const queuedFirst = queued.shift();
+			if (queuedFirst) enqueueClientFrame(queuedFirst, firstRequest);
+			for (const frame of queued) {
+				enqueueClientFrame(frame);
 			}
 		} catch (error) {
-			state.status.lastError = error instanceof Error ? error.message : String(error);
-			const policyViolation =
-				error instanceof CodexValidationError || isRuntimeProxyHttpError(error);
-			closeBoth(
-				policyViolation
-					? WEBSOCKET_CLOSE_POLICY_VIOLATION
-					: WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
-				policyViolation ? "WebSocket request rejected" : "WebSocket proxy failed",
-			);
+			rejectConnection(error);
 		} finally {
 			connecting = false;
 		}
 	};
 	client.on("message", (data, isBinary) => {
 		if (upstream?.readyState === WebSocket.OPEN) {
-			upstream.send(data, { binary: isBinary });
+			enqueueClientFrame({ data, isBinary });
 			return;
 		}
 		pending.push({ data, isBinary });
 		void initialize();
 	});
 	client.on("close", (code, reason) => {
+		settleAll("cancelled", "client_websocket_closed");
 		closed = true;
-		if (upstream?.readyState === WebSocket.OPEN) upstream.close(code, reason);
+		if (upstream) mirrorWebSocketClose(upstream, code, reason);
 	});
 	client.on("error", (error) => {
 		state.status.lastError = error.message;
+		settleAll("failure", "client_websocket_error");
 		closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Local WebSocket error");
 	});
 }
@@ -1226,7 +1495,6 @@ export async function startRuntimeRotationProxy(
 			return;
 		}
 		webSocketServer.handleUpgrade(req, socket, head, (client) => {
-			state.status.totalRequests += 1;
 			bridgeWebSocketConnection(state, req, client);
 		});
 	});

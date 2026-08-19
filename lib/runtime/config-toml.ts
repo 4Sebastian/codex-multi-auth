@@ -236,6 +236,7 @@ function createRuntimeRotationProviderBlock(
 		`base_url = ${tomlStringLiteral(baseUrl)}`,
 		"requires_openai_auth = false",
 		'wire_api = "responses"',
+		"supports_websockets = true",
 	];
 	if (clientApiKey.trim().length > 0) {
 		lines.splice(
@@ -348,4 +349,3 @@ export function restoreConfigTomlFromRuntimeRotationProviderWithoutBackup(
 	}
 	return restored.replace(/\r\n/g, "\n");
 }
-

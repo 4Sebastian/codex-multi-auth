@@ -285,6 +285,7 @@ describe("Codex app runtime rotation bind", () => {
 		expect(bound).toContain("requires_openai_auth = false");
 		expect(bound).toContain('experimental_bearer_token = "app-secret"');
 		expect(bound).toContain('wire_api = "responses"');
+		expect(bound).toContain("supports_websockets = true");
 		expect(bound).toContain("disable_response_storage = false");
 		expect(bound).toContain("[profiles.default]\nmodel = \"gpt-5.4\"\ndisable_response_storage = true");
 		expect(bound).not.toContain("env_key");

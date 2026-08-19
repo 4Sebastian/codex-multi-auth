@@ -3628,6 +3628,7 @@ function createRuntimeRotationProxyCanonicalCodexHome(
 		`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
 		`${providerTable}.requires_openai_auth=false`,
 		`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
+		`${providerTable}.supports_websockets=true`,
 		"disable_response_storage=false",
 	].flatMap((assignment) => ["-c", assignment]);
 
