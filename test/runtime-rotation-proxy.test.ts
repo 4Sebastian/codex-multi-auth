@@ -637,6 +637,194 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("refunds and records the initial request when the client leaves during handshake", async () => {
+		const server = createHttpServer();
+		const handshakeSockets = new Set<import("node:net").Socket>();
+		server.on("upgrade", (_request, socket) => {
+			handshakeSockets.add(socket);
+			socket.once("close", () => handshakeSockets.delete(socket));
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing test server address");
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const originalConsumeToken = accountManager.consumeToken.bind(accountManager);
+		let notifyTokenConsumed = (): void => undefined;
+		const tokenConsumed = new Promise<void>((resolve) => {
+			notifyTokenConsumed = resolve;
+		});
+		const consumeToken = vi
+			.spyOn(accountManager, "consumeToken")
+			.mockImplementation((account, family, model) => {
+				const consumed = originalConsumeToken(account, family, model);
+				if (consumed) notifyTokenConsumed();
+				return consumed;
+			});
+		const originalRefundToken = accountManager.refundToken.bind(accountManager);
+		let notifyTokenRefunded = (): void => undefined;
+		const tokenRefunded = new Promise<void>((resolve) => {
+			notifyTokenRefunded = resolve;
+		});
+		const refundToken = vi
+			.spyOn(accountManager, "refundToken")
+			.mockImplementation((account, family, model) => {
+				const refunded = originalRefundToken(account, family, model);
+				notifyTokenRefunded();
+				return refunded;
+			});
+		const usageRecords: unknown[] = [];
+		let notifyCancellation = (): void => undefined;
+		const cancellationRecorded = new Promise<void>((resolve) => {
+			notifyCancellation = resolve;
+		});
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input);
+						if (input.outcome === "cancelled") notifyCancellation();
+					},
+				};
+			});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: {
+				upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api`,
+				fetchTimeoutMs: 2_000,
+			},
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [],
+			}));
+			expect(
+				await Promise.race([
+					tokenConsumed.then(() => "consumed" as const),
+					timeoutResult(1_000),
+				]),
+			).toBe("consumed");
+			socket.terminate();
+			expect(
+				await Promise.race([
+					cancellationRecorded.then(() => "cancelled" as const),
+					timeoutResult(1_000),
+				]),
+			).toBe("cancelled");
+			expect(
+				await Promise.race([
+					tokenRefunded.then(() => "refunded" as const),
+					timeoutResult(1_000),
+				]),
+			).toBe("refunded");
+
+			expect(refundToken).toHaveBeenCalledTimes(1);
+			expect(usageRecords).toEqual([
+				expect.objectContaining({
+					outcome: "cancelled",
+					errorCode: "client_websocket_closed",
+				}),
+			]);
+		} finally {
+			socket.terminate();
+			for (const handshakeSocket of handshakeSockets) handshakeSocket.destroy();
+			server.close();
+			usageRecorder.mockRestore();
+			refundToken.mockRestore();
+			consumeToken.mockRestore();
+		}
+	});
+
+	it("rotates after an upstream WebSocket rate-limit event", async () => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				connectionCount += 1;
+				authorizationAttempts.push(request.headers.authorization);
+				socket.on("message", () => {
+					if (connectionCount === 1) {
+						socket.send(JSON.stringify({
+							type: "error",
+							status: HTTP_STATUS.TOO_MANY_REQUESTS,
+							retry_after_ms: 120_000,
+							error: { code: "rate_limit_exceeded" },
+						}));
+						return;
+					}
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const url = proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses";
+		const firstClient = await connectWebSocket(url);
+		let secondClient: WebSocket | null = null;
+		try {
+			const firstResponse = nextWebSocketMessage(firstClient);
+			firstClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "sticky-session",
+				input: [],
+			}));
+			expect(JSON.parse(await firstResponse)).toMatchObject({
+				type: "error",
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+			});
+			expect(
+				accountManager.isAccountAvailableForFamily(
+					0,
+					"gpt-5.2",
+					"gpt-5.6-sol",
+				),
+			).toBe(false);
+			const firstClosed = nextWebSocketClose(firstClient);
+			firstClient.close(1000);
+			await firstClosed;
+
+			secondClient = await connectWebSocket(url);
+			const secondResponse = nextWebSocketMessage(secondClient);
+			secondClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "sticky-session",
+				input: [],
+			}));
+			expect(JSON.parse(await secondResponse)).toMatchObject({
+				type: "response.completed",
+			});
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			firstClient.terminate();
+			secondClient?.terminate();
+			await upstream.close();
+		}
+	});
+
 	it("terminates peers when abnormal WebSocket close codes are mirrored", async () => {
 		let connectionCount = 0;
 		let resolveFirstUpstreamClose: ((code: number) => void) | null = null;
