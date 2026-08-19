@@ -662,6 +662,13 @@ function writePoolExhausted(params: {
 const CODEX_RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
 const WEBSOCKET_CLOSE_POLICY_VIOLATION = 1008;
 const WEBSOCKET_CLOSE_TRY_AGAIN_LATER = 1013;
+const MAX_WEBSOCKET_HANDSHAKE_ERROR_BODY_BYTES = 64 * 1024;
+const WEBSOCKET_AUTH_FAILURE_CODES: ReadonlySet<string> = new Set([
+	"authentication_error",
+	"invalid_api_key",
+	"invalid_authentication",
+	"unauthorized",
+]);
 
 interface PendingWebSocketFrame {
 	data: RawData;
@@ -711,11 +718,20 @@ interface WebSocketHandshakeLifecycle {
 
 class WebSocketHandshakeError extends Error {
 	readonly statusCode: number | null;
+	readonly headers: Headers;
+	readonly bodyText: string;
 
-	constructor(message: string, statusCode: number | null = null) {
+	constructor(
+		message: string,
+		statusCode: number | null = null,
+		headers = new Headers(),
+		bodyText = "",
+	) {
 		super(message);
 		this.name = "WebSocketHandshakeError";
 		this.statusCode = statusCode;
+		this.headers = headers;
+		this.bodyText = bodyText;
 	}
 }
 
@@ -740,6 +756,59 @@ function readFiniteNumber(record: Record<string, unknown> | null, key: string): 
 	return typeof value === "number" && Number.isFinite(value) && value >= 0
 		? value
 		: null;
+}
+
+function readWebSocketStatusCode(
+	...records: Array<Record<string, unknown> | null>
+): number | null {
+	for (const record of records) {
+		for (const key of ["status", "status_code"] as const) {
+			const value = record?.[key];
+			const parsed =
+				typeof value === "number"
+					? value
+					: typeof value === "string" && /^\d{3}$/.test(value.trim())
+						? Number.parseInt(value.trim(), 10)
+						: Number.NaN;
+			if (Number.isInteger(parsed) && parsed >= 100 && parsed <= 599) {
+				return parsed;
+			}
+		}
+	}
+	return null;
+}
+
+function inferWebSocketFailureStatus(errorCode: string | null, rawBody: string): number | null {
+	const normalizedCode = errorCode?.trim().toLowerCase() ?? "";
+	if (
+		normalizedCode === "token_invalidated" ||
+		WEBSOCKET_AUTH_FAILURE_CODES.has(normalizedCode) ||
+		isTokenInvalidationError(rawBody)
+	) {
+		return HTTP_STATUS.UNAUTHORIZED;
+	}
+	if (
+		/(?:rate.?limit|usage_limit|quota|insufficient_quota|billing|out_of_budget)/i.test(
+			normalizedCode,
+		)
+	) {
+		return HTTP_STATUS.TOO_MANY_REQUESTS;
+	}
+	if (
+		/(?:workspace|organization|account)_(?:disabled|expired|terminated|deactivated)/i.test(
+			normalizedCode,
+		)
+	) {
+		return HTTP_STATUS.FORBIDDEN;
+	}
+	if (
+		/(?:^|_)(?:server_error|internal_server_error|service_unavailable|overloaded|upstream_error)(?:$|_)/i.test(
+			normalizedCode,
+		)
+	) {
+		return HTTP_STATUS.SERVICE_UNAVAILABLE;
+	}
+	return null;
 }
 
 function buildWebSocketRequestContext(
@@ -891,9 +960,15 @@ function websocketTerminalUsage(
 	if (!parsed) return null;
 	const type = readStringRecordValue(parsed, "type");
 	let outcome: "success" | "failure" | "cancelled";
-	if (type === "response.completed") outcome = "success";
-	else if (type === "response.cancelled") outcome = "cancelled";
-	else if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+	if (
+		type === "response.completed" ||
+		type === "response.done" ||
+		type === "response.incomplete"
+	) {
+		outcome = "success";
+	} else if (type === "response.cancelled") {
+		outcome = "cancelled";
+	} else if (type === "response.failed" || type === "error") {
 		outcome = "failure";
 	} else {
 		return null;
@@ -919,34 +994,63 @@ function websocketTerminalUsage(
 	const retryHeaders = new Headers();
 	if (headerValues) {
 		for (const [name, value] of Object.entries(headerValues)) {
-			if (typeof value === "string" || typeof value === "number") {
+			if (
+				typeof value === "string" ||
+				typeof value === "number" ||
+				typeof value === "boolean"
+			) {
 				retryHeaders.set(name, String(value));
 			}
 		}
 	}
+	const errorCode =
+		readStringRecordValue(error ?? {}, "code") ??
+		readStringRecordValue(parsed, "code") ??
+		readStringRecordValue(error ?? {}, "type");
+	const rawBody = body.toString("utf8");
 	const statusCode =
-		readFiniteNumber(parsed, "status") ??
-		readFiniteNumber(response, "status") ??
-		(outcome === "success" ? HTTP_STATUS.OK : null);
+		readWebSocketStatusCode(parsed, response, error) ??
+		(outcome === "success"
+			? HTTP_STATUS.OK
+			: inferWebSocketFailureStatus(errorCode, rawBody));
 	return {
 		record: {
 			outcome,
 			statusCode,
-			errorCode:
-				readStringRecordValue(error ?? {}, "code") ??
-				readStringRecordValue(parsed, "code"),
+			errorCode,
 			inputTokens: readFiniteNumber(usage, "input_tokens"),
 			outputTokens: readFiniteNumber(usage, "output_tokens"),
 			cachedInputTokens: readFiniteNumber(inputDetails, "cached_tokens"),
 			reasoningTokens: readFiniteNumber(outputDetails, "reasoning_tokens"),
 			totalTokens: readFiniteNumber(usage, "total_tokens"),
 		},
-		rawBody: body.toString("utf8"),
+		rawBody,
 		retryAfterMs:
 			readFiniteNumber(parsed, "retry_after_ms") ??
 			readFiniteNumber(error, "retry_after_ms"),
 		retryHeaders: [...retryHeaders].length > 0 ? retryHeaders : null,
 	};
+}
+
+function applyWebSocketTransportAccountFailure(
+	state: RotationProxyState,
+	active: ActiveWebSocketRequest,
+): void {
+	const { accountManager, account, request } = active;
+	accountManager.recordFailure(
+		account,
+		request.context.family,
+		request.context.model,
+	);
+	accountManager.markAccountCoolingDown(
+		account,
+		state.networkErrorCooldownMs,
+		"network-error",
+	);
+	state.sessionAffinityStore?.forgetSession(request.context.sessionKey);
+	state.status.retries += 1;
+	state.status.rotations += 1;
+	accountManager.saveToDiskDebounced();
 }
 
 function applyWebSocketTerminalAccountFailure(
@@ -1122,6 +1226,8 @@ function openUpstreamWebSocket(
 		perMessageDeflate: false,
 	});
 		let settled = false;
+		let readingUnexpectedResponse = false;
+		let unexpectedResponse: IncomingMessage | null = null;
 		const finish = (error?: Error): void => {
 			if (settled) return;
 			settled = true;
@@ -1133,9 +1239,12 @@ function openUpstreamWebSocket(
 			else resolve(upstream);
 		};
 		const onOpen = (): void => finish();
-		const onError = (error: Error): void => finish(error);
+		const onError = (error: Error): void => {
+			if (!readingUnexpectedResponse) finish(error);
+		};
 		const onAbort = (): void => {
 			try {
+				unexpectedResponse?.destroy();
 				upstream.terminate();
 			} catch (error) {
 				finish(error instanceof Error ? error : new Error(String(error)));
@@ -1145,19 +1254,74 @@ function openUpstreamWebSocket(
 			_request: IncomingMessage,
 			response: IncomingMessage,
 		): void => {
-			response.resume();
-			finish(
-				new WebSocketHandshakeError(
-					`Upstream WebSocket handshake returned HTTP ${response.statusCode ?? 0}`,
-					response.statusCode ?? null,
-				),
-			);
+			readingUnexpectedResponse = true;
+			unexpectedResponse = response;
+			const statusCode = response.statusCode ?? null;
+			const responseHeaders = headersFromIncoming(response);
+			void readBoundedIncomingBody(
+				response,
+				MAX_WEBSOCKET_HANDSHAKE_ERROR_BODY_BYTES,
+				timeoutMs,
+			).then((bodyText) => {
+				finish(
+					new WebSocketHandshakeError(
+						`Upstream WebSocket handshake returned HTTP ${statusCode ?? 0}`,
+						statusCode,
+						responseHeaders,
+						bodyText,
+					),
+				);
+			});
 		};
 		upstream.once("open", onOpen);
 		upstream.once("error", onError);
 		upstream.once("unexpected-response", onUnexpectedResponse);
 		signal.addEventListener("abort", onAbort, { once: true });
 		if (signal.aborted) onAbort();
+	});
+}
+
+function readBoundedIncomingBody(
+	response: IncomingMessage,
+	maxBytes: number,
+	timeoutMs: number,
+): Promise<string> {
+	return new Promise((resolve) => {
+		const chunks: Buffer[] = [];
+		let totalBytes = 0;
+		let settled = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		function finish(): void {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			response.off("data", onData);
+			response.off("end", finish);
+			response.off("close", finish);
+			response.off("error", finish);
+			resolve(Buffer.concat(chunks, totalBytes).toString("utf8"));
+		}
+		function onData(chunk: Buffer | string): void {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			const remaining = maxBytes - totalBytes;
+			if (remaining > 0) {
+				const accepted = buffer.subarray(0, remaining);
+				chunks.push(accepted);
+				totalBytes += accepted.byteLength;
+			}
+			if (buffer.byteLength > remaining) {
+				response.destroy();
+				finish();
+			}
+		}
+		timeout = setTimeout(() => {
+			response.destroy();
+			finish();
+		}, Math.max(1, timeoutMs));
+		response.on("data", onData);
+		response.once("end", finish);
+		response.once("close", finish);
+		response.once("error", finish);
 	});
 }
 
@@ -1224,7 +1388,13 @@ async function prepareWebSocketAccount(
 					})
 				: selectAccount();
 		if (!selected) {
-			if (!reloaded && !isPinned && accountManager.getAccountCount() > 0) {
+			if (
+				!reloaded &&
+				!isPinned &&
+				accountManager.getAccountCount() > 0 &&
+				policyDecision.blockedAccountIndexes.size === 0 &&
+				![...skipReasons.values()].some((reason) => reason === "policy-blocked")
+			) {
 				reloaded = true;
 				const recovered = await recoverStaleRuntimeState(state);
 				if (recovered) {
@@ -1422,23 +1592,66 @@ async function connectManagedWebSocket(
 			refundPreparedWebSocketToken(prepared);
 			if (lifecycle.isClosed()) break;
 			state.status.lastError = error instanceof Error ? error.message : String(error);
-			accountManager.recordFailure(account, context.family, context.model);
-			const statusCode = error instanceof WebSocketHandshakeError ? error.statusCode : null;
+			const handshakeError = error instanceof WebSocketHandshakeError ? error : null;
+			const statusCode = handshakeError?.statusCode ?? null;
+			const bodyText = handshakeError?.bodyText ?? "";
+			const errorCode = extractErrorCodeFromBody(bodyText);
+			state.sessionAffinityStore?.forgetSession(context.sessionKey);
 			if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
+				accountManager.recordFailure(account, context.family, context.model);
+				if (
+					errorCode === "token_invalidated" ||
+					isTokenInvalidationError(bodyText)
+				) {
+					accountManager.markAuthInvalidated(
+						account,
+						errorCode ?? "token_invalidated",
+					);
+					applyMonotonicAuthCooldown(
+						accountManager,
+						account,
+						state.tokenInvalidationCooldownMs,
+					);
+					await accountManager.saveToDisk();
+					await request.usageRecorder.record({
+						outcome: "failure",
+						statusCode,
+						errorCode: "token_invalidated",
+						account,
+					});
+					throw createRuntimeProxyHttpError(
+						"OAuth token has been invalidated. Please re-login.",
+						HTTP_STATUS.UNAUTHORIZED,
+						"token_invalidated",
+					);
+				}
 				applyMonotonicAuthCooldown(
 					accountManager,
 					account,
 					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 				);
 			} else if (statusCode === HTTP_STATUS.TOO_MANY_REQUESTS) {
+				const retryAfterMs =
+					(handshakeError
+						? parseRetryAfterHeaderMs(handshakeError.headers, state.now())
+						: null) ??
+					parseRetryAfterBodyMs(bodyText, state.now()) ??
+					60_000;
+				state.preemptiveQuotaScheduler.markRateLimited(
+					buildQuotaScheduleKey(account, context.family, context.model),
+					retryAfterMs,
+					state.now(),
+				);
+				accountManager.recordRateLimit(account, context.family, context.model);
 				accountManager.markRateLimitedWithReason(
 					account,
-					60_000,
+					retryAfterMs,
 					context.family,
 					"quota",
 					context.model,
 				);
 			} else {
+				accountManager.recordFailure(account, context.family, context.model);
 				accountManager.markAccountCoolingDown(
 					account,
 					statusCode !== null && statusCode >= 500
@@ -1479,6 +1692,7 @@ function bridgeWebSocketConnection(
 	const settlePendingHandshake = (
 		outcome: "failure" | "cancelled",
 		errorCode: string,
+		applyAccountFailure = false,
 	): void => {
 		const prepared = pendingHandshake;
 		const request = prepared?.request ?? pendingInitialRequest;
@@ -1489,6 +1703,13 @@ function bridgeWebSocketConnection(
 		if (prepared) prepared.abortHandshake = null;
 		abortHandshake?.();
 		if (prepared) refundPreparedWebSocketToken(prepared);
+		if (prepared && applyAccountFailure) {
+			applyWebSocketTransportAccountFailure(state, {
+				request: prepared.request,
+				accountManager: prepared.accountManager,
+				account: prepared.account,
+			});
+		}
 		void request.usageRecorder.record({
 			outcome,
 			statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
@@ -1499,8 +1720,12 @@ function bridgeWebSocketConnection(
 	const settleAll = (
 		outcome: "failure" | "cancelled",
 		errorCode: string,
+		applyAccountFailure = false,
 	): void => {
 		for (const active of activeRequests.splice(0)) {
+			if (applyAccountFailure) {
+				applyWebSocketTransportAccountFailure(state, active);
+			}
 			void active.request.usageRecorder.record({
 				outcome,
 				statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
@@ -1582,7 +1807,8 @@ function bridgeWebSocketConnection(
 		try {
 			upstream.send(frame.data, { binary: frame.isBinary });
 		} catch (error) {
-			activeRequests.pop();
+			const active = activeRequests.pop();
+			if (active) applyWebSocketTransportAccountFailure(state, active);
 			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
 			else if (consumedForFrame && boundAccountManager && boundAccount) {
 				boundAccountManager.refundToken(
@@ -1679,15 +1905,15 @@ function bridgeWebSocketConnection(
 				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
 			});
 			upstream.on("close", (code, reason) => {
-				settlePendingHandshake("failure", "upstream_websocket_closed");
-				settleAll("failure", "upstream_websocket_closed");
+				settlePendingHandshake("failure", "upstream_websocket_closed", true);
+				settleAll("failure", "upstream_websocket_closed", true);
 				closed = true;
 				mirrorWebSocketClose(client, code, reason);
 			});
 			upstream.on("error", (error) => {
 				state.status.lastError = error.message;
-				settlePendingHandshake("failure", "upstream_websocket_error");
-				settleAll("failure", "upstream_websocket_error");
+				settlePendingHandshake("failure", "upstream_websocket_error", true);
+				settleAll("failure", "upstream_websocket_error", true);
 				closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Upstream WebSocket error");
 			});
 			const queued = pending.splice(0);
@@ -1884,7 +2110,13 @@ export async function startRuntimeRotationProxy(
 		});
 	});
 	server.on("upgrade", (req, socket, head) => {
-		const incomingUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+		let incomingUrl: URL;
+		try {
+			incomingUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+		} catch {
+			rejectWebSocketUpgrade(socket, HTTP_STATUS.BAD_REQUEST, "Bad Request");
+			return;
+		}
 		if (!isResponsesPath(incomingUrl.pathname)) {
 			rejectWebSocketUpgrade(socket, 404, "Not Found");
 			return;

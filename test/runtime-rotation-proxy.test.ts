@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer as createHttpServer, request } from "node:http";
+import { createConnection } from "node:net";
 import WebSocket, { WebSocketServer } from "ws";
 import { AccountManager } from "../lib/accounts.js";
 import { CodexValidationError } from "../lib/errors.js";
@@ -304,6 +305,48 @@ function nextWebSocketClose(socket: WebSocket): Promise<{ code: number; reason: 
 	});
 }
 
+function rawUpgradeStatus(proxy: RuntimeRotationProxyServer, target: string): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const socket = createConnection({ host: proxy.host, port: proxy.port });
+		let settled = false;
+		const timeout = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			reject(new Error("Timed out waiting for raw upgrade response"));
+		}, 2_000);
+		let response = "";
+		const finish = (error?: Error): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			socket.destroy();
+			if (error) reject(error);
+			else {
+				const match = /^HTTP\/1\.1 (\d{3})/.exec(response);
+				if (!match?.[1]) reject(new Error(`Missing HTTP status in ${response}`));
+				else resolve(Number.parseInt(match[1], 10));
+			}
+		};
+		socket.once("error", finish);
+		socket.on("data", (chunk) => {
+			response += chunk.toString();
+			if (response.includes("\r\n\r\n")) finish();
+		});
+		socket.once("connect", () => {
+			socket.write(
+				`GET ${target} HTTP/1.1\r\n` +
+					`Host: ${proxy.host}:${proxy.port}\r\n` +
+					"Connection: Upgrade\r\n" +
+					"Upgrade: websocket\r\n" +
+					"Sec-WebSocket-Version: 13\r\n" +
+					"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+					`Authorization: Bearer ${DEFAULT_CLIENT_API_KEY}\r\n\r\n`,
+			);
+		});
+	});
+}
+
 interface ActiveHandleProcess {
 	_getActiveHandles?: () => unknown[];
 }
@@ -501,6 +544,70 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("settles Pi WebSocket terminal variants in request order", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		let requestCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", () => {
+					requestCount += 1;
+					socket.send(JSON.stringify({
+						type: requestCount === 1 ? "response.done" : "response.incomplete",
+						response: {
+							usage: {
+								input_tokens: requestCount,
+								total_tokens: requestCount + 1,
+							},
+						},
+					}));
+				});
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			for (const requestNumber of [1, 2]) {
+				const response = nextWebSocketMessage(socket);
+				socket.send(JSON.stringify({
+					type: "response.create",
+					model: "gpt-5.6-sol",
+					prompt_cache_key: "pi-session",
+					input: [{ requestNumber }],
+				}));
+				await response;
+			}
+			expect(usageRecords).toEqual([
+				expect.objectContaining({ outcome: "success", inputTokens: 1, totalTokens: 2 }),
+				expect.objectContaining({ outcome: "success", inputTokens: 2, totalTokens: 3 }),
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+		}
+	});
+
 	it("re-evaluates policy before every response.create on a persistent connection", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
@@ -637,6 +744,118 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("stops handshake rotation for an explicitly invalidated token", async () => {
+		const body = JSON.stringify({
+			error: { code: "token_invalidated", message: "OAuth credentials rejected" },
+		});
+		const server = createHttpServer();
+		const authorizationAttempts: Array<string | undefined> = [];
+		server.on("upgrade", (request, socket) => {
+			authorizationAttempts.push(request.headers.authorization);
+			socket.end(
+				"HTTP/1.1 401 Unauthorized\r\n" +
+					"Connection: close\r\n" +
+					"Content-Type: application/json\r\n" +
+					`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+			);
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing test server address");
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api` },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await closed).toMatchObject({ code: 1008 });
+			expect(authorizationAttempts).toEqual(["Bearer access-1"]);
+			const firstAccount = accountManager.getAccountByIndex(0);
+			expect(firstAccount && accountManager.isAccountAuthInvalidated(firstAccount)).toBe(true);
+			expect(accountManager.getAccountByIndex(1)?.authInvalidatedAt).toBeUndefined();
+		} finally {
+			socket.terminate();
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+		}
+	});
+
+	it("honors retry metadata from failed WebSocket handshakes", async () => {
+		const now = Date.now();
+		const body = JSON.stringify({ error: { code: "rate_limit_exceeded" } });
+		const server = createHttpServer();
+		const webSocketServer = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+		const authorizationAttempts: Array<string | undefined> = [];
+		server.on("upgrade", (request, socket, head) => {
+			authorizationAttempts.push(request.headers.authorization);
+			if (request.headers.authorization === "Bearer access-1") {
+				socket.end(
+					"HTTP/1.1 429 Too Many Requests\r\n" +
+						"Connection: close\r\n" +
+						"Retry-After: 180\r\n" +
+						"Content-Type: application/json\r\n" +
+						`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+				);
+				return;
+			}
+			webSocketServer.handleUpgrade(request, socket, head, (upstreamSocket) => {
+				webSocketServer.emit("connection", upstreamSocket, request);
+			});
+		});
+		webSocketServer.on("connection", (socket) => {
+			socket.once("message", () => {
+				socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing test server address");
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api` },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			await response;
+			expect(authorizationAttempts).toEqual(["Bearer access-1", "Bearer access-2"]);
+			expect(
+				Math.max(
+					...Object.values(
+						accountManager.getAccountByIndex(0)?.rateLimitResetTimes ?? {},
+					),
+				),
+			).toBeGreaterThan(now + 150_000);
+		} finally {
+			socket.terminate();
+			for (const client of webSocketServer.clients) client.terminate();
+			await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+		}
+	});
+
 	it("defers WebSocket accounts held by the preemptive quota scheduler", async () => {
 		let upstreamConnections = 0;
 		const upstream = await startTestWebSocketUpstream({
@@ -684,6 +903,53 @@ describe("runtime rotation proxy", () => {
 		} finally {
 			socket.terminate();
 			await upstream.close();
+		}
+	});
+
+	it("does not recover stale WebSocket state for policy-blocked accounts", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const loadSpy = vi
+			.spyOn(AccountManager, "loadFromDisk")
+			.mockRejectedValue(new Error("policy-blocked state must not reload"));
+		const policySpy = vi
+			.spyOn(runtimePolicy, "evaluateRuntimePolicy")
+			.mockResolvedValue({
+				allowed: true,
+				statusCode: HTTP_STATUS.FORBIDDEN,
+				errorCode: null,
+				reasons: [],
+				projectKey: null,
+				blockedAccountIndexes: new Set([0, 1]),
+				blockedAccountReasons: { 0: "policy-blocked", 1: "policy-blocked" },
+				scoreBoostByAccount: {},
+				budgetEvaluations: [],
+			});
+		let upstreamConnections = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: () => {
+				upstreamConnections += 1;
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await closed).toMatchObject({ code: 1013 });
+			expect(loadSpy).not.toHaveBeenCalled();
+			expect(upstreamConnections).toBe(0);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			policySpy.mockRestore();
+			loadSpy.mockRestore();
 		}
 	});
 
@@ -1112,6 +1378,78 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("normalizes status_code and failure codes from WebSocket events", async () => {
+		const now = Date.now();
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				socket.once("message", () => {
+					if (connectionCount === 1) {
+						socket.send(JSON.stringify({
+							type: "error",
+							status_code: HTTP_STATUS.TOO_MANY_REQUESTS,
+							error: { type: "usage_limit_reached" },
+						}));
+						return;
+					}
+					socket.send(JSON.stringify({
+						type: "response.failed",
+						response: {
+							status: "failed",
+							error: { code: "server_error" },
+						},
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const firstClient = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		let secondClient: WebSocket | null = null;
+		try {
+			const firstResponse = nextWebSocketMessage(firstClient);
+			firstClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "normalized-session",
+				input: [],
+			}));
+			expect(JSON.parse(await firstResponse)).toMatchObject({
+				type: "error",
+				status_code: HTTP_STATUS.TOO_MANY_REQUESTS,
+			});
+			const firstClosed = nextWebSocketClose(firstClient);
+			firstClient.close(1000);
+			await firstClosed;
+
+			secondClient = await connectWebSocket(
+				proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+			);
+			const secondResponse = nextWebSocketMessage(secondClient);
+			secondClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "normalized-session",
+				input: [],
+			}));
+			expect(JSON.parse(await secondResponse)).toMatchObject({ type: "response.failed" });
+			expect(accountManager.getAccountByIndex(0)?.lastRateLimitReason).toBe("quota");
+			expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("server-error");
+		} finally {
+			firstClient.terminate();
+			secondClient?.terminate();
+			await upstream.close();
+		}
+	});
+
 	it("terminates peers when abnormal WebSocket close codes are mirrored", async () => {
 		let connectionCount = 0;
 		let resolveFirstUpstreamClose: ((code: number) => void) | null = null;
@@ -1160,6 +1498,45 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("cools down an account when upstream closes before a terminal event", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const recordFailure = vi.spyOn(accountManager, "recordFailure");
+		const forgetAffinity = vi.spyOn(SessionAffinityStore.prototype, "forgetSession");
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.once("message", () => socket.terminate());
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "broken-session",
+				input: [],
+			}));
+			expect(await closed).toMatchObject({ code: 1006 });
+			expect(recordFailure).toHaveBeenCalledTimes(1);
+			expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("network-error");
+			expect(forgetAffinity).toHaveBeenCalledWith("broken-session");
+			expect(proxy.getStatus()).toMatchObject({ retries: 1, rotations: 1 });
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			forgetAffinity.mockRestore();
+			recordFailure.mockRestore();
+		}
+	});
+
 	it("rejects unauthenticated WebSocket upgrades before accepting a client", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
@@ -1176,6 +1553,18 @@ describe("runtime rotation proxy", () => {
 			socket.once("error", reject);
 		});
 		expect(status).toBe(HTTP_STATUS.UNAUTHORIZED);
+	});
+
+	it("rejects malformed WebSocket request targets without stopping the proxy", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		expect(await rawUpgradeStatus(proxy, "http://%/codex/responses")).toBe(
+			HTTP_STATUS.BAD_REQUEST,
+		);
+		const response = await getModels(proxy);
+		expect(response.status).toBe(HTTP_STATUS.OK);
 	});
 
 	it("requires a client API key at startup", async () => {
