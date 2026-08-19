@@ -1290,11 +1290,10 @@ function readBoundedIncomingBody(
 		const chunks: Buffer[] = [];
 		let totalBytes = 0;
 		let settled = false;
-		let timeout: ReturnType<typeof setTimeout> | undefined;
 		function finish(): void {
 			if (settled) return;
 			settled = true;
-			if (timeout) clearTimeout(timeout);
+			clearTimeout(timeout);
 			response.off("data", onData);
 			response.off("end", finish);
 			response.off("close", finish);
@@ -1314,7 +1313,7 @@ function readBoundedIncomingBody(
 				finish();
 			}
 		}
-		timeout = setTimeout(() => {
+		const timeout = setTimeout(() => {
 			response.destroy();
 			finish();
 		}, Math.max(1, timeoutMs));

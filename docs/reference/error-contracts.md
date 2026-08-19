@@ -112,7 +112,7 @@ The request layer's thrown errors are backed by the typed hierarchy in `lib/erro
 
 ## Runtime Rotation Proxy Error Contract
 
-The default-on localhost Responses proxy returns JSON error payloads with a stable `error.code` field.
+For non-upgrade HTTP requests, the default-on localhost Responses proxy returns JSON error payloads with a stable `error.code` field.
 
 | Code | HTTP status | Meaning |
 | --- | --- | --- |
@@ -136,6 +136,11 @@ Pinned-account-unavailable responses also carry three recovery fields:
 `retry_after_ms` is advisory; it is not emitted as a `Retry-After` header.
 
 Account policy pause/drain is enforced through runtime policy evaluation and contributes to selection skip reasons such as `policy-blocked`.
+
+WebSocket upgrades use transport-native failures instead of the JSON contract above.
+Malformed targets, unsupported paths, and missing client authentication are rejected before upgrade with plain HTTP `400`, `404`, or `401` responses.
+After upgrade, an invalid initial `response.create` or a per-request policy/token rejection closes with `1008`; pool exhaustion or an explicit upstream error event closes with `1013`.
+Valid upstream close codes are mirrored, while reserved or otherwise unsendable close codes terminate the peer connection.
 
 ---
 

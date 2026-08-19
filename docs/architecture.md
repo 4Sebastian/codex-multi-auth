@@ -14,7 +14,7 @@ Public overview of how `codex-multi-auth` fits around the official Codex CLI: ac
 - The package does **not** publish a global `codex` binary; that name stays owned by the official Codex install path.
 - Account, settings, quota, usage, policy, backup, and diagnostic state live under `~/.codex/multi-auth`.
 - Runtime rotation is **default-on** for request-bearing sessions launched through this package's wrapper or app bind.
-- When runtime rotation is enabled, forwarded Codex CLI/app sessions can send Responses traffic through a localhost-only proxy that selects managed accounts per request.
+- When runtime rotation is enabled, forwarded Codex CLI/app sessions can send HTTP/SSE and persistent WebSocket Responses traffic through a localhost-only proxy that selects managed accounts per request or connection.
 - Local governance (usage ledger, budgets, account pause/drain, routing profiles, capability matrix) is enforced at runtime via `evaluateRuntimePolicy` on the rotation path.
 - The plugin-host entrypoint remains available for advanced host integrations, but it is not required for normal CLI use.
 
@@ -76,15 +76,17 @@ The proxy:
 
 - accepts only local authenticated client requests (per-process client token)
 - forwards Responses API, model discovery, and thread-goal routes (`/responses`, `/models`, `/thread/goal/*`, and `/codex/...` variants)
-- terminates local Codex WebSocket connections and opens authenticated upstream Codex WebSockets, keeping a selected account pinned for the lifetime of each persistent connection
+- accepts local Codex WebSocket connections and opens authenticated upstream Codex WebSockets, binding one selected account to each persistent connection
 - authenticates local clients with a per-process token via `Authorization: Bearer` or `x-api-key` (timing-safe compare); refuses non-loopback binds
 - caps request bodies at 64 MiB
 - replaces upstream auth headers with the selected managed account (no account emails in client-facing headers)
-- runs `evaluateRuntimePolicy` before account selection (pause/drain, budgets, routing profiles, capability matrix)
-- rotates accounts on rate limits, auth refresh failures, network errors, and server errors before response bytes are streamed
+- runs `evaluateRuntimePolicy` before HTTP/SSE account selection and before every WebSocket `response.create` frame (pause/drain, budgets, routing profiles, capability matrix)
+- rotates HTTP/SSE requests on rate limits, auth refresh failures, network errors, and server errors before response bytes are streamed
+- retries a failed upstream WebSocket handshake with another eligible account, bounded by `maxRuntimeAccountAttempts`; explicit token invalidation stops this failover instead of cascading across the pool
+- keeps each established WebSocket on one account, while terminal rate-limit/auth/server failures and transport failures update cooldown and affinity state so a later connection can select another account
 - strips hop-by-hop and stale decoded response headers before returning data to the local Codex client
 - records runtime status for `codex-multi-auth status`, `codex-multi-auth report`, and `codex-multi-auth rotation status`
-- appends redacted usage ledger rows after request completion or failure
+- appends redacted usage ledger rows after each HTTP/SSE request or WebSocket `response.create` completes, fails, or is cancelled
 
 ### 4. Local governance
 

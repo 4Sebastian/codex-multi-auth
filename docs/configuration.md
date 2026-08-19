@@ -146,7 +146,16 @@ Keep these enabled for most environments:
 
 A single forwarded run can be pinned to one account with `codex-multi-auth-codex --account <selector>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`). The pin is applied per-invocation by that run's own proxy instance, so it never touches the persisted `switch` pin and cannot leak across concurrent sessions. Because the proxy is required for the pin to take effect, `--account` fails hard when the proxy is disabled rather than silently using a rotated account. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation).
 
-The proxy preserves request bodies and streaming responses, replaces outbound auth headers with the selected managed account, and rotates to another account before response bytes are streamed when it sees rate limits, server errors, network failures, or refresh failures. It removes hop-by-hop headers, private account metadata headers, and stale decoded `content-encoding` from client responses. If every account is unavailable, the proxy returns a structured pool-exhaustion error that points to `codex-multi-auth rotation status`.
+For HTTP/SSE traffic, the proxy preserves request bodies and streaming responses, replaces outbound auth headers with the selected managed account, and rotates to another account before response bytes are streamed when it sees rate limits, server errors, network failures, or refresh failures.
+It removes hop-by-hop headers, private account metadata headers, and stale decoded `content-encoding` from HTTP client responses.
+If every account is unavailable, the proxy returns a structured pool-exhaustion error that points to `codex-multi-auth rotation status`.
+
+The generated provider configuration declares `supports_websockets = true`, so WebSocket-capable Codex clients can keep a persistent Responses connection through the same loopback proxy.
+The first `response.create` evaluates runtime policy before selecting and authenticating one managed account for that connection.
+Every `response.create`, including the first, consumes that account's request token and records its own redacted usage row; later requests re-evaluate policy while keeping the connection on the same account.
+Upstream handshake failures can try another eligible account up to `maxRuntimeAccountAttempts`, but explicit token invalidation stops failover to prevent an invalid-token cascade.
+An established WebSocket never changes accounts mid-connection; rate-limit, auth, server, or transport failures update cooldown and session-affinity state so the client's next connection can select another eligible account.
+Rate-limit terminal events honor retry headers and reset metadata when calculating that cooldown.
 
 **Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes two mitigations:
 

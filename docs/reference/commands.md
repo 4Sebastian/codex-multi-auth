@@ -522,7 +522,8 @@ The `runtimeSnapshot` field is present only with `--last`. `selected` is
 
 ## `codex-multi-auth rotation`
 
-Manages the default-on runtime Responses proxy used by forwarded official Codex sessions. This is separate from normal `codex-multi-auth switch`: the proxy can rotate managed accounts between backend Responses requests while a Codex session stays open.
+Manages the default-on runtime Responses proxy used by forwarded official Codex sessions.
+This is separate from normal `codex-multi-auth switch`: the proxy can rotate managed accounts between HTTP/SSE Responses requests or WebSocket reconnections while a Codex session stays open, while each established WebSocket remains on one account.
 
 Usage:
 

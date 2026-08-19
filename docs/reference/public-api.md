@@ -112,7 +112,8 @@ Runtime rotation is a CLI/runtime feature, not a library transport API.
 - `codex-multi-auth rotation disable` persists `pluginConfig.codexRuntimeRotationProxy=false`.
 - `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` disables the proxy for the current process without changing settings.
 - The local provider id is `codex-multi-auth-runtime-proxy`.
-- The proxy accepts only authenticated loopback requests for Responses API, model discovery, and thread-goal paths.
+- The proxy accepts only authenticated loopback HTTP requests for Responses API, model discovery, and thread-goal paths, plus authenticated WebSocket upgrades on Responses paths.
+- Persistent WebSocket transport behavior is documented in [Runtime Rotation Proxy](../configuration.md#runtime-rotation-proxy).
 - Account policy `pause` / `drain` (via `codex-multi-auth account ...`) is enforced by `evaluateRuntimePolicy` and blocks those accounts from hybrid selection.
 - The packaged app bind is reversible and must not patch official app binaries.
 - Client responses must not expose account emails, tokens, private account headers, hop-by-hop headers, or stale decoded `content-encoding`.

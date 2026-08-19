@@ -77,8 +77,8 @@ lib/runtime-rotation-proxy.ts
   |- validates local client token
   |- evaluates runtime policy (budget / tags / model allow-deny)
   |- selects/refreshes managed account
-  |- forwards Responses/model requests to official backend
-  |- rotates on rate limit/auth/network/server failure
+  |- forwards HTTP/SSE and persistent WebSocket Responses traffic
+  |- rotates HTTP/SSE requests and fails over WebSocket handshakes/client reconnects
   |- records usage ledger rows
   |- persists runtime observability and selected-account mirrors
 
@@ -178,12 +178,15 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
    | Everything else | request-bearing forwarded command | Shadow `CODEX_HOME` created inline by the wrapper process. |
 
 4. The wrapper starts `lib/runtime-rotation-proxy.ts` on `127.0.0.1` with a per-process client API key. Shadow-home branches copy relevant official Codex state and rewrite `config.toml` to select `codex-multi-auth-runtime-proxy`; the canonical-home branches instead inject the same provider through `-c` arguments and pass the client key via `OPENAI_API_KEY`.
-5. The official Codex CLI sends Responses/model traffic to the local provider.
-6. The proxy validates the client token, evaluates runtime policy, selects a managed account, refreshes tokens if needed, and forwards to the official backend.
-7. The proxy rotates to another account before streaming response bytes when it sees retryable auth refresh failures, 429s, 5xx responses, or network errors (subject to pin and min-rotation-interval throttling).
-8. Successful responses stream back to the local Codex client with hop-by-hop/private/stale decoded headers removed.
-9. Usage ledger rows and runtime counters are persisted for status/report/usage/budget commands.
-10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branches have nothing to sync — they read and wrote official state in place.
+5. The official Codex CLI sends HTTP/SSE Responses and model traffic, or persistent WebSocket Responses traffic, to the local provider.
+6. HTTP/SSE handling validates the client token, evaluates runtime policy, selects a managed account, refreshes tokens if needed, and forwards to the official backend.
+7. HTTP/SSE handling rotates to another account before streaming response bytes when it sees retryable auth refresh failures, 429s, 5xx responses, or network errors (subject to pin and min-rotation-interval throttling).
+8. WebSocket handling validates the upgrade token and path, waits for the first `response.create`, evaluates policy, and attempts eligible accounts up to `maxRuntimeAccountAttempts` until an upstream handshake succeeds.
+9. The selected WebSocket account remains bound to that connection; later `response.create` frames re-evaluate policy and consume request tokens on the same account.
+10. WebSocket terminal events settle usage in request order and update rate-limit, auth, server-error, cooldown, retry, and affinity state for later connections; explicit token invalidation during refresh or handshake stops account failover.
+11. Successful HTTP/SSE responses stream back to the local Codex client with hop-by-hop/private/stale decoded headers removed, while WebSocket frames remain bidirectional until either peer closes.
+12. Usage ledger rows and runtime counters are persisted for status/report/usage/budget commands.
+13. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branches have nothing to sync because they read and wrote official state in place.
 
 Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable.
 
