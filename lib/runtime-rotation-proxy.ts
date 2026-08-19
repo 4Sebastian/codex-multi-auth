@@ -695,6 +695,12 @@ interface WebSocketTerminalEvent {
 	record: Parameters<RuntimeUsageRecorder["record"]>[0];
 	rawBody: string;
 	retryAfterMs: number | null;
+	retryHeaders: Headers | null;
+}
+
+interface WebSocketAttemptBudget {
+	attempts: number;
+	limit: number;
 }
 
 interface WebSocketHandshakeLifecycle {
@@ -905,6 +911,19 @@ function websocketTerminalUsage(
 		: isRecord(parsed.error)
 			? parsed.error
 			: null;
+	const headerValues = isRecord(parsed.headers)
+		? parsed.headers
+		: isRecord(error?.headers)
+			? error.headers
+			: null;
+	const retryHeaders = new Headers();
+	if (headerValues) {
+		for (const [name, value] of Object.entries(headerValues)) {
+			if (typeof value === "string" || typeof value === "number") {
+				retryHeaders.set(name, String(value));
+			}
+		}
+	}
 	const statusCode =
 		readFiniteNumber(parsed, "status") ??
 		readFiniteNumber(response, "status") ??
@@ -926,6 +945,7 @@ function websocketTerminalUsage(
 		retryAfterMs:
 			readFiniteNumber(parsed, "retry_after_ms") ??
 			readFiniteNumber(error, "retry_after_ms"),
+		retryHeaders: [...retryHeaders].length > 0 ? retryHeaders : null,
 	};
 }
 
@@ -945,7 +965,13 @@ function applyWebSocketTerminalAccountFailure(
 		state.status.rotations += 1;
 	};
 	if (statusCode === HTTP_STATUS.TOO_MANY_REQUESTS) {
-		const retryAfterMs = terminal.retryAfterMs ?? 60_000;
+		const retryAfterMs =
+			(terminal.retryHeaders
+				? parseRetryAfterHeaderMs(terminal.retryHeaders, state.now())
+				: null) ??
+			terminal.retryAfterMs ??
+			parseRetryAfterBodyMs(terminal.rawBody, state.now()) ??
+			60_000;
 		state.preemptiveQuotaScheduler.markRateLimited(
 			buildQuotaScheduleKey(account, context.family, context.model),
 			retryAfterMs,
@@ -1010,6 +1036,16 @@ function applyWebSocketTerminalAccountFailure(
 		forgetAffinity();
 		accountManager.saveToDiskDebounced();
 	}
+}
+
+function applyWebSocketTerminalAccountSuccess(
+	state: RotationProxyState,
+	active: ActiveWebSocketRequest,
+	terminal: WebSocketTerminalEvent,
+): void {
+	if (terminal.record.outcome !== "success") return;
+	state.lastGlobalAccountIndex = active.account.index;
+	state.lastGlobalSwitchAt = state.now();
 }
 
 function isSendableWebSocketCloseCode(code: number): boolean {
@@ -1130,6 +1166,7 @@ async function prepareWebSocketAccount(
 	request: PreparedWebSocketRequest,
 	attemptedIndexes: Set<number>,
 	skipReasons: Map<number, string>,
+	attemptBudget: WebSocketAttemptBudget,
 	lifecycle: WebSocketHandshakeLifecycle,
 ): Promise<PreparedWebSocketAccount | null> {
 	const { context, policyDecision } = request;
@@ -1142,27 +1179,63 @@ async function prepareWebSocketAccount(
 		state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
 	}
 	let reloaded = false;
-	while (attemptedIndexes.size < accountManager.getAccountCount()) {
-		const selected = chooseAccount({
-			accountManager,
-			sessionAffinityStore: state.sessionAffinityStore,
-			sessionKey: context.sessionKey,
-			family: context.family,
-			model: context.model,
-			attemptedIndexes,
-			now: state.now(),
-			policy: policyDecision,
-			pinnedIndex,
-			skipReasons,
-			pidOffsetEnabled: state.pidOffsetEnabled,
-			schedulingStrategy: state.schedulingStrategy,
-		});
+	while (
+		attemptedIndexes.size < accountManager.getAccountCount() &&
+		attemptBudget.attempts < attemptBudget.limit
+	) {
+		const rotationStickyBoost: Record<number, number> =
+			state.minRotationIntervalMs > 0 &&
+			state.lastGlobalAccountIndex !== null &&
+			state.now() - state.lastGlobalSwitchAt < state.minRotationIntervalMs
+				? { [state.lastGlobalAccountIndex]: 1000 }
+				: {};
+		const selectAccount = (): ManagedAccount | null =>
+			chooseAccount({
+				accountManager,
+				sessionAffinityStore: state.sessionAffinityStore,
+				sessionKey: context.sessionKey,
+				family: context.family,
+				model: context.model,
+				attemptedIndexes,
+				now: state.now(),
+				policy: policyDecision,
+				pinnedIndex,
+				skipReasons,
+				stickyBoostByAccount: rotationStickyBoost,
+				pidOffsetEnabled: state.pidOffsetEnabled,
+				schedulingStrategy: state.schedulingStrategy,
+			});
+		const selected =
+			state.routingMutexMode === "enabled"
+				? await withRoutingMutex(state.routingMutexMode, async () => {
+						const candidate = selectAccount();
+						if (
+							candidate &&
+							pinnedIndex === null &&
+							state.schedulingStrategy !== "sequential"
+						) {
+							await accountManager.markSwitchedLocked(
+								candidate,
+								"rotation",
+								context.family,
+							);
+						}
+						return candidate;
+					})
+				: selectAccount();
 		if (!selected) {
 			if (!reloaded && !isPinned && accountManager.getAccountCount() > 0) {
 				reloaded = true;
 				const recovered = await recoverStaleRuntimeState(state);
 				if (recovered) {
 					accountManager = recovered;
+					attemptBudget.limit = Math.max(
+						1,
+						Math.min(
+							accountManager.getAccountCount(),
+							state.maxRuntimeAccountAttempts,
+						),
+					);
 					skipReasons.clear();
 					continue;
 				}
@@ -1170,10 +1243,37 @@ async function prepareWebSocketAccount(
 			break;
 		}
 		attemptedIndexes.add(selected.index);
+		const quotaScheduleKey = buildQuotaScheduleKey(
+			selected,
+			context.family,
+			context.model,
+		);
+		const preemptiveDeferral = state.preemptiveQuotaScheduler.getDeferral(
+			quotaScheduleKey,
+			state.now(),
+		);
+		if (preemptiveDeferral.defer && preemptiveDeferral.waitMs > 0) {
+			skipReasons.set(
+				selected.index,
+				preemptiveDeferral.reason ?? "quota-near-exhaustion",
+			);
+			accountManager.markRateLimitedWithReason(
+				selected,
+				preemptiveDeferral.waitMs,
+				context.family,
+				"quota",
+				context.model,
+			);
+			accountManager.recordRateLimit(selected, context.family, context.model);
+			accountManager.saveToDiskDebounced();
+			state.status.rotations += 1;
+			continue;
+		}
 		if (!accountManager.consumeToken(selected, context.family, context.model)) {
 			skipReasons.set(selected.index, "token-exhausted");
 			continue;
 		}
+		attemptBudget.attempts += 1;
 		const prepared: PreparedWebSocketAccount = {
 			accountManager,
 			account: selected,
@@ -1202,6 +1302,20 @@ async function prepareWebSocketAccount(
 			lifecycle.onReleased(prepared);
 			refundPreparedWebSocketToken(prepared);
 			skipReasons.set(selected.index, "auth-failure");
+			if (refreshed.invalidated) {
+				state.sessionAffinityStore?.forgetSession(context.sessionKey);
+				await request.usageRecorder.record({
+					outcome: "failure",
+					statusCode: HTTP_STATUS.UNAUTHORIZED,
+					errorCode: "token_invalidated",
+					account: selected,
+				});
+				throw createRuntimeProxyHttpError(
+					"OAuth token has been invalidated. Please re-login.",
+					HTTP_STATUS.UNAUTHORIZED,
+					"token_invalidated",
+				);
+			}
 			continue;
 		}
 		prepared.account = refreshed.account;
@@ -1239,12 +1353,26 @@ async function connectManagedWebSocket(
 ): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount } | null> {
 	const attemptedIndexes = new Set<number>();
 	const skipReasons = new Map<number, string>();
-	while (attemptedIndexes.size < state.activeAccountManager.getAccountCount()) {
+	const attemptBudget: WebSocketAttemptBudget = {
+		attempts: 0,
+		limit: Math.max(
+			1,
+			Math.min(
+				state.activeAccountManager.getAccountCount(),
+				state.maxRuntimeAccountAttempts,
+			),
+		),
+	};
+	while (
+		attemptedIndexes.size < state.activeAccountManager.getAccountCount() &&
+		attemptBudget.attempts < attemptBudget.limit
+	) {
 		const prepared = await prepareWebSocketAccount(
 			state,
 			request,
 			attemptedIndexes,
 			skipReasons,
+			attemptBudget,
 			lifecycle,
 		);
 		if (!prepared) break;
@@ -1540,6 +1668,7 @@ function bridgeWebSocketConnection(
 				if (terminal) {
 					const active = activeRequests.shift();
 					if (active) {
+						applyWebSocketTerminalAccountSuccess(state, active, terminal);
 						applyWebSocketTerminalAccountFailure(state, active, terminal);
 						void active.request.usageRecorder.record({
 							...terminal.record,

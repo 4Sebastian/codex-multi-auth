@@ -637,6 +637,174 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("defers WebSocket accounts held by the preemptive quota scheduler", async () => {
+		let upstreamConnections = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				upstreamConnections += 1;
+				socket.once("message", () => {
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() =>
+			textEventStream("data: served\n\n", {
+				"x-codex-primary-used-percent": "95",
+				"x-codex-primary-reset-after-seconds": "120",
+			}),
+		);
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: {
+				upstreamBaseUrl: upstream.baseUrl,
+				forcedAccountIndex: 0,
+			},
+		});
+		const primingResponse = await postResponses(proxy, {
+			model: "gpt-5.6-sol",
+			stream: true,
+		});
+		expect(primingResponse.status).toBe(HTTP_STATUS.OK);
+		await primingResponse.text();
+		const account = accountManager.getAccountByIndex(0);
+		if (!account) throw new Error("expected account");
+		account.rateLimitResetTimes = {};
+		account.coolingDownUntil = 0;
+
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await closed).toMatchObject({ code: 1013 });
+			expect(upstreamConnections).toBe(0);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("bounds failed WebSocket handshakes by the configured attempt limit", async () => {
+		const previousRetries = process.env.CODEX_AUTH_RETRY_ALL_MAX_RETRIES;
+		process.env.CODEX_AUTH_RETRY_ALL_MAX_RETRIES = "1";
+		const server = createHttpServer();
+		const authorizationAttempts: Array<string | undefined> = [];
+		server.on("upgrade", (request, socket) => {
+			authorizationAttempts.push(request.headers.authorization);
+			socket.end(
+				"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+			);
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Missing test server address");
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 4));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api` },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await closed).toMatchObject({ code: 1013 });
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			socket.terminate();
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error ? reject(error) : resolve())),
+			);
+			if (previousRetries === undefined) delete process.env.CODEX_AUTH_RETRY_ALL_MAX_RETRIES;
+			else process.env.CODEX_AUTH_RETRY_ALL_MAX_RETRIES = previousRetries;
+		}
+	});
+
+	it("selects sticky WebSocket accounts while holding the routing mutex", async () => {
+		const previousMutex = process.env.CODEX_AUTH_ROUTING_MUTEX;
+		const previousInterval = process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS;
+		process.env.CODEX_AUTH_ROUTING_MUTEX = "enabled";
+		process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS = "60000";
+		const authorizationAttempts: Array<string | undefined> = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				authorizationAttempts.push(request.headers.authorization);
+				socket.on("message", () => {
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const originalMarkSwitchedLocked = accountManager.markSwitchedLocked.bind(accountManager);
+		const lockStates: boolean[] = [];
+		const markSwitchedLocked = vi
+			.spyOn(accountManager, "markSwitchedLocked")
+			.mockImplementation((account, reason, family) => {
+				lockStates.push(isRoutingMutexHeld());
+				return originalMarkSwitchedLocked(account, reason, family);
+			});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const url = proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses";
+		let firstClient: WebSocket | null = null;
+		let secondClient: WebSocket | null = null;
+		try {
+			firstClient = await connectWebSocket(url);
+			const firstResponse = nextWebSocketMessage(firstClient);
+			firstClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "first-session",
+				input: [],
+			}));
+			await firstResponse;
+			const firstClosed = nextWebSocketClose(firstClient);
+			firstClient.close(1000);
+			await firstClosed;
+
+			secondClient = await connectWebSocket(url);
+			const secondResponse = nextWebSocketMessage(secondClient);
+			secondClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "second-session",
+				input: [],
+			}));
+			await secondResponse;
+
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-1",
+			]);
+			expect(lockStates).toEqual([true, true]);
+		} finally {
+			firstClient?.terminate();
+			secondClient?.terminate();
+			await upstream.close();
+			markSwitchedLocked.mockRestore();
+			if (previousMutex === undefined) delete process.env.CODEX_AUTH_ROUTING_MUTEX;
+			else process.env.CODEX_AUTH_ROUTING_MUTEX = previousMutex;
+			if (previousInterval === undefined) delete process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS;
+			else process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS = previousInterval;
+		}
+	});
+
 	it("refunds and records the initial request when the client leaves during handshake", async () => {
 		const server = createHttpServer();
 		const handshakeSockets = new Set<import("node:net").Socket>();
@@ -749,7 +917,73 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("stops WebSocket rotation when refresh explicitly invalidates a token", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const firstAccount = storage.accounts[0];
+		if (!firstAccount) throw new Error("expected account");
+		firstAccount.expiresAt = now - 60_000;
+		refreshAccessTokenMock.mockResolvedValueOnce({
+			type: "failed",
+			reason: "http_error",
+			statusCode: HTTP_STATUS.UNAUTHORIZED,
+			message: "Your authentication token has been invalidated.",
+		});
+		const accountManager = new AccountManager(undefined, storage);
+		const consumed = vi.spyOn(accountManager, "consumeToken");
+		const usageRecords: unknown[] = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input);
+					},
+				};
+			});
+		let upstreamConnections = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: () => {
+				upstreamConnections += 1;
+			},
+		});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(await closed).toMatchObject({ code: 1008 });
+			expect(upstreamConnections).toBe(0);
+			expect(consumed.mock.calls.map(([account]) => account.index)).toEqual([0]);
+			expect(usageRecords).toEqual([
+				expect.objectContaining({
+					outcome: "failure",
+					statusCode: HTTP_STATUS.UNAUTHORIZED,
+					errorCode: "token_invalidated",
+				}),
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+			consumed.mockRestore();
+		}
+	});
+
 	it("rotates after an upstream WebSocket rate-limit event", async () => {
+		const now = Date.now();
+		const resetAt = now + 240_000;
 		const authorizationAttempts: Array<string | undefined> = [];
 		let connectionCount = 0;
 		const upstream = await startTestWebSocketUpstream({
@@ -761,8 +995,10 @@ describe("runtime rotation proxy", () => {
 						socket.send(JSON.stringify({
 							type: "error",
 							status: HTTP_STATUS.TOO_MANY_REQUESTS,
-							retry_after_ms: 120_000,
-							error: { code: "rate_limit_exceeded" },
+							error: {
+								code: "rate_limit_exceeded",
+								resets_at: Math.floor(resetAt / 1000),
+							},
 						}));
 						return;
 					}
@@ -770,7 +1006,7 @@ describe("runtime rotation proxy", () => {
 				});
 			},
 		});
-		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
 		const { fetchImpl } = createRecordingFetch(() => textEventStream());
 		const proxy = await startProxy({
 			accountManager,
@@ -799,6 +1035,13 @@ describe("runtime rotation proxy", () => {
 					"gpt-5.6-sol",
 				),
 			).toBe(false);
+			expect(
+				Math.max(
+					...Object.values(
+						accountManager.getAccountByIndex(0)?.rateLimitResetTimes ?? {},
+					),
+				),
+			).toBeGreaterThan(now + 180_000);
 			const firstClosed = nextWebSocketClose(firstClient);
 			firstClient.close(1000);
 			await firstClosed;
@@ -821,6 +1064,50 @@ describe("runtime rotation proxy", () => {
 		} finally {
 			firstClient.terminate();
 			secondClient?.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("honors retry headers wrapped in WebSocket error events", async () => {
+		const now = Date.now();
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.once("message", () => {
+					socket.send(JSON.stringify({
+						type: "error",
+						status: HTTP_STATUS.TOO_MANY_REQUESTS,
+						headers: { "retry-after": "180" },
+						error: { code: "rate_limit_exceeded" },
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await response)).toMatchObject({
+				type: "error",
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+			});
+			expect(
+				Math.max(
+					...Object.values(
+						accountManager.getAccountByIndex(0)?.rateLimitResetTimes ?? {},
+					),
+				),
+			).toBeGreaterThan(now + 150_000);
+		} finally {
+			socket.terminate();
 			await upstream.close();
 		}
 	});
