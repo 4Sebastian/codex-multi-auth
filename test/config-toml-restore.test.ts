@@ -1,10 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+	rewriteConfigTomlForRuntimeRotationProvider,
 	configHasRuntimeRotationProvider,
 	restoreConfigTomlFromRuntimeRotationProviderWithoutBackup,
 	restoreTopLevelModelProvider,
 	restoreTopLevelResponseStorage,
 } from "../lib/runtime/config-toml.js";
+
+it("exposes image capability while preserving local bearer and static catalog", () => {
+	const config = rewriteConfigTomlForRuntimeRotationProvider('model_catalog_json = "C:/models-static.json"\n', "http://127.0.0.1:9999", "local-test-secret");
+	expect(config).toContain('name = "codex-multi-auth"');
+	expect(config).toContain('requires_openai_auth = false');
+	expect(config).toContain('experimental_bearer_token = "local-test-secret"');
+	expect(config).toContain('base_url = "http://127.0.0.1:9999"');
+	expect(config).toContain('model_catalog_json = "C:/models-static.json"');
+	expect(config).toContain('"x-openai-actor-authorization" = "codex-multi-auth-local"');
+});
 
 describe("restoreTopLevelModelProvider", () => {
 	it("rewrites the runtime rotation provider line back to the original", () => {

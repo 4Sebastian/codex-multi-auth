@@ -408,6 +408,8 @@ function createOutboundHeaders(
 	// header would ride along with the managed OAuth Bearer to OpenAI.
 	headers.delete("cookie");
 	headers.delete("proxy-authorization");
+	// Local capability marker for Codex image_gen, never an upstream credential.
+	headers.delete("x-openai-actor-authorization");
 	headers.set("authorization", `Bearer ${accessToken}`);
 	headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
 	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);

@@ -3890,6 +3890,7 @@ function createRuntimeRotationProxyCanonicalCodexHome(
 		`${providerTable}.base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
 		`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
 		`${providerTable}.requires_openai_auth=false`,
+		`${providerTable}.http_headers.x-openai-actor-authorization=${configTomlModule.tomlStringLiteral("codex-multi-auth-local")}`,
 		`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
 		"disable_response_storage=false",
 	].flatMap((assignment) => ["-c", assignment]);
