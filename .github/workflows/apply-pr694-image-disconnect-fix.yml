@@ -1,0 +1,148 @@
+name: Apply PR 694 image disconnect fix
+
+on:
+  push:
+    branches: [image-routes-runtime-proxy]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'rmarquesbarcelona/codex-multi-auth'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: image-routes-runtime-proxy
+          fetch-depth: 0
+
+      - name: Apply exact source hunk
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('lib/runtime-rotation-proxy.ts')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''\t\t\tlet upstream: Response;
+          \t\t\ttry {
+          \t\t\t\tstate.status.upstreamRequests += 1;
+          \t\t\t\tconst fetchAbortController = new AbortController();
+          \t\t\t\tconst upstreamRequestInit: RequestInit = {
+          \t\t\t\t\tmethod: context.method,
+          \t\t\t\t\theaders: outboundHeaders,
+          \t\t\t\t\tsignal: fetchAbortController.signal,
+          \t\t\t\t};
+          \t\t\t\tif (context.method === "POST") {
+          \t\t\t\t\tupstreamRequestInit.body = context.body;
+          \t\t\t\t}
+          \t\t\t\tconst fetchTimeoutMs = isImageRequest
+          \t\t\t\t\t? Math.max(state.fetchTimeoutMs, 300_000)
+          \t\t\t\t\t: state.fetchTimeoutMs;
+          \t\t\t\tupstream = await withTimeout(
+          \t\t\t\t\tstate.fetchImpl(upstreamUrl, upstreamRequestInit),
+          \t\t\t\t\tfetchTimeoutMs,
+          \t\t\t\t\t() => fetchAbortController.abort(),
+          \t\t\t\t\t`upstream fetch timed out after ${fetchTimeoutMs}ms`,
+          \t\t\t\t);
+          \t\t\t} catch (error) {
+          '''
+
+          new = '''\t\t\tlet upstream: Response;
+          \t\t\tlet clientDisconnectedDuringImageFetch = false;
+          \t\t\ttry {
+          \t\t\t\tstate.status.upstreamRequests += 1;
+          \t\t\t\tconst fetchAbortController = new AbortController();
+          \t\t\t\tconst onClientClose = (): void => {
+          \t\t\t\t\tif (res.writableEnded) return;
+          \t\t\t\t\tclientDisconnectedDuringImageFetch = true;
+          \t\t\t\t\tfetchAbortController.abort();
+          \t\t\t\t};
+          \t\t\t\tif (isImageRequest) {
+          \t\t\t\t\tres.once("close", onClientClose);
+          \t\t\t\t\tif (clientGone()) onClientClose();
+          \t\t\t\t}
+          \t\t\t\tconst upstreamRequestInit: RequestInit = {
+          \t\t\t\t\tmethod: context.method,
+          \t\t\t\t\theaders: outboundHeaders,
+          \t\t\t\t\tsignal: fetchAbortController.signal,
+          \t\t\t\t};
+          \t\t\t\tif (context.method === "POST") {
+          \t\t\t\t\tupstreamRequestInit.body = context.body;
+          \t\t\t\t}
+          \t\t\t\tconst fetchTimeoutMs = isImageRequest
+          \t\t\t\t\t? Math.max(state.fetchTimeoutMs, 300_000)
+          \t\t\t\t\t: state.fetchTimeoutMs;
+          \t\t\t\ttry {
+          \t\t\t\t\tupstream = await withTimeout(
+          \t\t\t\t\t\tstate.fetchImpl(upstreamUrl, upstreamRequestInit),
+          \t\t\t\t\t\tfetchTimeoutMs,
+          \t\t\t\t\t\t() => fetchAbortController.abort(),
+          \t\t\t\t\t\t`upstream fetch timed out after ${fetchTimeoutMs}ms`,
+          \t\t\t\t\t);
+          \t\t\t\t} finally {
+          \t\t\t\t\tif (isImageRequest) res.off("close", onClientClose);
+          \t\t\t\t}
+          \t\t\t} catch (error) {
+          \t\t\t\trefundConsumedPoolToken(refreshed.account);
+          \t\t\t\tif (isImageRequest && clientDisconnectedDuringImageFetch) {
+          \t\t\t\t\tawait usageRecorder.record({
+          \t\t\t\t\t\toutcome: "failure",
+          \t\t\t\t\t\tstatusCode: 499,
+          \t\t\t\t\t\terrorCode: "client_disconnected_before_upstream_headers",
+          \t\t\t\t\t\taccount: refreshed.account,
+          \t\t\t\t\t});
+          \t\t\t\t\treturn;
+          \t\t\t\t}
+          '''
+
+          if text.count(old) != 1:
+              raise SystemExit(f'expected source hunk exactly once, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old_refund = '''\t\t\t\tproxyLog.error("upstream transport failure", {
+          \t\t\t\t\ttraceId,
+          \t\t\t\t\tcode: "codex_runtime_rotation_transport_error",
+          \t\t\t\t\terror: transportError,
+          \t\t\t\t});
+          \t\t\t\trefundConsumedPoolToken(refreshed.account);
+          '''
+          new_refund = '''\t\t\t\tproxyLog.error("upstream transport failure", {
+          \t\t\t\t\ttraceId,
+          \t\t\t\t\tcode: "codex_runtime_rotation_transport_error",
+          \t\t\t\t\terror: transportError,
+          \t\t\t\t});
+          '''
+          if text.count(old_refund) != 1:
+              raise SystemExit(f'expected refund hunk exactly once, found {text.count(old_refund)}')
+          path.write_text(text.replace(old_refund, new_refund, 1), encoding='utf-8')
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Focused image lifecycle tests
+        run: npm test -- test/image-runtime-lifecycle.test.ts test/runtime-rotation-proxy.test.ts
+
+      - name: Verify diff is limited
+        shell: bash
+        run: |
+          git diff --check
+          git diff -- lib/runtime-rotation-proxy.ts
+          test "$(git diff --name-only | sort)" = "lib/runtime-rotation-proxy.ts"
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lib/runtime-rotation-proxy.ts
+          git rm .github/workflows/apply-pr694-image-disconnect-fix.yml
+          git commit -m "fix(images): abort upstream fetch when client disconnects"
+          git push origin HEAD:image-routes-runtime-proxy
