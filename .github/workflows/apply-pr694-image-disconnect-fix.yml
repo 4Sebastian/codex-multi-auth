@@ -1,14 +1,14 @@
-name: Apply PR 694 image disconnect fix
+name: Validate PR 694 image disconnect fix
 
 on:
   push:
     branches: [image-routes-runtime-proxy]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
+  validate:
     if: github.repository == 'rmarquesbarcelona/codex-multi-auth'
     runs-on: ubuntu-latest
     steps:
@@ -134,15 +134,14 @@ jobs:
         shell: bash
         run: |
           git diff --check
-          git diff -- lib/runtime-rotation-proxy.ts
           test "$(git diff --name-only | sort)" = "lib/runtime-rotation-proxy.ts"
+          git diff -- lib/runtime-rotation-proxy.ts > pr694-image-disconnect.patch
 
-      - name: Commit fix and remove temporary workflow
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add lib/runtime-rotation-proxy.ts
-          git rm .github/workflows/apply-pr694-image-disconnect-fix.yml
-          git commit -m "fix(images): abort upstream fetch when client disconnects"
-          git push origin HEAD:image-routes-runtime-proxy
+      - name: Upload validated source and patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr694-image-disconnect-fix
+          path: |
+            lib/runtime-rotation-proxy.ts
+            pr694-image-disconnect.patch
+          if-no-files-found: error
