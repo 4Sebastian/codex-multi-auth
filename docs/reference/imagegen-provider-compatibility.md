@@ -14,6 +14,23 @@ The provider name remains `codex-multi-auth`, `requires_openai_auth = false`, an
 
 Image route support is a separate prerequisite for successful generation. Client image capability/model-catalog requirements and subscription entitlements also still apply. This is a version-sensitive compatibility shim, not a documented general capability API; replace it if Codex exposes a supported provider capability setting.
 
-## Activation and rollback
+## Activation, upgrades, and rollback
 
-Newly generated wrapper/app-bind configuration carries the marker; start a fresh session after regenerating a bind through the normal supported flow. No account migration or reauthentication is needed. Revert this change and regenerate provider configuration to remove the shim. Do not enable native authentication as a substitute.
+Fresh wrapper-launched sessions receive the marker automatically in their generated runtime provider configuration. For the packaged desktop app, regenerate the persistent provider configuration with the existing supported command:
+
+```bash
+codex-multi-auth rotation bind-app
+```
+
+If an older bind is already active after upgrading the package, use the normal reversible flow to force regeneration from the newly installed version:
+
+```bash
+codex-multi-auth rotation unbind-app
+codex-multi-auth rotation bind-app
+```
+
+`codex-multi-auth rotation reset-runtime` is also supported when the intent is to clear volatile rotation state and restart the app bind; it is not required solely to add this marker. No new npm script is introduced or required for image-generation compatibility. Normal package upgrades keep using the existing install/update workflow, and package install/update may self-heal the app bind when runtime rotation is enabled and the desktop app is detected.
+
+Start a fresh Codex session after provider configuration is regenerated so the client re-evaluates its provider capability gates. No account migration or reauthentication is needed.
+
+To remove the shim, revert this change and regenerate provider configuration through the same wrapper/app-bind flow. For the packaged app, `codex-multi-auth rotation unbind-app` restores the backed-up Codex configuration; re-binding after reverting regenerates the provider without the marker. Do not enable native authentication as a substitute.
