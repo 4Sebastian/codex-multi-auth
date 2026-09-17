@@ -349,6 +349,31 @@ describe("normalizeForcedAccountIndex (#623)", () => {
 });
 
 describe("runtime rotation proxy", () => {
+	it("does not treat the local capability marker as client authentication", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await fetch(`${proxy.baseUrl}/responses`, {
+			method: "POST",
+			headers: { "x-openai-actor-authorization": "codex-multi-auth-local" },
+			body: "{}",
+		});
+		expect(response.status).toBe(401);
+		await response.text();
+		expect(calls).toHaveLength(0);
+	});
+	it.each(["/responses", "/v1/responses"])("strips mixed-case actor marker before dispatch to ChatGPT on %s", async (path) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response('{}', { headers: { "content-type": "application/json" } }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { upstreamBaseUrl: "https://chatgpt.com/backend-api" } });
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol" }, path, { "X-OpenAI-Actor-Authorization": "arbitrary-spoof" });
+		await response.text();
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(new URL(calls[0].url).hostname).toBe("chatgpt.com");
+		expect(calls[0].headers.has("x-openai-actor-authorization")).toBe(false);
+		expect(calls[0].headers.get("authorization")).toMatch(/^Bearer access-/);
+	});
 	it("records image operation and successful outcome through the runtime recorder", async () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
 		const record = vi.fn(async () => undefined);

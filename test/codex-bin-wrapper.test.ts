@@ -2548,6 +2548,9 @@ describe("codex bin wrapper", () => {
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.requires_openai_auth=false`,
 		);
 		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.http_headers.x-openai-actor-authorization="codex-multi-auth-local"`,
+		);
+		expect(output).toContain(
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
 		);
 		expect(output).toContain("disable_response_storage=false");

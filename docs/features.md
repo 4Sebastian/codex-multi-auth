@@ -36,6 +36,7 @@ User-facing capability map for Codex CLI multi-account OAuth, account switching,
 ## Rotate Live Codex Runtime Requests
 
 See [image route support](reference/image-routes.md) for the image-specific behavior and limitations.
+See [image_gen provider compatibility](reference/imagegen-provider-compatibility.md) for the image-specific behavior and limitations.
 
 Runtime rotation is part of the current architecture. It is default-on and local-only.
 
