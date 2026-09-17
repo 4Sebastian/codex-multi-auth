@@ -5,6 +5,24 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.15.0] - 2026-09-17
+
+Image generation and editing now run through the authenticated runtime rotation proxy, and built-in `image_gen` is exposed to Codex 0.154.0 sessions without native-auth fallback. [Full notes](docs/releases/v2.15.0.md).
+
+### Added
+
+- The runtime proxy accepts `POST /images/generations` and `POST /images/edits`
+  (with `/v1` aliases) and forwards request bodies unchanged to the upstream
+  image endpoints, reusing bearer authentication, account rotation, managed
+  OAuth refresh, and usage accounting. Image requests get a minimum five-minute
+  upstream-header timeout and are not replayed on ambiguous transport failures
+  ([#694](https://github.com/ndycode/codex-multi-auth/pull/694))
+- Provider configuration adds a non-secret
+  `x-openai-actor-authorization=codex-multi-auth-local` compatibility marker,
+  stripped case-insensitively at the upstream boundary, so Codex 0.154.0 exposes
+  its built-in `image_gen` tool for runtime-rotation sessions
+  ([#695](https://github.com/ndycode/codex-multi-auth/pull/695))
+
 ## [2.14.0] - 2026-09-09
 
 A long-running task no longer dies when the backend reports that the selected model is at capacity: the runtime proxy waits it out and re-sends instead of burning through the account pool. [Full notes](docs/releases/v2.14.0.md).
