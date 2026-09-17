@@ -1671,19 +1671,26 @@ async function handleRequestInner(
 			);
 
 			let upstream: Response;
+			// Abort the in-flight upstream fetch when the client disconnects
+			// before headers arrive. Image generation holds upstream capacity
+			// for the full fetch timeout, so a caller that goes away right
+			// after sending must not leave that work running. `forwardStreamingResponse`
+			// already cancels the stream once headers are written; this covers
+			// the pre-header window instead. `writableEnded` distinguishes a
+			// premature close from the clean `res.end()` that ends every request.
+			//
+			// The listener is removed in `finally` once the fetch settles. Without
+			// that, every retry above the 10-listener default threshold that reaches
+			// this fetch leaks another one-shot `close` handler onto the same `res`,
+			// emitting `MaxListenersExceededWarning` when `retryAllAccountsMaxRetries`
+			// is high and the account pool is large.
+			const fetchAbortController = new AbortController();
+			const onClientClose = () => {
+				if (!res.writableEnded) fetchAbortController.abort();
+			};
 			try {
 				state.status.upstreamRequests += 1;
-				const fetchAbortController = new AbortController();
-				// Abort the in-flight upstream fetch when the client disconnects
-				// before headers arrive. Image generation holds upstream capacity
-				// for the full fetch timeout, so a caller that goes away right
-				// after sending must not leave that work running. `forwardStreamingResponse`
-				// already cancels the stream once headers are written; this covers
-				// the pre-header window instead. `writableEnded` distinguishes a
-				// premature close from the clean `res.end()` that ends every request.
-				res.once("close", () => {
-					if (!res.writableEnded) fetchAbortController.abort();
-				});
+				res.once("close", onClientClose);
 				const upstreamRequestInit: RequestInit = {
 					method: context.method,
 					headers: outboundHeaders,
@@ -1757,6 +1764,8 @@ async function handleRequestInner(
 				state.status.retries += 1;
 				noteRotation();
 				continue;
+			} finally {
+				res.off("close", onClientClose);
 			}
 			reconcileManualSelection();
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
