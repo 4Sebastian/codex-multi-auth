@@ -1674,6 +1674,16 @@ async function handleRequestInner(
 			try {
 				state.status.upstreamRequests += 1;
 				const fetchAbortController = new AbortController();
+				// Abort the in-flight upstream fetch when the client disconnects
+				// before headers arrive. Image generation holds upstream capacity
+				// for the full fetch timeout, so a caller that goes away right
+				// after sending must not leave that work running. `forwardStreamingResponse`
+				// already cancels the stream once headers are written; this covers
+				// the pre-header window instead. `writableEnded` distinguishes a
+				// premature close from the clean `res.end()` that ends every request.
+				res.once("close", () => {
+					if (!res.writableEnded) fetchAbortController.abort();
+				});
 				const upstreamRequestInit: RequestInit = {
 					method: context.method,
 					headers: outboundHeaders,
