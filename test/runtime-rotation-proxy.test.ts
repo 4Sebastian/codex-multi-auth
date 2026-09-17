@@ -374,6 +374,117 @@ describe("runtime rotation proxy", () => {
 		expect(calls[0].headers.has("x-openai-actor-authorization")).toBe(false);
 		expect(calls[0].headers.get("authorization")).toMatch(/^Bearer access-/);
 	});
+	it("records image operation and successful outcome through the runtime recorder", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const record = vi.fn(async () => undefined);
+		const recorder = vi.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockReturnValue({ hasRecorded: () => record.mock.calls.length > 0, record });
+		const { fetchImpl } = createRecordingFetch(() => new Response('{"data":[]}', {
+			headers: { "content-type": "application/json" },
+		}));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/generations");
+		await response.text();
+		expect(response.status).toBe(200);
+		expect(recorder).toHaveBeenCalledWith(expect.objectContaining({ operation: "images", model: "gpt-image-2" }));
+		await vi.waitFor(() => expect(record).toHaveBeenCalledWith(expect.objectContaining({ outcome: "success", statusCode: 200 })));
+	});
+	it("keeps Responses usable after image success and a textual 429 with session affinity", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 15));
+		const policySpy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockResolvedValue({
+			allowed: true, statusCode: 200, errorCode: null, reasons: [], projectKey: null,
+			blockedAccountIndexes: new Set(Array.from({ length: 13 }, (_, i) => i + 2)),
+			scoreBoostByAccount: {}, budgetEvaluations: [],
+		});
+		const limited = vi.spyOn(accountManager, "markRateLimitedWithReason");
+		const { calls, fetchImpl } = createRecordingFetch((call, attempt) => {
+			if (attempt === 3) return new Response('{"error":{"code":"rate_limit_exceeded"}}', { status: 429, headers: { "retry-after": "60" } });
+			return call.url.includes("/images/")
+				? new Response('{"data":[]}', { headers: { "content-type": "application/json" } })
+				: textEventStream();
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const headers = { "session_id": "image-text-rotation" };
+		for (const [model, path] of [["gpt-5.6-sol", "/responses"], ["gpt-image-2", "/images/generations"], ["gpt-5.6-sol", "/responses"], ["gpt-5.6-luna", "/responses"]]) {
+			const response = await postResponses(proxy, { model, stream: path === "/responses" }, path, headers);
+			expect(response.status).toBe(200);
+			await response.text();
+		}
+		expect(calls).toHaveLength(5);
+		expect(limited).toHaveBeenCalled();
+		expect(calls[2].headers.get("authorization")).not.toBe(calls[3].headers.get("authorization"));
+		expect(calls[4].headers.get("authorization")).toBe(calls[3].headers.get("authorization"));
+		policySpy.mockRestore();
+	});
+	it.each(["/images/generations", "/images/edits", "/v1/images/generations", "/v1/images/edits"])("forwards image route %s through managed OAuth without rewriting JSON", async (path) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const payload = { model: "gpt-image-2", prompt: "test", images: [{ image_url: "data:image/png;base64,AA==" }], background: "auto" };
+		const result = { created: 123, data: [{ b64_json: "aW1hZ2U=" }], model: "upstream-model" };
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response(JSON.stringify(result), { headers: { "content-type": "application/json", "x-codex-imagegen-request-id": "image-test-id" } }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, payload, path, { "cookie": "local-secret" });
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(result);
+		expect(response.headers.get("x-codex-imagegen-request-id")).toBe("image-test-id");
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe(`https://example.test/backend-api/codex${path.replace(/^\/v1/, "")}`);
+		expect(calls[0].bodyText).toBe(JSON.stringify(payload));
+		expect(calls[0].headers.get("authorization")).toMatch(/^Bearer access-/);
+		expect(calls[0].headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toMatch(/^acc_/);
+		expect(calls[0].headers.get("cookie")).toBeNull();
+	});
+	it.each([400, 403, 500])("does not replay image error %s", async (status) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response('{"error":{"code":"image_test_error"}}', { status, headers: { "content-type": "application/json" } }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/generations");
+		expect(response.status).toBe(status);
+		expect((await response.json()).error.code).toBe("image_test_error");
+		expect(calls).toHaveLength(1);
+	});
+	it("does not replay an ambiguous image transport failure", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => { throw new Error("connection lost"); });
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/edits");
+		expect(response.status).toBe(502);
+		expect(calls).toHaveLength(1);
+	});
+	it("rotates images on an explicit quota rejection", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => attempt === 1 ? new Response('{"error":{"code":"rate_limit_exceeded"}}', { status: 429 }) : new Response('{"data":[{"b64_json":"aW1hZ2U="}]}', { headers: { "content-type": "application/json" } }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/generations");
+		expect(response.status).toBe(200);
+		await response.text();
+		expect(calls).toHaveLength(2);
+		expect(calls[0].headers.get("authorization")).not.toBe(calls[1].headers.get("authorization"));
+	});
+	it("requires a bearer for image requests", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response("unused"));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		for (const path of ["/images/generations", "/images/edits"]) {
+			const response = await fetch(`${proxy.baseUrl}${path}`, { method: "POST", headers: {}, body: "{}" });
+			expect(response.status).toBe(401);
+			await response.text();
+		}
+		expect(calls).toHaveLength(0);
+	});
+	it("refreshes an expired managed OAuth token for image edits", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 1);
+		storage.accounts[0].expiresAt = now - 60_000;
+		refreshAccessTokenMock.mockResolvedValueOnce({ type: "success", access: "fresh-image-access", refresh: "refresh-1", expires: now + 3_600_000 });
+		const accountManager = new AccountManager(undefined, storage);
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response('{"data":[]}', { headers: { "content-type": "application/json" } }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/edits");
+		expect(response.status).toBe(200);
+		await response.text();
+		expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
+		expect(calls[0].headers.get("authorization")).toBe("Bearer fresh-image-access");
+	});
 	it("requires a client API key at startup", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));
@@ -720,7 +831,7 @@ describe("runtime rotation proxy", () => {
 		expect(await authUnknownPath.json()).toEqual({
 			error: {
 				message:
-					"Runtime rotation proxy only accepts Responses API, model discovery, and Codex thread goal requests.",
+					"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
 				code: "runtime_rotation_proxy_not_found",
 			},
 		});

@@ -67,6 +67,21 @@ describe("usage ledger core", () => {
 		await expect(readUsageLedgerRows()).resolves.toEqual([row]);
 	});
 
+	it("round-trips image accounting without storing request bodies or raw identity", async () => {
+		const { appendUsageLedgerRow, readUsageLedgerRows, getUsageLedgerPaths } = await import("../lib/usage/index.js");
+		const row = await appendUsageLedgerRow({
+			source: "runtime-proxy", operation: "images", outcome: "success",
+			model: "gpt-image-2", statusCode: 200, accountId: "synthetic-image-account",
+			email: "image@example.test", accountIndex: 0,
+		});
+		expect(row.operation).toBe("images");
+		await expect(readUsageLedgerRows()).resolves.toEqual([row]);
+		const raw = await fs.readFile(getUsageLedgerPaths().current, "utf8");
+		expect(raw).not.toContain("synthetic-image-account");
+		expect(raw).not.toContain("image@example.test");
+		expect(raw).not.toContain("b64_json");
+	});
+
 	it("summarizes usage by model and applies date filters", async () => {
 		const { appendUsageLedgerRow, summarizeUsageLedger } = await import(
 			"../lib/usage/index.js"

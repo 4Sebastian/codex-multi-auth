@@ -29,6 +29,7 @@ Use it when you need a local Codex CLI multi-account workflow with visible accou
 - Local usage ledger, budget guards, account policy controls, routing profiles, and model/account capability views
 - Runtime counters, budget/cooldown state, and multi-auth probe visibility in `codex-multi-auth status` / `codex-multi-auth report`
 - Default-on loopback Responses proxy for live account rotation inside forwarded Codex CLI/app sessions
+- [Image generation/edit transport](docs/reference/image-routes.md) through the same authenticated runtime proxy
 - [Built-in image_gen provider compatibility](docs/reference/imagegen-provider-compatibility.md) through the same authenticated runtime proxy
 - Optional loopback-only local bridge for `/health`, `/v1/models`, and `/v1/responses`, protected by hashed local client tokens
 - Reversible packaged Codex app bind and user-level launcher routing helpers that do not patch official app binaries

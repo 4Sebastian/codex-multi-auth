@@ -76,6 +76,7 @@ The proxy:
 
 - accepts only local authenticated client requests (per-process client token)
 - forwards Responses API, model discovery, and thread-goal routes (`/responses`, `/models`, `/thread/goal/*`, and `/codex/...` variants)
+- forwards authenticated [image generation/edit routes](reference/image-routes.md), including `/v1` aliases, through the same account and policy machinery
 - authenticates local clients with a per-process token via `Authorization: Bearer` or `x-api-key` (timing-safe compare); refuses non-loopback binds
 - caps request bodies at 64 MiB
 - replaces upstream auth headers with the selected managed account (no account emails in client-facing headers)
