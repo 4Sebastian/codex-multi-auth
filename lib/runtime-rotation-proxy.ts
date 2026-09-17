@@ -354,6 +354,12 @@ const ALLOWED_MODELS_PATHS = new Set([
 	URL_PATHS.MODELS,
 	`/v1${URL_PATHS.MODELS}`,
 ]);
+const ALLOWED_IMAGE_PATHS = new Set([
+	"/images/generations",
+	"/images/edits",
+	"/v1/images/generations",
+	"/v1/images/edits",
+]);
 const ALLOWED_THREAD_GOAL_PATHS = new Set([
 	"/thread/goal/get",
 	"/thread/goal/set",
@@ -706,6 +712,18 @@ function buildResponsesRequestContext(
 	};
 }
 
+function buildImageRequestContext(
+	req: IncomingMessage,
+	body: Buffer,
+	pathname: string,
+): RequestContext {
+	return {
+		...buildResponsesRequestContext(req, body),
+		upstreamPath: `/codex${pathname.replace(/^\/v1/, "")}`,
+		family: "codex",
+	};
+}
+
 function buildModelsRequestContext(req: IncomingMessage): RequestContext {
 	return {
 		body: Buffer.alloc(0),
@@ -778,7 +796,7 @@ function writeMethodOrPathError(res: ServerResponse): void {
 	writeJson(res, 404, {
 		error: {
 			message:
-				"Runtime rotation proxy only accepts Responses API, model discovery, and Codex thread goal requests.",
+				"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
 			code: "runtime_rotation_proxy_not_found",
 		},
 	});
@@ -1080,24 +1098,32 @@ async function handleRequestInner(
 			req.method === "POST" && isResponsesPath(incomingUrl.pathname);
 		const isModelsRequest =
 			req.method === "GET" && isModelsPath(incomingUrl.pathname);
+		const isImageRequest =
+			req.method === "POST" && ALLOWED_IMAGE_PATHS.has(incomingUrl.pathname);
 		const isThreadGoalRequest =
 			(req.method === "GET" || req.method === "POST") &&
 			isThreadGoalPath(incomingUrl.pathname);
-		if (!isResponsesRequest && !isModelsRequest && !isThreadGoalRequest) {
+		if (
+			!isResponsesRequest && !isModelsRequest &&
+			!isThreadGoalRequest && !isImageRequest
+		) {
 			writeMethodOrPathError(res);
 			return;
 		}
 
 		state.status.totalRequests += 1;
 		const requestBody =
-			isResponsesRequest || (isThreadGoalRequest && req.method === "POST")
+			isResponsesRequest || isImageRequest ||
+			(isThreadGoalRequest && req.method === "POST")
 				? await readRequestBody(req, state.maxRequestBodyBytes)
 				: Buffer.alloc(0);
 		const context = isModelsRequest
 			? buildModelsRequestContext(req)
 			: isThreadGoalRequest
 				? buildThreadGoalRequestContext(req, requestBody, incomingUrl.pathname)
-				: buildResponsesRequestContext(req, requestBody);
+				: isImageRequest
+					? buildImageRequestContext(req, requestBody, incomingUrl.pathname)
+					: buildResponsesRequestContext(req, requestBody);
 		const requestStartedAt = state.now();
 		let policyDecision: RuntimePolicyDecision | null = null;
 		let projectKey: string | null = null;
@@ -1131,7 +1157,9 @@ async function handleRequestInner(
 				? "models"
 				: isThreadGoalRequest
 					? "thread-goal"
-					: "responses",
+					: isImageRequest
+						? "images"
+						: "responses",
 			model: context.model,
 			projectKey,
 			requestId: traceId,
@@ -1643,9 +1671,26 @@ async function handleRequestInner(
 			);
 
 			let upstream: Response;
+			// Abort the in-flight upstream fetch when the client disconnects
+			// before headers arrive. Image generation holds upstream capacity
+			// for the full fetch timeout, so a caller that goes away right
+			// after sending must not leave that work running. `forwardStreamingResponse`
+			// already cancels the stream once headers are written; this covers
+			// the pre-header window instead. `writableEnded` distinguishes a
+			// premature close from the clean `res.end()` that ends every request.
+			//
+			// The listener is removed in `finally` once the fetch settles. Without
+			// that, every retry above the 10-listener default threshold that reaches
+			// this fetch leaks another one-shot `close` handler onto the same `res`,
+			// emitting `MaxListenersExceededWarning` when `retryAllAccountsMaxRetries`
+			// is high and the account pool is large.
+			const fetchAbortController = new AbortController();
+			const onClientClose = () => {
+				if (!res.writableEnded) fetchAbortController.abort();
+			};
 			try {
 				state.status.upstreamRequests += 1;
-				const fetchAbortController = new AbortController();
+				res.once("close", onClientClose);
 				const upstreamRequestInit: RequestInit = {
 					method: context.method,
 					headers: outboundHeaders,
@@ -1654,11 +1699,14 @@ async function handleRequestInner(
 				if (context.method === "POST") {
 					upstreamRequestInit.body = context.body;
 				}
+				const fetchTimeoutMs = isImageRequest
+					? Math.max(state.fetchTimeoutMs, 300_000)
+					: state.fetchTimeoutMs;
 				upstream = await withTimeout(
 					state.fetchImpl(upstreamUrl, upstreamRequestInit),
-					state.fetchTimeoutMs,
+					fetchTimeoutMs,
 					() => fetchAbortController.abort(),
-					`upstream fetch timed out after ${state.fetchTimeoutMs}ms`,
+					`upstream fetch timed out after ${fetchTimeoutMs}ms`,
 				);
 			} catch (error) {
 				// errors-logging-08: a custom fetchImpl, a proxy agent, or an undici
@@ -1677,6 +1725,20 @@ async function handleRequestInner(
 					error: transportError,
 				});
 				refundConsumedPoolToken(refreshed.account);
+				// A timeout may occur after generation; do not retry within this request.
+				if (isImageRequest) {
+					writeJson(res, 502, {
+						error: {
+							code: "image_upstream_transport_error",
+							message: "Image upstream transport failed; not retried by the proxy.",
+						},
+					});
+					await usageRecorder.record({
+						outcome: "failure", statusCode: 502,
+						errorCode: "image_upstream_transport_error", account: refreshed.account,
+					});
+					return;
+				}
 				// A pre-header transport exception is a property of the network path,
 				// not of this account's credentials or quota, so it must NOT feed the
 				// account's circuit breaker / health tracker: that is what would
@@ -1702,6 +1764,8 @@ async function handleRequestInner(
 				state.status.retries += 1;
 				noteRotation();
 				continue;
+			} finally {
+				res.off("close", onClientClose);
 			}
 			reconcileManualSelection();
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
@@ -1914,6 +1978,19 @@ async function handleRequestInner(
 				continue;
 			}
 
+			// Forward image validation/moderation/5xx errors without cross-account replay.
+			// Explicit 429 quota and 401 auth handling above still use the existing pool.
+			if (isImageRequest && upstream.status >= 400) {
+				const forwarded = await forwardStreamingResponse(
+					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
+				);
+				await usageRecorder.record({
+					outcome: "failure", statusCode: upstream.status,
+					errorCode: forwarded ? "image_upstream_error" : "stream_forward_failed",
+					account: refreshed.account,
+				});
+				return;
+			}
 			if (upstream.status >= 500) {
 				const bodyText = await readErrorBody(
 					upstream,
