@@ -15,6 +15,7 @@ import {
 } from "../lib/runtime-rotation-proxy.js";
 import { PreemptiveQuotaScheduler } from "../lib/preemptive-quota-scheduler.js";
 import { SessionAffinityStore } from "../lib/session-affinity.js";
+import { ContextBudgetGuard } from "../lib/context-budget-guard.js";
 import { clearCircuitBreakers } from "../lib/circuit-breaker.js";
 import {
 	__resetRoutingMutexForTests,
@@ -425,6 +426,8 @@ afterEach(async () => {
 	// Forced-account pin (#623) is read from the ambient env by startRuntimeRotationProxy;
 	// never let one test's value bleed into the next.
 	delete process.env.CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX;
+	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED;
+	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT;
 });
 
 describe("normalizeForcedAccountIndex (#623)", () => {
@@ -638,6 +641,97 @@ describe("runtime rotation proxy", () => {
 			socket.terminate();
 			await upstream.close();
 			usageRecorder.mockRestore();
+		}
+	});
+
+	it("blocks the next WebSocket turn after crossing the context budget", async () => {
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
+		const upstreamFrames: string[] = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", (data) => {
+					upstreamFrames.push(data.toString());
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { usage: { input_tokens: 27_000, output_tokens: 1 } },
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.5",
+				prompt_cache_key: "budget-session",
+				input: [],
+			}));
+			await firstResponse;
+			const closed = nextWebSocketClose(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.5",
+				prompt_cache_key: "budget-session",
+				input: [],
+			}));
+			expect(await closed).toMatchObject({ code: 1008 });
+			expect(upstreamFrames).toHaveLength(1);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("does not enforce context budgets when the guard is disabled", async () => {
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
+		let upstreamFrames = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", () => {
+					upstreamFrames += 1;
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { usage: { input_tokens: 27_000, output_tokens: 1 } },
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			for (let turn = 0; turn < 2; turn += 1) {
+				const response = nextWebSocketMessage(socket);
+				socket.send(JSON.stringify({
+					type: "response.create",
+					model: "gpt-5.5",
+					prompt_cache_key: "unguarded-session",
+					input: [],
+				}));
+				await response;
+			}
+			expect(upstreamFrames).toBe(2);
+		} finally {
+			socket.terminate();
+			await upstream.close();
 		}
 	});
 
@@ -2100,6 +2194,8 @@ describe("runtime rotation proxy", () => {
 	});
 
 	it("records one final outcome after a pre-event WebSocket disconnect", async () => {
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
+		const guardUpdate = vi.spyOn(ContextBudgetGuard.prototype, "update");
 		const usageRecords: Array<Record<string, unknown>> = [];
 		const usageRecorder = vi
 			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
@@ -2124,7 +2220,10 @@ describe("runtime rotation proxy", () => {
 						socket.terminate();
 						return;
 					}
-					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { usage: { input_tokens: 12, output_tokens: 3 } },
+					}));
 				});
 			},
 		});
@@ -2140,7 +2239,12 @@ describe("runtime rotation proxy", () => {
 		);
 		try {
 			const response = nextWebSocketMessage(socket);
-			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.5",
+				prompt_cache_key: "replayed-budget-session",
+				input: [],
+			}));
 			expect(JSON.parse(await response)).toMatchObject({ type: "response.completed" });
 			expect(usageRecorder).toHaveBeenCalledTimes(1);
 			expect(usageRecords).toEqual([
@@ -2149,10 +2253,12 @@ describe("runtime rotation proxy", () => {
 					account: expect.objectContaining({ index: 1 }),
 				}),
 			]);
+			expect(guardUpdate).toHaveBeenCalledTimes(1);
 		} finally {
 			socket.terminate();
 			await upstream.close();
 			usageRecorder.mockRestore();
+			guardUpdate.mockRestore();
 		}
 	});
 

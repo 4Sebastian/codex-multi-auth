@@ -1129,6 +1129,26 @@ async function prepareWebSocketRequest(
 			policyDecision.errorCode ?? "policy_blocked",
 		);
 	}
+	const budgetAdvisory = state.contextBudgetGuard.getAdvisory(
+		context.stableSessionKey ?? "",
+		startedAt,
+		context.model,
+	);
+	if (budgetAdvisory.level === "hard") {
+		state.contextBudgetGuard.noteHardPauseEmitted(
+			context.stableSessionKey ?? "",
+		);
+		await usageRecorder.record({
+			outcome: "blocked",
+			statusCode: HTTP_STATUS.OK,
+			errorCode: "context_budget_guard_paused",
+		});
+		throw createRuntimeProxyHttpError(
+			"Context budget guard paused this WebSocket request.",
+			HTTP_STATUS.OK,
+			"context_budget_guard_paused",
+		);
+	}
 	return { context, policyDecision, usageRecorder };
 }
 
@@ -2229,6 +2249,23 @@ function bridgeWebSocketConnection(
 					if (settled) {
 						applyWebSocketTerminalAccountSuccess(state, settled, terminal);
 						applyWebSocketTerminalAccountFailure(state, settled, terminal);
+						if (
+							terminal.record.outcome === "success" &&
+							settled.request.context.stableSessionKey &&
+							settled.request.context.model &&
+							typeof terminal.record.inputTokens === "number" &&
+							typeof terminal.record.outputTokens === "number"
+						) {
+							state.contextBudgetGuard.update(
+								settled.request.context.stableSessionKey,
+								{
+									model: settled.request.context.model,
+									contextTokens:
+										terminal.record.inputTokens + terminal.record.outputTokens,
+									updatedAt: state.now(),
+								},
+							);
+						}
 						void settled.request.usageRecorder.record({
 							...terminal.record,
 							account: settled.account,
