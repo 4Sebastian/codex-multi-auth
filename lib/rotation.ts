@@ -1,7 +1,7 @@
 /**
  * Rotation Strategy Module
  *
- * Implements health-based account selection with token bucket rate limiting.
+ * Implements health-based account selection and the legacy token-bucket utility.
  * Ported from antigravity-auth rotation logic for optimal account rotation
  * when rate limits are encountered.
  */
@@ -198,13 +198,8 @@ export const DEFAULT_TOKEN_BUCKET_CONFIG: TokenBucketConfig = {
 	tokensPerMinute: 6,
 };
 
-// Must cover the full request lifetime so a token consumed at request start can
-// still be refunded when the request fails at the very end. The runtime proxy
-// refunds on network error / upstream timeout, and the default fetch timeout is
-// 60_000ms (config.ts fetchTimeoutMs) — measured AFTER token consumption and a
-// token refresh. 90_000ms = that 60s timeout plus slack for the refresh and
-// processing, so a genuinely timed-out request's token is reversed instead of
-// leaking (gradual token-bucket starvation -> spurious token-exhausted skips).
+// Preserve the historical refund window for direct TokenBucketTracker callers.
+// Runtime admission no longer consumes or refunds these tokens.
 const TOKEN_REFUND_WINDOW_MS = 90_000;
 
 interface TokenBucketEntry {
@@ -214,8 +209,8 @@ interface TokenBucketEntry {
 }
 
 /**
- * Client-side token bucket for rate limiting requests per account.
- * Prevents sending requests to accounts that are likely to be rate-limited.
+ * Legacy client-side token-bucket utility retained for API compatibility and
+ * selection diagnostics. Runtime admission does not enforce it.
  */
 export class TokenBucketTracker {
 	private buckets: Map<string, TokenBucketEntry> = new Map();

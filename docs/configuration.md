@@ -152,9 +152,10 @@ If every account is unavailable, the proxy returns a structured pool-exhaustion 
 
 The generated provider configuration declares `supports_websockets = true`, so WebSocket-capable Codex clients can keep a persistent Responses connection through the same loopback proxy.
 The first `response.create` evaluates runtime policy before selecting and authenticating one managed account for that connection.
-Every `response.create`, including the first, consumes that account's request token and records its own redacted usage row; later requests re-evaluate policy while keeping the connection on the same account.
+Every `response.create`, including the first, passes the runtime policy, quota/cooldown, and circuit-breaker availability gates and records exactly one redacted usage row for its final outcome.
 Upstream handshake failures can try another eligible account up to `maxRuntimeAccountAttempts`, but explicit token invalidation stops failover to prevent an invalid-token cascade.
-An established WebSocket never changes accounts mid-connection; rate-limit, auth, server, or transport failures update cooldown and session-affinity state so the client's next connection can select another eligible account.
+Each healthy upstream WebSocket remains bound to one account, but the persistent local connection can replace that upstream and replay a full `response.create` when the account becomes unavailable or the transport fails before any response event is forwarded.
+Connection-scoped continuations are not replayed on a replacement upstream; the proxy emits `previous_response_not_found` so the client can rebuild a full request.
 Rate-limit terminal events honor retry headers and reset metadata when calculating that cooldown.
 
 **Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes two mitigations:
@@ -166,7 +167,7 @@ Rate-limit terminal events honor retry headers and reset metadata when calculati
 
 `schedulingStrategy` controls how the proxy picks an account for each request:
 
-- `hybrid` (default) spreads load across all available accounts using a weighted health/token/freshness score. Both accounts tend to consume quota at a similar pace.
+- `hybrid` (default) spreads load across all available accounts using a weighted health/freshness score. Both accounts tend to consume quota at a similar pace.
 - `sequential` (drain-first) routes every new request to one active account and only advances to the next available account once the current one is fully exhausted (rate-limited, cooling down, or circuit-open). Because the scan wraps the pool, an earlier account that has recovered its quota window is reclaimed as soon as the current account drains. This staggers quota recovery across accounts for longer uninterrupted sessions.
 
 In `sequential` mode a manual pin (`codex-multi-auth switch <index>`) still takes precedence and is never overridden. Sequential mode intentionally ignores per-session affinity: once the active account changes, all subsequent requests follow the new active account regardless of which account originally handled a conversation. Enable it with `schedulingStrategy: "sequential"` in settings or `CODEX_AUTH_SCHEDULING_STRATEGY=sequential` for a per-process trial.

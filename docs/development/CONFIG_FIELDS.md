@@ -75,7 +75,7 @@ Used only for host plugin mode through the host runtime config file.
 | `unsupportedCodexFallbackChain` | `{}` |
 
 `schedulingStrategy` selects how the runtime proxy picks an account for each HTTP/SSE request or new WebSocket connection.
-`hybrid` (default) keeps the weighted health/token/freshness selection that spreads load across all available accounts.
+`hybrid` (default) keeps the weighted health/freshness selection that spreads load across all available accounts.
 `sequential` (drain-first) sticks to one active account and only advances to the next available account once the current one is fully exhausted (rate-limited / cooling down / circuit-open); earlier accounts become eligible again as soon as their quota window recovers, staggering recovery across the pool.
 A manual pin still overrides this, and sequential mode intentionally ignores per-session affinity so all new requests and connections follow the single active account.
 Overridable per-process via `CODEX_AUTH_SCHEDULING_STRATEGY`.
