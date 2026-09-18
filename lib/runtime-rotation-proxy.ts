@@ -877,6 +877,7 @@ interface PendingWebSocketFrame {
 	data: RawData;
 	isBinary: boolean;
 	recoveryAttempts?: number;
+	request?: PreparedWebSocketRequest;
 }
 
 function hasConnectionScopedContinuation(frame: PendingWebSocketFrame): boolean {
@@ -1160,14 +1161,14 @@ async function consumeWebSocketRequestForAccount(
 			runtimeSkipReason === "circuit-open" ||
 			runtimeSkipReason === "cooling-down" ||
 			runtimeSkipReason.startsWith("cooling-down:");
-		await request.usageRecorder.record({
-			outcome: "failure",
-			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
-			errorCode: recoverable
-				? "websocket_account_deferred"
-				: "websocket_account_unavailable",
-			account,
-		});
+		if (!recoverable) {
+			await request.usageRecorder.record({
+				outcome: "failure",
+				statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+				errorCode: "websocket_account_unavailable",
+				account,
+			});
+		}
 		throw createRuntimeProxyHttpError(
 			"The account bound to this WebSocket connection is temporarily unavailable.",
 			HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -1177,12 +1178,6 @@ async function consumeWebSocketRequestForAccount(
 		);
 	}
 	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {
-		await request.usageRecorder.record({
-			outcome: "failure",
-			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
-			errorCode: "circuit_open",
-			account,
-		});
 		throw createRuntimeProxyHttpError(
 			"The account bound to this WebSocket connection is temporarily unavailable.",
 			HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -1904,11 +1899,6 @@ async function connectManagedWebSocket(
 			state.status.rotations += 1;
 		}
 	}
-	await request.usageRecorder.record({
-		outcome: "failure",
-		statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
-		errorCode: "codex_runtime_rotation_pool_exhausted",
-	});
 	return null;
 }
 
@@ -1973,6 +1963,19 @@ function bridgeWebSocketConnection(
 			});
 		}
 	};
+	const settlePending = (
+		outcome: "failure" | "cancelled",
+		errorCode: string,
+	): void => {
+		for (const frame of pending.splice(0)) {
+			if (!frame.request) continue;
+			void frame.request.usageRecorder.record({
+				outcome,
+				statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
+				errorCode,
+			});
+		}
+	};
 	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
 		if (closed) return;
 		closed = true;
@@ -2021,7 +2024,7 @@ function bridgeWebSocketConnection(
 			}
 			return;
 		}
-		let request = preparedHandshake?.request;
+		let request = preparedHandshake?.request ?? frame.request;
 		let consumedForFrame = false;
 		if (!request) {
 			const parsed = parseRequestBody(rawDataToBuffer(frame.data));
@@ -2066,6 +2069,7 @@ function bridgeWebSocketConnection(
 				pending.unshift({
 					...frame,
 					recoveryAttempts: frame.recoveryAttempts ?? 0,
+					request,
 				});
 				void initialize();
 				return;
@@ -2159,7 +2163,9 @@ function bridgeWebSocketConnection(
 				reportConnectionScopedContinuationLoss();
 				return;
 			}
-			const firstRequest = await prepareWebSocketRequest(state, req, firstFrame.data);
+			const firstRequest =
+				firstFrame.request ?? await prepareWebSocketRequest(state, req, firstFrame.data);
+			firstFrame.request = firstRequest;
 			pendingInitialRequest = firstRequest;
 			if (closed) {
 				settlePendingHandshake("cancelled", "client_websocket_closed");
@@ -2187,6 +2193,12 @@ function bridgeWebSocketConnection(
 					reconnectTimer.unref?.();
 					return;
 				}
+				pending.shift();
+				await firstRequest.usageRecorder.record({
+					outcome: "failure",
+					statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+					errorCode: "codex_runtime_rotation_pool_exhausted",
+				});
 				closeBoth(
 					WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
 					"All managed Codex accounts are temporarily unavailable",
@@ -2293,6 +2305,7 @@ function bridgeWebSocketConnection(
 		}
 		settlePendingHandshake("cancelled", "client_websocket_closed");
 		settleAll("cancelled", "client_websocket_closed");
+		settlePending("cancelled", "client_websocket_closed");
 		closed = true;
 		if (upstream) mirrorWebSocketClose(upstream, code, reason);
 	});
@@ -2300,6 +2313,7 @@ function bridgeWebSocketConnection(
 		state.status.lastError = error.message;
 		settlePendingHandshake("failure", "client_websocket_error");
 		settleAll("failure", "client_websocket_error");
+		settlePending("failure", "client_websocket_error");
 		closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Local WebSocket error");
 	});
 }

@@ -1390,6 +1390,21 @@ describe("runtime rotation proxy", () => {
 		},
 	])("rotates a persistent WebSocket after a $name", async ({ event }) => {
 		const authorizationAttempts: Array<string | undefined> = [];
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		const evaluatePolicy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy");
 		let connectionCount = 0;
 		const upstream = await startTestWebSocketUpstream({
 			onConnection: (socket, request) => {
@@ -1440,9 +1455,84 @@ describe("runtime rotation proxy", () => {
 				"Bearer access-1",
 				"Bearer access-2",
 			]);
+			expect(evaluatePolicy).toHaveBeenCalledTimes(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords[1]).toMatchObject({
+				outcome: "success",
+				account: expect.objectContaining({ index: 1 }),
+			});
 		} finally {
 			socket.terminate();
 			await upstream.close();
+			evaluatePolicy.mockRestore();
+			usageRecorder.mockRestore();
+		}
+	});
+
+	it("keeps one usage recorder while WebSocket recovery is delayed", async () => {
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		const evaluatePolicy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy");
+		let requestCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", () => {
+					requestCount += 1;
+					socket.send(JSON.stringify(
+						requestCount === 1
+							? {
+								type: "response.failed",
+								status_code: HTTP_STATUS.INTERNAL_SERVER_ERROR,
+								response: { error: { code: "server_error" } },
+							}
+							: { type: "response.completed", response: {} },
+					));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: {
+				upstreamBaseUrl: upstream.baseUrl,
+				serverErrorCooldownMs: 1_000,
+			},
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			await firstResponse;
+
+			const secondResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await secondResponse)).toMatchObject({
+				type: "response.completed",
+			});
+			expect(evaluatePolicy).toHaveBeenCalledTimes(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords[1]).toMatchObject({ outcome: "success" });
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			evaluatePolicy.mockRestore();
+			usageRecorder.mockRestore();
 		}
 	});
 
