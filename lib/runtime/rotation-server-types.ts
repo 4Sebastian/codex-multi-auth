@@ -42,6 +42,7 @@ export interface RuntimeRotationProxyOptions {
 	maxRequestBodyBytes?: number;
 	fetchTimeoutMs?: number;
 	streamStallTimeoutMs?: number;
+	serverErrorCooldownMs?: number;
 	/**
 	 * Ephemeral, per-instance account pin (0-based) for a single invocation
 	 * (issue #623: `codex-multi-auth-codex --account`). When set, this proxy

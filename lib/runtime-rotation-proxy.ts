@@ -861,7 +861,7 @@ const CODEX_RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
 const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE =
 	"Previous response was not found. Retrying the full request.";
-const INITIAL_WEBSOCKET_RECOVERY_DELAY_MS = 5_000;
+const INITIAL_WEBSOCKET_RECOVERY_DELAY_MS = 100;
 const MAX_WEBSOCKET_RECOVERY_DELAY_MS = 60_000;
 const WEBSOCKET_CLOSE_POLICY_VIOLATION = 1008;
 const WEBSOCKET_CLOSE_TRY_AGAIN_LATER = 1013;
@@ -1565,6 +1565,7 @@ async function prepareWebSocketAccount(
 	skipReasons: Map<number, string>,
 	attemptBudget: WebSocketAttemptBudget,
 	lifecycle: WebSocketHandshakeLifecycle,
+	allowStaleRecovery: boolean,
 ): Promise<PreparedWebSocketAccount | null> {
 	const { context, policyDecision } = request;
 	let accountManager = state.activeAccountManager;
@@ -1622,6 +1623,7 @@ async function prepareWebSocketAccount(
 				: selectAccount();
 		if (!selected) {
 			if (
+				allowStaleRecovery &&
 				!reloaded &&
 				!isPinned &&
 				accountManager.getAccountCount() > 0 &&
@@ -1753,6 +1755,7 @@ async function connectManagedWebSocket(
 	req: IncomingMessage,
 	request: PreparedWebSocketRequest,
 	lifecycle: WebSocketHandshakeLifecycle,
+	allowStaleRecovery: boolean,
 ): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount } | null> {
 	const attemptedIndexes = new Set<number>();
 	const skipReasons = new Map<number, string>();
@@ -1777,6 +1780,7 @@ async function connectManagedWebSocket(
 			skipReasons,
 			attemptBudget,
 			lifecycle,
+			allowStaleRecovery,
 		);
 		if (!prepared) break;
 		const { accountManager, account, accessToken, accountId, isPinned } = prepared;
@@ -2176,6 +2180,7 @@ function bridgeWebSocketConnection(
 				req,
 				firstRequest,
 				handshakeLifecycle,
+				firstFrame.recoveryAttempts === undefined,
 			);
 			if (!connected) {
 				pendingInitialRequest = null;
@@ -2395,7 +2400,8 @@ export async function startRuntimeRotationProxy(
 	);
 	const tokenRefreshSkewMs = getTokenRefreshSkewMs(pluginConfig);
 	const networkErrorCooldownMs = getNetworkErrorCooldownMs(pluginConfig);
-	const serverErrorCooldownMs = getServerErrorCooldownMs(pluginConfig);
+	const serverErrorCooldownMs =
+		options.serverErrorCooldownMs ?? getServerErrorCooldownMs(pluginConfig);
 	// Normalize the explicit option as well as the env var: a caller passing a
 	// negative or multi-hour value would otherwise bypass the documented cap.
 	// `0` stays 0, since it is the documented kill switch.
