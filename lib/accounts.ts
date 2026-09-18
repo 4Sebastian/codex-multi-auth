@@ -1140,10 +1140,7 @@ export class AccountManager {
 	): void {
 		const quotaKey = model ? `${family}:${model}` : family;
 		const healthTracker = getHealthTracker();
-		const tokenTracker = getTokenTracker();
-		const trackerKey = getRuntimeTrackerKey(account);
-		healthTracker.recordRateLimit(trackerKey, quotaKey);
-		tokenTracker.drain(trackerKey, quotaKey);
+		healthTracker.recordRateLimit(getRuntimeTrackerKey(account), quotaKey);
 	}
 
 	recordFailure(
@@ -1157,67 +1154,45 @@ export class AccountManager {
 		getCircuitBreaker(getAccountCircuitKey(account)).recordFailure();
 	}
 
+	/**
+	 * Admit a request through the circuit breaker. The legacy method name is
+	 * retained for API compatibility, but CMA no longer consumes a local request
+	 * token or imposes a requests-per-minute limit.
+	 */
 	consumeToken(
 		account: ManagedAccount,
 		family: ModelFamily,
 		model?: string | null,
-		options: { bypassTokenBucket?: boolean } = {},
+		_options: { bypassTokenBucket?: boolean } = {},
 	): boolean {
-		return this.consumeTokenWithReason(account, family, model, options).ok;
+		return this.consumeTokenWithReason(account, family, model).ok;
 	}
 
-	/**
-	 * `consumeToken`, but it says which admission gate rejected the request.
-	 *
-	 * There are two gates and they are not interchangeable to a caller writing
-	 * `account_skip_reasons`: the pool-scoring token bucket, and the circuit
-	 * breaker's race-safe admission slot. Re-deriving the answer afterwards
-	 * with `getManagedAccountRuntimeSkipReason` gets it wrong in both
-	 * directions -- that helper reports the FIRST blocker it finds (so a live
-	 * cooldown masks a drained bucket), and its `isAvailable()` check answers
-	 * true for a half-open breaker whose single probe `canExecute()` just
-	 * handed to a concurrent request. Reporting the gate that actually
-	 * rejected removes the race and the mis-attribution, and avoids a second
-	 * state-mutating evaluation (`clearExpiredRateLimits`) on the hot path.
-	 */
+	/** Return the circuit-breaker admission verdict for a runtime request. */
 	consumeTokenWithReason(
 		account: ManagedAccount,
-		family: ModelFamily,
-		model?: string | null,
-		options: { bypassTokenBucket?: boolean } = {},
-	): { ok: true } | { ok: false; reason: "token-exhausted" | "circuit-open" } {
-		const quotaKey = model ? `${family}:${model}` : family;
-		const tokenTracker = getTokenTracker();
-		const trackerKey = getRuntimeTrackerKey(account);
-		const shouldConsumeToken = options.bypassTokenBucket !== true;
-		if (shouldConsumeToken && !tokenTracker.tryConsume(trackerKey, quotaKey)) {
-			return { ok: false, reason: "token-exhausted" };
-		}
-
+		_family: ModelFamily,
+		_model?: string | null,
+		_options: { bypassTokenBucket?: boolean } = {},
+	): { ok: true } | { ok: false; reason: "circuit-open" } {
 		try {
 			getCircuitBreaker(getAccountCircuitKey(account)).canExecute();
 			return { ok: true };
 		} catch {
-			if (shouldConsumeToken) {
-				tokenTracker.refundToken(trackerKey, quotaKey);
-			}
 			return { ok: false, reason: "circuit-open" };
 		}
 	}
 
 	/**
-	 * Refund a token consumed within the refund window (30 seconds).
-	 * Use this when a request fails due to network errors (not rate limits).
-	 * @returns true if refund was successful, false if no valid consumption found
+	 * Compatibility no-op retained for callers built against the former local
+	 * token bucket. Runtime admission no longer consumes refundable tokens.
 	 */
 	refundToken(
-		account: ManagedAccount,
-		family: ModelFamily,
-		model?: string | null,
+		_account: ManagedAccount,
+		_family: ModelFamily,
+		_model?: string | null,
 	): boolean {
-		const quotaKey = model ? `${family}:${model}` : family;
-		const tokenTracker = getTokenTracker();
-		return tokenTracker.refundToken(getRuntimeTrackerKey(account), quotaKey);
+		return false;
 	}
 
 	markSwitched(

@@ -552,7 +552,7 @@ function isRuntimeProxyHttpError(error: unknown): error is RuntimeProxyHttpError
 }
 
 function isRecoverableWebSocketAccountError(error: unknown): boolean {
-	return isRuntimeProxyHttpError(error) && error.code === "token_exhausted";
+	return isRuntimeProxyHttpError(error) && error.code === "circuit_open";
 }
 
 async function readRequestBody(
@@ -1149,14 +1149,14 @@ async function consumeWebSocketRequestForAccount(
 	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {
 		await request.usageRecorder.record({
 			outcome: "failure",
-			statusCode: HTTP_STATUS.TOO_MANY_REQUESTS,
-			errorCode: "token_exhausted",
+			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+			errorCode: "circuit_open",
 			account,
 		});
 		throw createRuntimeProxyHttpError(
-			"The account bound to this WebSocket connection has no request tokens available.",
-			HTTP_STATUS.TOO_MANY_REQUESTS,
-			"token_exhausted",
+			"The account bound to this WebSocket connection is temporarily unavailable.",
+			HTTP_STATUS.SERVICE_UNAVAILABLE,
+			"circuit_open",
 		);
 	}
 }
@@ -1648,7 +1648,7 @@ async function prepareWebSocketAccount(
 			continue;
 		}
 		if (!accountManager.consumeToken(selected, context.family, context.model)) {
-			skipReasons.set(selected.index, "token-exhausted");
+			skipReasons.set(selected.index, "circuit-open");
 			continue;
 		}
 		attemptBudget.attempts += 1;
@@ -2777,16 +2777,6 @@ async function handleRequestInner(
 		// applies unchanged because it all keys off `pinnedIndex` / `isPinned`.
 		const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
 		const isPinned = typeof pinnedIndex === "number";
-		// The token bucket spreads load across a selectable pool. A pin has no
-		// alternative account, so exhausting that local heuristic can only reject a
-		// request that the pinned account could serve. Keep circuit-breaker admission
-		// inside consumeToken, but do not debit the pool-scoring bucket for a pin.
-		const bypassPoolTokenBucket = isPinned;
-		const refundConsumedPoolToken = (account: ManagedAccount): void => {
-			if (!bypassPoolTokenBucket) {
-				accountManager.refundToken(account, context.family, context.model);
-			}
-		};
 		// `rotations` counts moves to a DIFFERENT account. A pinned request has
 		// nowhere to move: every retry below re-attempts the same one. Counting
 		// those reported several account rotations on a single-account pool whose
@@ -2818,9 +2808,9 @@ async function handleRequestInner(
 		 * ends as a pool-exhausted 503 within seconds. That is what kills a
 		 * long-running task started before the user stepped away.
 		 *
-		 * The responding account is left completely unpenalized: its pool token is
-		 * refunded, it is not marked rate limited, not cooled down, and it is
-		 * removed from `attemptedIndexes` so it stays selectable. Selection then
+		 * The responding account is left completely unpenalized: it is not marked
+		 * rate limited or cooled down, and it is removed from `attemptedIndexes` so
+		 * it stays selectable. Selection then
 		 * runs normally on the next pass, which may pick a different account. That
 		 * is deliberate: with capacity being model-wide, no account is a better bet,
 		 * and forcing a request-local pin here would duplicate the pinning path for
@@ -2861,11 +2851,6 @@ async function handleRequestInner(
 				remainingMs,
 				budgetMs,
 			});
-			// The attempt debited a pool token before the upstream call. The account
-			// did not fail, so refund it: without this a sustained capacity event
-			// drains healthy accounts and later requests are refused admission with
-			// `token-exhausted` well before the retry budget expires.
-			refundConsumedPoolToken(account);
 			attemptedIndexes.delete(account.index);
 			await sleep(waitMs);
 			// A capacity wait runs for tens of seconds. Re-sending an authenticated
@@ -3034,7 +3019,6 @@ async function handleRequestInner(
 				selected,
 				context.family,
 				context.model,
-				{ bypassTokenBucket: bypassPoolTokenBucket },
 			);
 			if (!admission.ok) {
 				accountSkipReasons.set(selected.index, admission.reason);
@@ -3060,7 +3044,6 @@ async function handleRequestInner(
 				tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs,
 			});
 			if (!refreshed.ok) {
-				refundConsumedPoolToken(selected);
 				// No accountSkipReasons write here: ensureFreshAccessToken always
 				// applies an auth cooldown before returning !ok, so the next
 				// selection pass overwrites whatever this set with
@@ -3095,7 +3078,6 @@ async function handleRequestInner(
 
 			const accountId = resolveAccountId(refreshed.account, refreshed.accessToken);
 			if (!accountId) {
-				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				accountManager.markAccountCoolingDown(
 					refreshed.account,
@@ -3180,7 +3162,6 @@ async function handleRequestInner(
 					code: "codex_runtime_rotation_transport_error",
 					error: transportError,
 				});
-				refundConsumedPoolToken(refreshed.account);
 				// A timeout may occur after generation; do not retry within this request.
 				if (isImageRequest) {
 					writeJson(res, 502, {
@@ -3295,7 +3276,6 @@ async function handleRequestInner(
 					const accountWasEnabled =
 						accountManager.getAccountByIndex(refreshed.account.index)?.enabled !==
 						false;
-					refundConsumedPoolToken(refreshed.account);
 					if (accountWasEnabled) {
 						accountManager.recordFailure(
 							refreshed.account,
@@ -3383,7 +3363,6 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
@@ -3470,7 +3449,6 @@ async function handleRequestInner(
 					}
 					if (outcome === "retry") continue;
 				}
-				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				accountManager.markAccountCoolingDown(
 					refreshed.account,

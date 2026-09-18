@@ -5,6 +5,13 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## Unreleased
+
+### Changed
+
+- Runtime requests no longer consume or enforce CMA's synthetic in-memory token bucket. Admission now follows upstream quota responses, persisted account cooldowns, policy, and circuit-breaker health, so concurrent sessions are not rejected by the former six-requests-per-minute refill rate.
+- Persistent WebSocket clients can replace failed upstream account connections without latching the local client onto HTTP/SSE; connection-scoped continuations receive the standard retryable `previous_response_not_found` protocol error.
+
 ## [2.15.0] - 2026-09-17
 
 Image generation and editing now run through the authenticated runtime rotation proxy, and built-in `image_gen` is exposed to Codex 0.154.0 sessions without native-auth fallback. [Full notes](docs/releases/v2.15.0.md).

@@ -158,7 +158,7 @@ Runtime proxy account selection is implemented in `lib/runtime/rotation-account-
 2. **Sequential \| affinity**
    - When `schedulingStrategy === "sequential"` (drain-first): stick to the active account until it is fully exhausted, then scan forward; **session affinity is skipped** so all new requests follow the single active account.
    - Otherwise, if session affinity is enabled and a preferred account exists for the session key, use that account when it is still eligible.
-3. **Hybrid** — weighted health + token-bucket + freshness selection (`selectHybridAccount` / `getCurrentOrNextForFamilyHybrid`), including optional PID offset and policy score boosts.
+3. **Hybrid** — weighted health + freshness selection (`selectHybridAccount` / `getCurrentOrNextForFamilyHybrid`), including optional PID offset and policy score boosts. Runtime admission does not debit or enforce the legacy in-memory token-bucket API; upstream quota responses and persisted cooldowns determine availability.
 4. **Scan** — linear pool walk for the next eligible account (not already attempted, not policy-blocked, not rate-limited / cooling down / circuit-open). Sequential mode uses this fallback without advancing the drain-first active pointer unless true exhaustion occurred.
 
 Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained accounts, apply tag/model routing-profile constraints, apply score boosts, and soft-block requests that exceed budget guards before selection proceeds.

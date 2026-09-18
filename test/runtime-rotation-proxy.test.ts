@@ -447,6 +447,35 @@ describe("normalizeForcedAccountIndex (#623)", () => {
 });
 
 describe("runtime rotation proxy", () => {
+	it("forwards 80 concurrent requests without a synthetic local request cap", async () => {
+		const accountManager = new AccountManager(
+			undefined,
+			createStorage(Date.now(), 2),
+		);
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const responses = await Promise.all(
+			Array.from({ length: 80 }, (_, index) =>
+				postResponses(
+					proxy,
+					{ model: "gpt-5.6-sol", stream: true, input: [{ index }] },
+					"/responses",
+					{ session_id: `load-session-${index}` },
+				),
+			),
+		);
+		await Promise.all(responses.map((response) => response.text()));
+
+		expect(responses.every((response) => response.status === HTTP_STATUS.OK)).toBe(
+			true,
+		);
+		expect(calls).toHaveLength(80);
+		expect(
+			calls.every((call) => call.headers.get("authorization")?.startsWith("Bearer ")),
+		).toBe(true);
+	});
+
 	it("forwards persistent Codex WebSocket connections with managed OAuth headers", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));

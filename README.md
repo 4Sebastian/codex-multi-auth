@@ -23,6 +23,7 @@ Use it when you need a local Codex CLI multi-account workflow with visible accou
 - Explicit ChatGPT account login, saved-account listing, account switching, health checks, and diagnostics
 - Optional `codex-multi-auth-codex ...` forwarding wrapper for official Codex CLI commands when you choose wrapper-launched sessions
 - Health-aware account selection, quota forecasting, automatic failover, and flagged-account recovery
+- No synthetic local requests-per-minute cap: runtime admission follows upstream quota signals, account cooldowns, policy, and circuit-breaker health
 - Project-scoped account storage under `~/.codex/multi-auth/projects/<project-key>/...` for repo-specific workflows
 - Interactive terminal dashboard for account actions, settings, search, and hotkeys
 - Forecast, report, fix, doctor, verify, monitor, and rotation commands for operational confidence

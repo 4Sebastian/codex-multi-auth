@@ -1046,8 +1046,7 @@ describe("AccountManager", () => {
 		});
 
 		// Regression (accounts-02): removing an account must clear its identity-keyed
-		// health/token state so a later re-add of the same identity starts fresh
-		// instead of inheriting the old penalty.
+		// health and circuit state so a later re-add starts fresh.
 		it("clears identity-keyed health state when an account is removed", () => {
 			const now = Date.now();
 			const stored = {
@@ -1068,18 +1067,10 @@ describe("AccountManager", () => {
 			const identityKey = getRuntimeTrackerKey(target!);
 			expect(identityKey).toBe("account:acc_stable");
 
-			// accounts-02 (extended): consume a token and open the breaker BEFORE the
-			// health failures (an open breaker would otherwise block consumeToken), so
-			// the regression fails if removeAccount stops clearing token buckets
-			// (lib/rotation.ts clearAccountKey) or stale circuit breakers
-			// (lib/circuit-breaker.ts). Use a LIVE reference for these mutations.
+			// Open the breaker before the health failures so removal must clear both
+			// independent identity-keyed runtime trackers.
 			const liveStable = manager.getAccountByIndex(0);
 			expect(liveStable?.accountId).toBe("acc_stable");
-			expect(manager.consumeToken(liveStable!, "codex")).toBe(true);
-			const tokenTracker = getTokenTracker();
-			expect(tokenTracker.getTokens(identityKey, "codex")).toBeLessThan(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 			const breakerKey = getAccountIdentityKey(liveStable!)!;
 			const breaker = getCircuitBreaker(breakerKey);
 			breaker.recordFailure();
@@ -1105,11 +1096,6 @@ describe("AccountManager", () => {
 			expect(afterRemoval).toBe(100);
 			expect(afterRemoval).toBeGreaterThan(penalized);
 
-			// Token bucket reset: a fresh lookup for the same identity reports the
-			// full default capacity (the consumed token did not carry over).
-			expect(tokenTracker.getTokens(identityKey, "codex")).toBe(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 			// Circuit breaker reset: a fresh breaker for the same identity is closed.
 			expect(getCircuitBreaker(breakerKey).getState()).toBe("closed");
 		});
@@ -1142,13 +1128,8 @@ describe("AccountManager", () => {
 
 			const account = manager.getAccountByIndex(0)!;
 			const healthTracker = getHealthTracker();
-			const tokenTracker = getTokenTracker();
 
-			// Pin + capture the stable tracker key BEFORE enrichment. consumeToken
-			// calls getRuntimeTrackerKey internally, which pins _runtimeTrackerKey.
-			// Consume the token FIRST: the recordFailure loop below opens the circuit
-			// breaker, which would otherwise block consumeToken.
-			expect(manager.consumeToken(account, "codex")).toBe(true);
+			// Pin + capture the stable tracker key before identity enrichment.
 			const stableTrackerKey = getRuntimeTrackerKey(account);
 			expect(stableTrackerKey).toBe("email:stale@example.com");
 
@@ -1156,9 +1137,6 @@ describe("AccountManager", () => {
 			for (let i = 0; i < 5; i++) manager.recordFailure(account, "codex");
 			const penalizedScore = healthTracker.getScore(stableTrackerKey, "codex");
 			expect(penalizedScore).toBeLessThan(100);
-			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBeLessThan(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 
 			// Enrich identity so the account gains an accountId. The pinned tracker
 			// key stays "email:stale@example.com", but the RECOMPUTED identity key
@@ -1186,13 +1164,9 @@ describe("AccountManager", () => {
 			// Remove the (live) account. Cleanup must clear the STABLE tracker key.
 			expect(manager.removeAccount(account)).toBe(true);
 
-			// Under the buggy code (clear only the recomputed identity key), the
-			// stale entries under the stable key survive: getScore < 100 and
-			// getTokens < max. The fix clears the stable key, so both reset.
+			// Under the buggy code (clearing only the recomputed identity key), the
+			// stale entry under the stable key survives with a score below 100.
 			expect(healthTracker.getScore(stableTrackerKey, "codex")).toBe(100);
-			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBe(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 		});
 
 		it("returns false when removing non-existent account", () => {
@@ -4039,7 +4013,7 @@ describe("AccountManager", () => {
 			expect(mockSaveAccounts).not.toHaveBeenCalled();
 		});
 
-		it("recordRateLimit updates health and drains token bucket", () => {
+		it("recordRateLimit updates health without creating a local request limit", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4058,7 +4032,7 @@ describe("AccountManager", () => {
 			const score = healthTracker.getScore(trackerKey, "codex:gpt-5.1");
 			const tokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
 			expect(score).toBeLessThan(100);
-			expect(tokens).toBeLessThan(50);
+			expect(tokens).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 		});
 
 		it("recordRateLimit uses family-only quotaKey when model is undefined", () => {
@@ -4190,7 +4164,7 @@ describe("AccountManager", () => {
 			expect(score).toBeLessThan(100);
 		});
 
-		it("consumeToken returns true and consumes from token bucket", () => {
+		it("admits sustained concurrent requests without a local token-bucket cap", async () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4204,11 +4178,15 @@ describe("AccountManager", () => {
 			const trackerKey = getRuntimeAccountIdentityKey(account)!;
 
 			const initialTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
-			const result = manager.consumeToken(account, "codex", "gpt-5.1");
+			const results = await Promise.all(
+				Array.from({ length: 100 }, async () =>
+					manager.consumeToken(account, "codex", "gpt-5.1"),
+				),
+			);
 			const afterTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
 
-			expect(result).toBe(true);
-			expect(afterTokens).toBeLessThan(initialTokens);
+			expect(results).toEqual(Array.from({ length: 100 }, () => true));
+			expect(afterTokens).toBe(initialTokens);
 		});
 
 		it("consumeToken uses family-only quotaKey when model is undefined", () => {
@@ -4227,7 +4205,7 @@ describe("AccountManager", () => {
 			expect(result).toBe(true);
 		});
 
-		it("can bypass an exhausted pool bucket without bypassing circuit admission", () => {
+		it("ignores legacy token-bucket state without bypassing circuit admission", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4252,41 +4230,14 @@ describe("AccountManager", () => {
 				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
 			);
 
+			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(true);
+			manager.recordFailure(account, "codex", "gpt-5.1");
+			manager.recordFailure(account, "codex", "gpt-5.1");
+			manager.recordFailure(account, "codex", "gpt-5.1");
 			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(false);
-			const tryConsumeSpy = vi.spyOn(tokenTracker, "tryConsume");
-			const refundTokenSpy = vi.spyOn(tokenTracker, "refundToken");
-			try {
-				expect(
-					manager.consumeToken(account, "codex", "gpt-5.1", {
-						bypassTokenBucket: true,
-					}),
-				).toBe(true);
-				expect(tryConsumeSpy).not.toHaveBeenCalled();
-				expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBeLessThan(1);
-
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				expect(
-					manager.consumeToken(account, "codex", "gpt-5.1", {
-						bypassTokenBucket: true,
-					}),
-				).toBe(false);
-				// A rejected bypass must not refund another request's bucket token.
-				expect(tryConsumeSpy).not.toHaveBeenCalled();
-				expect(refundTokenSpy).not.toHaveBeenCalled();
-				expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBeLessThan(1);
-			} finally {
-				tryConsumeSpy.mockRestore();
-				refundTokenSpy.mockRestore();
-			}
 		});
 
-		it("names the admission gate that actually rejected the request", () => {
-			// `account_skip_reasons` is written from this verdict. Re-deriving it
-			// afterwards with getManagedAccountRuntimeSkipReason reports the FIRST
-			// blocker on the account instead of the gate that rejected, so a drained
-			// bucket on a cooling-down account came back as the cooldown.
+		it("reports circuit-breaker admission failures directly", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4302,53 +4253,20 @@ describe("AccountManager", () => {
 			};
 			const manager = new AccountManager(undefined, stored);
 			const account = manager.getCurrentAccount()!;
-			const tokenTracker = getTokenTracker();
-			const trackerKey = getRuntimeTrackerKey(account);
-			const quotaKey = "codex:gpt-5.1";
 
 			expect(manager.consumeTokenWithReason(account, "codex", "gpt-5.1")).toEqual({
 				ok: true,
 			});
-
-			tokenTracker.drain(
-				trackerKey,
-				quotaKey,
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
-			// A cooldown on the same account must not be reported in place of the
-			// bucket: the bucket is what rejected.
-			manager.markAccountCoolingDown(account, 60_000, "server-error");
-			expect(manager.consumeTokenWithReason(account, "codex", "gpt-5.1")).toEqual({
-				ok: false,
-				reason: "token-exhausted",
-			});
-			// Contrast: re-deriving the reason from account state answers with the
-			// cooldown, which is NOT what rejected this call. That substitution is
-			// exactly the mis-attribution consumeTokenWithReason exists to avoid.
-			expect(
-				manager.getManagedAccountRuntimeSkipReason(account, "codex", "gpt-5.1"),
-			).toBe("cooling-down:server-error");
-
-			// With the bucket bypassed the only gate left is circuit admission, so a
-			// rejection there is reported as such and never as an exhausted bucket.
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			expect(
-				manager.consumeTokenWithReason(account, "codex", "gpt-5.1", {
-					bypassTokenBucket: true,
-				}),
+				manager.consumeTokenWithReason(account, "codex", "gpt-5.1"),
 			).toEqual({ ok: false, reason: "circuit-open" });
-
-			// consumeToken stays the boolean face of the same evaluation.
-			expect(
-				manager.consumeToken(account, "codex", "gpt-5.1", {
-					bypassTokenBucket: true,
-				}),
-			).toBe(false);
+			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(false);
 		});
 
-		it("consumeToken returns false and refunds the token when the circuit is open", () => {
+		it("consumeToken returns false without changing legacy token state when the circuit is open", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4377,7 +4295,7 @@ describe("AccountManager", () => {
 			expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(initialTokens);
 		});
 
-		it("consumeToken returns false and refunds when the half-open slot is exhausted", () => {
+		it("consumeToken returns false without changing legacy token state when the half-open slot is exhausted", () => {
 			vi.useFakeTimers();
 			vi.setSystemTime(new Date(0));
 
@@ -4412,9 +4330,7 @@ describe("AccountManager", () => {
 
 				expect(manager.consumeToken(account, "codex")).toBe(true);
 				expect(manager.consumeToken(account, "codex")).toBe(false);
-				expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(
-					initialTokens - 1,
-				);
+				expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(initialTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4456,7 +4372,7 @@ describe("AccountManager", () => {
 				);
 				expect(
 					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
-				).toBeLessThan(50);
+				).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4524,7 +4440,7 @@ describe("AccountManager", () => {
 				);
 				expect(
 					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
-				).toBeLessThan(50);
+				).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4572,8 +4488,8 @@ describe("AccountManager", () => {
 			expect(healthTracker.getScore(trackerKey, "codex:gpt-5.1")).toBeLessThan(
 				100,
 			);
-			expect(tokenTracker.getTokens(trackerKey, "codex:gpt-5.1")).toBeLessThan(
-				50,
+			expect(tokenTracker.getTokens(trackerKey, "codex:gpt-5.1")).toBe(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
 			);
 		});
 	});
