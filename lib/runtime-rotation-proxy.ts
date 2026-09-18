@@ -552,7 +552,10 @@ function isRuntimeProxyHttpError(error: unknown): error is RuntimeProxyHttpError
 }
 
 function isRecoverableWebSocketAccountError(error: unknown): boolean {
-	return isRuntimeProxyHttpError(error) && error.code === "circuit_open";
+	return (
+		isRuntimeProxyHttpError(error) &&
+		(error.code === "circuit_open" || error.code === "websocket_account_deferred")
+	);
 }
 
 async function readRequestBody(
@@ -1144,6 +1147,33 @@ async function consumeWebSocketRequestForAccount(
 			"Runtime policy blocked the account bound to this WebSocket connection.",
 			HTTP_STATUS.FORBIDDEN,
 			"policy_blocked",
+		);
+	}
+	const runtimeSkipReason = accountManager.getManagedAccountRuntimeSkipReason(
+		account,
+		request.context.family,
+		request.context.model,
+	);
+	if (runtimeSkipReason) {
+		const recoverable =
+			runtimeSkipReason === "rate-limited" ||
+			runtimeSkipReason === "circuit-open" ||
+			runtimeSkipReason === "cooling-down" ||
+			runtimeSkipReason.startsWith("cooling-down:");
+		await request.usageRecorder.record({
+			outcome: "failure",
+			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+			errorCode: recoverable
+				? "websocket_account_deferred"
+				: "websocket_account_unavailable",
+			account,
+		});
+		throw createRuntimeProxyHttpError(
+			"The account bound to this WebSocket connection is temporarily unavailable.",
+			HTTP_STATUS.SERVICE_UNAVAILABLE,
+			recoverable
+				? "websocket_account_deferred"
+				: "websocket_account_unavailable",
 		);
 	}
 	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {

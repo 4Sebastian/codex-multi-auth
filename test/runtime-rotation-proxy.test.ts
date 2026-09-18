@@ -1367,6 +1367,85 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it.each([
+		{
+			name: "rate limit",
+			event: {
+				type: "error",
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				retry_after_ms: 120_000,
+				error: { code: "rate_limit_exceeded" },
+			},
+		},
+		{
+			name: "server failure",
+			event: {
+				type: "response.failed",
+				status_code: HTTP_STATUS.INTERNAL_SERVER_ERROR,
+				response: {
+					status: "failed",
+					error: { code: "server_error" },
+				},
+			},
+		},
+	])("rotates a persistent WebSocket after a $name", async ({ event }) => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				connectionCount += 1;
+				const connectionNumber = connectionCount;
+				authorizationAttempts.push(request.headers.authorization);
+				socket.on("message", () => {
+					if (connectionNumber === 1) {
+						socket.send(JSON.stringify(event));
+						return;
+					}
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(
+			undefined,
+			createStorage(Date.now(), 2),
+		);
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [{ role: "user", content: "first" }],
+			}));
+			expect(JSON.parse(await firstResponse)).toMatchObject({ type: event.type });
+
+			const secondResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [{ role: "user", content: "second" }],
+			}));
+			expect(JSON.parse(await secondResponse)).toMatchObject({
+				type: "response.completed",
+			});
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
 	it("honors retry headers wrapped in WebSocket error events", async () => {
 		const now = Date.now();
 		const upstream = await startTestWebSocketUpstream({
