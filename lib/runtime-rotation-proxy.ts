@@ -58,7 +58,7 @@ import {
 } from "./policy/runtime-policy.js";
 import {
 	createUsageStreamScanner,
-	extractUsageTokenCounts,
+	extractResponsesUsage,
 } from "./usage/usage-extraction.js";
 import {
 	isModelAtCapacityError,
@@ -1231,7 +1231,7 @@ function websocketTerminalUsage(
 		return null;
 	}
 	const response = isRecord(parsed.response) ? parsed.response : null;
-	const usage = extractUsageTokenCounts(response?.usage);
+	const usage = extractResponsesUsage(parsed);
 	const error = response && isRecord(response.error)
 		? response.error
 		: isRecord(parsed.error)

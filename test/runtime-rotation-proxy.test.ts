@@ -30,6 +30,8 @@ import {
 	resetTrackers,
 } from "../lib/rotation.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
+import { estimateUsageCostUsd } from "../lib/usage/pricing.js";
+import type { UsageTokenCounts } from "../lib/usage/types.js";
 
 const {
 	refreshAccessTokenMock,
@@ -758,6 +760,74 @@ describe("runtime rotation proxy", () => {
 				reasoningTokens: 25_000,
 				totalTokens: 47_000,
 			});
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+		}
+	});
+
+	it("preserves WebSocket service tier for ledger pricing", async () => {
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", () => {
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: {
+							service_tier: "priority",
+							usage: {
+								input_tokens: 1_000_000,
+								output_tokens: 1_000_000,
+								output_tokens_details: { reasoning_tokens: 500_000 },
+								total_tokens: 2_000_000,
+							},
+						},
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-6-astra",
+				input: [],
+			}));
+			await response;
+			expect(usageRecords).toHaveLength(1);
+			expect(usageRecords[0]).toMatchObject({
+				inputTokens: 1_000_000,
+				outputTokens: 500_000,
+				reasoningTokens: 500_000,
+				serviceTier: "priority",
+			});
+			expect(
+				estimateUsageCostUsd("gpt-6-astra", usageRecords[0] as unknown as UsageTokenCounts),
+			).toBe(120);
 		} finally {
 			socket.terminate();
 			await upstream.close();
