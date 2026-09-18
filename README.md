@@ -28,7 +28,7 @@ Use it when you need a local Codex CLI multi-account workflow with visible accou
 - Forecast, report, fix, doctor, verify, monitor, and rotation commands for operational confidence
 - Local usage ledger, budget guards, account policy controls, routing profiles, and model/account capability views
 - Runtime counters, budget/cooldown state, and multi-auth probe visibility in `codex-multi-auth status` / `codex-multi-auth report`
-- Default-on loopback Responses proxy with persistent WebSocket forwarding for live account rotation inside forwarded Codex CLI/app sessions
+- Default-on loopback Responses proxy with resilient persistent WebSocket forwarding, safe upstream reconnection, and live account rotation for forwarded Codex CLI/app and Pi sessions; lost connection-scoped continuations use the standard retryable Responses error so clients rebuild a fresh request instead of replaying invalid state upstream
 - Optional loopback-only local bridge for `/health`, `/v1/models`, and `/v1/responses`, protected by hashed local client tokens
 - Reversible packaged Codex app bind and user-level launcher routing helpers that do not patch official app binaries
 - Session affinity, live account sync, proactive refresh, and preemptive quota deferral controls

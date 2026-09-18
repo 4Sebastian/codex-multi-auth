@@ -415,6 +415,10 @@ function isRuntimeProxyHttpError(error: unknown): error is RuntimeProxyHttpError
 	);
 }
 
+function isRecoverableWebSocketAccountError(error: unknown): boolean {
+	return isRuntimeProxyHttpError(error) && error.code === "token_exhausted";
+}
+
 async function readRequestBody(
 	req: IncomingMessage,
 	maxBytes = MAX_REQUEST_BODY_BYTES,
@@ -660,6 +664,11 @@ function writePoolExhausted(params: {
 }
 
 const CODEX_RESPONSES_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE =
+	"Previous response was not found. Retrying the full request.";
+const INITIAL_WEBSOCKET_RECOVERY_DELAY_MS = 5_000;
+const MAX_WEBSOCKET_RECOVERY_DELAY_MS = 60_000;
 const WEBSOCKET_CLOSE_POLICY_VIOLATION = 1008;
 const WEBSOCKET_CLOSE_TRY_AGAIN_LATER = 1013;
 const MAX_WEBSOCKET_HANDSHAKE_ERROR_BODY_BYTES = 64 * 1024;
@@ -673,6 +682,12 @@ const WEBSOCKET_AUTH_FAILURE_CODES: ReadonlySet<string> = new Set([
 interface PendingWebSocketFrame {
 	data: RawData;
 	isBinary: boolean;
+	recoveryAttempts?: number;
+}
+
+function hasConnectionScopedContinuation(frame: PendingWebSocketFrame): boolean {
+	const body = parseRequestBody(rawDataToBuffer(frame.data));
+	return readStringRecordValue(body ?? {}, "previous_response_id") !== null;
 }
 
 interface PreparedWebSocketAccount {
@@ -696,6 +711,8 @@ interface ActiveWebSocketRequest {
 	request: PreparedWebSocketRequest;
 	accountManager: AccountManager;
 	account: ManagedAccount;
+	frame: PendingWebSocketFrame;
+	sawUpstreamEvent: boolean;
 }
 
 interface WebSocketTerminalEvent {
@@ -1034,7 +1051,7 @@ function websocketTerminalUsage(
 
 function applyWebSocketTransportAccountFailure(
 	state: RotationProxyState,
-	active: ActiveWebSocketRequest,
+	active: Pick<ActiveWebSocketRequest, "request" | "accountManager" | "account">,
 ): void {
 	const { accountManager, account, request } = active;
 	accountManager.recordFailure(
@@ -1687,6 +1704,7 @@ function bridgeWebSocketConnection(
 	let pendingHandshake: PreparedWebSocketAccount | null = null;
 	let connecting = false;
 	let closed = false;
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let clientFrameQueue = Promise.resolve();
 	const settlePendingHandshake = (
 		outcome: "failure" | "cancelled",
@@ -1736,8 +1754,27 @@ function bridgeWebSocketConnection(
 	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
 		if (closed) return;
 		closed = true;
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		}
 		mirrorWebSocketClose(client, code, reason);
 		if (upstream) mirrorWebSocketClose(upstream, code, reason);
+	};
+	const reportConnectionScopedContinuationLoss = (): void => {
+		if (client.readyState !== WebSocket.OPEN) return;
+		// Match the Responses WebSocket protocol used by the official Codex CLI.
+		// It treats this code as retryable, discards its cached socket state, and
+		// rebuilds the next attempt from the full request instead of replaying a
+		// previous_response_id that belonged to a different upstream connection.
+		client.send(JSON.stringify({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				code: PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+				message: PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
+			},
+		}));
 	};
 	const rejectConnection = (error: unknown): void => {
 		state.status.lastError = error instanceof Error ? error.message : String(error);
@@ -1778,16 +1815,46 @@ function bridgeWebSocketConnection(
 					"websocket_account_unavailable",
 				);
 			}
-			await consumeWebSocketRequestForAccount(
-				request,
-				boundAccountManager,
-				boundAccount,
-			);
+			try {
+				await consumeWebSocketRequestForAccount(
+					request,
+					boundAccountManager,
+					boundAccount,
+				);
+			} catch (error) {
+				if (!isRecoverableWebSocketAccountError(error)) throw error;
+				const staleUpstream = upstream;
+				const staleAccount = boundAccount;
+				upstream = null;
+				boundAccountManager = null;
+				boundAccount = null;
+				if (staleUpstream) {
+					mirrorWebSocketClose(staleUpstream, 1000, "account_rotation");
+				}
+				if (hasConnectionScopedContinuation(frame)) {
+					void request.usageRecorder.record({
+						outcome: "failure",
+						statusCode: HTTP_STATUS.BAD_GATEWAY,
+						errorCode: "websocket_continuation_lost",
+						account: staleAccount ?? undefined,
+					});
+					reportConnectionScopedContinuationLoss();
+					return;
+				}
+				pending.unshift({
+					...frame,
+					recoveryAttempts: frame.recoveryAttempts ?? 0,
+				});
+				void initialize();
+				return;
+			}
 			consumedForFrame = true;
 			activeRequests.push({
 				request,
 				accountManager: boundAccountManager,
 				account: boundAccount,
+				frame,
+				sawUpstreamEvent: false,
 			});
 		} else {
 			if (!boundAccountManager || !boundAccount) {
@@ -1801,6 +1868,8 @@ function bridgeWebSocketConnection(
 				request,
 				accountManager: boundAccountManager,
 				account: boundAccount,
+				frame,
+				sawUpstreamEvent: false,
 			});
 		}
 		try {
@@ -1853,12 +1922,21 @@ function bridgeWebSocketConnection(
 		},
 		isClosed: () => closed,
 	};
-	const initialize = async (): Promise<void> => {
-		if (connecting || upstream || pending.length === 0) return;
+	async function initialize(): Promise<void> {
+		if (connecting || reconnectTimer || upstream || pending.length === 0) return;
 		connecting = true;
 		try {
 			const firstFrame = pending[0];
 			if (!firstFrame) return;
+			// previous_response_id is scoped to the upstream WebSocket connection.
+			// If the proxy needs a new upstream connection, replaying that delta frame
+			// would make Codex reject it. Emit the backend's standard retryable error so
+			// the client clears its cached continuation and rebuilds a full request.
+			if (hasConnectionScopedContinuation(firstFrame)) {
+				pending.shift();
+				reportConnectionScopedContinuationLoss();
+				return;
+			}
 			const firstRequest = await prepareWebSocketRequest(state, req, firstFrame.data);
 			pendingInitialRequest = firstRequest;
 			if (closed) {
@@ -1873,6 +1951,20 @@ function bridgeWebSocketConnection(
 			);
 			if (!connected) {
 				pendingInitialRequest = null;
+				if (firstFrame.recoveryAttempts !== undefined) {
+					const attempt = firstFrame.recoveryAttempts + 1;
+					firstFrame.recoveryAttempts = attempt;
+					const delayMs = Math.min(
+						INITIAL_WEBSOCKET_RECOVERY_DELAY_MS * 2 ** Math.max(0, attempt - 1),
+						MAX_WEBSOCKET_RECOVERY_DELAY_MS,
+					);
+					reconnectTimer = setTimeout(() => {
+						reconnectTimer = null;
+						void initialize();
+					}, delayMs);
+					reconnectTimer.unref?.();
+					return;
+				}
 				closeBoth(
 					WEBSOCKET_CLOSE_TRY_AGAIN_LATER,
 					"All managed Codex accounts are temporarily unavailable",
@@ -1880,40 +1972,77 @@ function bridgeWebSocketConnection(
 				return;
 			}
 			upstream = connected.upstream;
+			const connectedUpstream = connected.upstream;
 			boundAccountManager = connected.prepared.accountManager;
 			boundAccount = connected.prepared.account;
 			if (closed || client.readyState !== WebSocket.OPEN) {
 				settlePendingHandshake("cancelled", "client_websocket_closed");
-				mirrorWebSocketClose(upstream, 1000, "Local client closed");
+				mirrorWebSocketClose(connectedUpstream, 1000, "Local client closed");
 				return;
 			}
 			state.status.streamsStarted += 1;
-			upstream.on("message", (data, isBinary) => {
+			connectedUpstream.on("message", (data, isBinary) => {
+				const active = activeRequests[0];
+				if (active) active.sawUpstreamEvent = true;
 				const terminal = websocketTerminalUsage(data);
 				if (terminal) {
-					const active = activeRequests.shift();
-					if (active) {
-						applyWebSocketTerminalAccountSuccess(state, active, terminal);
-						applyWebSocketTerminalAccountFailure(state, active, terminal);
-						void active.request.usageRecorder.record({
+					const settled = activeRequests.shift();
+					if (settled) {
+						applyWebSocketTerminalAccountSuccess(state, settled, terminal);
+						applyWebSocketTerminalAccountFailure(state, settled, terminal);
+						void settled.request.usageRecorder.record({
 							...terminal.record,
-							account: active.account,
+							account: settled.account,
 						});
 					}
 				}
 				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
 			});
-			upstream.on("close", (code, reason) => {
+			connectedUpstream.on("close", (code, reason) => {
+				if (upstream !== connectedUpstream) return;
+				upstream = null;
+				boundAccountManager = null;
+				boundAccount = null;
 				settlePendingHandshake("failure", "upstream_websocket_closed", true);
+				if (activeRequests.length === 0) return;
+				if (
+					activeRequests.length === 1 &&
+					activeRequests[0]?.sawUpstreamEvent === false
+				) {
+					const [interrupted] = activeRequests.splice(0);
+					if (interrupted) {
+						applyWebSocketTransportAccountFailure(state, interrupted);
+						if (hasConnectionScopedContinuation(interrupted.frame)) {
+							void interrupted.request.usageRecorder.record({
+								outcome: "failure",
+								statusCode: HTTP_STATUS.BAD_GATEWAY,
+								errorCode: "websocket_continuation_lost",
+								account: interrupted.account,
+							});
+							reportConnectionScopedContinuationLoss();
+							return;
+						}
+						void interrupted.request.usageRecorder.record({
+							outcome: "failure",
+							statusCode: HTTP_STATUS.BAD_GATEWAY,
+							errorCode: "upstream_websocket_closed",
+							account: interrupted.account,
+						});
+						pending.unshift({
+							...interrupted.frame,
+							recoveryAttempts: interrupted.frame.recoveryAttempts ?? 0,
+						});
+						void initialize();
+						return;
+					}
+				}
 				settleAll("failure", "upstream_websocket_closed", true);
 				closed = true;
 				mirrorWebSocketClose(client, code, reason);
 			});
-			upstream.on("error", (error) => {
+			connectedUpstream.on("error", (error) => {
 				state.status.lastError = error.message;
-				settlePendingHandshake("failure", "upstream_websocket_error", true);
-				settleAll("failure", "upstream_websocket_error", true);
-				closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Upstream WebSocket error");
+				connectedUpstream.terminate();
 			});
 			const queued = pending.splice(0);
 			const queuedFirst = queued.shift();
@@ -1926,7 +2055,7 @@ function bridgeWebSocketConnection(
 		} finally {
 			connecting = false;
 		}
-	};
+	}
 	client.on("message", (data, isBinary) => {
 		if (upstream?.readyState === WebSocket.OPEN) {
 			enqueueClientFrame({ data, isBinary });
@@ -1936,6 +2065,10 @@ function bridgeWebSocketConnection(
 		void initialize();
 	});
 	client.on("close", (code, reason) => {
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		}
 		settlePendingHandshake("cancelled", "client_websocket_closed");
 		settleAll("cancelled", "client_websocket_closed");
 		closed = true;

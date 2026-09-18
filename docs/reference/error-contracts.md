@@ -139,7 +139,7 @@ Account policy pause/drain is enforced through runtime policy evaluation and con
 
 WebSocket upgrades use transport-native failures instead of the JSON contract above.
 Malformed targets, unsupported paths, and missing client authentication are rejected before upgrade with plain HTTP `400`, `404`, or `401` responses.
-After upgrade, an invalid initial `response.create` or a per-request policy/token rejection closes with `1008`; pool exhaustion or an explicit upstream error event closes with `1013`.
+After upgrade, an invalid initial `response.create` or a per-request policy/token rejection closes with `1008`; pool exhaustion or an explicit upstream error event closes with `1013`. If an upstream reconnect would invalidate a connection-scoped `previous_response_id`, the proxy instead emits the standard Responses WebSocket `error` event with code `previous_response_not_found`; official Codex-compatible clients treat it as retryable, reset their socket continuation state, and reconstruct a full request.
 Valid upstream close codes are mirrored, while reserved or otherwise unsendable close codes terminate the peer connection.
 
 ---

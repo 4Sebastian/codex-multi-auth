@@ -76,14 +76,15 @@ The proxy:
 
 - accepts only local authenticated client requests (per-process client token)
 - forwards Responses API, model discovery, and thread-goal routes (`/responses`, `/models`, `/thread/goal/*`, and `/codex/...` variants)
-- accepts local Codex WebSocket connections and opens authenticated upstream Codex WebSockets, binding one selected account to each persistent connection
+- accepts persistent local Codex WebSocket connections and opens account-authenticated upstream Codex WebSockets, replacing the upstream connection without dropping the local client when an idle connection closes, a bound account exhausts request tokens, or a transport fails before response events begin, provided the pending request is replayable; connection-scoped continuations receive `previous_response_not_found` so the client resets cached socket state and retries with full context
 - authenticates local clients with a per-process token via `Authorization: Bearer` or `x-api-key` (timing-safe compare); refuses non-loopback binds
 - caps request bodies at 64 MiB
 - replaces upstream auth headers with the selected managed account (no account emails in client-facing headers)
 - runs `evaluateRuntimePolicy` before HTTP/SSE account selection and before every WebSocket `response.create` frame (pause/drain, budgets, routing profiles, capability matrix)
 - rotates HTTP/SSE requests on rate limits, auth refresh failures, network errors, and server errors before response bytes are streamed
 - retries a failed upstream WebSocket handshake with another eligible account, bounded by `maxRuntimeAccountAttempts`; explicit token invalidation stops this failover instead of cascading across the pool
-- keeps each established WebSocket on one account, while terminal rate-limit/auth/server failures and transport failures update cooldown and affinity state so a later connection can select another account
+- replays an interrupted `response.create` on a replacement upstream only when no response event reached the local client, then keeps retrying transient connection recovery with 5s-to-60s exponential backoff instead of forcing Codex or Pi onto HTTP/SSE
+- keeps each upstream WebSocket on one account while it is healthy; terminal rate-limit/auth/server failures and transport failures update cooldown and affinity state so the persistent local connection can select another account
 - strips hop-by-hop and stale decoded response headers before returning data to the local Codex client
 - records runtime status for `codex-multi-auth status`, `codex-multi-auth report`, and `codex-multi-auth rotation status`
 - appends redacted usage ledger rows after each HTTP/SSE request or WebSocket `response.create` completes, fails, or is cancelled

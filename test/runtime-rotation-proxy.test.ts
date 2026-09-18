@@ -1450,7 +1450,7 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("terminates peers when abnormal WebSocket close codes are mirrored", async () => {
+	it("mirrors client termination and abnormal closes after upstream events", async () => {
 		let connectionCount = 0;
 		let resolveFirstUpstreamClose: ((code: number) => void) | null = null;
 		const firstUpstreamClose = new Promise<number>((resolve) => {
@@ -1466,7 +1466,10 @@ describe("runtime rotation proxy", () => {
 					});
 					return;
 				}
-				socket.once("message", () => socket.terminate());
+				socket.once("message", () => {
+					socket.send(JSON.stringify({ type: "response.created", response: {} }));
+					setImmediate(() => socket.terminate());
+				});
 			},
 		});
 		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
@@ -1498,7 +1501,361 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("cools down an account when upstream closes before a terminal event", async () => {
+	it("recovers an interrupted request on another upstream WebSocket before emitting events", async () => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				connectionCount += 1;
+				authorizationAttempts.push(request.headers.authorization);
+				socket.once("message", () => {
+					if (connectionCount === 1) {
+						socket.terminate();
+						return;
+					}
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { id: "recovered-response" },
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "recover-before-events",
+				input: [],
+			}));
+			expect(JSON.parse(await response)).toMatchObject({
+				type: "response.completed",
+				response: { id: "recovered-response" },
+			});
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+			expect(proxy.getStatus()).toMatchObject({
+				upstreamRequests: 2,
+				streamsStarted: 2,
+				retries: 1,
+				rotations: 1,
+			});
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("reconnects upstream between requests without closing the client WebSocket", async () => {
+		let connectionCount = 0;
+		let resolveIdleClose: (() => void) | null = null;
+		const idleClose = new Promise<void>((resolve) => {
+			resolveIdleClose = resolve;
+		});
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				socket.once("message", () => {
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { id: `response-${connectionCount}` },
+					}));
+					if (connectionCount === 1) {
+						socket.close(1000, "upstream_idle_rotation");
+						socket.once("close", () => resolveIdleClose?.());
+					}
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await firstResponse)).toMatchObject({
+				response: { id: "response-1" },
+			});
+			await idleClose;
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+
+			const secondResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await secondResponse)).toMatchObject({
+				response: { id: "response-2" },
+			});
+			expect(connectionCount).toBe(2);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("reports a retryable protocol error instead of replaying a continuation after an idle upstream disconnect", async () => {
+		let connectionCount = 0;
+		let resolveIdleClose: (() => void) | null = null;
+		const idleClose = new Promise<void>((resolve) => {
+			resolveIdleClose = resolve;
+		});
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				const connectionNumber = connectionCount;
+				socket.once("message", () => {
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: { id: `response-${connectionNumber}` },
+					}));
+					if (connectionNumber === 1) {
+						socket.close(1000, "upstream_idle_rotation");
+						socket.once("close", () => resolveIdleClose?.());
+					}
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await firstResponse)).toMatchObject({
+				response: { id: "response-1" },
+			});
+			await idleClose;
+
+			const continuationError = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				previous_response_id: "response-1",
+				input: [{ type: "message", role: "user", content: [] }],
+			}));
+			expect(JSON.parse(await continuationError)).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					code: "previous_response_not_found",
+					message: "Previous response was not found. Retrying the full request.",
+				},
+			});
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+			expect(connectionCount).toBe(1);
+
+			const retriedResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [{ type: "message", role: "user", content: [] }],
+			}));
+			expect(JSON.parse(await retriedResponse)).toMatchObject({
+				response: { id: "response-2" },
+			});
+			expect(connectionCount).toBe(2);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("reports a retryable protocol error when an in-flight continuation loses its upstream", async () => {
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				let requestCount = 0;
+				socket.on("message", () => {
+					requestCount += 1;
+					if (requestCount === 1) {
+						socket.send(JSON.stringify({
+							type: "response.completed",
+							response: { id: "response-1" },
+						}));
+						return;
+					}
+					socket.terminate();
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await firstResponse)).toMatchObject({
+				response: { id: "response-1" },
+			});
+
+			const continuationError = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				previous_response_id: "response-1",
+				input: [{ type: "message", role: "user", content: [] }],
+			}));
+			expect(JSON.parse(await continuationError)).toMatchObject({
+				type: "error",
+				error: { code: "previous_response_not_found" },
+			});
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+			expect(connectionCount).toBe(1);
+			expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("network-error");
+		} finally {
+			socket.terminate();
+			await upstream.close();
+		}
+	});
+
+	it("requires a full request before rotating an exhausted continuation to another account", async () => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				authorizationAttempts.push(request.headers.authorization);
+				socket.on("message", () => {
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const originalConsumeToken = accountManager.consumeToken.bind(accountManager);
+		let accountZeroConsumptions = 0;
+		const consumeToken = vi
+			.spyOn(accountManager, "consumeToken")
+			.mockImplementation((account, family, model) => {
+				if (account.index === 0 && accountZeroConsumptions++ > 0) return false;
+				return originalConsumeToken(account, family, model);
+			});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await firstResponse)).toMatchObject({ type: "response.completed" });
+
+			const continuationError = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				previous_response_id: "response-1",
+				input: [{ type: "message", role: "user", content: [] }],
+			}));
+			expect(JSON.parse(await continuationError)).toMatchObject({
+				type: "error",
+				error: { code: "previous_response_not_found" },
+			});
+			expect(authorizationAttempts).toEqual(["Bearer access-1"]);
+
+			const retriedResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				input: [{ type: "message", role: "user", content: [] }],
+			}));
+			expect(JSON.parse(await retriedResponse)).toMatchObject({ type: "response.completed" });
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			consumeToken.mockRestore();
+		}
+	});
+
+	it("rotates the upstream connection when its bound account exhausts request tokens", async () => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				authorizationAttempts.push(request.headers.authorization);
+				socket.on("message", () => {
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const originalConsumeToken = accountManager.consumeToken.bind(accountManager);
+		let accountZeroConsumptions = 0;
+		const consumeToken = vi
+			.spyOn(accountManager, "consumeToken")
+			.mockImplementation((account, family, model) => {
+				if (account.index === 0 && accountZeroConsumptions++ > 0) return false;
+				return originalConsumeToken(account, family, model);
+			});
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			for (const requestNumber of [1, 2]) {
+				const response = nextWebSocketMessage(socket);
+				socket.send(JSON.stringify({
+					type: "response.create",
+					model: "gpt-5.6-sol",
+					input: [{ requestNumber }],
+				}));
+				expect(JSON.parse(await response)).toMatchObject({ type: "response.completed" });
+			}
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-2",
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			consumeToken.mockRestore();
+		}
+	});
+
+	it("keeps the client WebSocket open while a disconnected account is cooling down", async () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
 		const recordFailure = vi.spyOn(accountManager, "recordFailure");
 		const forgetAffinity = vi.spyOn(SessionAffinityStore.prototype, "forgetSession");
@@ -1517,14 +1874,17 @@ describe("runtime rotation proxy", () => {
 			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
 		);
 		try {
-			const closed = nextWebSocketClose(socket);
+			const clientClosed = new Promise<"closed">((resolve) => {
+				socket.once("close", () => resolve("closed"));
+			});
 			socket.send(JSON.stringify({
 				type: "response.create",
 				model: "gpt-5.6-sol",
 				prompt_cache_key: "broken-session",
 				input: [],
 			}));
-			expect(await closed).toMatchObject({ code: 1006 });
+			expect(await Promise.race([clientClosed, timeoutResult(100)])).toBe("timeout");
+			expect(socket.readyState).toBe(WebSocket.OPEN);
 			expect(recordFailure).toHaveBeenCalledTimes(1);
 			expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("network-error");
 			expect(forgetAffinity).toHaveBeenCalledWith("broken-session");

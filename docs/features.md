@@ -39,7 +39,7 @@ Runtime rotation is part of the current architecture. It is default-on and local
 | Capability | What it gives you | Primary entry |
 | --- | --- | --- |
 | Local Responses proxy | Routes forwarded official Codex Responses/model traffic through a loopback provider named `codex-multi-auth-runtime-proxy` | `codex-multi-auth rotation status` |
-| Persistent WebSocket forwarding | Accepts authenticated local Codex WebSockets and forwards frames over an account-authenticated upstream WebSocket, preserving one account per connection | runtime proxy |
+| Resilient persistent WebSocket forwarding | Keeps the authenticated local Codex/Pi WebSocket open while replacing idle, interrupted-before-output, or token-exhausted account-authenticated upstream connections when the request is replayable; connection-scoped `previous_response_id` continuations receive the retryable Responses protocol error `previous_response_not_found` so the client resets its socket state and retries with full context instead of sending an invalid continuation to a replacement upstream | runtime proxy |
 | HTTP/SSE request rotation | Moves to another managed account on quota, auth refresh, network, or server failure before streaming response bytes | runtime proxy |
 | Runtime policy gate | Applies pause/drain, budgets, routing profiles, and capability checks via `evaluateRuntimePolicy` before selection and every WebSocket `response.create` | runtime proxy |
 | Per-invocation account force-pin | Forces one account for a single wrapper session (ephemeral, fail-hard; never touches the persisted `switch` pin) | `codex-multi-auth-codex --account <index\|email\|id>` |
