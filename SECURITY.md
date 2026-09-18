@@ -79,7 +79,8 @@ The following are not treated as vulnerabilities in this repository:
 
 Security override rationale (`package.json` -> `overrides`):
 
-- `hono`: pinned to `4.12.33` to keep builds out of the vulnerable `<4.12.33` range. This covers the earlier `GHSA-3hrh-pfw6-9m5x`, `GHSA-2gcr-mfcq-wcc3`, `GHSA-xrhx-7g5j-rcj5`, and `GHSA-f577-qrjj-4474` advisories (Set-Cookie injection, `app.mount()` path-decoding, IPv6 IP-restriction bypass, and JWT scheme-acceptance) plus `GHSA-hvrm-45r6-mjfj` and `GHSA-w62v-xxxg-mg59` (JSX per-request context disclosure and XSS via the `cx()` escaping bypass), both of which reach `<=4.12.26`.
+- `hono`: pinned to `4.13.8` to keep builds clear of the currently disclosed vulnerable ranges, including the earlier `GHSA-3hrh-pfw6-9m5x`, `GHSA-2gcr-mfcq-wcc3`, `GHSA-xrhx-7g5j-rcj5`, `GHSA-f577-qrjj-4474`, `GHSA-hvrm-45r6-mjfj`, and `GHSA-w62v-xxxg-mg59` advisories.
+- `nanoid`: pinned to `3.3.18` to clear the high-severity dev dependency advisory affecting versions below `3.3.18`.
 - `rollup`: pinned to `^4.59.0` to keep the Vite and Vitest transitive graph above the vulnerable `<4.59.0` range surfaced by `npm audit`.
 - `brace-expansion`: pinned to `5.0.9` to lift the dev graph above the ReDoS ranges `>=2.0.0 <2.1.3` and `>=4.0.0 <5.0.8`. Transitive dev-only, so the pin is the practical fix rather than waiting on each consumer to bump.
 - `postcss`: pinned to `8.5.25` to clear the `<=8.5.17` advisory reaching the dev graph through the Vite toolchain.
