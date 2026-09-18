@@ -12,6 +12,10 @@ function firstNonEmpty(values: Array<string | undefined>): string | null {
 	return null;
 }
 
+function joinPath(...paths: string[]): string {
+	return process.platform === "win32" ? win32.join(...paths) : join(...paths);
+}
+
 function getResolvedUserHomeDir(): string {
 	if (process.platform === "win32") {
 		const homeDrive = (process.env.HOMEDRIVE ?? "").trim();
@@ -42,7 +46,8 @@ function getResolvedUserHomeDir(): string {
 
 export function getCodexHomeDir(): string {
 	const fromEnv = (process.env.CODEX_HOME ?? "").trim();
-	return fromEnv.length > 0 ? fromEnv : join(getResolvedUserHomeDir(), ".codex");
+	if (fromEnv.length > 0) return fromEnv;
+	return joinPath(getResolvedUserHomeDir(), ".codex");
 }
 
 /**
@@ -111,20 +116,20 @@ function hasStorageSignals(dir: string): boolean {
 		"dashboard-settings.json",
 	];
 	for (const signal of signals) {
-		if (existsSync(join(dir, signal))) {
+		if (existsSync(joinPath(dir, signal))) {
 			return true;
 		}
 	}
-	return existsSync(join(dir, "projects"));
+	return existsSync(joinPath(dir, "projects"));
 }
 
 function hasAccountsStorage(dir: string): boolean {
 	const accountFiles = ["openai-codex-accounts.json", "codex-accounts.json"];
 	for (const fileName of accountFiles) {
-		if (existsSync(join(dir, fileName))) {
+		if (existsSync(joinPath(dir, fileName))) {
 			return true;
 		}
-		if (existsSync(join(dir, `${fileName}.wal`))) {
+		if (existsSync(joinPath(dir, `${fileName}.wal`))) {
 			return true;
 		}
 	}
@@ -161,8 +166,8 @@ function getFallbackCodexHomeDirs(): string[] {
 	const userHome = getResolvedUserHomeDir();
 	return deduplicatePaths([
 		getCodexHomeDir(),
-		join(userHome, "DevTools", "config", "codex"),
-		join(userHome, ".codex"),
+		joinPath(userHome, "DevTools", "config", "codex"),
+		joinPath(userHome, ".codex"),
 	]);
 }
 
@@ -186,13 +191,13 @@ export function getCodexMultiAuthDir(): string {
 	}
 
 	const codexHomeFromEnv = (process.env.CODEX_HOME ?? "").trim();
-	const defaultCodexHome = join(getResolvedUserHomeDir(), ".codex");
+	const defaultCodexHome = joinPath(getResolvedUserHomeDir(), ".codex");
 	const isExplicitNonDefaultHome =
 		codexHomeFromEnv.length > 0 && !pathsEqualNormalized(codexHomeFromEnv, defaultCodexHome);
 
-	const primary = join(getCodexHomeDir(), "multi-auth");
+	const primary = joinPath(getCodexHomeDir(), "multi-auth");
 	const fallbackCandidates = deduplicatePaths([
-		...getFallbackCodexHomeDirs().map((dir) => join(dir, "multi-auth")),
+		...getFallbackCodexHomeDirs().map((dir) => joinPath(dir, "multi-auth")),
 		getLegacyCodexDir(),
 	]);
 	const orderedCandidates = deduplicatePaths([primary, ...fallbackCandidates]);
@@ -235,7 +240,7 @@ export function getCodexMultiAuthDir(): string {
  * @returns The filesystem path to the Codex cache directory.
  */
 export function getCodexCacheDir(): string {
-	return join(getCodexMultiAuthDir(), "cache");
+	return joinPath(getCodexMultiAuthDir(), "cache");
 }
 
 /**
@@ -249,7 +254,7 @@ export function getCodexCacheDir(): string {
  * @returns The path to the Codex `logs` directory (i.e., `<multi-auth-dir>/logs`)
  */
 export function getCodexLogDir(): string {
-	return join(getCodexMultiAuthDir(), "logs");
+	return joinPath(getCodexMultiAuthDir(), "logs");
 }
 
 /**
@@ -264,6 +269,5 @@ export function getCodexLogDir(): string {
  * @returns The filesystem path for the legacy directory (e.g. `/home/alice/.codex`).
  */
 export function getLegacyCodexDir(): string {
-	return join(getResolvedUserHomeDir(), ".codex");
+	return joinPath(getResolvedUserHomeDir(), ".codex");
 }
-

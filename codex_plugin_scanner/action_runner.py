@@ -1,7 +1,6 @@
 """Run the installed scanner with UTF-8 output on every supported platform."""
 
 from pathlib import Path
-import runpy
 import sys
 
 from codex_plugin_scanner import __path__ as package_paths
@@ -24,4 +23,10 @@ def _installed_runner() -> Path:
 
 _use_utf8(sys.stdout)
 _use_utf8(sys.stderr)
-runpy.run_path(str(_installed_runner()), run_name="__main__")
+runner_path = _installed_runner()
+runner_globals = {
+    "__file__": str(runner_path),
+    "__name__": "__main__",
+    "__package__": "codex_plugin_scanner",
+}
+exec(compile(runner_path.read_bytes(), str(runner_path), "exec"), runner_globals)

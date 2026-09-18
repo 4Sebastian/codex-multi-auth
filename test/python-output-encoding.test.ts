@@ -10,10 +10,10 @@ describe("repository Python startup", () => {
 		const installedPackageRoot = mkdtempSync(join(tmpdir(), "scanner-package-"));
 		const installedPackage = join(installedPackageRoot, "codex_plugin_scanner");
 		mkdirSync(installedPackage);
-		writeFileSync(join(installedPackage, "__init__.py"), "");
+		writeFileSync(join(installedPackage, "__init__.py"), "__version__ = 'fixture'\n");
 		writeFileSync(
 			join(installedPackage, "action_runner.py"),
-			"import sys\nprint(sys.stdout.encoding)\nprint('🔗 scanner report')\n",
+			"import sys\nfrom . import __version__\nprint(sys.stdout.encoding)\nprint(f'🔗 scanner report {__version__}')\n",
 		);
 		const output = execFileSync(
 			"python3",
@@ -29,6 +29,6 @@ describe("repository Python startup", () => {
 			},
 		);
 
-		expect(output).toBe("utf-8\n🔗 scanner report\n");
+		expect(output).toMatch(/^utf-8\n🔗 scanner report \S+\n$/);
 	});
 });
