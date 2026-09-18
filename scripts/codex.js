@@ -78,6 +78,8 @@ const APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME";
 const APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM";
+const RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV =
+	"CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL";
 const APP_SERVER_CONFIG_ARGS_ENV =
 	"CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON";
 const APP_RUNTIME_HELPER_STATUS_FILE =
@@ -167,6 +169,95 @@ let warnedPendingAccountReadIdOverflow = false;
 let warnedShadowHomeSqliteLinkFailure = false;
 const warnedShadowHomeLinkOnlyDirectoryFailures = new Set();
 const warnedShadowHomeSqliteSidecarPlaceholderFailures = new Set();
+
+/**
+ * True only for a NUMERIC loopback literal, as `new URL().hostname` reports it.
+ *
+ * A name is deliberately not enough. `localhost` is resolved by the OS at
+ * connect time, so an /etc/hosts or Windows hosts entry can point it at a
+ * routable address, and the upstream request carries the managed OAuth bearer
+ * token and the request body. WHATWG URL always reports an IPv6 host in its
+ * bracketed form, so `::1` is only ever seen here as `[::1]`.
+ */
+function isLoopbackUrlHostname(hostname) {
+	if (hostname === "[::1]") {
+		return true;
+	}
+	const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+	if (!ipv4) {
+		return false;
+	}
+	const octets = ipv4.slice(1).map((part) => Number(part));
+	if (octets.some((octet) => !Number.isInteger(octet) || octet > 255)) {
+		return false;
+	}
+	// The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+	return octets[0] === 127;
+}
+
+/**
+ * Whether the raw URL text carries an explicit `:port`.
+ *
+ * `new URL()` erases a port that matches the scheme default, so
+ * `http://127.0.0.1:80/x` reports `parsed.port === ""` and a `!parsed.port`
+ * check would reject a perfectly valid, explicitly-ported loopback URL.
+ */
+function hasExplicitUrlPort(raw) {
+	const withoutScheme = raw.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "");
+	const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? "";
+	// Strip userinfo first, or a password containing ':' reads as a port.
+	const hostAndPort = authority.slice(authority.lastIndexOf("@") + 1);
+	if (hostAndPort.startsWith("[")) {
+		const close = hostAndPort.indexOf("]");
+		return close !== -1 && /^:\d+$/.test(hostAndPort.slice(close + 1));
+	}
+	const colon = hostAndPort.indexOf(":");
+	return colon !== -1 && /^:\d+$/.test(hostAndPort.slice(colon));
+}
+
+function resolveRuntimeRotationProxyUpstreamBaseUrl(env = process.env) {
+	const raw = (env[RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV] ?? "").trim();
+	if (!raw) {
+		return undefined;
+	}
+
+	let parsed;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error(
+			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must be an absolute loopback HTTP URL.`,
+		);
+	}
+
+	if (
+		parsed.protocol !== "http:" ||
+		!isLoopbackUrlHostname(parsed.hostname.toLowerCase()) ||
+		!(parsed.port || hasExplicitUrlPort(raw)) ||
+		parsed.username ||
+		parsed.password ||
+		parsed.search ||
+		parsed.hash
+	) {
+		throw new Error(
+			`${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} must use HTTP with a numeric loopback host (127.0.0.0/8 or [::1]; a name such as "localhost" is not accepted because it can resolve off-host), an explicit port, and no credentials, query, or fragment.`,
+		);
+	}
+
+	return parsed.toString().replace(/\/$/, "");
+}
+
+/**
+ * @param clientApiKey Shared secret the wrapper and proxy authenticate with.
+ * @param upstreamBaseUrl Already-resolved upstream, or undefined for the
+ * default backend. Callers pass the value they resolved rather than the env, so
+ * one launch never parses (and never re-reports) the same variable twice.
+ */
+function createRuntimeRotationProxyOptions(clientApiKey, upstreamBaseUrl) {
+	return upstreamBaseUrl
+		? { clientApiKey, upstreamBaseUrl }
+		: { clientApiKey };
+}
 
 async function loadRuntimeConstants() {
 	const fallback = {
@@ -421,6 +512,14 @@ function extractForcedAccountFlag(args) {
 	let sawFlag = false;
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
+		// `--` ends option parsing: everything after it is Codex's root
+		// `[PROMPT]` text. A `--account` spelled in there is the user's prompt,
+		// not a launcher flag — stripping it would both mangle the prompt and
+		// silently pin the run to an account nobody selected.
+		if (arg === "--") {
+			strippedArgs.push(...args.slice(index));
+			break;
+		}
 		if (arg === "--account") {
 			sawFlag = true;
 			const next = args[index + 1];
@@ -566,7 +665,27 @@ async function applyForcedAccountSelection(rawArgs, env = process.env) {
 }
 
 function resolveModelFamilyForStatus(model) {
-	const normalized = typeof model === "string" ? model.trim().toLowerCase() : "";
+	// `resolveStatusModel` hands over the raw `--model` / `-m` value or the
+	// config value verbatim, so a provider-qualified id arrives intact. Every
+	// branch below is a `startsWith`, so `openai/gpt-6` used to match none of
+	// them and return null, dropping status routing back to `activeIndex`
+	// instead of the family index. Strip the prefix once, for all of them.
+	const normalized =
+		typeof model === "string"
+			? stripProviderPrefix(model.trim()).toLowerCase()
+			: "";
+	// GPT-6 Astra and the Daybreak cyber models share the gpt-5.2 prompt family
+	// with the GPT-5.6 general tiers (see lib/request/helpers/model-map.ts
+	// MODEL_PROFILES). Daybreak has to be checked explicitly: its slug matches
+	// none of the branches below, so it used to fall through to `null` and get
+	// bucketed against no family at all.
+	if (
+		(normalized.startsWith("gpt-6") || normalized.startsWith("astra")) &&
+		!normalized.includes("codex")
+	) {
+		return "gpt-5.2";
+	}
+	if (normalized.includes("daybreak")) return "gpt-5.2";
 	// GPT-5.6 general tiers share the gpt-5.2 prompt family (see
 	// lib/request/helpers/model-map.ts MODEL_PROFILES). Check before the generic
 	// gpt-5 catch-all, which would otherwise mis-bucket them as codex.
@@ -1251,7 +1370,18 @@ const DIRECT_UNSUPPORTED_MODEL_PATTERN =
 	/['"]([^'"]+)['"]\s+model is not supported when using codex with a chatgpt account/i;
 const CURRENT_CODEX_MODEL = "gpt-5.3-codex";
 const LEGACY_CODEX_MODEL = "gpt-5-codex";
+// Mirrors the GPT-6 rows of lib/request/error-classification.ts
+// `DEFAULT_UNSUPPORTED_CODEX_FALLBACK_CHAIN`. This table is walked differently
+// from lib's: `resolveUnsupportedModelRetryTarget` keys on the model named in
+// the error output and falls back to the original requested model, with
+// `attemptedModels` accumulating, so a row's later entries ARE reachable here.
+// The two tables are not identical today (`gpt-5.3-codex` has a row in lib and
+// not here), which predates GPT-6 and is left alone; the GPT-6 rows are pinned
+// in parity by test/codex-model-resolution.test.ts.
 const WRAPPER_UNSUPPORTED_MODEL_FALLBACK_CHAIN = {
+	"gpt-6-astra": ["gpt-5.6-sol", "gpt-5.5"],
+	"gpt-6-astra-aeon": ["gpt-6-astra", "gpt-5.6-sol"],
+	"gpt-5.6-sol": ["gpt-5.5"],
 	"gpt-5": ["gpt-5.5"],
 	"gpt-5-pro": ["gpt-5.5-pro"],
 	"gpt-5-chat-latest": ["gpt-5.5"],
@@ -1365,6 +1495,9 @@ function replaceRequestedModel(args, nextModel) {
 	const nextArgs = [...args];
 	for (let i = 0; i < nextArgs.length; i += 1) {
 		const arg = nextArgs[i];
+		// Past `--` the tokens are the user's prompt. Rewriting one in place
+		// would edit the prompt text itself before re-forwarding it.
+		if (arg === "--") break;
 		if ((arg === "--model" || arg === "-m") && typeof nextArgs[i + 1] === "string") {
 			nextArgs[i + 1] = nextModel;
 			return nextArgs;
@@ -1859,6 +1992,11 @@ async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
 function hasCliAuthCredentialsStoreOverride(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
+		// Everything after `--` is the root `[PROMPT]` positional, not options:
+		// a prompt whose text spells `--config=cli_auth_credentials_store=...` is
+		// not a caller override, and treating it as one would silently drop the
+		// file auth store this wrapper depends on.
+		if (arg === "--") break;
 		if (arg === "-c" || arg === "--config") {
 			const next = args[i + 1];
 			if (!next || !next.includes("=")) continue;
@@ -1885,6 +2023,10 @@ function hasCliAuthCredentialsStoreOverride(args) {
 // This wrapper runs before the TypeScript build, so it cannot import that source.
 const SUPPORTED_REASONING_EFFORTS_BY_MODEL = {
 	[CURRENT_CODEX_MODEL]: ["low", "medium", "high", "xhigh"],
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-6-astra-aeon": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-daybreak-blue-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-daybreak-red-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -1944,6 +2086,18 @@ const GPT_5_6_LUNA_MODEL = "gpt-5.6-luna";
 const GPT_5_6_FLAGSHIP_ALIAS = "gpt-5.6";
 const GPT_5_6_SOL_TERRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const GPT_5_6_LUNA_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+// GPT-6 Astra (2026-09-03). No Sol/Terra/Luna split this generation: the
+// flagship plus `aeon`, a long-horizon variant. Same frontier effort ladder as
+// 5.6 (no `none`/`minimal`, `ultra` at the top). Bare `gpt-6` -> flagship.
+const GPT_6_ASTRA_MODEL = "gpt-6-astra";
+const GPT_6_ASTRA_AEON_MODEL = "gpt-6-astra-aeon";
+const GPT_6_FLAGSHIP_ALIAS = "gpt-6";
+const GPT_6_ASTRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+// Daybreak cyber models from the upstream Codex catalog. `red` is the
+// cyber-permissive variant, `blue` the defensive one.
+const DAYBREAK_BLUE_MODEL = "gpt-daybreak-blue-latest";
+const DAYBREAK_RED_MODEL = "gpt-daybreak-red-latest";
+const DAYBREAK_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const GENERAL_GPT5_VERSION_CATALOG = {
 	1: {
 		base: "gpt-5.1",
@@ -2147,6 +2301,47 @@ function seedRequestedModelAliases() {
 		GPT_5_6_SOL_MODEL,
 		GPT_5_6_SOL_TERRA_EFFORTS,
 	);
+	addRequestedModelEffortAliases(
+		GPT_6_ASTRA_MODEL,
+		GPT_6_ASTRA_MODEL,
+		GPT_6_ASTRA_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		GPT_6_ASTRA_AEON_MODEL,
+		GPT_6_ASTRA_AEON_MODEL,
+		GPT_6_ASTRA_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		GPT_6_FLAGSHIP_ALIAS,
+		GPT_6_ASTRA_MODEL,
+		GPT_6_ASTRA_EFFORTS,
+	);
+	addRequestedModelEffortAliases("astra", GPT_6_ASTRA_MODEL, GPT_6_ASTRA_EFFORTS);
+	addRequestedModelEffortAliases(
+		"astra-aeon",
+		GPT_6_ASTRA_AEON_MODEL,
+		GPT_6_ASTRA_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		DAYBREAK_BLUE_MODEL,
+		DAYBREAK_BLUE_MODEL,
+		DAYBREAK_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		DAYBREAK_RED_MODEL,
+		DAYBREAK_RED_MODEL,
+		DAYBREAK_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		"daybreak-blue",
+		DAYBREAK_BLUE_MODEL,
+		DAYBREAK_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		"daybreak-red",
+		DAYBREAK_RED_MODEL,
+		DAYBREAK_EFFORTS,
+	);
 	addRequestedModelReasoningAliases(CURRENT_CODEX_MODEL, CURRENT_CODEX_MODEL);
 	addRequestedModelReasoningAliases("gpt-5.3-codex-spark", CURRENT_CODEX_MODEL);
 	addRequestedModelReasoningAliases(LEGACY_CODEX_MODEL, CURRENT_CODEX_MODEL);
@@ -2202,6 +2397,13 @@ function resolveStableGeneralGpt5Variant(variant) {
 	return fallback;
 }
 
+// The final clause is a catch-all on the `codex` substring, matching
+// `resolveCodexCatalogModel` in lib/request/helpers/model-map.ts. It used to be
+// an exact `normalized === "codex"` check, so any codex id the explicit list
+// above did not name (`gpt-6-codex`, `gpt-5.7-codex`, …) resolved to nothing in
+// the wrapper while lib resolved it to the current codex model — a silent drift
+// between the two, which is exactly what test/codex-model-resolution.test.ts
+// exists to prevent.
 function resolveCodexRequestedModel(normalized) {
 	if (
 		normalized.includes("gpt-5.1-codex-max") ||
@@ -2230,7 +2432,7 @@ function resolveCodexRequestedModel(normalized) {
 		normalized.includes("gpt 5.1 codex") ||
 		normalized.includes("gpt-5-codex") ||
 		normalized.includes("gpt 5 codex") ||
-		normalized === "codex"
+		normalized.includes("codex")
 	) {
 		return CURRENT_CODEX_MODEL;
 	}
@@ -2242,6 +2444,51 @@ function resolveCodexRequestedModel(normalized) {
 // future `gpt-5.6-terra-fast`). Without this the general GPT-5 resolver sees
 // minor `6`, finds no catalog entry, and silently falls back to 5.5. Unknown
 // tiers resolve to Sol, matching OpenAI's bare `gpt-5.6` alias.
+// Resolve GPT-6 identifiers that are not exact aliases (a dated snapshot, the
+// `gpt-6-astra-pro` plan tier, or a tier OpenAI adds later). Without this the
+// general GPT-5 resolver never matches (it needs a `gpt 5` token pair) and the
+// id falls through to 5.5 — running GPT-5.5 for a caller who asked for the
+// frontier model. `aeon` keeps its own id because it is a behaviourally
+// different model, not a rename. Mirrors lib/request/helpers/model-map.ts.
+function resolveGpt6RequestedModel(stripped) {
+	const tokens = tokenizeRequestedModel(stripped);
+	const gptIndex = tokens.indexOf("gpt");
+	// `gpt6` with no separator tokenizes as one token, so the `gpt` + `6` pair
+	// never forms; mirror lib and claim it here.
+	const versionToken = gptIndex === -1 ? undefined : tokens[gptIndex + 1];
+	// `gpt6` with no separator tokenizes as one token, so the `gpt` + `6` pair
+	// never forms; mirror lib and claim it here.
+	const isGpt6 = versionToken === "6" || tokens.includes("gpt6");
+	// A bare `astra` token counts too: picker labels and OpenAI's own material
+	// say "Astra" with no `gpt-6` prefix, so `Astra Pro` arrives with no version
+	// tokens and would otherwise miss every branch and land on 5.5. Anchored so
+	// an id naming a different GPT major version, `gpt-4-astra-x`, is not
+	// claimed for the frontier model.
+	const namesOtherGptVersion =
+		versionToken !== undefined &&
+		/^\d+$/.test(versionToken) &&
+		versionToken !== "6";
+	const isAstra = tokens.includes("astra") && !namesOtherGptVersion;
+	if ((!isGpt6 && !isAstra) || tokens.includes("codex")) {
+		return "";
+	}
+	if (tokens.includes("aeon")) return GPT_6_ASTRA_AEON_MODEL;
+	return GPT_6_ASTRA_MODEL;
+}
+
+// Daybreak slugs carry neither a `codex` nor a `gpt 5` token, so every other
+// resolver declines them and they would reach the 5.5 default. An unrecognised
+// Daybreak id resolves to `blue`, the more restricted of the two, so a typo
+// cannot silently upgrade a caller into the cyber-permissive model.
+function resolveDaybreakRequestedModel(stripped) {
+	const tokens = tokenizeRequestedModel(stripped);
+	if (!tokens.includes("daybreak")) {
+		return "";
+	}
+	if (tokens.includes("red")) return DAYBREAK_RED_MODEL;
+	return DAYBREAK_BLUE_MODEL;
+}
+
 function resolveGpt56RequestedModel(stripped) {
 	const tokens = tokenizeRequestedModel(stripped);
 	const gptIndex = tokens.indexOf("gpt");
@@ -2300,9 +2547,19 @@ function normalizeRequestedModel(model) {
 		return exactMatch;
 	}
 
+	const daybreakModel = resolveDaybreakRequestedModel(stripped);
+	if (daybreakModel) {
+		return daybreakModel;
+	}
+
 	const codexModel = resolveCodexRequestedModel(normalized);
 	if (codexModel) {
 		return codexModel;
+	}
+
+	const gpt6Model = resolveGpt6RequestedModel(stripped);
+	if (gpt6Model) {
+		return gpt6Model;
 	}
 
 	const gpt56Model = resolveGpt56RequestedModel(stripped);
@@ -2357,6 +2614,10 @@ function coerceReasoningEffortForModel(model, effort) {
 function extractRequestedModel(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
+		// Past `--` every token is root `[PROMPT]` text; a `-m` in there names
+		// no model, and reading one would coerce reasoning config for a model
+		// the user never requested.
+		if (arg === "--") break;
 		if (arg === "--model" || arg === "-m") {
 			const next = args[i + 1];
 			if (typeof next === "string" && next.trim().length > 0) {
@@ -2427,6 +2688,8 @@ function rewriteReasoningConfigArgs(rawArgs) {
 	const nextArgs = [...rawArgs];
 	for (let i = 0; i < nextArgs.length; i += 1) {
 		const arg = nextArgs[i];
+		// Past `--` a `-c key=value` pair is prompt text, not a config override.
+		if (arg === "--") break;
 		if ((arg === "-c" || arg === "--config") && typeof nextArgs[i + 1] === "string") {
 			nextArgs[i + 1] = rewriteReasoningConfigAssignment(
 				nextArgs[i + 1],
@@ -3627,6 +3890,7 @@ function createRuntimeRotationProxyCanonicalCodexHome(
 		`${providerTable}.base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
 		`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
 		`${providerTable}.requires_openai_auth=false`,
+		`${providerTable}.http_headers.x-openai-actor-authorization=${configTomlModule.tomlStringLiteral("codex-multi-auth-local")}`,
 		`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
 		`${providerTable}.supports_websockets=true`,
 		"disable_response_storage=false",
@@ -4540,7 +4804,12 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			throw new Error("runtime rotation config helpers are unavailable");
 		}
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
-		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
+		proxyServer = await proxyModule.startRuntimeRotationProxy(
+			createRuntimeRotationProxyOptions(
+				clientApiKey,
+				resolveRuntimeRotationProxyUpstreamBaseUrl(),
+			),
+		);
 		const useCanonicalHome =
 			(process.env[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV] ?? "").trim() ===
 			"1";
@@ -4904,13 +5173,20 @@ async function createRuntimeRotationAppHelperContext(
 		}
 	};
 
+	const injectedArgs = [
+		...helperArgs,
+		"-c",
+		`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+	];
 	return {
-		args: [
-			...baseContext.args,
-			...helperArgs,
-			"-c",
-			`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
-		],
+		// Root TUI argv can end in the optional `[PROMPT]` positional, and `--`
+		// binds everything after it to that positional — overrides appended
+		// there would become prompt text, so the interactive branch asks for
+		// them to be injected ahead of the prompt instead.
+		args:
+			options.injectArgsBeforeRootPrompt === true
+				? insertArgsBeforeRootPrompt(baseContext.args, injectedArgs)
+				: insertArgsBeforeForwardedSeparator(baseContext.args, injectedArgs),
 		env: {
 			...baseContext.env,
 			...helperEnv,
@@ -4934,13 +5210,52 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	baseContext,
 	rawArgs,
 ) {
+	// Resolve the configured upstream BEFORE the enabled gate. Every path that
+	// leaves this function with `baseContext` forwards Responses traffic, and its
+	// managed OAuth bearer token, straight to the real backend. An explicit
+	// upstream is a routing requirement rather than a rotation preference, so
+	// `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`, `CODEX_MULTI_AUTH_BYPASS=1`, a
+	// missing `dist/lib/config.js` or a disabled setting must all fail closed
+	// here instead of silently reaching chatgpt.com.
+	let configuredUpstreamBaseUrl;
+	try {
+		configuredUpstreamBaseUrl =
+			resolveRuntimeRotationProxyUpstreamBaseUrl(baseContext.env);
+	} catch (error) {
+		baseContext.cleanup?.();
+		return {
+			startupError: `codex-multi-auth runtime rotation upstream is invalid: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		};
+	}
+	// The one exception is a subcommand that never reaches the backend at all
+	// (`--version`, `login`, ...): there is no traffic to misroute, so it passes
+	// through with the upstream simply unused.
+	const requireConfiguredUpstream =
+		configuredUpstreamBaseUrl !== undefined &&
+		shouldUseRuntimeRoutingForForwardedArgs(rawArgs);
+
 	const enabled = await isRuntimeRotationProxyEnabled(rawArgs, baseContext.env);
 	if (!enabled) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation is disabled, so ${RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV} cannot be honored and requests would go to the direct backend instead. Enable runtime rotation or unset that variable.`,
+			};
+		}
 		return baseContext;
 	}
 
 	const configTomlModule = await loadRuntimeConfigTomlModule();
 	if (!configTomlModule) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError:
+					"codex-multi-auth runtime rotation config helpers are unavailable; configured upstream routing cannot continue.",
+			};
+		}
 		console.error(
 			"codex-multi-auth runtime rotation config helpers are unavailable; continuing without runtime rotation.",
 		);
@@ -4992,18 +5307,31 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	if (isCodexAppCommand(rawArgs)) {
 		return startAppHelperContext();
 	}
-	if (
-		isCodexInteractiveTuiCommand(rawArgs) ||
-		isCodexInteractiveResumeCommand(rawArgs)
-	) {
+	// Classify once: each predicate re-walks the whole argv, and the root-TUI
+	// answer is needed twice below.
+	const isRootTuiLaunch = isCodexInteractiveTuiCommand(rawArgs);
+	if (isRootTuiLaunch || isCodexInteractiveResumeCommand(rawArgs)) {
 		return startAppHelperContext({
 			detachOnExit: true,
 			useCanonicalHome: true,
+			// Root TUI launches may carry the optional `[PROMPT]` positional
+			// (possibly forced by `--`); the provider overrides must stay on the
+			// option side of it. `resume`/`fork` keep the appended ordering their
+			// argv has always forwarded with — their tokens are subcommand args,
+			// not the root prompt.
+			injectArgsBeforeRootPrompt: isRootTuiLaunch,
 		});
 	}
 
 	const proxyModule = await loadRuntimeRotationProxyModule();
 	if (!proxyModule) {
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError:
+					"codex-multi-auth runtime rotation proxy is unavailable; configured upstream routing cannot continue.",
+			};
+		}
 		console.error(
 			"codex-multi-auth runtime rotation proxy is unavailable; continuing without runtime rotation.",
 		);
@@ -5014,7 +5342,12 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	let shadowContext;
 	try {
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
-		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
+		proxyServer = await proxyModule.startRuntimeRotationProxy(
+			createRuntimeRotationProxyOptions(
+				clientApiKey,
+				configuredUpstreamBaseUrl,
+			),
+		);
 		shadowContext = createRuntimeRotationProxyCodexHome(
 			baseContext.env,
 			proxyServer.baseUrl,
@@ -5026,6 +5359,14 @@ async function createRuntimeRotationProxyContextIfEnabled(
 			await proxyServer?.close?.();
 		} catch {
 			// Best-effort cleanup only.
+		}
+		if (requireConfiguredUpstream) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation proxy failed to start with configured upstream: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
 		}
 		console.error(
 			`codex-multi-auth runtime rotation proxy failed to start; continuing without runtime rotation: ${error instanceof Error ? error.message : String(error)}`,
@@ -5089,90 +5430,257 @@ function isPureHelpOrVersionArgs(rawArgs) {
 	);
 }
 
+// Hoisted: every argv walk calls consumesNextArg once per token, and a Set
+// rebuilt per call allocated this list on every one of them.
+const OPTIONS_CONSUMING_NEXT_ARG = new Set([
+	"-c",
+	"--config",
+	"--enable",
+	"--disable",
+	"--listen",
+	"--remote",
+	"--remote-auth-token-env",
+	"--ws-auth",
+	"--ws-token-file",
+	"--ws-token-sha256",
+	"--ws-shared-secret-file",
+	"--ws-issuer",
+	"--ws-audience",
+	"--ws-max-clock-skew-seconds",
+	"--download-url",
+	"-i",
+	"--image",
+	"-m",
+	"--model",
+	"--local-provider",
+	"-p",
+	"--profile",
+	"-s",
+	"--sandbox",
+	"-a",
+	"--ask-for-approval",
+	"-C",
+	"--cd",
+	"--add-dir",
+	"--output-schema",
+	"--color",
+	"-o",
+	"--output-last-message",
+]);
+
 function consumesNextArg(arg) {
-	return new Set([
-		"-c",
-		"--config",
-		"--enable",
-		"--disable",
-		"--listen",
-		"--remote",
-		"--remote-auth-token-env",
-		"--ws-auth",
-		"--ws-token-file",
-		"--ws-token-sha256",
-		"--ws-shared-secret-file",
-		"--ws-issuer",
-		"--ws-audience",
-		"--ws-max-clock-skew-seconds",
-		"--download-url",
-		"-i",
-		"--image",
-		"-m",
-		"--model",
-		"--local-provider",
-		"-p",
-		"--profile",
-		"-s",
-		"--sandbox",
-		"-a",
-		"--ask-for-approval",
-		"-C",
-		"--cd",
-		"--add-dir",
-		"--output-schema",
-		"--color",
-		"-o",
-		"--output-last-message",
-	]).has(arg);
+	return OPTIONS_CONSUMING_NEXT_ARG.has(arg);
+}
+
+// Codex's root grammar is `codex [OPTIONS] [PROMPT]` / `codex [OPTIONS]
+// <COMMAND> [ARGS]`, so the first positional is only a command when it names a
+// real root subcommand — otherwise it is the optional initial prompt of an
+// interactive TUI launch. The allowlist mirrors `codex --help`; treating an
+// unknown positional as a prompt matches native Codex, where an unrecognized
+// token also falls through to the prompt positional rather than erroring as a
+// bad subcommand. Routing predicates all resolve through this map so aliases
+// classify like their canonical command.
+//
+// A real root subcommand missing from this set is misrouted, not merely
+// misnamed: it classifies as an interactive prompt and takes the app-helper
+// branch with `detachOnExit: true`, so a short-lived command leaves a detached
+// helper and its loopback proxy idling until the rotation idle timeout. Keep
+// the set in sync with the upstream grammar — clap publishes the authoritative
+// root list in its own completions, so
+//   codex completion bash | grep -oE 'opts="[^"]*"' | grep ' exec '
+// prints every root command (and alias) for the installed codex-cli.
+
+const CODEX_ROOT_COMMAND_ALIASES = new Map([
+	["e", "exec"],
+	["a", "apply"],
+]);
+const CODEX_ROOT_COMMANDS = new Set([
+	"exec",
+	"review",
+	"login",
+	"logout",
+	"mcp",
+	"plugin",
+	"mcp-server",
+	"app-server",
+	"remote-control",
+	"app",
+	"completion",
+	"update",
+	"doctor",
+	"sandbox",
+	"debug",
+	"apply",
+	"resume",
+	"archive",
+	"delete",
+	"migrate-rollouts",
+	"unarchive",
+	"fork",
+	"cloud",
+	"exec-server",
+	"features",
+	"help",
+	"auth",
+	// Hidden root subcommands: absent from `codex --help`, but real — each is
+	// documented by `codex help <name>`.
+	"responses-api-proxy",
+	"cloud-tasks",
+	"execpolicy",
+	// Internal stdio/UDS relay. Hidden like the three above, and short-lived:
+	// omitting it classified `codex stdio-to-uds <socket>` as a root prompt,
+	// which took the detached app-helper branch and leaked a helper per call.
+	"stdio-to-uds",
+]);
+
+function resolveCodexRootCommand(token) {
+	const command = CODEX_ROOT_COMMAND_ALIASES.get(token) ?? token;
+	return CODEX_ROOT_COMMANDS.has(command) ? command : null;
+}
+
+// `-i/--image` is greedy (`<FILE>...`): native Codex consumes every following
+// free token up to the next option-like token, so a prompt can only follow the
+// image list after another option or a `--`. Every argv walker below skips the
+// same span, or the wrapper would disagree with native Codex about where the
+// positional side starts.
+function consumesRemainingFreeArgs(arg) {
+	return arg === "-i" || arg === "--image";
+}
+
+function skipOptionValueSpan(args, i) {
+	const arg = args[i];
+	if (consumesRemainingFreeArgs(arg)) {
+		let end = i;
+		while (
+			end + 1 < args.length &&
+			typeof args[end + 1] === "string" &&
+			args[end + 1].length > 0 &&
+			(args[end + 1] === "-" || !args[end + 1].startsWith("-"))
+		) {
+			end += 1;
+		}
+		return end;
+	}
+	return consumesNextArg(arg) ? i + 1 : i;
+}
+
+/**
+ * The single definition of where an argv's option side ends. Walking from
+ * `startIndex`, skips option flags and the values they consume — including a
+ * greedy `-i a.png b.png` span — and reports what stopped the walk:
+ *
+ * - `index`: the first free (positional) token, or null when there is none.
+ * - `terminatorIndex`: the bare `--` that ended option parsing, or null.
+ * - `boundary`: where option-side content ends, i.e. the positional, the
+ *   `--`, or `args.length`. This is where injected overrides belong.
+ *
+ * Callers keep their own policy for `--` (the root grammar binds everything
+ * after it to `[PROMPT]`; a subcommand's does not), but they must not keep
+ * their own copy of the walk: a classifier and an injector that disagree by
+ * one token put a `-c` override into prompt text or read prompt text as a
+ * subcommand.
+ */
+function findRootPositional(args, startIndex = 0) {
+	if (!Array.isArray(args)) {
+		return { index: null, terminatorIndex: null, boundary: 0 };
+	}
+	for (let i = startIndex; i < args.length; i += 1) {
+		const arg = args[i];
+		if (typeof arg !== "string" || arg.length === 0) continue;
+		if (arg === "--") {
+			return { index: null, terminatorIndex: i, boundary: i };
+		}
+		if (arg.startsWith("--config=")) {
+			continue;
+		}
+		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
+			i = skipOptionValueSpan(args, i);
+			continue;
+		}
+		return { index: i, terminatorIndex: null, boundary: i };
+	}
+	return { index: null, terminatorIndex: null, boundary: args.length };
 }
 
 function findForwardedCommand(rawArgs) {
 	if (!Array.isArray(rawArgs) || rawArgs.length === 0) {
 		return null;
 	}
-	for (let i = 0; i < rawArgs.length; i += 1) {
-		const arg = rawArgs[i];
-		if (typeof arg !== "string" || arg.length === 0) continue;
-		if (arg === "--") {
-			return i + 1 < rawArgs.length
-				? { command: rawArgs[i + 1], index: i + 1 }
-				: null;
+	// `--` ends option parsing: everything after it binds to the root
+	// `[PROMPT]` positional, never to a subcommand, even when the text happens
+	// to spell a command name. `findRootPositional` reports it as a terminator
+	// and yields no positional, which settles the launch as interactive.
+	//
+	// Native Codex fills the root `[PROMPT]` slot with the first free token and
+	// still tries a later one as a subcommand (`codex hello exec …` runs exec),
+	// so an unknown positional keeps the scan going.
+	for (
+		let cursor = findRootPositional(rawArgs, 0);
+		cursor.index !== null;
+		cursor = findRootPositional(rawArgs, cursor.index + 1)
+	) {
+		const command = resolveCodexRootCommand(rawArgs[cursor.index]);
+		if (command !== null) {
+			return { command, index: cursor.index };
 		}
-		if (arg.startsWith("--config=")) {
-			continue;
-		}
-		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
-			if (consumesNextArg(arg)) {
-				i += 1;
-			}
-			continue;
-		}
-		return { command: arg, index: i };
 	}
 
 	return null;
 }
 
-function findForwardedSubcommand(rawArgs, commandIndex) {
-	for (let i = commandIndex + 1; i < rawArgs.length; i += 1) {
-		const arg = rawArgs[i];
-		if (typeof arg !== "string" || arg.length === 0) continue;
-		if (arg === "--") {
-			return i + 1 < rawArgs.length ? rawArgs[i + 1] : null;
-		}
-		if (arg.startsWith("--config=")) {
-			continue;
-		}
-		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
-			if (consumesNextArg(arg)) {
-				i += 1;
-			}
-			continue;
-		}
-		return arg;
+// Inserts option-side args ahead of the root `[PROMPT]` positional (or the
+// `--` that forces one), so injected overrides cannot be read as prompt text.
+// With no positional at all this is a plain append, which keeps bare-TUI argv
+// byte-identical to the pre-insertion shape.
+function insertArgsBeforeRootPrompt(baseArgs, injectedArgs) {
+	const { boundary } = findRootPositional(baseArgs);
+	return [
+		...baseArgs.slice(0, boundary),
+		...injectedArgs,
+		...baseArgs.slice(boundary),
+	];
+}
+
+// Inserts args before a `--` separator when one is present, else appends.
+// Subcommand argv keeps its leading subcommand token — `resume`/`fork` argv is
+// pinned to it — but anything appended past a `--` lands in the subcommand's
+// own positional list: Codex rejects that outright for `exec`/`review`
+// ("unexpected argument '-c' found"), and worse, silently forwards it as
+// arguments for `sandbox` and into the stored config for `mcp add`. The
+// separator bounds the append.
+function insertArgsBeforeForwardedSeparator(baseArgs, injectedArgs) {
+	// Deliberately not `findRootPositional`: that reports where the option side
+	// ends, stopping at the first positional, and a subcommand's own arguments
+	// are positionals — it would answer `exec` for `exec -- hi`. The question
+	// here is only where the separator sits, and a bare `indexOf` answers it
+	// exactly: clap never consumes `--` as an option value (`codex --cd -- hi`
+	// is "a value is required for '--cd'"), so the first `--` is always the
+	// separator, and it always follows the subcommand token because
+	// `findForwardedCommand` returns null the moment it sees one.
+	const separatorIndex = baseArgs.indexOf("--");
+	if (separatorIndex === -1) {
+		return [...baseArgs, ...injectedArgs];
 	}
-	return null;
+	return [
+		...baseArgs.slice(0, separatorIndex),
+		...injectedArgs,
+		...baseArgs.slice(separatorIndex),
+	];
+}
+
+function findForwardedSubcommand(rawArgs, commandIndex) {
+	const { index, terminatorIndex } = findRootPositional(
+		rawArgs,
+		commandIndex + 1,
+	);
+	// Unlike the root grammar, a subcommand's `--` still precedes its own
+	// positional args, so the token after it is the nested subcommand.
+	if (terminatorIndex !== null) {
+		return terminatorIndex + 1 < rawArgs.length
+			? rawArgs[terminatorIndex + 1]
+			: null;
+	}
+	return index === null ? null : rawArgs[index];
 }
 
 function hasHelpFlagAfterCommand(rawArgs, commandIndex) {
@@ -5180,8 +5688,8 @@ function hasHelpFlagAfterCommand(rawArgs, commandIndex) {
 		const arg = rawArgs[i];
 		if (arg === "--") return false;
 		if (arg === "--help" || arg === "-h" || arg === "help") return true;
-		if (typeof arg === "string" && consumesNextArg(arg)) {
-			i += 1;
+		if (typeof arg === "string") {
+			i = skipOptionValueSpan(rawArgs, i);
 		}
 	}
 	return false;
@@ -5195,6 +5703,11 @@ function isCodexAppServerCommand(rawArgs) {
 	return findForwardedCommand(rawArgs)?.command === "app-server";
 }
 
+// True for every root TUI launch: bare `codex [OPTIONS]`, and `codex
+// [OPTIONS] [PROMPT]` with the optional initial prompt — including a prompt
+// forced by `--`. Both shapes start the same interactive session and need the
+// canonical home, or Codex stalls rebuilding the omitted thread index inside
+// the shadow mirror before it can submit the already-delivered prompt.
 function isCodexInteractiveTuiCommand(rawArgs) {
 	return findForwardedCommand(rawArgs) === null;
 }
@@ -5220,7 +5733,14 @@ function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 
 	const command = findForwardedCommand(rawArgs);
 	if (!command) {
-		return true;
+		// A help flag alongside a root prompt (`codex "prompt" --help`) prints
+		// help and exits clean, so it must skip the transport for the same
+		// reason as the request-command help forms below: the interactive
+		// branch detaches its helper on a clean exit, and a helper started
+		// just to print help would idle until its detached timeout. The scan
+		// stops at `--`, so help-looking text inside a forced prompt still
+		// routes normally.
+		return !hasHelpFlagAfterCommand(rawArgs, -1);
 	}
 
 	const requestCommands = new Set(["exec", "review", "resume", "fork", "app"]);
@@ -5451,12 +5971,16 @@ function buildForwardArgs(rawArgs) {
 		return { args: compatibilityArgs, requestedModel };
 	}
 
+	const authStoreArgs = ["-c", 'cli_auth_credentials_store="file"'];
 	return {
-		args: [
-			...compatibilityArgs,
-			"-c",
-			'cli_auth_credentials_store="file"',
-		],
+		// A root launch may end in the `[PROMPT]` positional — possibly forced
+		// by `--`, where an appended `-c` pair would be read as prompt text —
+		// so the override is inserted on the option side of the prompt there.
+		// Subcommand argv keeps the appended ordering it has always forwarded.
+		args:
+			findForwardedCommand(compatibilityArgs) === null
+				? insertArgsBeforeRootPrompt(compatibilityArgs, authStoreArgs)
+				: insertArgsBeforeForwardedSeparator(compatibilityArgs, authStoreArgs),
 		requestedModel,
 	};
 }
@@ -6023,6 +6547,7 @@ export {
 	coerceReasoningEffortForModel,
 	resolveModelFamilyForStatus,
 	canonicalizeRequestedModelName,
+	WRAPPER_UNSUPPORTED_MODEL_FALLBACK_CHAIN,
 };
 
 // Run the wrapper only when actually launched (as the `codex-multi-auth-codex`

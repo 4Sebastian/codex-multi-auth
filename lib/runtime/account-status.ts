@@ -39,18 +39,78 @@ export function getRateLimitResetTimeForFamily(
 	return minReset;
 }
 
+/** The value when it is still a live bound at `now`, otherwise null. */
+function activeBound(value: number | undefined, now: number): number | null {
+	if (typeof value !== "number" || !Number.isFinite(value)) return null;
+	return value > now ? value : null;
+}
+
+/** The later of two bounds, treating null as "does not bound". */
+function laterBound(a: number | null, b: number | null): number | null {
+	if (a === null) return b;
+	if (b === null) return a;
+	return a > b ? a : b;
+}
+
+export interface AccountRecoveryBounds {
+	/**
+	 * The moment the account becomes usable again: `rateLimitAtMs` widened by
+	 * any active cooldown, because the account stays skipped while ANY gating
+	 * record is active. Null when nothing bounds recovery.
+	 */
+	recoveryAtMs: number | null;
+	/**
+	 * The rate-limit records' own contribution to `recoveryAtMs`, cooldowns
+	 * excluded. The pinned-503 uses it to decide whether the deadline it
+	 * advertises is in fact the rate limit's own reset — with a breaker or
+	 * cooldown ending later, the full recovery bound outlives the rate limit
+	 * and must not be worded as its reset. Null when no rate-limit record
+	 * gates the request.
+	 */
+	rateLimitAtMs: number | null;
+}
+
 /**
- * The moment the account becomes usable again for a `family`/`model`
- * request: the LATEST bound among the records that actually gate that
- * request plus any active cooldown. Two deliberate differences from
- * getRateLimitResetTimeForFamily, whose earliest-reset answer feeds wait
- * displays: the account stays skipped while ANY gating record is active,
- * so the earliest reset would send clients back into a 503 — and only the
- * keys selection consults (`family`, plus `family:<model>` when a model is
- * known; see isRateLimitedForFamily) may contribute, because another
- * model's record does not block this request and would overstate its
- * recovery. Null when nothing bounds recovery.
+ * Both recovery bounds for a `family`/`model` request, from ONE pass over
+ * `rateLimitResetTimes` against a single `now`.
+ *
+ * Two deliberate differences from getRateLimitResetTimeForFamily, whose
+ * earliest-reset answer feeds wait displays: the latest bound wins, because
+ * the earliest reset would send clients back into a 503 — and only the keys
+ * selection consults (`family`, plus `family:<model>` when a model is known;
+ * see isRateLimitedForFamily) may contribute, because another model's record
+ * does not block this request and would overstate its recovery.
+ *
+ * A caller that needs both bounds must take them from one call. Measuring
+ * them separately lets a record expire between the two walks, which reports
+ * a rate-limited account as if a cooldown bounded its recovery.
  */
+export function getAccountRecoveryBoundsForFamily(
+	account: {
+		rateLimitResetTimes?: Record<string, number | undefined>;
+		coolingDownUntil?: number;
+	},
+	now: number,
+	family: ModelFamily,
+	model?: string | null,
+): AccountRecoveryBounds {
+	const times = account.rateLimitResetTimes;
+	const rateLimitAtMs = times
+		? laterBound(
+				activeBound(times[getQuotaKey(family)], now),
+				model ? activeBound(times[getQuotaKey(family, model)], now) : null,
+			)
+		: null;
+	return {
+		rateLimitAtMs,
+		recoveryAtMs: laterBound(
+			rateLimitAtMs,
+			activeBound(account.coolingDownUntil, now),
+		),
+	};
+}
+
+/** The `recoveryAtMs` bound alone; see getAccountRecoveryBoundsForFamily. */
 export function getAccountRecoveryTimeForFamily(
 	account: {
 		rateLimitResetTimes?: Record<string, number | undefined>;
@@ -60,19 +120,21 @@ export function getAccountRecoveryTimeForFamily(
 	family: ModelFamily,
 	model?: string | null,
 ): number | null {
-	let latest: number | null = null;
-	const consider = (value: number | undefined): void => {
-		if (typeof value !== "number" || !Number.isFinite(value)) return;
-		if (value <= now) return;
-		if (latest === null || value > latest) latest = value;
-	};
-	const times = account.rateLimitResetTimes;
-	if (times) {
-		consider(times[getQuotaKey(family)]);
-		if (model) consider(times[getQuotaKey(family, model)]);
-	}
-	consider(account.coolingDownUntil);
-	return latest;
+	return getAccountRecoveryBoundsForFamily(account, now, family, model)
+		.recoveryAtMs;
+}
+
+/** The `rateLimitAtMs` bound alone; see getAccountRecoveryBoundsForFamily. */
+export function getRateLimitRecoveryTimeForFamily(
+	account: {
+		rateLimitResetTimes?: Record<string, number | undefined>;
+	},
+	now: number,
+	family: ModelFamily,
+	model?: string | null,
+): number | null {
+	return getAccountRecoveryBoundsForFamily(account, now, family, model)
+		.rateLimitAtMs;
 }
 
 export function formatRateLimitEntry(
@@ -113,17 +175,6 @@ export function getRateLimitResetTimeForModel(
 	family: ModelFamily,
 	model: string,
 ): number | null {
-	const times = account.rateLimitResetTimes;
-	if (!times) return null;
-
-	let latest: number | null = null;
-	const consider = (value: number | undefined): void => {
-		if (typeof value !== "number" || !Number.isFinite(value)) return;
-		if (value <= now) return;
-		if (latest === null || value > latest) latest = value;
-	};
-
-	consider(times[getQuotaKey(family)]);
-	consider(times[getQuotaKey(family, model)]);
-	return latest;
+	return getAccountRecoveryBoundsForFamily(account, now, family, model)
+		.rateLimitAtMs;
 }

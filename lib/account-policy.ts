@@ -107,13 +107,28 @@ export function getAccountPolicyPath(): string {
 }
 
 export function getAccountPolicyKey(
-	account: Pick<AccountMetadataV3, "accountId" | "email">,
+	account: Pick<AccountMetadataV3, "accountId" | "email"> & {
+		refreshToken?: string | null;
+	},
 	_index?: number,
 ): string {
+	// The key must be stable across processes and independent of the account's
+	// slot (policy state is persisted and survives reordering), so it is derived
+	// from identity, never from `_index`.
+	//
+	// An account whose accountId AND email are both missing — freshly imported,
+	// or not yet hydrated from its token — used to hash the literal "unknown",
+	// which gave EVERY such account the same key: pausing, draining or tagging
+	// one silently applied to all of them. Fall back to the refresh token
+	// instead, which every account has and no two accounts share. It is
+	// namespaced before hashing so a token value can never collide with an
+	// email or accountId of the same text, and only its digest is persisted.
+	// Mirrors getAccountIdentityKey's `allowRefreshFallback`.
+	const refreshFallback = account.refreshToken?.trim();
 	const identity =
 		account.accountId?.trim() ||
 		account.email?.trim().toLowerCase() ||
-		"unknown";
+		(refreshFallback ? `refresh:${refreshFallback}` : "unknown");
 	return `sha256:${createHash("sha256").update(identity).digest("hex")}`;
 }
 

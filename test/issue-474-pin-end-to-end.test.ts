@@ -437,7 +437,11 @@ describe("issue #474 — end-to-end pin honored over real HTTP proxy", () => {
 			};
 			expect(body.error.code).toBe("codex_pinned_account_unavailable");
 			expect(body.error.reason).toBe("cooling-down:auth-failure");
-			expect(body.error.message).toContain("(cooling-down:auth-failure)");
+			// The raw token stays in the machine-readable reason above; the human
+			// sentence translates it into the blocker it names.
+			expect(body.error.message).toContain(
+				"(cooling down after authentication failures)",
+			);
 			expect(body.error.account_skip_reasons[String(pinnedIndex)]).toBe(
 				"cooling-down:auth-failure",
 			);

@@ -235,6 +235,7 @@ function createRuntimeRotationProviderBlock(
 		'name = "codex-multi-auth"',
 		`base_url = ${tomlStringLiteral(baseUrl)}`,
 		"requires_openai_auth = false",
+		'http_headers = { "x-openai-actor-authorization" = "codex-multi-auth-local" }',
 		'wire_api = "responses"',
 		"supports_websockets = true",
 	];

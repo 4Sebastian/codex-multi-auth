@@ -81,5 +81,47 @@ describe("account policy store", () => {
 			getAccountPolicyKey(unidentified, 4),
 		);
 	});
+
+	it("separates two accounts that have neither an accountId nor an email", async () => {
+		const { getAccountPolicyKey } = await import("../lib/account-policy.js");
+
+		// Both used to hash the literal "unknown" and share one policy entry, so
+		// pausing, draining or tagging either one silently applied to both.
+		expect(
+			getAccountPolicyKey({ refreshToken: "refresh-a" }, 0),
+		).not.toBe(getAccountPolicyKey({ refreshToken: "refresh-b" }, 1));
+	});
+
+	it("keeps the refresh-token fallback key stable across slots", async () => {
+		const { getAccountPolicyKey } = await import("../lib/account-policy.js");
+		const account = { refreshToken: "refresh-a" };
+
+		// Policy state is persisted and survives reordering, so the key must not
+		// move when the account does.
+		expect(getAccountPolicyKey(account, 0)).toBe(getAccountPolicyKey(account, 6));
+	});
+
+	it("prefers a real identity over the refresh-token fallback", async () => {
+		const { getAccountPolicyKey } = await import("../lib/account-policy.js");
+		const withId = { accountId: "acc_1", refreshToken: "refresh-a" };
+		const withEmail = { email: "user@example.com", refreshToken: "refresh-a" };
+
+		// Hydrating an account's identity must not orphan its existing policy.
+		expect(getAccountPolicyKey(withId)).toBe(
+			getAccountPolicyKey({ accountId: "acc_1", refreshToken: "refresh-z" }),
+		);
+		expect(getAccountPolicyKey(withEmail)).toBe(
+			getAccountPolicyKey({ email: "USER@example.com", refreshToken: "refresh-z" }),
+		);
+		expect(getAccountPolicyKey(withId)).not.toBe(getAccountPolicyKey(withEmail));
+	});
+
+	it("namespaces the refresh token so it cannot collide with an email", async () => {
+		const { getAccountPolicyKey } = await import("../lib/account-policy.js");
+
+		expect(getAccountPolicyKey({ refreshToken: "user@example.com" })).not.toBe(
+			getAccountPolicyKey({ email: "user@example.com", refreshToken: "refresh-a" }),
+		);
+	});
 });
 

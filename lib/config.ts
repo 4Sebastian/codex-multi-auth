@@ -2,6 +2,7 @@ import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { parseBooleanEnv } from "./env-parsing.js";
+import { stripModelEffortSuffix } from "./constants.js";
 import { withRetry, withRetrySync } from "./fs-retry.js";
 import { logWarn } from "./logger.js";
 import { StorageError } from "./errors.js";
@@ -243,6 +244,10 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
 	preemptiveQuotaRemainingPercent5h: 5,
 	preemptiveQuotaRemainingPercent7d: 5,
 	preemptiveQuotaMaxDeferralMs: 2 * 60 * 60_000,
+	contextBudgetGuardEnabled: false,
+	contextBudgetGuardSoftPercent: 65,
+	contextBudgetGuardHardPercent: 69,
+	contextBudgetGuardModelWindowOverrides: {},
 	routingMutex: "legacy",
 	schedulingStrategy: "hybrid",
 };
@@ -1049,6 +1054,13 @@ function resolveNumberSetting(
 		);
 	}
 	const candidate = envValue ?? configValue ?? defaultValue;
+	// Math.max/Math.min propagate NaN, so a non-finite candidate would be
+	// returned as-is and every threshold comparison against it reads false --
+	// a setting that silently disables whatever it gates. parseNumberEnv already
+	// rejects non-finite env values and zod rejects NaN on the config field, so
+	// this is a boundary guard for the ~20 settings that share this helper
+	// rather than a reachable path through loadPluginConfig.
+	if (!Number.isFinite(candidate)) return defaultValue;
 	const min = options?.min ?? Number.NEGATIVE_INFINITY;
 	const max = options?.max ?? Number.POSITIVE_INFINITY;
 	return Math.max(min, Math.min(max, candidate));
@@ -1245,10 +1257,12 @@ export function getUnsupportedCodexFallbackChain(
 		const stripped = trimmed.includes("/")
 			? (trimmed.split("/").pop() ?? trimmed)
 			: trimmed;
-		return stripped.replace(/-(none|minimal|low|medium|high|xhigh)$/i, "");
+		return stripModelEffortSuffix(stripped);
 	};
 
-	const normalized: Record<string, string[]> = {};
+	// Null-prototype: the keys come from user config, so a `__proto__` entry on a
+	// plain object would reassign this object's prototype rather than add a row.
+	const normalized: Record<string, string[]> = Object.create(null);
 	for (const [key, value] of Object.entries(chain)) {
 		if (typeof key !== "string" || !Array.isArray(value)) continue;
 		const normalizedKey = normalizeModel(key);
@@ -1842,6 +1856,79 @@ export function getPreemptiveQuotaMaxDeferralMs(
 	);
 }
 
+/**
+ * Whether the (experimental, opt-in) context budget guard is enabled.
+ *
+ * Ships disabled: pausing a session before it hits the context window is a
+ * staged behavior change, not a default-on safety net like preemptive quota
+ * deferral, so an explicit opt-in is required.
+ */
+export function getContextBudgetGuardEnabled(pluginConfig: PluginConfig): boolean {
+	return resolveBooleanSetting(
+		"CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED",
+		pluginConfig.contextBudgetGuardEnabled,
+		false,
+	);
+}
+
+/** Percent of the effective context window at which the guard's non-blocking advisory fires. */
+export function getContextBudgetGuardSoftPercent(pluginConfig: PluginConfig): number {
+	return resolveNumberSetting(
+		"CODEX_AUTH_CONTEXT_BUDGET_SOFT_PCT",
+		pluginConfig.contextBudgetGuardSoftPercent,
+		65,
+		{ min: 0, max: 100 },
+	);
+}
+
+/**
+ * Percent of the effective context window at which the guard pauses the next
+ * request.
+ *
+ * Floored at 10, not 0. `resolveNumberSetting` clamps out-of-range values
+ * instead of rejecting them, so a configured (or env-supplied) `0` would be a
+ * legal threshold that every recorded snapshot clears — pausing every session
+ * from its first turn on. The guard applies the same floor in `configure()`
+ * so a directly constructed instance cannot be set below it either.
+ */
+export function getContextBudgetGuardHardPercent(pluginConfig: PluginConfig): number {
+	return resolveNumberSetting(
+		"CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT",
+		pluginConfig.contextBudgetGuardHardPercent,
+		69,
+		{ min: 10, max: 100 },
+	);
+}
+
+/**
+ * User-supplied context-window sizes, keyed by normalized model id, that
+ * always take priority over this package's own best-effort estimates (see
+ * `lib/context-budget/model-context-windows.ts`). Settings-only: there is no
+ * environment override, the same as `unsupportedCodexFallbackChain`, since a
+ * per-model token count is not a reasonable single env var.
+ */
+export function getContextBudgetGuardModelWindowOverrides(
+	pluginConfig: PluginConfig,
+): Record<string, number> {
+	const overrides = pluginConfig.contextBudgetGuardModelWindowOverrides;
+	if (!overrides || typeof overrides !== "object") {
+		return {};
+	}
+	const normalized: Record<string, number> = {};
+	for (const [rawModel, rawValue] of Object.entries(overrides)) {
+		const model = rawModel.trim().toLowerCase();
+		if (!model) continue;
+		if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) continue;
+		// Floor first: the schema accepts any positive number, so a sub-1 value
+		// passes a `rawValue > 0` check and then floors to 0, which is stored as
+		// a window of zero tokens and silently ignored downstream.
+		const tokens = Math.floor(rawValue);
+		if (tokens <= 0) continue;
+		normalized[model] = tokens;
+	}
+	return normalized;
+}
+
 const ROUTING_MUTEX_MODES = new Set<string>(["enabled", "legacy"]);
 
 /**
@@ -2229,6 +2316,26 @@ const CONFIG_EXPLAIN_ENTRIES: ConfigExplainMeta[] = [
 		key: "preemptiveQuotaMaxDeferralMs",
 		envNames: ["CODEX_AUTH_PREEMPTIVE_QUOTA_MAX_DEFERRAL_MS"],
 		getValue: getPreemptiveQuotaMaxDeferralMs,
+	},
+	{
+		key: "contextBudgetGuardEnabled",
+		envNames: ["CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED"],
+		getValue: getContextBudgetGuardEnabled,
+	},
+	{
+		key: "contextBudgetGuardSoftPercent",
+		envNames: ["CODEX_AUTH_CONTEXT_BUDGET_SOFT_PCT"],
+		getValue: getContextBudgetGuardSoftPercent,
+	},
+	{
+		key: "contextBudgetGuardHardPercent",
+		envNames: ["CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT"],
+		getValue: getContextBudgetGuardHardPercent,
+	},
+	{
+		key: "contextBudgetGuardModelWindowOverrides",
+		envNames: [],
+		getValue: getContextBudgetGuardModelWindowOverrides,
 	},
 	// config-01/config-07: these three live settings were missing from the explain
 	// report, so `config explain` silently under-reported the effective config. A

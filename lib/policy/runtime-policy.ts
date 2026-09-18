@@ -24,12 +24,20 @@ import {
 	type UsageLedgerOperation,
 	type UsageLedgerOutcome,
 	type UsageLedgerSource,
+	type UsageServiceTier,
 } from "../usage/index.js";
 
 export interface RuntimePolicyAccount {
 	index: number;
 	accountId?: string | null;
 	email?: string | null;
+	/**
+	 * Only used to key account policy for an account with no accountId and no
+	 * email. Without it the runtime would key such an account as "unknown"
+	 * while the CLI keys it by refresh-token digest, and pause/drain/tag state
+	 * written by one would be invisible to the other.
+	 */
+	refreshToken?: string | null;
 }
 
 export interface RuntimePolicyDecision {
@@ -66,6 +74,14 @@ export interface RuntimeUsageRecordInput {
 	cachedInputTokens?: number | null;
 	reasoningTokens?: number | null;
 	totalTokens?: number | null;
+	/**
+	 * Billed service tier, when upstream reported one. Carried explicitly
+	 * because the row below is rebuilt field by field: a spread from the
+	 * usage deferral reaches this input, but anything not named here is
+	 * dropped before the ledger, which would price a Fast response at the
+	 * standard rate.
+	 */
+	serviceTier?: UsageServiceTier;
 }
 
 export async function loadRuntimePolicyState(
@@ -184,6 +200,7 @@ export async function evaluateRuntimePolicy(input: {
 			{
 				accountId: account.accountId ?? undefined,
 				email: account.email ?? undefined,
+				refreshToken: account.refreshToken ?? undefined,
 			},
 			account.index,
 		);
@@ -290,6 +307,7 @@ export function createRuntimeUsageRecorder(input: {
 				cachedInputTokens: recordInput.cachedInputTokens,
 				reasoningTokens: recordInput.reasoningTokens,
 				totalTokens: recordInput.totalTokens,
+				serviceTier: recordInput.serviceTier,
 			};
 			await append(row).catch(() => undefined);
 		},

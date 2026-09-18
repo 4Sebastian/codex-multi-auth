@@ -1291,7 +1291,8 @@ export function normalizeAccountStorage(
 		if (
 			typeof raw !== "number" ||
 			!Number.isFinite(raw) ||
-			!Number.isInteger(raw) ||
+			// See readAffinityGenerationFromDisk: an unsafe integer wedges the bump.
+			!Number.isSafeInteger(raw) ||
 			raw < 0
 		) {
 			log.warn("Dropping invalid affinityGeneration from storage", {
@@ -1339,7 +1340,11 @@ export function readAffinityGenerationFromDisk(path: string): number {
 		if (
 			typeof generation === "number" &&
 			Number.isFinite(generation) &&
-			Number.isInteger(generation) &&
+			// Safe, not merely integral: past 2^53 `Math.max(gen, disk) + 1 === gen`,
+			// so `bumpStorageAffinityGeneration` silently stops advancing and no
+			// running proxy ever observes another `switch`. Rejecting the value
+			// lets the next bump write 1 and repair the file.
+			Number.isSafeInteger(generation) &&
 			generation >= 0
 		) {
 			return generation;
@@ -1351,47 +1356,121 @@ export function readAffinityGenerationFromDisk(path: string): number {
 }
 
 /**
+ * Advance the session-affinity generation so a running runtime proxy drops its
+ * sticky session→account bindings on the next request.
+ *
+ * Session affinity remembers an account by ITS INDEX, so any mutation that
+ * reshuffles the pool (removing an account, restoring a backup) silently
+ * re-points every live session at a different account until the generation
+ * changes. `switch`/`best`/`unpin` already bump it; the reshuffling paths are
+ * the ones that need it most, because they move every index at once.
+ *
+ * Re-reads the on-disk generation first so concurrent CLI processes do not lose
+ * increments via lost-update on the load+mutate pair. `Math.max` keeps the
+ * counter monotonic: an extra bump only costs one additional affinity
+ * invalidation, while a missed bump lets the proxy cling to the wrong account.
+ * See issue #474.
+ */
+export function bumpStorageAffinityGeneration(
+	storage: { affinityGeneration?: number },
+	storagePath?: string | null,
+): number {
+	let diskGeneration = 0;
+	try {
+		const path = storagePath ?? getStoragePath();
+		if (path) diskGeneration = readAffinityGenerationFromDisk(path);
+	} catch {
+		// No resolvable storage path (never configured). The in-memory counter
+		// is still bumped below; only the lost-update guard is unavailable.
+	}
+	// Guard the in-memory side too, not just the disk read. Past 2^53
+	// `Math.max(gen, disk) + 1 === gen`, so an unsafe value here would write the
+	// same generation forever and no running proxy would observe another
+	// `switch`. Treating it as 0 makes the next write repair the counter.
+	const rawInMemory = storage.affinityGeneration ?? 0;
+	const inMemoryGeneration =
+		Number.isSafeInteger(rawInMemory) && rawInMemory >= 0 ? rawInMemory : 0;
+	const next = Math.max(inMemoryGeneration, diskGeneration) + 1;
+	storage.affinityGeneration = next;
+	return next;
+}
+
+/**
  * Synchronously reads both the top-level `pinnedAccountIndex` and
  * `affinityGeneration` fields from the accounts storage file. Used by
  * `AccountManager.buildStorageSnapshot` to refresh from disk just before
  * persisting routine state (rate-limit hits, cooldowns, etc.) so a CLI
  * `switch`/`unpin` that landed between proxy startup and the save is not
  * clobbered. Returns `pinnedAccountIndex: undefined` and
- * `affinityGeneration: 0` on any failure. See issue #474.
+ * `affinityGeneration: 0` on any failure by default. See issue #474.
+ *
+ * `strict` callers additionally need to know when the metadata could not be
+ * OBSERVED AT ALL, because persisting a stale in-memory pin over a newer disk
+ * pin is exactly the #474 regression. Strict mode therefore throws for the two
+ * cases where a newer selection may be hiding behind the failure:
+ *   - the file exists but cannot be read (EBUSY/EPERM/EACCES: on Windows an AV
+ *     scanner or indexer can hold accounts.json open), and
+ *   - the bytes are not valid JSON (a torn read of a concurrent atomic write).
+ *
+ * A MISSING file and a successfully parsed file with INVALID field values are
+ * deliberately not failures, in either mode. Neither can be concealing a newer
+ * pin (there is no file, or we can see the whole file and the field is
+ * unusable), and both are self-repaired by the very write that follows. Making
+ * them throw would wedge persistence permanently, since recreating or repairing
+ * storage goes through the same save path, and it would take every rate-limit
+ * window, cooldown and rotated refresh token in memory down with it.
  */
-export function readPinAndGenFromDisk(path: string): {
+export function readPinAndGenFromDisk(
+	path: string,
+	options?: { strict?: boolean },
+): {
 	pinnedAccountIndex: number | undefined;
 	affinityGeneration: number;
 } {
+	const unselected = {
+		pinnedAccountIndex: undefined,
+		affinityGeneration: 0,
+	} as const;
 	if (!existsSync(path)) {
-		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
+		return { ...unselected };
 	}
+	let parsed: unknown;
 	try {
-		const bytes = readFileSync(path);
-		const parsed = JSON.parse(bytes.toString("utf8")) as {
-			pinnedAccountIndex?: unknown;
-			affinityGeneration?: unknown;
-		};
-		const rawPin = parsed.pinnedAccountIndex;
-		const pinnedAccountIndex =
-			typeof rawPin === "number" &&
-			Number.isFinite(rawPin) &&
-			Number.isInteger(rawPin) &&
-			rawPin >= 0
-				? rawPin
-				: undefined;
-		const rawGen = parsed.affinityGeneration;
-		const affinityGeneration =
-			typeof rawGen === "number" &&
-			Number.isFinite(rawGen) &&
-			Number.isInteger(rawGen) &&
-			rawGen >= 0
-				? rawGen
-				: 0;
-		return { pinnedAccountIndex, affinityGeneration };
-	} catch {
-		return { pinnedAccountIndex: undefined, affinityGeneration: 0 };
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		// The file was deleted or renamed between existsSync and the read; same
+		// reasoning as the missing-file branch above.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { ...unselected };
+		}
+		if (options?.strict) {
+			throw new Error("Unable to read account selection metadata", {
+				cause: error,
+			});
+		}
+		return { ...unselected };
 	}
+	if (!isRecord(parsed)) {
+		return { ...unselected };
+	}
+	const rawPin = parsed.pinnedAccountIndex;
+	const pinnedAccountIndex =
+		typeof rawPin === "number" &&
+		Number.isFinite(rawPin) &&
+		Number.isInteger(rawPin) &&
+		rawPin >= 0
+			? rawPin
+			: undefined;
+	const rawGen = parsed.affinityGeneration;
+	const affinityGeneration =
+		typeof rawGen === "number" &&
+		Number.isFinite(rawGen) &&
+		// See readAffinityGenerationFromDisk: an unsafe integer wedges the bump.
+		Number.isSafeInteger(rawGen) &&
+		rawGen >= 0
+			? rawGen
+			: 0;
+	return { pinnedAccountIndex, affinityGeneration };
 }
 
 /**

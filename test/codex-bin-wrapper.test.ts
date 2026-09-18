@@ -373,8 +373,11 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"  };",
 			"}",
 			"",
-			"export async function startRuntimeRotationProxy() {",
+			"export async function startRuntimeRotationProxy(options = {}) {",
 			"  const baseUrl = process.env.CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL ?? 'http://127.0.0.1:4567';",
+			"  if ((process.env.CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM ?? '').trim() === '1') {",
+			"    appendMarker(`upstream:${options.upstreamBaseUrl ?? ''}`);",
+			"  }",
 			// Opt-in (#623): record the forced-account pin env the proxy process actually
 			// observed, so a test can prove the value crossed the launcher -> detached
 			// app-helper boundary. Gated so it never perturbs the exact-marker assertions
@@ -1288,6 +1291,76 @@ describe("codex bin wrapper", () => {
 		expect(output).not.toContain("--account");
 	});
 
+	// `--` makes everything after it the root `[PROMPT]` positional, so a
+	// launcher-only flag spelled inside that prompt is the user's text. The
+	// stripper walked the whole argv, so it both mangled the prompt and pinned
+	// the run to an account nobody selected — or hard-failed on a range check
+	// for a launch that contained no flag at all.
+	it("leaves a `--account` inside a `--`-forced prompt as prompt text", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeAccountsFixture(originalHome, 3);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			'console.log(`FORCED_INDEX:${process.env.CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX ?? ""}`);',
+			"process.exit(0);",
+		]);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["exec", "--", "--account", "3", "is", "wrong"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(0);
+		// The prompt reaches Codex intact, flag tokens and all.
+		expect(output).toContain("-- --account 3 is wrong");
+		// And no pin was inferred from the user's prose.
+		expect(output).toContain("FORCED_INDEX:");
+		expect(output).not.toContain("FORCED_INDEX:2");
+	});
+
+	// Same boundary, different scanner: a `-m` inside the prompt named no
+	// model, but the wrapper read one and then rewrote it in place on the
+	// unsupported-model retry — editing the user's prompt text before
+	// re-forwarding it.
+	it("does not read or rewrite a `-m` inside a `--`-forced prompt", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeAccountsFixture(originalHome, 1);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(0);",
+		]);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["exec", "--", "-m", "gpt-4", "please", "fix"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(0);
+		expect(output).toContain("-- -m gpt-4 please fix");
+	});
+
 	it("repairs local session index and suppresses known Codex rollout-store noise", () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
@@ -1563,6 +1636,197 @@ describe("codex bin wrapper", () => {
 		expect(result.stdout).toContain(
 			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
 		);
+	});
+
+	it.each([
+		["shadow runtime", ["exec", "status"]],
+		["interactive helper", ["resume", "session-fixture"]],
+	])(
+		"forwards an explicit loopback upstream through the %s proxy",
+		async (_label, args) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, args, {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+					"http://127.0.0.1:8787/backend-api",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "150",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM: "1",
+			});
+
+			expect(result.status).toBe(0);
+			await waitForFileText(
+				markerPath,
+				[
+					"upstream:http://127.0.0.1:8787/backend-api",
+					"start:http://127.0.0.1:4567",
+					"close",
+					"",
+				].join("\n"),
+			);
+		},
+	);
+
+	it.each([
+		// An explicit default port is still an explicit port: `new URL()` erases
+		// it, so the resolved value drops back to the canonical form.
+		[
+			"http://127.0.0.1:80/backend-api",
+			"http://127.0.0.1/backend-api",
+		],
+		// The whole 127.0.0.0/8 block is loopback, not only 127.0.0.1.
+		[
+			"http://127.9.9.9:8787/backend-api",
+			"http://127.9.9.9:8787/backend-api",
+		],
+		["http://[::1]:8787/backend-api", "http://[::1]:8787/backend-api"],
+	])(
+		"accepts the loopback runtime-proxy upstream %s",
+		async (upstream, expectedForwarded) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, ["exec", "status"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL: upstream,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_UPSTREAM: "1",
+			});
+
+			expect(result.status).toBe(0);
+			await waitForFileText(
+				markerPath,
+				[
+					`upstream:${expectedForwarded}`,
+					"start:http://127.0.0.1:4567",
+					"close",
+					"",
+				].join("\n"),
+			);
+		},
+	);
+
+	it("fails closed when runtime rotation is off but an upstream is configured", () => {
+		// Regression: the upstream used to be resolved only AFTER the enabled
+		// gate, so with rotation disabled the wrapper silently talked to the real
+		// backend while the operator believed traffic was pinned to their local
+		// listener.
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+				"http://127.0.0.1:8787/backend-api",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+
+		expect(result.status).toBe(1);
+		expect(combinedOutput(result)).toContain(
+			"codex-multi-auth runtime rotation is disabled",
+		);
+		expect(result.stdout).not.toContain("FORWARDED:");
+	});
+
+	it("still runs a non-request subcommand when an upstream is configured", () => {
+		// `--version` never reaches the backend, so there is no traffic to
+		// misroute and the configured upstream is simply unused.
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["--version"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL:
+				"http://127.0.0.1:8787/backend-api",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("FORWARDED:");
+	});
+
+	it.each([
+		"https://127.0.0.1:8787/backend-api",
+		"http://example.com:8787/backend-api",
+		"http://127.0.0.1/backend-api",
+		"http://user:pass@127.0.0.1:8787/backend-api",
+		"http://127.0.0.1:8787/backend-api?route=unsafe",
+		"http://127.0.0.1:8787/backend-api#unsafe",
+		// A name is not a loopback guarantee: a hosts-file entry can point
+		// `localhost` at a routable address and the upstream request carries the
+		// managed OAuth bearer token.
+		"http://localhost:8787/backend-api",
+		"http://127.0.0.1.example.com:8787/backend-api",
+		"http://[::2]:8787/backend-api",
+		"not-a-url",
+	])("fails closed for an unsafe runtime-proxy upstream: %s", (upstream) => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL: upstream,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+
+		expect(result.status).toBe(1);
+		expect(combinedOutput(result)).toContain(
+			"codex-multi-auth runtime rotation upstream is invalid",
+		);
+		expect(existsSync(markerPath)).toBe(false);
+		expect(result.stdout).not.toContain("FORWARDED:");
 	});
 
 	it("starts the opt-in runtime rotation proxy with a shadow CODEX_HOME provider", () => {
@@ -2284,6 +2548,9 @@ describe("codex bin wrapper", () => {
 		);
 		expect(output).toContain(
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.requires_openai_auth=false`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.http_headers.x-openai-actor-authorization="codex-multi-auth-local"`,
 		);
 		expect(output).toContain(
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
@@ -4334,6 +4601,287 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
+	// The root grammar is `codex [OPTIONS] [PROMPT]`: an initial prompt makes the
+	// launch no less interactive, but the classifier used to read the first
+	// positional as a subcommand, so prompt-bearing launches fell through to the
+	// shadow-home transport. The shadow mirror deliberately omits the runtime
+	// SQLite state, so native Codex rebuilt the entire thread index from
+	// rollouts — a startup stall that scales with session history — before it
+	// submitted the already-delivered prompt (#673).
+	for (const promptForm of [
+		{
+			label: "a prompt after value-consuming options",
+			args: [
+				"-c",
+				'model_reasoning_effort="high"',
+				"-i",
+				"notes.png",
+				// `--cd` ends the greedy image span; without an option (or `--`)
+				// between them, native Codex reads the prompt as a second image.
+				"--cd",
+				".",
+				"Reply with exactly READY, then stop.",
+			],
+			prompt: "Reply with exactly READY, then stop.",
+			// The provider overrides are injected before the prompt, so the
+			// prompt stays the final argument with the last override beside it.
+			penultimateArg: 'model_provider="codex-multi-auth-runtime-proxy"',
+		},
+		{
+			// `--` forces the positional, so prompt text that spells a real
+			// command name must still launch the TUI: native Codex parses
+			// `codex -- exec` as the prompt "exec", not as the exec subcommand.
+			label: "a `--`-forced prompt that spells a command name",
+			args: ["--", "exec"],
+			prompt: "exec",
+			// The overrides must land on the option side of the `--`, or Codex
+			// would read them as prompt text.
+			penultimateArg: "--",
+		},
+		{
+			// `-i/--image` is greedy: native Codex consumes every free token up
+			// to the next option, so the image list must stay contiguous and the
+			// injected overrides must land after it — an override pair splitting
+			// the list would demote the second image to the prompt and make the
+			// real prompt an "unexpected argument" hard error.
+			label: "a prompt after a greedy multi-image option",
+			args: ["-i", "a.png", "b.png", "--cd", ".", "look at these"],
+			prompt: "look at these",
+			penultimateArg: 'model_provider="codex-multi-auth-runtime-proxy"',
+		},
+	] as const) {
+		it(`uses the canonical Codex home for a TUI launch with ${promptForm.label} (#673)`, async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				'const fs = require("node:fs");',
+				'const path = require("node:path");',
+				"const args = process.argv.slice(2);",
+				'if (args[0] === "app-server") {',
+				'  console.log(`APP_SERVER_FORWARDED:${args.join(" ")}`);',
+				"  process.exit(0);",
+				"}",
+				"console.log(`PROMPT_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				// The thread index only exists in the canonical home; the shadow
+				// mirror omits it, which is what forced the startup rebuild.
+				'const statePath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite");',
+				"console.log(`PROMPT_SEES_THREAD_INDEX:${fs.existsSync(statePath)}`);",
+				`console.log(\`PROMPT_ARG_VERBATIM:\${args.includes(${JSON.stringify(
+					promptForm.prompt,
+				)})}\`);`,
+				"console.log(`PROMPT_LAST_ARG:${args[args.length - 1]}`);",
+				"console.log(`PROMPT_PENULTIMATE_ARG:${args[args.length - 2]}`);",
+				'console.log(`PROMPT_HAS_BASE_URL_OVERRIDE:${args.some((arg) => arg.includes("model_providers.codex-multi-auth-runtime-proxy.base_url="))}`);',
+				"console.log(`PROMPT_CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+			writeFileSync(
+				join(originalHome, "state_5.sqlite"),
+				"canonical-thread-index\n",
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, [...promptForm.args], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("PROMPT_HOME_IS_ORIGINAL:true");
+			expect(output).toContain("PROMPT_SEES_THREAD_INDEX:true");
+			expect(output).toContain("PROMPT_ARG_VERBATIM:true");
+			expect(output).toContain(`PROMPT_LAST_ARG:${promptForm.prompt}`);
+			expect(output).toContain(
+				`PROMPT_PENULTIMATE_ARG:${promptForm.penultimateArg}`,
+			);
+			// Rotation is still active: the proxy overrides ride along as `-c` args.
+			expect(output).toContain("PROMPT_HAS_BASE_URL_OVERRIDE:true");
+			expect(output).toContain("PROMPT_CLI_PATH_IS_SHIM:true");
+			// The canonical home is never rewritten on disk.
+			expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+				'model_provider = "openai"\n',
+			);
+			await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+		});
+	}
+
+	// Native Codex fills the root `[PROMPT]` slot with the first free token and
+	// still tries a later one as a subcommand: `codex hello exec …` runs exec.
+	// The classifier scans past unknown positionals the same way, so this stays
+	// a noninteractive exec on the isolated shadow home (#673).
+	it("classifies a command after a filled prompt slot like native Codex (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["hello", "exec", "echo hi"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+	});
+
+	// The alias resolves through the same allowlist as its canonical command, so
+	// `codex e ...` must classify exactly like `codex exec ...` — a real
+	// noninteractive request on the isolated shadow home, not a prompt (#673).
+	it("keeps the `e` exec alias on the shadow Codex home (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["e", "do something"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+	});
+
+	// The other alias: `a` resolves to `apply`, which makes no model requests,
+	// so it must skip the rotation transport entirely — exactly like a spelled-
+	// out `codex apply` always did, instead of routing as an unknown token (#673).
+	it("forwards the `a` apply alias without starting the rotation transport (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"console.log(`ALIAS_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["a"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(existsSync(markerPath)).toBe(false);
+		expect(output).toContain("ALIAS_HOME_IS_ORIGINAL:true");
+		expect(output).toContain("FORWARDED:a");
+		expect(output).not.toContain("model_provider=");
+	});
+
+	// A hidden root subcommand (absent from `codex --help`, real per
+	// `codex help <name>`) is still a command, not a prompt: it keeps the
+	// routing fall-through it always had instead of spinning up an interactive
+	// canonical-home helper that would outlive its short clean exit (#673).
+	//
+	// The allowlist is what decides this, so a real root command missing from
+	// it is misrouted rather than merely misnamed. `stdio-to-uds` is that case:
+	// it is a genuine hidden root subcommand of codex-cli, and every invocation
+	// classified as a prompt left a detached helper idling behind it.
+	for (const args of [
+		["execpolicy", "check"],
+		["stdio-to-uds", "/tmp/codex.sock"],
+	] as const) {
+		it(`classifies the hidden \`${args[0]}\` subcommand as a command, not a prompt (#673)`, () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, [...args], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+		});
+	}
+
 	// `resume`/`fork` are interactive TUI entry points, but they carry a forwarded
 	// subcommand, so they used to fall through to the shadow-home transport. The
 	// shadow mirror omits the runtime SQLite state, so the requested thread was
@@ -4406,6 +4954,55 @@ describe("codex bin wrapper", () => {
 			await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
 		});
 	}
+
+	// The rotation helper injects its own options (shim args plus
+	// `-c model_provider=...`) into subcommand argv, and appending those past a
+	// `--` hands them to the subcommand as positionals instead. The separator
+	// bounds that injection too (#673).
+	it("injects rotation helper args before a `--` on the resume path (#673)", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			"const sep = args.indexOf(\"--\");",
+			"console.log(`SEP_INDEX:${sep}`);",
+			"console.log(`AFTER_SEP:${args.slice(sep + 1).join(\" \")}`);",
+			'console.log(`OVERRIDE_BEFORE_SEP:${args.slice(0, sep).some((a) => a.startsWith("model_provider="))}`);',
+			"console.log(`FIRST_ARG:${args[0]}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["resume", "--last", "--", "do it"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		// The subcommand still leads, the injected overrides sit on the option
+		// side, and only the user's own text survives past the separator.
+		expect(output).toContain("FIRST_ARG:resume");
+		expect(output).toContain("AFTER_SEP:do it");
+		expect(output).toContain("OVERRIDE_BEFORE_SEP:true");
+		await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+	});
 
 	// Printing help makes no model requests, so it must not pay for the rotation
 	// transport at all. This matters most for resume/fork now that they are
@@ -5107,6 +5704,47 @@ describe("codex bin wrapper", () => {
 		expect(
 			result.stdout.match(/cli_auth_credentials_store=/g) ?? [],
 		).toHaveLength(1);
+	});
+
+	// Everything after `--` is the root prompt, so prompt text that happens to
+	// spell the override is not a caller override. Scanning past `--` would let
+	// it suppress the injection and silently drop the file auth store (#673).
+	it("still injects the file auth store when the prompt text spells the override (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		// A single token, which is the only runnable shape that tripped the old
+		// scan: a two-token `-c <assignment>` prompt is surplus positionals that
+		// Codex rejects before any of this matters.
+		const result = runWrapper(
+			fixtureRoot,
+			["--", '--config=cli_auth_credentials_store="keyring"'],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			},
+		);
+
+		expect(result.status).toBe(0);
+		// The wrapper's own override is injected ahead of the `--`, and the
+		// prompt text reaches Codex untouched behind it.
+		expect(result.stdout).toContain(
+			'FORWARDED:-c cli_auth_credentials_store="file" -- --config=cli_auth_credentials_store="keyring"',
+		);
+	});
+
+	// Appending past a `--` puts the injected pair in the subcommand's own
+	// positional list, which Codex rejects with "unexpected argument '-c'".
+	// The separator bounds the append for subcommand argv too (#673).
+	it("injects the file auth store before a subcommand's `--` separator (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const result = runWrapper(fixtureRoot, ["exec", "--", "do the thing"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec -c cli_auth_credentials_store="file" -- do the thing',
+		);
 	});
 
 	it("propagates downstream file-store write errors from forwarded wrapper execution", () => {

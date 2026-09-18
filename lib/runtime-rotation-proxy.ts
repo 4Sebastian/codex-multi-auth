@@ -27,6 +27,10 @@ import {
 	getPreemptiveQuotaMaxDeferralMs,
 	getPreemptiveQuotaRemainingPercent5h,
 	getPreemptiveQuotaRemainingPercent7d,
+	getContextBudgetGuardEnabled,
+	getContextBudgetGuardSoftPercent,
+	getContextBudgetGuardHardPercent,
+	getContextBudgetGuardModelWindowOverrides,
 	getRoutingMutexMode,
 	getSchedulingStrategy,
 	loadPluginConfig,
@@ -52,11 +56,20 @@ import {
 	type RuntimePolicyDecision,
 	type RuntimeUsageRecorder,
 } from "./policy/runtime-policy.js";
-import { isWorkspaceDisabledError } from "./request/fetch-helpers.js";
+import { createUsageStreamScanner } from "./usage/usage-extraction.js";
+import {
+	isModelAtCapacityError,
+	isWorkspaceDisabledError,
+} from "./request/fetch-helpers.js";
 import {
 	PreemptiveQuotaScheduler,
 	readQuotaSchedulerSnapshot,
 } from "./preemptive-quota-scheduler.js";
+import { ContextBudgetGuard } from "./context-budget-guard.js";
+import {
+	buildContextBudgetHeaders,
+	createContextBudgetPauseResponse,
+} from "./context-budget-response.js";
 import { createLogger, maskString, runWithCorrelationId } from "./logger.js";
 import { CodexValidationError } from "./errors.js";
 import { normalizeEmailKey } from "./storage/identity.js";
@@ -76,7 +89,7 @@ import {
 	responseHeadersForClient,
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
-import { getAccountRecoveryTimeForFamily } from "./runtime/account-status.js";
+import { getAccountRecoveryBoundsForFamily } from "./runtime/account-status.js";
 import { chooseAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
@@ -100,7 +113,7 @@ import {
 } from "./runtime/rotation-token-refresh.js";
 import { SessionAffinityStore } from "./session-affinity.js";
 import type { RequestBody } from "./types.js";
-import { isRecord } from "./utils.js";
+import { isRecord, sleep } from "./utils.js";
 
 // Re-exports: these symbols were defined in this module before the §4.1.3
 // phase-1 and phase-2 carves and are part of its public surface (lib/index.ts
@@ -186,14 +199,20 @@ const PINNED_PERMANENT_SKIP_REASONS: ReadonlySet<string> = new Set([
 const DEFAULT_QUOTA_REMAINING_THRESHOLD = 10;
 
 /** @internal Stable identity key for in-memory quota snapshots across reloads. */
-export function buildQuotaScheduleKey(
+/**
+ * Quota-scheduler key prefix identifying ONE account across every family and
+ * model key it owns.
+ *
+ * The trailing separator is part of the contract: without it the prefix
+ * `account:email:foo` also matches `account:email:foobar:codex`, so clearing
+ * one account's observations would silently clear a neighbour's.
+ */
+export function buildQuotaScheduleAccountPrefix(
 	account: Pick<ManagedAccount, "accountId" | "email" | "refreshToken"> & {
 		/** Stable per-record discriminator retained across token/account-id updates. */
 		addedAt?: number;
 		recordId?: string;
 	},
-	family: ModelFamily,
-	model?: string | null,
 ): string {
 	const emailKey = normalizeEmailKey(account.email);
 	const accountId = account.accountId?.trim();
@@ -212,10 +231,119 @@ export function buildQuotaScheduleKey(
 		: accountId
 			? `id:${accountId}${recordDiscriminator}`
 			: `refresh:${createHash("sha256").update(refreshToken).digest("hex")}${recordDiscriminator}`;
-	return `account:${accountIdentity}:${model ?? family}`;
+	return `account:${accountIdentity}:`;
+}
+
+export function buildQuotaScheduleKey(
+	account: Pick<ManagedAccount, "accountId" | "email" | "refreshToken"> & {
+		/** Stable per-record discriminator retained across token/account-id updates. */
+		addedAt?: number;
+		recordId?: string;
+	},
+	family: ModelFamily,
+	model?: string | null,
+): string {
+	return `${buildQuotaScheduleAccountPrefix(account)}${model ?? family}`;
 }
 
 const DEFAULT_MAX_RUNTIME_ACCOUNT_ATTEMPTS = 4;
+// This is a hard safety ceiling over every pinned selection pass, including
+// branches that do not consume the transient-attempt budget. It deliberately
+// overrides larger retry settings for pinned requests.
+const MAX_PINNED_SELECTION_ITERATIONS = 16;
+/**
+ * Ceiling on same-account re-sends for one pinned request.
+ *
+ * The pool's transient budget is derived from `retryAllAccountsMaxRetries`,
+ * whose documented meaning is "wait and retry when EVERY account is
+ * rate-limited". For an unpinned pool that budget spends across different
+ * accounts; for a pin every unit of it is another copy of the same
+ * (non-idempotent) request to the same upstream, so raising that pool knob
+ * must not silently multiply pinned re-sends. A user who LOWERS the knob
+ * still gets fewer attempts.
+ */
+const MAX_PINNED_TRANSIENT_ATTEMPTS = 4;
+/**
+ * Backoff before each pinned re-attempt: 250ms, 500ms, 1s, capped.
+ *
+ * A pinned retry re-sends the SAME non-idempotent request to the SAME
+ * upstream, and the retry loop has no other delay anywhere in it. The
+ * account's cooldown used to supply that spacing by accident, by blocking
+ * selection outright — which is also why the retry budget could never be
+ * spent. Waiving the cooldown for the retry (see `allowPinnedCooldown`)
+ * removes that accidental spacing, so replace it with a real one that is
+ * short enough not to dominate the request's latency: at most
+ * 250 + 500 + 1000 = 1.75s across the whole request at the default budget.
+ */
+const PINNED_RETRY_BACKOFF_STEPS_MS = [250, 500, 1_000] as const;
+
+function pinnedRetryBackoffMs(attempt: number): number {
+	const index = Math.min(
+		Math.max(0, attempt - 1),
+		PINNED_RETRY_BACKOFF_STEPS_MS.length - 1,
+	);
+	return PINNED_RETRY_BACKOFF_STEPS_MS[index] ?? 0;
+}
+
+/**
+ * Backoff schedule for a model-capacity wait (issue #689).
+ *
+ * Deliberately much longer than `PINNED_RETRY_BACKOFF_STEPS_MS`. That schedule
+ * spaces out re-sends of a request whose account might already be fine;
+ * capacity pressure is upstream and measured in minutes, so re-sending every
+ * 250ms would just be a tight poll against a busy backend. The last step
+ * repeats for every attempt past the table.
+ */
+const CAPACITY_RETRY_BACKOFF_STEPS_MS = [
+	2_000, 5_000, 15_000, 30_000, 60_000,
+] as const;
+
+/**
+ * Default wall-clock ceiling on capacity waiting for ONE request.
+ *
+ * The reporter's case is a long-running task started before stepping away, so
+ * the default has to be long enough to outlast a real capacity blip. It is
+ * still a hard ceiling: the request ends with the normal pool-exhausted 503
+ * rather than hanging forever.
+ */
+const DEFAULT_MODEL_CAPACITY_RETRY_MS = 10 * 60_000;
+const MAX_MODEL_CAPACITY_RETRY_MS = 60 * 60_000;
+const MODEL_CAPACITY_RETRY_ENV = "CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS";
+
+function capacityRetryBackoffMs(attempt: number): number {
+	const index = Math.min(
+		Math.max(0, attempt - 1),
+		CAPACITY_RETRY_BACKOFF_STEPS_MS.length - 1,
+	);
+	return CAPACITY_RETRY_BACKOFF_STEPS_MS[index] ?? 0;
+}
+
+/**
+ * Total time one request may spend waiting out model capacity.
+ *
+ * `0` disables the behaviour entirely and restores the pre-#689 handling, where
+ * a capacity response rotates the pool and 503s. Anything unparseable falls
+ * back to the default rather than disabling, so a typo does not silently turn
+ * the feature off.
+ */
+export function normalizeModelCapacityRetryMs(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		return DEFAULT_MODEL_CAPACITY_RETRY_MS;
+	}
+	return Math.min(Math.floor(value), MAX_MODEL_CAPACITY_RETRY_MS);
+}
+
+export function resolveModelCapacityRetryMs(
+	env: NodeJS.ProcessEnv = process.env,
+): number {
+	const raw = (env[MODEL_CAPACITY_RETRY_ENV] ?? "").trim();
+	if (!raw) return DEFAULT_MODEL_CAPACITY_RETRY_MS;
+	// An explicit 0 is the documented kill switch and must survive normalization,
+	// which otherwise treats "not a usable number" as "use the default".
+	const parsed = Number(raw);
+	if (parsed === 0) return 0;
+	return normalizeModelCapacityRetryMs(parsed);
+}
 
 const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_THREAD_GOAL_FALLBACKS = 512;
@@ -228,6 +356,12 @@ const ALLOWED_RESPONSES_PATHS = new Set([
 const ALLOWED_MODELS_PATHS = new Set([
 	URL_PATHS.MODELS,
 	`/v1${URL_PATHS.MODELS}`,
+]);
+const ALLOWED_IMAGE_PATHS = new Set([
+	"/images/generations",
+	"/images/edits",
+	"/v1/images/generations",
+	"/v1/images/edits",
 ]);
 const ALLOWED_THREAD_GOAL_PATHS = new Set([
 	"/thread/goal/get",
@@ -283,6 +417,8 @@ function createOutboundHeaders(
 	// header would ride along with the managed OAuth Bearer to OpenAI.
 	headers.delete("cookie");
 	headers.delete("proxy-authorization");
+	// Local capability marker for Codex image_gen, never an upstream credential.
+	headers.delete("x-openai-actor-authorization");
 	headers.set("authorization", `Bearer ${accessToken}`);
 	headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
 	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
@@ -493,6 +629,45 @@ function getThreadGoalFallback(
 	return goal;
 }
 
+/**
+ * Session identity that is stable for the life of a conversation.
+ *
+ * Every source here keeps the same value across turns, so state keyed on it
+ * accumulates. `resolveSessionKey` adds `previous_response_id` on top for
+ * callers that only need "requests that belong together right now".
+ */
+function resolveStableSessionKey(
+	headers: Headers,
+	parsedBody: RequestBody | null,
+): string | null {
+	const headerKey =
+		headers.get(OPENAI_HEADERS.SESSION_ID) ??
+		headers.get(OPENAI_HEADERS.CONVERSATION_ID) ??
+		null;
+	if (headerKey && headerKey.trim().length > 0) return headerKey.trim();
+	if (!parsedBody) return null;
+	if (typeof parsedBody.prompt_cache_key === "string") {
+		const key = parsedBody.prompt_cache_key.trim();
+		if (key.length > 0) return key;
+	}
+	const metadata = parsedBody.metadata;
+	if (isRecord(metadata)) {
+		return (
+			readStringRecordValue(metadata, "session_id") ??
+			readStringRecordValue(metadata, "conversation_id") ??
+			readStringRecordValue(metadata, "thread_id")
+		);
+	}
+	return null;
+}
+
+/**
+ * Session identity for affinity/pinning: the stable sources above, plus
+ * `previous_response_id` as a last resort. Precedence is unchanged from
+ * before `resolveStableSessionKey` was split out — `previous_response_id`
+ * still outranks the `metadata` fallbacks — so which account a request pins
+ * to does not shift.
+ */
 function resolveSessionKey(headers: Headers, parsedBody: RequestBody | null): string | null {
 	const headerKey =
 		headers.get(OPENAI_HEADERS.SESSION_ID) ??
@@ -542,6 +717,19 @@ function buildResponsesRequestContext(
 		family: getModelFamily(model ?? CURRENT_CODEX_MODEL),
 		stream: parsedBody?.stream === true,
 		sessionKey: resolveSessionKey(headers, parsedBody),
+		stableSessionKey: resolveStableSessionKey(headers, parsedBody),
+	};
+}
+
+function buildImageRequestContext(
+	req: IncomingMessage,
+	body: Buffer,
+	pathname: string,
+): RequestContext {
+	return {
+		...buildResponsesRequestContext(req, body),
+		upstreamPath: `/codex${pathname.replace(/^\/v1/, "")}`,
+		family: "codex",
 	};
 }
 
@@ -555,6 +743,7 @@ function buildModelsRequestContext(req: IncomingMessage): RequestContext {
 		family: "codex",
 		stream: false,
 		sessionKey: null,
+		stableSessionKey: null,
 	};
 }
 
@@ -583,6 +772,8 @@ function buildThreadGoalRequestContext(
 		family: "codex",
 		stream: false,
 		sessionKey,
+		stableSessionKey:
+			bodyThreadKey ?? queryThreadKey ?? resolveStableSessionKey(headers, parsedBody),
 	};
 }
 
@@ -614,7 +805,7 @@ function writeMethodOrPathError(res: ServerResponse): void {
 	writeJson(res, 404, {
 		error: {
 			message:
-				"Runtime rotation proxy only accepts Responses API, model discovery, and Codex thread goal requests.",
+				"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
 			code: "runtime_rotation_proxy_not_found",
 		},
 	});
@@ -848,6 +1039,7 @@ function buildWebSocketRequestContext(
 		family: getModelFamily(model ?? CURRENT_CODEX_MODEL),
 		stream: true,
 		sessionKey: resolveSessionKey(headers, parsedBody),
+		stableSessionKey: resolveStableSessionKey(headers, parsedBody),
 	};
 }
 
@@ -2165,6 +2357,15 @@ export async function startRuntimeRotationProxy(
 	const tokenRefreshSkewMs = getTokenRefreshSkewMs(pluginConfig);
 	const networkErrorCooldownMs = getNetworkErrorCooldownMs(pluginConfig);
 	const serverErrorCooldownMs = getServerErrorCooldownMs(pluginConfig);
+	// Normalize the explicit option as well as the env var: a caller passing a
+	// negative or multi-hour value would otherwise bypass the documented cap.
+	// `0` stays 0, since it is the documented kill switch.
+	const modelCapacityRetryMs =
+		options.modelCapacityRetryMs === 0
+			? 0
+			: options.modelCapacityRetryMs === undefined
+				? resolveModelCapacityRetryMs()
+				: normalizeModelCapacityRetryMs(options.modelCapacityRetryMs);
 	const tokenInvalidationCooldownMs = getTokenInvalidationCooldownMs(pluginConfig);
 	const minRotationIntervalMs = getMinRotationIntervalMs(pluginConfig);
 	const pidOffsetEnabled = getPidOffsetEnabled(pluginConfig);
@@ -2190,6 +2391,12 @@ export async function startRuntimeRotationProxy(
 			getPreemptiveQuotaRemainingPercent7d(pluginConfig),
 		maxDeferralMs: getPreemptiveQuotaMaxDeferralMs(pluginConfig),
 	});
+	const contextBudgetGuard = new ContextBudgetGuard({
+		enabled: getContextBudgetGuardEnabled(pluginConfig),
+		softPercent: getContextBudgetGuardSoftPercent(pluginConfig),
+		hardPercent: getContextBudgetGuardHardPercent(pluginConfig),
+		modelWindowOverrides: getContextBudgetGuardModelWindowOverrides(pluginConfig),
+	});
 	const sessionAffinityStore = getSessionAffinity(pluginConfig)
 		? new SessionAffinityStore({
 				ttlMs: getSessionAffinityTtlMs(pluginConfig),
@@ -2212,6 +2419,7 @@ export async function startRuntimeRotationProxy(
 		tokenRefreshSkewMs,
 		networkErrorCooldownMs,
 		serverErrorCooldownMs,
+		modelCapacityRetryMs,
 		tokenInvalidationCooldownMs,
 		minRotationIntervalMs,
 		pidOffsetEnabled,
@@ -2221,6 +2429,7 @@ export async function startRuntimeRotationProxy(
 		maxRequestBodyBytes,
 		quotaRemainingPercentThreshold,
 		preemptiveQuotaScheduler,
+		contextBudgetGuard,
 		sessionAffinityStore,
 		lastObservedAffinityGeneration,
 		forcedAccountIndex,
@@ -2345,24 +2554,32 @@ async function handleRequestInner(
 			req.method === "POST" && isResponsesPath(incomingUrl.pathname);
 		const isModelsRequest =
 			req.method === "GET" && isModelsPath(incomingUrl.pathname);
+		const isImageRequest =
+			req.method === "POST" && ALLOWED_IMAGE_PATHS.has(incomingUrl.pathname);
 		const isThreadGoalRequest =
 			(req.method === "GET" || req.method === "POST") &&
 			isThreadGoalPath(incomingUrl.pathname);
-		if (!isResponsesRequest && !isModelsRequest && !isThreadGoalRequest) {
+		if (
+			!isResponsesRequest && !isModelsRequest &&
+			!isThreadGoalRequest && !isImageRequest
+		) {
 			writeMethodOrPathError(res);
 			return;
 		}
 
 		state.status.totalRequests += 1;
 		const requestBody =
-			isResponsesRequest || (isThreadGoalRequest && req.method === "POST")
+			isResponsesRequest || isImageRequest ||
+			(isThreadGoalRequest && req.method === "POST")
 				? await readRequestBody(req, state.maxRequestBodyBytes)
 				: Buffer.alloc(0);
 		const context = isModelsRequest
 			? buildModelsRequestContext(req)
 			: isThreadGoalRequest
 				? buildThreadGoalRequestContext(req, requestBody, incomingUrl.pathname)
-				: buildResponsesRequestContext(req, requestBody);
+				: isImageRequest
+					? buildImageRequestContext(req, requestBody, incomingUrl.pathname)
+					: buildResponsesRequestContext(req, requestBody);
 		const requestStartedAt = state.now();
 		let policyDecision: RuntimePolicyDecision | null = null;
 		let projectKey: string | null = null;
@@ -2396,7 +2613,9 @@ async function handleRequestInner(
 				? "models"
 				: isThreadGoalRequest
 					? "thread-goal"
-					: "responses",
+					: isImageRequest
+						? "images"
+						: "responses",
 			model: context.model,
 			projectKey,
 			requestId: traceId,
@@ -2431,6 +2650,50 @@ async function handleRequestInner(
 			});
 			return;
 		}
+		// Context budget guard: pause BEFORE spending an upstream round-trip on a
+		// request that the tracked session is already over the hard threshold
+		// for, rather than reacting to the eventual context_length_exceeded 400
+		// (which this rotation-proxy path does not otherwise handle at all — see
+		// lib/context-overflow.ts, wired only into the plugin-loader fetch path).
+		// Runs independent of account selection: which account serves the
+		// request has no bearing on how full its context already is. Hoisted
+		// to function scope (not just this `if`) so the soft-threshold branch
+		// below can attach its non-blocking header to the eventual forwarded
+		// response.
+		let budgetAdvisory: ReturnType<typeof state.contextBudgetGuard.getAdvisory> = {
+			level: "ok",
+		};
+		if (isResponsesRequest) {
+			budgetAdvisory = state.contextBudgetGuard.getAdvisory(
+				context.stableSessionKey ?? "",
+				requestStartedAt,
+				context.model,
+			);
+			if (budgetAdvisory.level === "hard") {
+				// One-shot: the pause returns before the request is forwarded, so
+				// `update()` below never runs for it and the recorded usage cannot
+				// fall on its own. Without dropping the snapshot the first crossing
+				// would wedge the session permanently — including the `/compact`
+				// turn this pause tells the user to run, which carries the same
+				// session key.
+				state.contextBudgetGuard.noteHardPauseEmitted(
+					context.stableSessionKey ?? "",
+				);
+				await usageRecorder.record({
+					outcome: "blocked",
+					statusCode: HTTP_STATUS.OK,
+					errorCode: "context_budget_guard_paused",
+				});
+				const pauseResponse = createContextBudgetPauseResponse(budgetAdvisory);
+				res.writeHead(
+					pauseResponse.status,
+					Object.fromEntries(pauseResponse.headers.entries()),
+				);
+				res.end(await pauseResponse.text());
+				return;
+			}
+		}
+
 		const upstreamUrl = buildUpstreamUrl(
 			req,
 			state.upstreamBaseUrl,
@@ -2445,6 +2708,24 @@ async function handleRequestInner(
 		);
 		let transientAttempts = 0;
 		let transientExhaustionReason: ExhaustionReason | null = null;
+		// Capacity waits are counted separately from `transientAttempts` and from
+		// the pinned selection cap. Both of those bound how many DIFFERENT
+		// accounts or re-sends a failing request may burn; a capacity wait is not
+		// a failure of any account, it is the same request pausing for an
+		// upstream that is busy, and it has its own wall-clock ceiling. See #689.
+		let capacityRetries = 0;
+		// A wall-clock deadline, not a sum of sleeps. The upstream request and
+		// the error-body read also consume the budget, so summing only the
+		// planned sleeps let a slow capacity response push one request past the
+		// documented ceiling. Request-local, so concurrent requests never share
+		// a deadline.
+		let capacityDeadlineAt: number | null = null;
+		// Only the RESPONSE tells us the caller is still there. `req` is an
+		// IncomingMessage whose stream Node destroys once the request body has
+		// been fully read, which this proxy does up front, so `req.destroyed` is
+		// routinely true on a perfectly healthy request and must not be read as a
+		// disconnect.
+		const clientGone = (): boolean => res.destroyed || res.writableEnded;
 		const accountSkipReasons = new Map<number, string>();
 		let reloadedAfterNoAccount = false;
 
@@ -2456,7 +2737,38 @@ async function handleRequestInner(
 		// otherwise glue an in-flight chat thread to the previously selected
 		// account. The proxy itself never bumps the generation, so its own
 		// debounced disk writes do not clear affinity. See issue #474.
-		const storageMeta = readStorageMetaFromDisk();
+		/** Reconcile once before selection or recording a new upstream observation. */
+		const reconcileManualSelection = () => {
+			const meta = readStorageMetaFromDisk();
+			for (const manager of state.knownAccountManagers) {
+				manager.applyManualSelection(meta);
+			}
+			if (meta.affinityGeneration > state.lastObservedAffinityGeneration) {
+				const switchedAccount = meta.pinnedAccountIndex === null
+					? null
+					: accountManager.getAccountByIndex(meta.pinnedAccountIndex);
+				if (switchedAccount) {
+					state.preemptiveQuotaScheduler.clearByPrefix(
+						buildQuotaScheduleAccountPrefix(switchedAccount),
+					);
+				} else if (meta.pinnedAccountIndex !== null) {
+					// A pin we cannot resolve: this long-lived proxy re-reads only
+					// pin/gen, never the account list, so a `login` that appended an
+					// account before the `switch` leaves the new index out of range
+					// here. The generation only bumps on the NEXT user-initiated
+					// switch, so skipping the clear and advancing anyway would strand
+					// the pre-switch quota observation forever, which is the exact
+					// deferral this reconciliation exists to end. Drop every cached
+					// observation instead: it only costs a re-probe, and real 429
+					// windows live on the accounts themselves, not in this cache.
+					state.preemptiveQuotaScheduler.clearAll();
+				}
+				state.sessionAffinityStore?.clearAll();
+				state.lastObservedAffinityGeneration = meta.affinityGeneration;
+			}
+			return meta;
+		};
+		const storageMeta = reconcileManualSelection();
 		// The ephemeral --account pin (issue #623) takes precedence over the
 		// persisted `switch` pin for this invocation, without ever mutating disk
 		// state. Use `??` (not `||`) so a forced index of 0 is honored. When set,
@@ -2465,15 +2777,120 @@ async function handleRequestInner(
 		// applies unchanged because it all keys off `pinnedIndex` / `isPinned`.
 		const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
 		const isPinned = typeof pinnedIndex === "number";
-		if (storageMeta.affinityGeneration > state.lastObservedAffinityGeneration) {
-			state.sessionAffinityStore?.clearAll();
-			state.lastObservedAffinityGeneration = storageMeta.affinityGeneration;
+		// The token bucket spreads load across a selectable pool. A pin has no
+		// alternative account, so exhausting that local heuristic can only reject a
+		// request that the pinned account could serve. Keep circuit-breaker admission
+		// inside consumeToken, but do not debit the pool-scoring bucket for a pin.
+		const bypassPoolTokenBucket = isPinned;
+		const refundConsumedPoolToken = (account: ManagedAccount): void => {
+			if (!bypassPoolTokenBucket) {
+				accountManager.refundToken(account, context.family, context.model);
+			}
+		};
+		// `rotations` counts moves to a DIFFERENT account. A pinned request has
+		// nowhere to move: every retry below re-attempts the same one. Counting
+		// those reported several account rotations on a single-account pool whose
+		// pin forbids rotation, in `rotation status` and the persisted counters.
+		const noteRotation = (): void => {
+			if (!isPinned) state.status.rotations += 1;
+		};
+		// Pool attempts are normally capped by account count because an unpinned
+		// account is selected at most once per request. A pin can only retry the
+		// same account, so use the configured transient-attempt limit instead of
+		// the account-count limit -- capped by MAX_PINNED_TRANSIENT_ATTEMPTS so a
+		// pool knob about rate-limited rotation cannot become a same-account
+		// re-send multiplier. Every pinned pass is still subject to the hard
+		// 16-selection ceiling above.
+		if (isPinned) {
+			transientAttemptLimit = Math.max(
+				1,
+				Math.min(state.maxRuntimeAccountAttempts, MAX_PINNED_TRANSIENT_ATTEMPTS),
+			);
 		}
 
+		/**
+		 * Wait out a "selected model is at capacity" response, then let the loop
+		 * re-send the request (issue #689).
+		 *
+		 * Capacity is a property of the MODEL, not of an account, so the normal
+		 * handling is actively wrong for it: rotating spends the pool's transient
+		 * budget against accounts that will all fail identically, and the request
+		 * ends as a pool-exhausted 503 within seconds. That is what kills a
+		 * long-running task started before the user stepped away.
+		 *
+		 * The responding account is left completely unpenalized: its pool token is
+		 * refunded, it is not marked rate limited, not cooled down, and it is
+		 * removed from `attemptedIndexes` so it stays selectable. Selection then
+		 * runs normally on the next pass, which may pick a different account. That
+		 * is deliberate: with capacity being model-wide, no account is a better bet,
+		 * and forcing a request-local pin here would duplicate the pinning path for
+		 * no gain.
+		 *
+		 * @param retryAfterMs Upstream hint when one was actually sent, else `null`
+		 * so the backoff table is used. Do NOT pass a synthesized default.
+		 * @param account Account that just saw the capacity response.
+		 * @returns `"retry"` to re-send, `"give-up"` to fall through to normal
+		 * handling, `"client-gone"` when the caller must abandon the request.
+		 */
+		const waitOutModelCapacity = async (
+			retryAfterMs: number | null,
+			account: ManagedAccount,
+		): Promise<"retry" | "give-up" | "client-gone"> => {
+			const budgetMs = state.modelCapacityRetryMs;
+			if (!Number.isFinite(budgetMs) || budgetMs <= 0) return "give-up";
+			if (capacityDeadlineAt === null) {
+				capacityDeadlineAt = state.now() + budgetMs;
+			}
+			const remainingMs = capacityDeadlineAt - state.now();
+			if (remainingMs <= 0) return "give-up";
+			if (clientGone()) return "client-gone";
+			const hinted =
+				retryAfterMs !== null &&
+				Number.isFinite(retryAfterMs) &&
+				retryAfterMs > 0
+					? retryAfterMs
+					: capacityRetryBackoffMs(capacityRetries + 1);
+			const waitMs = Math.min(Math.max(0, Math.floor(hinted)), remainingMs);
+			if (waitMs <= 0) return "give-up";
+			capacityRetries += 1;
+			state.status.retries += 1;
+			proxyLog.warn("model at capacity; waiting before re-sending", {
+				traceId,
+				waitMs,
+				attempt: capacityRetries,
+				remainingMs,
+				budgetMs,
+			});
+			// The attempt debited a pool token before the upstream call. The account
+			// did not fail, so refund it: without this a sustained capacity event
+			// drains healthy accounts and later requests are refused admission with
+			// `token-exhausted` well before the retry budget expires.
+			refundConsumedPoolToken(account);
+			attemptedIndexes.delete(account.index);
+			await sleep(waitMs);
+			// A capacity wait runs for tens of seconds. Re-sending an authenticated
+			// upstream request for a response nobody is reading wastes upstream
+			// capacity and extends how long the token is in flight.
+			if (clientGone()) return "client-gone";
+			return "retry";
+		};
+
+		let runtimeSelectionIterations = 0;
 		while (
-			attemptedIndexes.size < accountCount &&
-			transientAttempts < transientAttemptLimit
+			(isPinned || attemptedIndexes.size < accountCount) &&
+			transientAttempts < transientAttemptLimit &&
+			(!isPinned ||
+				runtimeSelectionIterations - capacityRetries <
+					MAX_PINNED_SELECTION_ITERATIONS)
 		) {
+			// Space out same-account re-sends. The loop has no other delay in it,
+			// and the pinned retry deliberately waives the account's own cooldown
+			// (below), so without this two copies of the same non-idempotent
+			// request would hit upstream back to back.
+			if (isPinned && transientAttempts > 0) {
+				await sleep(pinnedRetryBackoffMs(transientAttempts));
+			}
+			runtimeSelectionIterations += 1;
 			const rotationStickyBoost: Record<number, number> =
 				state.minRotationIntervalMs > 0 &&
 				state.lastGlobalAccountIndex !== null &&
@@ -2510,6 +2927,12 @@ async function handleRequestInner(
 					stickyBoostByAccount: rotationStickyBoost,
 					pidOffsetEnabled: state.pidOffsetEnabled,
 					schedulingStrategy: state.schedulingStrategy,
+					// Only on a RETRY pass. The first pass still honors a cooldown
+					// another request left on the pin, so an already-cooling pinned
+					// account 503s immediately as before; from the second pass on,
+					// this request's own retry budget outranks the cooldown it just
+					// created for itself.
+					allowPinnedCooldown: isPinned && transientAttempts > 0,
 				});
 			const selected =
 				state.routingMutexMode === "enabled"
@@ -2598,13 +3021,32 @@ async function handleRequestInner(
 				);
 				accountManager.recordRateLimit(selected, context.family, context.model);
 				accountManager.saveToDiskDebounced();
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
-			if (!accountManager.consumeToken(selected, context.family, context.model)) {
-				accountSkipReasons.set(selected.index, "token-exhausted");
+			// consumeToken also takes the race-safe circuit admission slot, so it
+			// can reject for either gate. Take the reason from the call that
+			// rejected rather than re-deriving it: a second evaluation reports the
+			// first blocker it finds (a live cooldown would mask a drained bucket)
+			// and cannot see a half-open probe slot that was just claimed.
+			const admission = accountManager.consumeTokenWithReason(
+				selected,
+				context.family,
+				context.model,
+				{ bypassTokenBucket: bypassPoolTokenBucket },
+			);
+			if (!admission.ok) {
+				accountSkipReasons.set(selected.index, admission.reason);
 				exhaustionReason = "rate-limit";
+				// Neither gate can change inside this loop -- nothing here refills the
+				// bucket or closes a circuit -- and a pin has no other account to move
+				// to, so re-selecting would burn the whole 16-iteration ceiling
+				// re-deriving the identical verdict. (For a pin the bucket is bypassed
+				// entirely, so the reason here is always circuit-open.) Unpinned
+				// selection still continues -- there the next pass picks a DIFFERENT
+				// account.
+				if (isPinned) break;
 				continue;
 			}
 
@@ -2618,7 +3060,13 @@ async function handleRequestInner(
 				tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs,
 			});
 			if (!refreshed.ok) {
-				accountManager.refundToken(selected, context.family, context.model);
+				refundConsumedPoolToken(selected);
+				// No accountSkipReasons write here: ensureFreshAccessToken always
+				// applies an auth cooldown before returning !ok, so the next
+				// selection pass overwrites whatever this set with
+				// cooling-down:auth-failure, the invalidated exit returns a 401
+				// without reading the map at all, and the budget-boundary block
+				// below already records "auth-failure" for a pin out of retries.
 				exhaustionReason = "auth-failure";
 				if (refreshed.invalidated) {
 					// Refresh endpoint explicitly revoked the token. Stop cascade:
@@ -2641,13 +3089,13 @@ async function handleRequestInner(
 				transientAttempts += 1;
 				transientExhaustionReason = "auth-failure";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
 			const accountId = resolveAccountId(refreshed.account, refreshed.accessToken);
 			if (!accountId) {
-				accountManager.refundToken(refreshed.account, context.family, context.model);
+				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				accountManager.markAccountCoolingDown(
 					refreshed.account,
@@ -2664,7 +3112,7 @@ async function handleRequestInner(
 				transientAttempts += 1;
 				transientExhaustionReason = "auth-failure";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
@@ -2679,9 +3127,26 @@ async function handleRequestInner(
 			);
 
 			let upstream: Response;
+			// Abort the in-flight upstream fetch when the client disconnects
+			// before headers arrive. Image generation holds upstream capacity
+			// for the full fetch timeout, so a caller that goes away right
+			// after sending must not leave that work running. `forwardStreamingResponse`
+			// already cancels the stream once headers are written; this covers
+			// the pre-header window instead. `writableEnded` distinguishes a
+			// premature close from the clean `res.end()` that ends every request.
+			//
+			// The listener is removed in `finally` once the fetch settles. Without
+			// that, every retry above the 10-listener default threshold that reaches
+			// this fetch leaks another one-shot `close` handler onto the same `res`,
+			// emitting `MaxListenersExceededWarning` when `retryAllAccountsMaxRetries`
+			// is high and the account pool is large.
+			const fetchAbortController = new AbortController();
+			const onClientClose = () => {
+				if (!res.writableEnded) fetchAbortController.abort();
+			};
 			try {
 				state.status.upstreamRequests += 1;
-				const fetchAbortController = new AbortController();
+				res.once("close", onClientClose);
 				const upstreamRequestInit: RequestInit = {
 					method: context.method,
 					headers: outboundHeaders,
@@ -2690,29 +3155,75 @@ async function handleRequestInner(
 				if (context.method === "POST") {
 					upstreamRequestInit.body = context.body;
 				}
+				const fetchTimeoutMs = isImageRequest
+					? Math.max(state.fetchTimeoutMs, 300_000)
+					: state.fetchTimeoutMs;
 				upstream = await withTimeout(
 					state.fetchImpl(upstreamUrl, upstreamRequestInit),
-					state.fetchTimeoutMs,
+					fetchTimeoutMs,
 					() => fetchAbortController.abort(),
-					`upstream fetch timed out after ${state.fetchTimeoutMs}ms`,
+					`upstream fetch timed out after ${fetchTimeoutMs}ms`,
 				);
 			} catch (error) {
-				state.status.lastError = error instanceof Error ? error.message : String(error);
-				accountManager.refundToken(refreshed.account, context.family, context.model);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				// errors-logging-08: a custom fetchImpl, a proxy agent, or an undici
+				// cause chain can embed the request URL or credential material in the
+				// raw message, so mask before it reaches any state.status consumer.
+				const transportError = maskString(
+					error instanceof Error ? error.message : String(error),
+				);
+				state.status.lastError = transportError;
+				// errors-logging-01: give the failure a structured, trace-correlated
+				// line instead of only a last-write-wins status string. Nothing else
+				// on this path reaches proxyLog, because the request does not throw.
+				proxyLog.error("upstream transport failure", {
+					traceId,
+					code: "codex_runtime_rotation_transport_error",
+					error: transportError,
+				});
+				refundConsumedPoolToken(refreshed.account);
+				// A timeout may occur after generation; do not retry within this request.
+				if (isImageRequest) {
+					writeJson(res, 502, {
+						error: {
+							code: "image_upstream_transport_error",
+							message: "Image upstream transport failed; not retried by the proxy.",
+						},
+					});
+					await usageRecorder.record({
+						outcome: "failure", statusCode: 502,
+						errorCode: "image_upstream_transport_error", account: refreshed.account,
+					});
+					return;
+				}
+				// A pre-header transport exception is a property of the network path,
+				// not of this account's credentials or quota, so it must NOT feed the
+				// account's circuit breaker / health tracker: that is what would
+				// otherwise retire a healthy account for an outage it did not cause.
+				// See #677.
+				//
+				// The short timed cooldown IS still applied. It is self-healing, it
+				// keeps an account whose upstream hangs from stalling 1/N of every
+				// later request for the full fetch timeout, and it is what gives the
+				// exhaustion 503 a non-zero `retry_after_ms` to back the client off
+				// with (`getMinWaitTimeForFamily` returns 0 while any account is
+				// still selectable).
 				accountManager.markAccountCoolingDown(
 					refreshed.account,
 					state.networkErrorCooldownMs,
 					"network-error",
 				);
 				accountManager.saveToDiskDebounced();
+				accountSkipReasons.set(refreshed.account.index, "network-error");
 				exhaustionReason = "network-error";
 				transientAttempts += 1;
 				transientExhaustionReason = "network-error";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
+			} finally {
+				res.off("close", onClientClose);
 			}
+			reconcileManualSelection();
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
 				upstream.headers,
 				upstream.status,
@@ -2724,10 +3235,35 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				const retryAfterMs =
+				// Keep the upstream HINT separate from the 60s fallback. Passing the
+				// synthesized default into the capacity wait would make every
+				// hint-less capacity 429 sleep a full minute and leave the 2s/5s/15s
+				// backoff table dead on this path.
+				const retryAfterHintMs =
 					parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
-					parseRetryAfterBodyMs(bodyText, state.now()) ??
-					60_000;
+					parseRetryAfterBodyMs(bodyText, state.now());
+				const retryAfterMs = retryAfterHintMs ?? 60_000;
+				// Reading the body awaited I/O; a switch may have landed meanwhile.
+				reconcileManualSelection();
+				// A capacity 429 is not this account's quota. Marking it rate
+				// limited would take a healthy account out of the pool for the
+				// retry-after window on an outage that affects every account.
+				if (isModelAtCapacityError(upstream.status, bodyText)) {
+					const outcome = await waitOutModelCapacity(
+						retryAfterHintMs,
+						refreshed.account,
+					);
+					if (outcome === "client-gone") {
+						await usageRecorder.record({
+							outcome: "failure",
+							statusCode: upstream.status,
+							errorCode: "client_disconnected_during_capacity_wait",
+							account: refreshed.account,
+						});
+						return;
+					}
+					if (outcome === "retry") continue;
+				}
 				state.preemptiveQuotaScheduler.markRateLimited(
 					quotaScheduleKey,
 					retryAfterMs,
@@ -2748,7 +3284,7 @@ async function handleRequestInner(
 				transientAttempts += 1;
 				transientExhaustionReason = "rate-limit";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
@@ -2759,11 +3295,7 @@ async function handleRequestInner(
 					const accountWasEnabled =
 						accountManager.getAccountByIndex(refreshed.account.index)?.enabled !==
 						false;
-					accountManager.refundToken(
-						refreshed.account,
-						context.family,
-						context.model,
-					);
+					refundConsumedPoolToken(refreshed.account);
 					if (accountWasEnabled) {
 						accountManager.recordFailure(
 							refreshed.account,
@@ -2776,7 +3308,7 @@ async function handleRequestInner(
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					exhaustionReason = "deactivated";
 					state.status.retries += 1;
-					state.status.rotations += 1;
+					noteRotation();
 					continue;
 				}
 
@@ -2851,7 +3383,7 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				accountManager.refundToken(refreshed.account, context.family, context.model);
+				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
@@ -2898,13 +3430,47 @@ async function handleRequestInner(
 				transientAttempts += 1;
 				transientExhaustionReason = "auth-failure";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
+			// Forward image validation/moderation/5xx errors without cross-account replay.
+			// Explicit 429 quota and 401 auth handling above still use the existing pool.
+			if (isImageRequest && upstream.status >= 400) {
+				const forwarded = await forwardStreamingResponse(
+					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
+				);
+				await usageRecorder.record({
+					outcome: "failure", statusCode: upstream.status,
+					errorCode: forwarded ? "image_upstream_error" : "stream_forward_failed",
+					account: refreshed.account,
+				});
+				return;
+			}
 			if (upstream.status >= 500) {
-				await readErrorBody(upstream, state.streamStallTimeoutMs);
-				accountManager.refundToken(refreshed.account, context.family, context.model);
+				const bodyText = await readErrorBody(
+					upstream,
+					state.streamStallTimeoutMs,
+				);
+				// A capacity 5xx is upstream load, not a broken account, so it
+				// must not cool the account down or count against the pool.
+				if (isModelAtCapacityError(upstream.status, bodyText)) {
+					const outcome = await waitOutModelCapacity(
+						parseRetryAfterHeaderMs(upstream.headers, state.now()),
+						refreshed.account,
+					);
+					if (outcome === "client-gone") {
+						await usageRecorder.record({
+							outcome: "failure",
+							statusCode: upstream.status,
+							errorCode: "client_disconnected_during_capacity_wait",
+							account: refreshed.account,
+						});
+						return;
+					}
+					if (outcome === "retry") continue;
+				}
+				refundConsumedPoolToken(refreshed.account);
 				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				accountManager.markAccountCoolingDown(
 					refreshed.account,
@@ -2916,7 +3482,7 @@ async function handleRequestInner(
 				transientAttempts += 1;
 				transientExhaustionReason = "server-error";
 				state.status.retries += 1;
-				state.status.rotations += 1;
+				noteRotation();
 				continue;
 			}
 
@@ -2991,11 +3557,25 @@ async function handleRequestInner(
 				state.schedulingStrategy,
 			);
 
+			// Recover the upstream token counts as the body streams past. Without
+			// them every ledger row lands with all-zero tokens and a zero cost, so
+			// evaluateBudgetGuard compares `0 >= limit` for maxTokens/maxCostUsd
+			// and those caps never fire — `budget set --cost 50` would allow
+			// unlimited spend, with only --requests actually enforced.
+			const usageScanner = createUsageStreamScanner({
+				contentType: upstream.headers.get("content-type"),
+			});
 			const forwarded = await forwardStreamingResponse(
 				upstream,
 				res,
 				state.status,
 				() => {
+					// Deliberately NOT the pre-header transport policy above,
+					// which skips recordFailure (#677). By this point the
+					// upstream accepted the request and began responding, so a
+					// broken stream is a signal about THIS account's session
+					// (upstream tearing it down) rather than about the shared
+					// network path, and it should still credit the breaker.
 					accountManager.recordFailure(
 						refreshed.account,
 						context.family,
@@ -3010,19 +3590,69 @@ async function handleRequestInner(
 					accountManager.saveToDiskDebounced();
 				},
 				state.streamStallTimeoutMs,
+				usageScanner.push,
+				budgetAdvisory.level === "soft"
+					? buildContextBudgetHeaders(budgetAdvisory)
+					: undefined,
 			);
+			// A stream that broke mid-flight still bills for whatever the upstream
+			// reported before the break, so record the counts on both outcomes.
+			const usageTokens = usageScanner.result();
+			// Responses is mostly stateless (store=false): each successful turn's
+			// input_tokens reflects the full conversation resent this call, so it
+			// doubles as a live read of the session's current context size. Record
+			// it even on a broken stream, matching the ledger's own choice above —
+			// the tokens upstream billed for were still resent as full context.
+			//
+			// input + output, NOT total: `usageTokens.totalTokens` is the
+			// provider's `total_tokens`, which also counts `reasoning_tokens`.
+			// Reasoning is not carried into the next turn's input, so counting
+			// it here inflates the measurement by this turn's thinking budget
+			// against a deliberately tight threshold. `outputTokens` is already
+			// reasoning-stripped (lib/usage/usage-extraction.ts).
+			if (usageTokens && context.stableSessionKey && context.model) {
+				state.contextBudgetGuard.update(context.stableSessionKey, {
+					model: context.model,
+					contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
+					updatedAt: state.now(),
+				});
+			}
 			await usageRecorder.record({
 				outcome: forwarded ? "success" : "failure",
 				statusCode: upstream.status,
 				errorCode: forwarded ? null : "stream_forward_failed",
 				account: refreshed.account,
+				...(usageTokens ?? {}),
 			});
 			return;
 		}
 
 		if (
+			isPinned &&
+			typeof pinnedIndex === "number" &&
+			transientAttempts >= transientAttemptLimit
+		) {
+			const pinnedAccount = accountManager.getAccountByIndex(pinnedIndex);
+			const liveReason = pinnedAccount
+				? accountManager.getManagedAccountRuntimeSkipReason(
+						pinnedAccount,
+						context.family,
+						context.model,
+					)
+				: "missing";
+			const finalAttemptReason =
+				transientExhaustionReason === "rate-limit"
+					? "rate-limited"
+					: transientExhaustionReason;
+			const finalPinnedReason = liveReason ?? finalAttemptReason;
+			if (finalPinnedReason !== null) {
+				accountSkipReasons.set(pinnedIndex, finalPinnedReason);
+			}
+		}
+
+		if (
 			transientAttempts >= transientAttemptLimit &&
-			attemptedIndexes.size < accountCount
+			(isPinned || attemptedIndexes.size < accountCount)
 		) {
 			exhaustionReason = "budget";
 		} else if (
@@ -3054,17 +3684,13 @@ async function handleRequestInner(
 			// so advertising a record's expiry would invite a retry into another
 			// 503.
 			//
-			// The recorded reason alone is not enough to detect one. It is the
-			// SELECTION verdict, and this request can make the pin permanently
-			// unselectable after selection already ran: a workspace-disabled
-			// 402/403 calls setAccountEnabled(index, false) above and then
-			// continues, so the next pass records "already-attempted" and the
-			// disable never surfaces. With a breaker tripped by the same failure
-			// the 503 would then advertise the circuit's ~30s reset for an
-			// account no timer will ever re-admit. Re-read the pin's CURRENT
-			// runtime state so a permanent blocker cannot hide behind the
-			// verdict; the recorded reason still covers the selection-only
-			// verdicts ("missing", "policy-blocked") that state cannot express.
+			// The recorded reason alone is not enough to detect every concurrent
+			// state change: it is the most recent selection/attempt verdict, while
+			// this request or another one can make the pin permanently unselectable
+			// after that verdict was recorded. Re-read the pin's CURRENT runtime
+			// state so a permanent blocker cannot hide behind an earlier transient
+			// failure; the recorded reason still covers selection-only verdicts
+			// ("missing", "policy-blocked") that state cannot express.
 			const pinnedCurrentSkipReason =
 				pinnedAccount === null
 					? null
@@ -3078,28 +3704,34 @@ async function handleRequestInner(
 					PINNED_PERMANENT_SKIP_REASONS.has(pinnedSkipReason)) ||
 				(pinnedCurrentSkipReason !== null &&
 					PINNED_PERMANENT_SKIP_REASONS.has(pinnedCurrentSkipReason));
-			// Otherwise recovery comes from the pinned account's persisted state, not the
-			// recorded skip reason: a direct 429/cooldown on the pinned account
-			// reaches this 503 as "already-attempted" (the retry loop's selection
-			// verdict) while the record it just wrote is what actually bounds
-			// recovery — and with several overlapping records the account stays
-			// skipped until the LAST one expires, so the latest bound is the one
-			// worth advertising.
-			const pinnedStateRecoveryAtMs =
+			// Otherwise recovery comes from the pinned account's persisted state,
+			// not merely the recorded skip token. With several overlapping records
+			// the account stays skipped until the LAST one expires, so the latest
+			// bound is the one worth advertising.
+			//
+			// One clock for the whole body. The recovery bound and the
+			// rate-limit bound are compared against each other below, so
+			// reading state.now() per lookup would let a record expire between
+			// them and report a rate-limited pin as bounded by something else.
+			const evaluatedAtMs = state.now();
+			// Both bounds come from a single pass over the account's records.
+			const pinnedRecoveryBounds =
 				pinnedAccount === null
 					? null
-					: getAccountRecoveryTimeForFamily(
+					: getAccountRecoveryBoundsForFamily(
 							pinnedAccount,
-							state.now(),
+							evaluatedAtMs,
 							context.family,
 							context.model,
 						);
+			const pinnedStateRecoveryAtMs =
+				pinnedRecoveryBounds?.recoveryAtMs ?? null;
 			// An open circuit outlives the short failure cooldowns that tripped
 			// it; its deadline lives in the breaker, not the account record.
 			const pinnedCircuitRecoveryAtMs =
 				pinnedAccount === null
 					? null
-					: accountManager.getCircuitRecoveryTime(pinnedAccount, state.now());
+					: accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs);
 			const pinnedResetAtMs =
 				pinnedBlockedPermanently ||
 				(pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null)
@@ -3108,6 +3740,17 @@ async function handleRequestInner(
 							pinnedStateRecoveryAtMs ?? 0,
 							pinnedCircuitRecoveryAtMs ?? 0,
 						);
+			// The message only words the recovery deadline as a rate-limit reset
+			// when the rate-limit records are in fact what supplies it — a
+			// breaker or cooldown can end later and then bounds it instead.
+			const pinnedRateLimitResetAtMs =
+				pinnedRecoveryBounds?.rateLimitAtMs ?? null;
+			const recoveryBound =
+				pinnedResetAtMs !== null &&
+				pinnedRateLimitResetAtMs !== null &&
+				pinnedRateLimitResetAtMs >= pinnedResetAtMs
+					? "rate-limit"
+					: "other";
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,
 				accountSkipReasons,
@@ -3116,7 +3759,11 @@ async function handleRequestInner(
 					pinSource:
 						typeof state.forcedAccountIndex === "number" ? "forced" : "manual",
 					resetAtMs: pinnedResetAtMs,
-					now: state.now(),
+					recoveryBound,
+					// Re-read runtime state for the operator-facing sentence so a
+					// concurrent or later blocker can refine the recorded verdict.
+					currentSkipReason: pinnedCurrentSkipReason,
+					now: evaluatedAtMs,
 				},
 			);
 			if (errorBody.reason === null) {

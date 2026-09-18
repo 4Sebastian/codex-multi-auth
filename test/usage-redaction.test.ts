@@ -15,6 +15,11 @@ function sha256(value: string): string {
 }
 
 describe("usage ledger redaction and normalization", () => {
+	it("preserves the images operation instead of silently normalizing it to unknown", () => {
+		const row = normalizeUsageLedgerRow({ source: "runtime-proxy", operation: "images", outcome: "success", model: "gpt-image-2", statusCode: 200, accountIndex: 1 });
+		expect(row.operation).toBe("images");
+		expect(row.account?.index).toBe(1);
+	});
 	afterEach(() => {
 		vi.useRealTimers();
 	});

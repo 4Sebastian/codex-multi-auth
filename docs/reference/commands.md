@@ -1,6 +1,6 @@
 # Command Reference
 
-Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.8.6`).
+Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.15.0`).
 
 ---
 
@@ -38,9 +38,10 @@ Compatibility forms are supported for migrations and wrapper-routed environments
 
 | Command | Description |
 | --- | --- |
-| `codex-multi-auth login` | Open interactive auth dashboard. Flags: `--device-auth`, `--manual`/`--no-browser`, `login --org <org_id>` |
+| `codex-multi-auth login` | Open interactive auth dashboard. Flags: `--device-auth`, `--manual`/`--no-browser`, `--org <org_id>`, `--preserve-selection`, `--account <index\|email\|account_id>` |
 | `codex-multi-auth status` | Print account pool, pin, runtime metrics, and storage summary (`list` is the same command) |
 | `codex-multi-auth check` | Live-probe account health against the Codex backend |
+| `codex-multi-auth limits --json` | Print configured accounts joined to their cached quota windows; add `--refresh` for an age-gated refresh |
 
 ---
 
@@ -78,6 +79,53 @@ Reset-time details:
   `forecast` keep their narrower percentage-only summaries.
 
 Turning `showQuotaDetails` off reduces the line to a bare `live session OK`.
+
+---
+
+## `codex-multi-auth limits`
+
+Prints a stable, machine-readable quota snapshot for local integrations:
+
+```console
+codex-multi-auth limits --json
+codex-multi-auth limits --json --refresh
+codex-multi-auth auth limits --json          # supported namespaced alias
+codex-multi-auth auth limits --json --refresh
+```
+
+The default command reads the local quota cache and performs no network
+requests. `--refresh` reuses the dashboard's sequential quota refresh and its
+five-minute freshness floor: only enabled accounts with usable credentials and
+missing or stale cache entries are probed. Countdown text should be calculated
+by the consumer from `resetAtMs`; the command emits numeric values rather than
+locale-formatted dates.
+
+The top-level object has `schemaVersion: 1`, a millisecond `generatedAt`, a
+`mode` of `cached` or `refresh` describing the requested command mode,
+`selection`, and `accounts`. Each configured account includes
+`index`, `label`, `enabled`, `current`, and either a `quota` object or `null`.
+Quota objects contain `updatedAt`, HTTP `status`, `planType`, and `primary` /
+`secondary` windows with `usedPercent`, `windowMinutes`, and `resetAtMs`.
+Unavailable provider values are explicit JSON `null`; internal probe-model names,
+credentials, and orphan cache entries are not emitted. Account emails are masked
+inside `label` the same way `forecast --json` masks them.
+
+`selection` reports the configured routing target: `pinnedIndex` is the `switch`
+pin or `null`, `activeIndexByFamily` is the per-family active index, and
+`routedIndex` is `pinnedIndex` when a pin is set and the `codex` active index
+otherwise (`null` for an empty pool). An account's `current` is true when its
+`index` equals `routedIndex`.
+
+`selection` describes configuration, not liveness. It is not a prediction of
+which account the next request lands on: the runtime proxy skips an account that
+is disabled, inside a rate-limit window, cooling down, or behind an open circuit
+breaker, and it applies session affinity and the ephemeral `--account` override,
+none of which are written to storage. Use `enabled` on each row for the cheap
+check, and `why-selected --json` when you need the live selection and its
+reasoning.
+
+`--json` (`-j`) is required. `--help` / `-h` prints focused usage. Unknown flags
+fail with exit code 1 without reading account storage or quota cache.
 
 ---
 
@@ -147,7 +195,9 @@ Turning `showQuotaDetails` off reduces the line to a bare `live session OK`.
 | `--device-auth` | login | Use the OpenAI Codex device-code flow for remote/headless login (mutually exclusive with `--manual` / `--no-browser`) |
 | `--manual`, `--no-browser` | login | Skip browser launch and use manual callback flow (mutually exclusive with `--device-auth`) |
 | `--org <org_id>` | login | Bind this login to a specific ChatGPT workspace/org id (same seat can be registered as personal vs team/business) |
-| `--json` | verify-flagged, verify, why-selected, best, forecast, report, usage, budget, models, monitor, integrations, fix, doctor, config explain, debug bundle, history | Print machine-readable output |
+| `--preserve-selection` | login | Add or refresh credentials without changing the active global/model-family selections or manual pin; performs one sign-in and exits |
+| `--account <index\|email\|account_id>` | login | Re-authenticate exactly one saved account. Implies `--preserve-selection`, refuses a different OAuth identity before writing, keeps a disabled account disabled, and cannot be combined with `--org` |
+| `--json` | limits, verify-flagged, verify, why-selected, best, forecast, report, usage, budget, models, monitor, integrations, fix, doctor, config explain, debug bundle, history | Print machine-readable output |
 | `--csv` | usage | Print or write CSV bucket output |
 | `--explain` | forecast, report | Include reasoning details (forecast text/JSON, report text) |
 | `--live` | best, forecast, report, fix | Use live probe before decisions/output |
@@ -358,6 +408,16 @@ Windows are `hour|day|week|month` (UTC). Example:
 ```bash
 codex-multi-auth budget limit personal --window day --requests 100 --tokens 500000 --cost 10
 ```
+
+`--cost` can only be enforced for models with a known price. Some routable
+models have no published rate (`UNPRICED_ROUTABLE_MODELS` in
+`lib/usage/pricing.ts`, which currently covers every `pro`, `mini`, and `nano`
+tier), and their spend is recorded as unknown rather than guessed. If usage in
+the window includes such a model, a `--cost` limit **fails closed**: the guard
+reports `cost limit cannot be evaluated` and blocks, because treating unknown
+spend as `$0.00` would let a cost cap be exceeded without ever firing. Budget on
+`--requests` or `--tokens` instead if you route to unpriced models, or add a
+rate to `MODEL_PRICING`. Priced models are unaffected.
 
 `monitor` aggregates runtime observability, usage, policy, routing profile,
 budget, model matrix, quota cache, and current project context. `models`
@@ -637,8 +697,15 @@ failure.
 
 ## Upgrade Notes
 
+- `codex-multi-auth limits` adds a machine-readable quota contract. It requires
+  `--json`, emits schema version 1, defaults to zero-network cached mode, and
+  accepts `--refresh` for the existing sequential five-minute age-gated refresh.
+  The namespaced `codex-multi-auth auth limits ...` form is an alias. No npm
+  scripts or storage migrations were added.
 - `codex-multi-auth login` remains browser-first by default.
+- `codex-multi-auth login --org <org_id>` binds the login to one ChatGPT workspace.
 - `codex-multi-auth login --device-auth` uses OpenAI Codex device-code login. It prints `https://auth.openai.com/codex/device` and a one-time code, then polls for completion without opening a browser or starting the local callback server.
+- `codex-multi-auth login --account <identity> --preserve-selection` refreshes a saved account transactionally without changing which account is selected. If the provider returns a different account id/email, the write is refused and the previous credentials remain intact. Refreshing the account that is currently active still writes its new tokens to the native `~/.codex/auth.json`, so plain `codex` keeps working; refreshing any other account leaves that file alone. A manual `switch <n>` pin survives the refresh, and an account you disabled stays disabled. `--account` cannot be combined with `--org` — re-authenticate the saved row on its own workspace, or register the other workspace with `--org` on its own. Combine it with `--device-auth` for remote shells.
 - `codex-multi-auth login --manual` and `codex-multi-auth login --no-browser` force the manual callback flow instead of launching a browser.
 - `CODEX_AUTH_NO_BROWSER=1` suppresses browser launch for automation/headless sessions. False-like values such as `0` and `false` do not disable browser launch by themselves.
 - In non-TTY/manual shells, pass the full redirect URL on stdin, for example: `echo "http://127.0.0.1:1455/auth/callback?code=..." | codex-multi-auth login --manual`.

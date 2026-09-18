@@ -5,6 +5,350 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.15.0] - 2026-09-17
+
+Image generation and editing now run through the authenticated runtime rotation proxy, and built-in `image_gen` is exposed to Codex 0.154.0 sessions without native-auth fallback. [Full notes](docs/releases/v2.15.0.md).
+
+### Added
+
+- The runtime proxy accepts `POST /images/generations` and `POST /images/edits`
+  (with `/v1` aliases) and forwards request bodies unchanged to the upstream
+  image endpoints, reusing bearer authentication, account rotation, managed
+  OAuth refresh, and usage accounting. Image requests get a minimum five-minute
+  upstream-header timeout and are not replayed on ambiguous transport failures
+  ([#694](https://github.com/ndycode/codex-multi-auth/pull/694))
+- Provider configuration adds a non-secret
+  `x-openai-actor-authorization=codex-multi-auth-local` compatibility marker,
+  stripped case-insensitively at the upstream boundary, so Codex 0.154.0 exposes
+  its built-in `image_gen` tool for runtime-rotation sessions
+  ([#695](https://github.com/ndycode/codex-multi-auth/pull/695))
+
+## [2.14.0] - 2026-09-09
+
+A long-running task no longer dies when the backend reports that the selected model is at capacity: the runtime proxy waits it out and re-sends instead of burning through the account pool. [Full notes](docs/releases/v2.14.0.md).
+
+### Added
+
+- The runtime proxy waits out a "selected model is at capacity" response instead
+  of rotating. There was no handling for this error before: it fell into the
+  generic `status >= 500` branch, which cools the account down and rotates. That
+  is the wrong shape, because capacity is a property of the MODEL rather than of
+  an account, so every account in the pool fails identically, the rotation
+  leaves server-error cooldowns on healthy accounts on the way past, the
+  transient-attempt budget runs out within seconds and the request ends as a
+  pool-exhausted 503. The wait backs off 2s, 5s, 15s, 30s then 60s, an upstream
+  `retry-after` wins when one is sent, and the whole thing stops at a wall-clock
+  deadline that covers the upstream calls too, not just the time asleep. The
+  responding account is left completely unpenalized: its pool token is refunded
+  and it is never marked rate limited or cooled down. A client disconnect during
+  a wait abandons the request rather than sending another upstream call for a
+  response nobody is reading
+  ([#692](https://github.com/ndycode/codex-multi-auth/pull/692), closing
+  [#689](https://github.com/ndycode/codex-multi-auth/issues/689))
+- `CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS` sets that deadline: 10 minutes by
+  default, 1 hour maximum, `0` to restore the previous rotate-and-fail
+  behaviour. An unparseable value falls back to the default rather than
+  disabling, so a typo cannot silently switch the feature off
+  ([#692](https://github.com/ndycode/codex-multi-auth/pull/692))
+
+## [2.13.0] - 2026-09-08
+
+A machine-readable quota snapshot, an explicit loopback upstream for the runtime proxy, and a manual `switch` that actually revalidates a rate-limited account. [Full notes](docs/releases/v2.13.0.md).
+
+### Added
+
+- `codex-multi-auth limits --json [--refresh]` prints a stable quota snapshot for
+  local integrations, so nothing has to scrape terminal output or read the
+  internal cache file. Cached mode makes no network requests; `--refresh` reuses
+  the dashboard's sequential refresh and its five-minute freshness floor. The
+  payload carries `schemaVersion: 1`, a `selection` block naming the pin, the
+  per-family active index and the resulting `routedIndex`, and one row per
+  account. Absent provider values are explicit JSON `null`, access tokens and
+  probe-model names are never emitted, and account emails are masked in `label`
+  exactly as `forecast --json` masks them
+  ([#688](https://github.com/ndycode/codex-multi-auth/pull/688), closing
+  [#687](https://github.com/ndycode/codex-multi-auth/issues/687))
+- `CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL` routes the runtime rotation
+  proxy through an explicit local upstream for operators chaining it into a local
+  inspection proxy. The value must be HTTP with a numeric loopback host
+  (`127.0.0.0/8` or `[::1]`) and an explicit port; a name such as `localhost` is
+  rejected because the OS resolves it at connect time and the request carries the
+  managed OAuth bearer token. It fails closed: an invalid value, a proxy that
+  cannot start, or runtime rotation being disabled all exit non-zero on a
+  request-bearing invocation rather than falling back to the direct backend
+  ([#690](https://github.com/ndycode/codex-multi-auth/pull/690))
+
+### Fixed
+
+- `switch <n>` clears the selected account's rate-limit windows in the same
+  atomic write that sets the pin. After an out-of-band quota reset the markers
+  survived, so the runtime proxy kept treating the account as blocked and
+  deferring or returning 503 until the recorded window expired on its own: the
+  one command meant to say "use this account now" could not unblock it. A 429
+  that raced the switch is still preserved; one recorded earlier is not
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- The runtime proxy drops the switched account's cached quota observations when
+  it observes a new selection generation. It previously cleared session affinity
+  and nothing else, so a pre-switch reading kept driving preemptive deferrals
+  against the account just selected
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- A failed debounced save re-arms with backoff and a bounded retry count. The
+  debounce timer clears itself before the save runs, so one transient failure,
+  such as a Windows antivirus scanner holding `accounts.json` open, silently
+  discarded every rate-limit window, cooldown and rotated refresh token recorded
+  since the last successful write
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- `flushPendingSave()` logs a failure and resolves instead of rejecting.
+  `RuntimeRotationProxy.close` awaits it with no catch, so a save failure during
+  teardown aborted the rest of proxy shutdown
+  ([#691](https://github.com/ndycode/codex-multi-auth/pull/691))
+- Every reader of `affinityGeneration`, and the increment itself, now require a
+  safe integer. The counter is how a running proxy notices a selection change,
+  and past 2^53 `Math.max(counter, disk) + 1` equals the counter, so one hand
+  edit or corrupted write to a 16-digit value froze it: each later switch wrote
+  the same number and no proxy ever observed another selection change. A poisoned
+  counter is dropped, so the next write repairs it to 1
+
+## [2.12.0] - 2026-09-04
+
+Effort suffixes resolve to one key per model, usage is priced by service tier instead of assuming standard rates, and a class of lookup defect where a prototype member name was mistaken for a model id is closed. [Full notes](docs/releases/v2.12.0.md).
+
+### Added
+
+- Service-tier aware pricing. Every rate in `MODEL_PRICING` is a STANDARD-tier
+  rate and the estimator had no tier input, so a session billed at OpenAI's Fast
+  tier was priced at half its cost and a `maxCostUsd` cap could overrun without
+  tripping. The tier is read off the Responses payload (both the bare object and
+  the stream-event shape), carried on `UsageTokenCounts` so it reaches the ledger
+  through every existing path, and applied at Astra's published Fast rate of $20
+  / $100 per 1M. A tier with no published rate is reported as unknown cost rather
+  than approximated, so a budget fails closed exactly as it does for an unpriced
+  model ([#686](https://github.com/ndycode/codex-multi-auth/pull/686))
+- `gpt-6-astra` carries a cached-input rate of $1 standard and $2 on Fast. It
+  shipped without one in 2.11.0, which made Astra the only row in the table
+  billing cached tokens at the FULL input rate: a tenfold over-statement on a
+  cache-heavy session that trips a cost cap far too early. The 90% cached
+  discount is a uniform platform rate every other row already encodes at
+  input/10 ([#686](https://github.com/ndycode/codex-multi-auth/pull/686))
+
+### Fixed
+
+- `max` and `ultra` effort suffixes are stripped from a model id, so
+  `gpt-6-astra-ultra` no longer keys separately from the model it routes to. Four
+  call sites stripped only `none|minimal|low|medium|high|xhigh`, a set that
+  predates GPT-5.6: the entitlement cache blocked the same account and model pair
+  twice under two keys, the capability policy recorded outcomes under a key the
+  matrix never reads, and the fallback chain found no row for an effort-suffixed
+  model. The shared `stripModelEffortSuffix` derives its set from
+  `REASONING_EFFORTS` and names the one real exception, `codex-max` and
+  `gpt-5.1-codex-max`, whose final segment is part of the model NAME
+  ([#685](https://github.com/ndycode/codex-multi-auth/pull/685))
+- The service tier survives the runtime recorder and a ledger round-trip.
+  `createRuntimeUsageRecorder` rebuilds the ledger input field by field and
+  `normalizeParsedUsageRow` rebuilds only the numeric token fields, so a Fast
+  response through the runtime proxy, the default path, priced at the standard
+  rate, and a persisted Fast row read back as standard
+  ([#686](https://github.com/ndycode/codex-multi-auth/pull/686))
+- A response reporting its tier as `fast` is recognised. The upstream catalog
+  names the tier `priority` and displays it as "Fast", so either spelling can
+  arrive; unmapped it became `unknown` and failed a cost budget closed on a tier
+  that does have a rate ([#686](https://github.com/ndycode/codex-multi-auth/pull/686))
+- `normalizeUsageLedgerRow` validates the service tier instead of accepting any
+  truthy value. Every other field in that normaliser is checked against its
+  allowed set, and the ledger read path already rejected an unknown tier, which
+  left the write path as the only unvalidated way onto a row
+
+## [2.11.0] - 2026-09-04
+
+GPT-6 Astra and the Daybreak cyber models are first-class, and five defects found while wiring them up are fixed. [Full notes](docs/releases/v2.11.0.md).
+
+### Added
+
+- GPT-6 Astra is a first-class model family. `gpt-6-astra` and the long-horizon
+  `gpt-6-astra-aeon` each resolve to their own canonical id with the frontier
+  reasoning ladder (`low` through `max`, plus `ultra`, which is rewritten to
+  `max` on the wire exactly as upstream Codex does). Bare `gpt-6` and `astra`
+  resolve to the flagship, and `none`/`minimal` are coerced up to `low` because
+  Astra does not accept them. A dedicated GPT-6 resolver claims every id the
+  alias table does not name, including the `gpt-6-astra-pro` plan tier, dated
+  snapshots, and any tier OpenAI adds later, so an unrecognised GPT-6 id can
+  never fall through to GPT-5.5. That silent downgrade is the exact failure
+  v2.5.0 had to fix for GPT-5.6, one major version down. `aeon` deliberately
+  keeps its own id rather than collapsing into the flagship: it is a
+  behaviourally different model, not a rename. Both shipped config templates
+  carry the two models, and the `codex-multi-auth-codex` wrapper mirrors the
+  same map, with a model-by-effort parity suite pinning the two together
+- The Daybreak cyber models from the upstream Codex catalog
+  (`gpt-daybreak-blue-latest`, `gpt-daybreak-red-latest`, plus `daybreak-blue`
+  and `daybreak-red` shorthands) resolve to their own ids. Their slugs carry
+  neither a `codex` nor a `gpt 5` token, so every resolver declined them and
+  asking for the cyber-permissive model silently ran GPT-5.5. An unrecognised
+  Daybreak id resolves to `blue`, the defensive variant, so a typo cannot
+  upgrade a caller into the permissive one. They stay out of the picker
+  templates, matching their `visibility: hide` upstream
+- `gpt-6-astra` is priced at its published launch rate, $10 per 1M input and $50
+  per 1M output on the standard service tier. No cached-input rate was
+  published, so cached tokens bill at the full input rate, which over-states
+  cost and makes a `maxCostUsd` budget trip early rather than late. OpenAI's
+  Fast service tier is 2x standard, and no row in this table has ever carried a
+  service-tier dimension, so a session billed at that tier is under-counted by
+  half for Astra exactly as it already is for `gpt-5.6-sol` and every other
+  priced model. Nothing in this repo selects that tier: `fastSession` is a local
+  latency setting that lowers reasoning effort, not OpenAI's billed Fast mode.
+  `gpt-6-astra-aeon` and both Daybreak models
+  have no published rate and are listed in `UNPRICED_ROUTABLE_MODELS` rather
+  than guessed at, so a cost budget fails closed while they are in the window
+- An unsupported-model fallback chain for Astra: `gpt-6-astra` steps to
+  `gpt-5.6-sol`, and `gpt-6-astra-aeon` steps to the flagship first, since that
+  is still GPT-6 Astra without the long-horizon behaviour. Astra rolls out org
+  by org, so an account that is not entitled yet gets a real unsupported-model
+  response for it. The chain is opt-in (`fallbackOnUnsupportedCodexModel`
+  defaults to `false`) and fires only on that response, so it never swaps the
+  model out from under a request the account could have served
+- `gpt-5.6-sol` gains its own chain entry to `gpt-5.5`. The chain is walked one
+  hop at a time (`index.ts` reassigns the model and passes that as the next
+  `requestedModel`), so a model with no entry of its own ends the walk. GPT-5.6
+  shipped without one, which would have stranded the Astra path a rung short of
+  a model every account has. Terra and Luna stay without entries: nothing steps
+  into them
+- All four new models are listed in `UNESTIMATED_ROUTABLE_MODELS`. OpenAI
+  published two different context windows for Astra on launch day, 1.05M for the
+  API surface and 272K for Codex, and this wrapper talks to the Codex backend.
+  Set `contextBudgetGuardModelWindowOverrides` once you know your real ceiling
+
+### Fixed
+
+- The `codex-multi-auth-codex` wrapper resolves codex model ids that its
+  explicit list does not name, matching lib. Its final clause tested
+  `model === "codex"` where `resolveCodexCatalogModel` tests for the `codex`
+  substring, so ids such as `gpt-6-codex` resolved to nothing in the wrapper
+  while lib resolved them to the current codex model
+- The wrapper buckets Daybreak ids into the `gpt-5.2` prompt family for status
+  instead of returning no family at all. Their slug matched none of
+  `resolveModelFamilyForStatus`'s branches
+- `resolveModelFamilyForStatus` strips the provider prefix before classifying.
+  Every branch is a `startsWith`, and `resolveStatusModel` forwards the raw
+  `--model` value, so `openai/gpt-6` matched none of them and status routing
+  fell back to `activeIndex` instead of the family index. This affected
+  `openai/gpt-5.6-sol` and `openai/gpt-5.1` the same way before GPT-6 existed
+- `gpt6`, written with no separator, resolves to Astra rather than GPT-5.5.
+  `tokenizeModelId` splits on non-alphanumeric runs, so it produced a single
+  `gpt6` token, the `gpt` + `6` pair never formed, and the id fell to
+  `DEFAULT_MODEL` while still passing `capability-policy`'s catalog gate. Gate
+  and resolver now agree on it
+- The `codex-multi-auth-codex` wrapper retries the GPT-6 rows too. It keeps its
+  own `WRAPPER_UNSUPPORTED_MODEL_FALLBACK_CHAIN`, which shipped without them, so
+  `codex-multi-auth-codex --model gpt-6-astra` on an unentitled account exited
+  with the failure code while the plugin-host path retried, and the docs
+  advertised the retry for both. A parity test now pins the GPT-6 rows across
+  the two tables. Note the wrapper's retry has always been unconditional rather
+  than gated on `fallbackOnUnsupportedCodexModel`; it prints the swap to stderr,
+  and the docs now say which path gates it and which does not
+- The bare-`astra` branch of the GPT-6 resolver is anchored to a GPT-6 version
+  token or to an id with no GPT version at all. It existed for picker labels
+  such as `Astra Pro`, but it also claimed any id merely containing `astra`, so
+  a `gpt-4-astra-x` would have run the frontier model for a caller who named
+  GPT-4
+- `capability-policy`'s catalog gate matches the tokenizer's separator rule.
+  It tested a hand-picked `[-_\s]` where `tokenizeModelId` splits on any run of
+  non-alphanumerics, so `gpt.6-turbo` and `gpt---5` kept their raw string as the
+  policy key while routing resolved them to a canonical model, leaving the store
+  tracking a key no request reads. It is still narrow enough that `gpt-4o`,
+  `gpt-4.5-preview` and `gpt.4-turbo` do not reach the resolver
+
+- Prototype member names are no longer mistaken for model ids. Model strings
+  reach several lookup tables raw from the caller, so `constructor`,
+  `__proto__` and `toString` indexed them and came back truthy. Three
+  consequences, all fixed: `estimateUsageCostUsd` returned `NaN` rather than
+  `null`, which silently made a `maxCostUsd` cap unenforceable because
+  `NaN >= limit` is false; the unsupported-model fallback chain threw
+  `TypeError: targets is not iterable` inside the request path; and
+  `models --model <name>` emitted a row whose normalizedModel, promptFamily
+  and capabilities were all undefined. The fallback chains are now
+  null-prototype objects, which also stops an `unsupportedCodexFallbackChain`
+  key of `__proto__` reassigning the object's prototype
+
+## [2.10.0] - 2026-08-31
+
+A pinned account gets a real bounded retry instead of a single attempt, and a new opt-in guard can pause a session before it overflows the model's context window. [Full notes](docs/releases/v2.10.0.md).
+
+### Added
+
+- Context Budget Guard, experimental and shipping **disabled**. Enable it from Settings → Experimental or with `contextBudgetGuardEnabled`. It tracks how full each session's context window is from the tokens each turn actually carries (`input_tokens` plus the reasoning-stripped output, never `total_tokens`) and answers the next request locally with a `/compact` notice once usage crosses `contextBudgetGuardHardPercent`, before that request costs an upstream round-trip. A soft threshold attaches a non-blocking `x-codex-context-budget-percent` header instead. Window sizes are best-effort estimates, not published facts, so `contextBudgetGuardModelWindowOverrides` always wins and a model with no estimate is skipped rather than guessed at. The pause is one-shot per measurement: it drops what it recorded as it fires, so the `/compact` turn it asks for is never blocked by it ([#681](https://github.com/ndycode/codex-multi-auth/pull/681))
+
+### Fixed
+
+- A pinned request retries a transient upstream failure instead of returning `codex_pinned_account_unavailable` on the first one. Every transient branch cools the account down before the next selection pass, and selection refuses a cooling-down pin, so the retry budget could never be spent. A pinned retry now waives that account's own cooldown, and only from the second pass of the same request, with 250ms/500ms/1s backoff and a cap of `min(retryAllAccountsMaxRetries + 1, 4)` upstream attempts. Rate limits, open circuits, disabled accounts and policy blocks all still stop it, the cooldown still applies to every other request and still sets `retry_after_ms`, and a pin already cooling down on arrival is still refused without an upstream call ([#683](https://github.com/ndycode/codex-multi-auth/pull/683))
+- A pinned request is no longer refused by the local token bucket. That bucket spreads load across the selectable pool, and a pin has no alternative account, so a drained bucket could only reject a request the pinned account could serve. Circuit-breaker admission still applies, and the bucket is neither consumed nor refunded for a pin ([#682](https://github.com/ndycode/codex-multi-auth/pull/682))
+- `account_skip_reasons` names the admission gate that actually rejected a request. The reason was re-derived from account state afterwards, which reports the first blocker it finds — so a drained bucket on a cooling-down account was reported as the cooldown, and a rejection from a half-open circuit whose probe another request had just claimed was reported as an exhausted bucket ([#682](https://github.com/ndycode/codex-multi-auth/pull/682))
+- A context-window override below 1 token is dropped instead of being stored as a window of zero. `contextBudgetGuardModelWindowOverrides` validated positivity on the raw value and floored afterwards, so any value in `(0, 1)` was accepted by the schema and then silently ignored ([#681](https://github.com/ndycode/codex-multi-auth/pull/681))
+
+## [2.9.2] - 2026-08-30
+
+A maintenance release with no runtime, CLI, or configuration changes: `npm run typecheck:scripts` failed on every clean checkout. [Full notes](docs/releases/v2.9.2.md).
+
+### Fixed
+
+- `npm run typecheck:scripts` builds generated output before it runs the compiler. `scripts/codex-multi-auth.js` imports `../dist/lib/codex-manager.js` and `tsconfig.scripts.json` typechecks that file with `checkJs`, so on a fresh clone the script stopped with `TS2307: Cannot find module '../dist/lib/codex-manager.js'`. The build now lives in the script itself, matching `pack:check`, `coverage`, `bench:runtime-path` and `generate:schema`, which covers all three CI call sites and a clean local tree in one place ([#680](https://github.com/ndycode/codex-multi-auth/pull/680), thanks [@smpark00](https://github.com/smpark00))
+
+### Changed
+
+- `CONTRIBUTING.md` lists `npm run typecheck:scripts` in the documented local gate, now that it works from a clean checkout ([#680](https://github.com/ndycode/codex-multi-auth/pull/680))
+- The `validate` CI job drops a build step made redundant by the script change, leaving per-job compile counts unchanged, and `test/ci-workflows.test.ts` derives its build-ordering guard over every job in `ci.yml` instead of a hardcoded pair, reading steps by YAML key position so a commented-out or `if:`-guarded build cannot satisfy it ([#680](https://github.com/ndycode/codex-multi-auth/pull/680))
+
+## [2.9.1] - 2026-08-28
+
+A `--cost` budget can no longer be silently defeated by the models most worth capping, and refreshing one account from the login dashboard stops disturbing the others. [Full notes](docs/releases/v2.9.1.md).
+
+### Added
+
+- `codex-multi-auth login --account <index|email|account_id>` re-authenticates exactly one saved account, leaving the active selection, every per-family rotation position, and a manual `switch` pin untouched. The write is refused if the OAuth identity is not the account you named, so the previous credentials stay intact. Implies `--preserve-selection`, and cannot be combined with `--org` ([#679](https://github.com/ndycode/codex-multi-auth/pull/679), thanks [@fnmendez](https://github.com/fnmendez))
+
+### Fixed
+
+- A `--cost` budget is enforced for models with no published price instead of counting them as free. 2.9.0 fixed the guard comparing `0 >= limit`, but eight of the fifteen routable model ids (`gpt-5.4-pro`, `gpt-5.5-pro`, `gpt-5.2-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1` — every `pro` tier among them) had no `MODEL_PRICING` entry, so their rows priced to `null`, aggregated as `$0.00`, and a cost cap never fired: two million tokens on `gpt-5.5-pro` passed a `--cost 1` cap. Usage summaries now carry `unpricedRequests` and a `--cost` limit fails closed with `cost limit cannot be evaluated`. The missing rates are deliberately not guessed — a wrong figure would move the trip point rather than fix it ([fe9b0d1](https://github.com/ndycode/codex-multi-auth/commit/fe9b0d16))
+- A plain `login` no longer resets every model family's rotation position onto the account just signed in. Families track which account they are on independently, so one that had rotated away from a rate-limited account kept its own position; adding an account discarded that. Families that were following the global selection still follow it ([fe9b0d1](https://github.com/ndycode/codex-multi-auth/commit/fe9b0d16))
+- Refreshing an account from the login dashboard no longer rewrites the native `~/.codex/auth.json` unconditionally. Refreshing account 3 while account 1 was active handed plain `codex` account 3's credentials, silently switching accounts; the sync now runs only when the refreshed account is the one Codex is using — which also means refreshing the active account does update it, where a selection-preserving refresh previously left it on expired tokens ([#679](https://github.com/ndycode/codex-multi-auth/pull/679))
+- Refreshing a disabled account no longer returns it to rotation. The merge set `enabled: true` unconditionally, so topping up a credential silently undid a deliberate disable; a targeted refresh now preserves the flag and says the account is still out of rotation ([#679](https://github.com/ndycode/codex-multi-auth/pull/679))
+
+## [2.9.0] - 2026-08-25
+
+`budget set --cost` and `--tokens` were accepted but never enforced, a dead network path counted against account health, and account removal left live sessions routed to the wrong account. [Full notes](docs/releases/v2.9.0.md).
+
+### Added
+
+- The usage ledger records real token counts and cost. Both the runtime rotation proxy and the plugin host read the upstream `usage` object out of the response as it streams past, so `codex-multi-auth usage` reports actual consumption instead of zeros ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Transport failures emit a trace-correlated `proxyLog.error` line. That path never throws, so it previously produced no structured log entry at all ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+
+### Fixed
+
+- `maxTokens` and `maxCostUsd` budget limits are enforced. Every ledger row recorded zero tokens and zero cost, so the guard compared `0 >= limit` and never fired — `budget set --cost 50` allowed unlimited spend, with only `--requests` doing anything ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Reasoning tokens are subtracted out of the output bucket before recording. The upstream reports `output_tokens` inclusive of `output_tokens_details.reasoning_tokens` while the cost estimator prices the two as disjoint, so recording both raw would bill reasoning twice and trip a cost cap early ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- A streaming request's ledger row is written when the stream ends rather than when the handler returns, which is the only point at which its token counts exist. A client that disconnects mid-stream still records a row, without counts ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- An upstream transport failure before response headers no longer feeds the account's circuit breaker or health tracker. A socket reset, TLS drop, or fetch timeout is a property of the network path, not of the account, and three of them used to open that account's breaker for ~30s during an outage that affected every account equally ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+- Deleting an account, restoring a backup, and the automatic removal of revoked-token accounts bump `affinityGeneration`. Session affinity is keyed by account index, so without the bump a running proxy kept routing in-flight conversations to whatever account slid into the vacated slot ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Two accounts with neither an `accountId` nor an email no longer share one account-policy entry. Both hashed the literal `"unknown"`, so pausing, draining, or tagging one applied to all of them; the key now falls back to the refresh token and remains independent of account position ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- `withStreamingFailover` respects consumer backpressure. It enqueued every chunk as fast as the upstream delivered it, so a slow client buffered the whole response in memory — a 50-chunk stream was fully drained for a consumer that had read one chunk ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- A transport failure records a runtime skip reason for the account it happened on, instead of clearing the skip-reason overlay that `forecast` and `report` read ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+
+## [2.8.7] - 2026-08-21
+
+`codex "your prompt"` took the slow shadow-home startup path, prompt text after `--` was parsed as configuration, and the pinned-account 503 called every recovery deadline a limit reset. [Full notes](docs/releases/v2.8.7.md).
+
+### Fixed
+
+- A root TUI launch carrying the optional initial prompt (`codex "your prompt"`) keeps the canonical `CODEX_HOME`. It was classified as a subcommand launch and took the shadow home, whose omitted SQLite state made Codex rebuild its whole thread index from rollouts before submitting the prompt you had already typed ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- A prompt forced with `--` is treated as a prompt, so `codex -- exec` opens a session whose prompt is the word "exec" rather than dispatching the exec subcommand — matching how Codex itself parses it ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- The launcher no longer reads flags out of prompt text: `--account`, `-m`/`--model`, and `--config=` written after a `--` are left alone instead of being stripped, treated as settings, or rewritten in place on a retry ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- Wrapper-injected options are placed on the option side of `--` instead of appended. Appending put them in the subcommand's positional list, so `codex exec -- ...` failed with `unexpected argument '-c' found`, `codex sandbox -- echo hi` passed the pair to the sandboxed command, and `codex mcp add t -- echo hi` wrote it into that server's stored `args` in `config.toml` ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- The pinned-account 503 words its recovery deadline by the blocker actually holding the account — circuit breaker, cooldown, or rate limit — instead of calling every deadline a recorded limit reset, which made provider outages read as blown subscription quotas ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+- That wording is taken from the pin's live runtime state rather than the retry loop's selection verdict, so the common case where the pinned account 429s mid-request no longer reports the internal token `already-attempted` with a deadline attributed to nothing ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+- The quota phrasing is used only when the rate limit is what bounds recovery; when a cooldown or breaker ends later, the deadline is worded neutrally ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+
+### Changed
+
+- `docs/development/ARCHITECTURE.md` and `docs/development/CONFIG_FLOW.md` describe the interactive-TUI branch as covering prompt-bearing launches, matching the routing the wrapper now performs ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+
 ## [2.8.6] - 2026-08-16
 
 `forecast --model` reported an account `ready` while every request to it failed, and the pinned-account 503 told forced pins to run a command that clears nothing. [Full notes](docs/releases/v2.8.6.md).

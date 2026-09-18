@@ -1,4 +1,5 @@
 import { AccountManager } from "../accounts.js";
+import type { ContextBudgetGuard } from "../context-budget-guard.js";
 import type { PreemptiveQuotaScheduler } from "../preemptive-quota-scheduler.js";
 import {
 	recordRuntimeReload,
@@ -25,6 +26,12 @@ export interface RotationProxyStateInit {
 	tokenRefreshSkewMs: number;
 	networkErrorCooldownMs: number;
 	serverErrorCooldownMs: number;
+	/**
+	 * Wall-clock ceiling on how long ONE request may wait out a model-capacity
+	 * response before giving up. `0` restores the pre-#689 behaviour of rotating
+	 * the pool and returning the exhaustion 503.
+	 */
+	modelCapacityRetryMs: number;
 	tokenInvalidationCooldownMs: number;
 	minRotationIntervalMs: number;
 	pidOffsetEnabled: boolean;
@@ -34,6 +41,7 @@ export interface RotationProxyStateInit {
 	maxRequestBodyBytes: number;
 	quotaRemainingPercentThreshold: number;
 	preemptiveQuotaScheduler: PreemptiveQuotaScheduler;
+	contextBudgetGuard: ContextBudgetGuard;
 	sessionAffinityStore: SessionAffinityStore | null;
 	lastObservedAffinityGeneration: number;
 	/**

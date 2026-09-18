@@ -304,4 +304,47 @@ describe("stream failover", () => {
 			process.off("unhandledRejection", onUnhandled);
 		}
 	});
+
+	it("stops pulling from upstream while the consumer is not reading", async () => {
+		const TOTAL_CHUNKS = 50;
+		let produced = 0;
+		const source = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (produced >= TOTAL_CHUNKS) {
+					controller.close();
+					return;
+				}
+				produced += 1;
+				controller.enqueue(encoder.encode(`data: chunk-${produced}\n\n`));
+			},
+		});
+		const response = withStreamingFailover(
+			new Response(source, { headers: { "content-type": "text/event-stream" } }),
+			async () => null,
+			{ maxFailovers: 1, stallTimeoutMs: 10_000 },
+		);
+
+		const reader = response.body?.getReader();
+		expect(reader).toBeDefined();
+		const first = await reader?.read();
+		expect(new TextDecoder().decode(first?.value)).toBe("data: chunk-1\n\n");
+
+		// Let every pending microtask and timer turn settle without reading
+		// again. A pump that ignores controller.desiredSize drains the whole
+		// upstream into the controller queue here, buffering it in memory for a
+		// consumer that asked for exactly one chunk.
+		for (let tick = 0; tick < 5; tick += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(produced).toBeLessThan(TOTAL_CHUNKS);
+		// A small constant of read-ahead is expected (the source stream and the
+		// wrapper each hold one queued chunk); the point is that it is bounded and
+		// does not grow with the length of the stream.
+		expect(produced).toBeLessThanOrEqual(6);
+
+		// Demand resumes the pump rather than wedging it.
+		const second = await reader?.read();
+		expect(new TextDecoder().decode(second?.value)).toBe("data: chunk-2\n\n");
+		await reader?.cancel();
+	});
 });

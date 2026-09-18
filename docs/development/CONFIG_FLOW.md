@@ -70,10 +70,10 @@ For dashboard display values:
 ## 6) Runtime Rotation Flow
 
 1. Resolve `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY`; if unset, read `pluginConfig.codexRuntimeRotationProxy`, which defaults to enabled.
-2. If disabled or the forwarded command is help/non-requesting, forward directly to official Codex.
+2. If disabled or the forwarded command is help/non-requesting, forward directly to official Codex. This includes a help flag on a root launch that also carries a prompt (`codex "prompt" --help`): it prints help and exits clean, and the interactive branch detaches its helper on a clean exit, so a helper started just to print help would idle until its detached timeout. The scan stops at `--`, so help-looking text inside a forced prompt still routes normally (#673).
 3. If enabled, start a loopback HTTP/SSE and persistent WebSocket Responses proxy with a per-process client token.
 4. Select a transport from the forwarded argv:
-   - **No forwarded subcommand (interactive TUI)** — keep the canonical `CODEX_HOME` and pass `codex-multi-auth-runtime-proxy` as ephemeral `-c model_providers.*` overrides. Nothing is copied, no provider or transport config is written into `config.toml`, and the helper detaches on exit. The transport-independent `cli_auth_credentials_store` reconcile below still applies.
+   - **No forwarded root subcommand (interactive TUI)** — bare `codex [OPTIONS]`, and `codex [OPTIONS] [PROMPT]` carrying the optional initial prompt (including one forced by `--`), whose provider overrides are injected ahead of that prompt rather than appended (#673). Keep the canonical `CODEX_HOME` and pass `codex-multi-auth-runtime-proxy` as ephemeral `-c model_providers.*` overrides. Nothing is copied, no provider or transport config is written into `config.toml`, and the helper detaches on exit. The transport-independent `cli_auth_credentials_store` reconcile below still applies.
    - **`resume` / `fork`** — the same canonical-home transport as the interactive TUI. These resume an existing thread, and the shadow home omits the runtime SQLite state, so the shadow transport could not see the requested thread (#647).
    - **`codex app`** — run the app runtime helper against a shadow `CODEX_HOME`.
    - **Any other request-bearing command** — create a temporary shadow `CODEX_HOME` and rewrite its `config.toml` to use `codex-multi-auth-runtime-proxy`.

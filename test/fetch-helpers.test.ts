@@ -1060,6 +1060,73 @@ describe('createEntitlementErrorResponse', () => {
 			expect(text).toBe('stream body');
 		});
 
+		it('reports streaming usage only once the body is consumed', async () => {
+			const onUsage = vi.fn();
+			const response = new Response(
+				[
+					'data: {"type":"response.output_text.delta","delta":"hi"}',
+					'',
+					'data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":400},"output_tokens":500,"output_tokens_details":{"reasoning_tokens":200},"total_tokens":1500}}}',
+					'',
+				].join('\n'),
+				{ status: 200, headers: new Headers({ 'content-type': 'text/event-stream' }) },
+			);
+
+			const result = await handleSuccessResponse(response, true, { onUsage });
+
+			// The tee only sees bytes the client pulls, so nothing is known yet.
+			// This is why the plugin host defers its usage-ledger row instead of
+			// writing it when the handler returns.
+			expect(onUsage).not.toHaveBeenCalled();
+
+			const text = await result.text();
+
+			// The stream is passed through untouched.
+			expect(text).toContain('response.output_text.delta');
+			expect(onUsage).toHaveBeenCalledTimes(1);
+			expect(onUsage).toHaveBeenCalledWith({
+				inputTokens: 1000,
+				// reasoning_tokens is a SUBSET of output_tokens upstream, but
+				// estimateUsageCostUsd prices the two buckets as disjoint, so it is
+				// subtracted out or every reasoning request is billed twice.
+				outputTokens: 300,
+				cachedInputTokens: 400,
+				reasoningTokens: 200,
+				totalTokens: 1500,
+			});
+		});
+
+		it('reports non-streaming usage before returning, from the assembled response', async () => {
+			const onUsage = vi.fn();
+			const response = new Response(
+				[
+					'data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}',
+					'',
+				].join('\n'),
+				{ status: 200, headers: new Headers({ 'content-type': 'text/event-stream' }) },
+			);
+
+			await handleSuccessResponse(response, false, { onUsage });
+
+			// The non-streaming branch already holds the whole response, so the
+			// caller can fold the counts straight into its ledger row.
+			expect(onUsage).toHaveBeenCalledWith(
+				expect.objectContaining({ inputTokens: 10, outputTokens: 4, totalTokens: 14 }),
+			);
+		});
+
+		it('leaves the stream untouched when no usage callback is supplied', async () => {
+			const body = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":1}}}\n\n';
+			const response = new Response(body, {
+				status: 200,
+				headers: new Headers({ 'content-type': 'text/event-stream' }),
+			});
+
+			const result = await handleSuccessResponse(response, true);
+
+			expect(await result.text()).toBe(body);
+		});
+
 		it('captures response ids from streaming semantic SSE without rewriting the stream', async () => {
 			const onResponseId = vi.fn();
 			const response = new Response(

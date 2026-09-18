@@ -67,6 +67,21 @@ describe("usage ledger core", () => {
 		await expect(readUsageLedgerRows()).resolves.toEqual([row]);
 	});
 
+	it("round-trips image accounting without storing request bodies or raw identity", async () => {
+		const { appendUsageLedgerRow, readUsageLedgerRows, getUsageLedgerPaths } = await import("../lib/usage/index.js");
+		const row = await appendUsageLedgerRow({
+			source: "runtime-proxy", operation: "images", outcome: "success",
+			model: "gpt-image-2", statusCode: 200, accountId: "synthetic-image-account",
+			email: "image@example.test", accountIndex: 0,
+		});
+		expect(row.operation).toBe("images");
+		await expect(readUsageLedgerRows()).resolves.toEqual([row]);
+		const raw = await fs.readFile(getUsageLedgerPaths().current, "utf8");
+		expect(raw).not.toContain("synthetic-image-account");
+		expect(raw).not.toContain("image@example.test");
+		expect(raw).not.toContain("b64_json");
+	});
+
 	it("summarizes usage by model and applies date filters", async () => {
 		const { appendUsageLedgerRow, summarizeUsageLedger } = await import(
 			"../lib/usage/index.js"
@@ -245,6 +260,45 @@ describe("usage ledger core", () => {
 				totalTokens: 2,
 			}),
 		).toBeNull();
+	});
+
+	it("counts token-consuming rows it cannot price", async () => {
+		const { summarizeUsageRows } = await import("../lib/usage/index.js");
+
+		const baseRow = {
+			version: 1 as const,
+			createdAt: 1_700_000_000_000,
+			source: "runtime-proxy" as const,
+			operation: "responses" as const,
+			outcome: "success" as const,
+			projectKey: undefined,
+			account: undefined,
+			requestId: undefined,
+			statusCode: 200,
+			errorCode: undefined,
+			durationMs: 10,
+		};
+		const tokens = (total: number) => ({
+			inputTokens: total,
+			outputTokens: 0,
+			cachedInputTokens: 0,
+			reasoningTokens: 0,
+			totalTokens: total,
+		});
+
+		const summary = summarizeUsageRows([
+			// Priced: contributes real cost, not counted as unpriced.
+			{ ...baseRow, id: "a", model: "gpt-5.3-codex", tokens: tokens(1000), costUsd: 0.00125 },
+			// Unpriced but consumed tokens: cost is an under-count, so flag it.
+			{ ...baseRow, id: "b", model: "gpt-5.5-pro", tokens: tokens(2000), costUsd: null },
+			// Unpriced and consumed nothing (e.g. a blocked request): must NOT make
+			// a cost budget unevaluable.
+			{ ...baseRow, id: "c", model: "gpt-5.5-pro", tokens: tokens(0), costUsd: null },
+		] as Parameters<typeof summarizeUsageRows>[0]);
+
+		expect(summary.totals.unpricedRequests).toBe(1);
+		expect(summary.totals.requests).toBe(3);
+		expect(summary.totals.costUsd).toBe(0.00125);
 	});
 
 	it("retries transient append failures", async () => {

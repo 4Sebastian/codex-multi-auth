@@ -4,6 +4,7 @@ import { isCodexUnavailableError } from "../errors.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import {
 	type AccountStorageV3,
+	bumpStorageAffinityGeneration,
 	type FlaggedAccountMetadataV1,
 	reconcilePinnedAccountIndex,
 } from "../storage.js";
@@ -339,6 +340,13 @@ export async function runRuntimeAccountCheck(
 			pinnedAccount,
 			workingStorage.accounts,
 		);
+		// The filter can drop several accounts at once, shifting every index
+		// after each hole. Session affinity remembers accounts BY INDEX, so
+		// without a generation bump a live proxy keeps routing in-flight
+		// sessions to whatever now occupies the old slot — and this path is
+		// AUTOMATIC (revoked-token accounts are removed without a prompt), so
+		// nothing else invalidates the affinity map. See issue #474.
+		bumpStorageAffinityGeneration(workingStorage);
 		state.storageChanged = true;
 	}
 

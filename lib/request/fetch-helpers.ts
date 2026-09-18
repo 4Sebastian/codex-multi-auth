@@ -17,6 +17,7 @@ import {
 	ensureContentType,
 } from "./response-handler.js";
 import type { UserConfig, RequestBody } from "../types.js";
+import type { UsageTokenCounts } from "../usage/types.js";
 import { isRecord } from "../utils.js";
 import {
 	HTTP_STATUS,
@@ -41,6 +42,7 @@ export {
 	resolveUnsupportedCodexFallbackModel,
 	shouldFallbackToGpt52OnUnsupportedGpt53,
 	isEntitlementError,
+	isModelAtCapacityError,
 	isWorkspaceDisabledError,
 	createEntitlementErrorResponse,
 } from "./error-classification.js";
@@ -285,6 +287,12 @@ export async function handleSuccessResponse(
     isStreaming: boolean,
     options?: {
 		onResponseId?: (responseId: string) => void;
+		/**
+		 * Reports the upstream token counts once they are known, for the usage
+		 * ledger. Fires from the SSE tee on the streaming path and from the
+		 * assembled response on the non-streaming path.
+		 */
+		onUsage?: (usage: UsageTokenCounts) => void;
 		streamStallTimeoutMs?: number;
 	},
 ): Promise<Response> {
@@ -299,7 +307,12 @@ export async function handleSuccessResponse(
 	}
 
 	// For streaming requests (streamText), return stream as-is
-	return attachResponseIdCapture(response, responseHeaders, options?.onResponseId);
+	return attachResponseIdCapture(
+		response,
+		responseHeaders,
+		options?.onResponseId,
+		options?.onUsage,
+	);
 }
 
 async function safeReadBody(response: Response): Promise<string> {

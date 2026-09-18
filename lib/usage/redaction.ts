@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import type {
-	UsageLedgerAccountRef,
-	UsageLedgerAppendInput,
-	UsageLedgerOperation,
-	UsageLedgerOutcome,
-	UsageLedgerRow,
-	UsageLedgerSource,
-	UsageTokenCounts,
+import {
+	isKnownServiceTier,
+	type UsageLedgerAccountRef,
+	type UsageLedgerAppendInput,
+	type UsageLedgerOperation,
+	type UsageLedgerOutcome,
+	type UsageLedgerRow,
+	type UsageLedgerSource,
+	type UsageTokenCounts,
 } from "./types.js";
 import { estimateUsageCostUsd } from "./pricing.js";
 
@@ -19,6 +20,7 @@ const VALID_SOURCES = new Set<UsageLedgerSource>([
 ]);
 const VALID_OPERATIONS = new Set<UsageLedgerOperation>([
 	"responses",
+	"images",
 	"models",
 	"thread-goal",
 	"auth-refresh",
@@ -127,6 +129,18 @@ function normalizeTokens(input: UsageLedgerAppendInput): UsageTokenCounts {
 			providedTotal === null
 				? computedTotal
 				: Math.max(0, Math.trunc(providedTotal)),
+		// Carried through so `estimateUsageCostUsd` below can refuse to price a
+		// tier it has no rate for. Dropping it here would silently restore the
+		// standard-rate under-count this field exists to prevent.
+		//
+		// Validated, not passed through on truthiness. Every other field in this
+		// normaliser is checked against its allowed set (`normalizeSource`,
+		// `normalizeOperation`, `normalizeOutcome`), and the ledger READ path
+		// already rejects an unknown tier. Accepting one here made the write
+		// path the only unvalidated way onto a row.
+		...(isKnownServiceTier(input.serviceTier)
+			? { serviceTier: input.serviceTier }
+			: {}),
 	};
 }
 

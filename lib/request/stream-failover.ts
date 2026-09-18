@@ -144,6 +144,34 @@ export function withStreamingFailover(
 
 	let closed = false;
 	let releaseCurrentReaderForCancel: (() => Promise<void>) | null = null;
+	// Backpressure. `pump()` runs from `start()` as a free-running loop, so
+	// without a demand signal it enqueues every chunk upstream delivers as fast
+	// as it arrives and the whole stream buffers in memory for a slow consumer.
+	// `pull()` (and cancellation) release the loop; the sibling forwarder in
+	// stream-failover-runtime.ts gets the same guarantee from waitForDrain.
+	let demandWaiter: (() => void) | null = null;
+	let demandPending = false;
+	const signalDemand = (): void => {
+		if (demandWaiter) {
+			demandWaiter();
+			return;
+		}
+		// `pull()` can fire before the loop parks. Latch it, or the next
+		// awaitDemand() would block on a signal that already happened.
+		demandPending = true;
+	};
+	const awaitDemand = (): Promise<void> => {
+		if (demandPending || closed) {
+			demandPending = false;
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			demandWaiter = () => {
+				demandWaiter = null;
+				resolve();
+			};
+		});
+	};
 	const body = new ReadableStream<Uint8Array>({
 		start(controller) {
 			let currentReader = initialResponse.body?.getReader() ?? null;
@@ -205,6 +233,15 @@ export function withStreamingFailover(
 						if (result.value && result.value.byteLength > 0) {
 							emittedBytes += result.value.byteLength;
 							controller.enqueue(result.value);
+							// Park until the consumer asks for more. desiredSize is
+							// null once the controller is errored or closed, and the
+							// loop's own `closed` checks cover that case.
+							if (
+								typeof controller.desiredSize === "number" &&
+								controller.desiredSize <= 0
+							) {
+								await awaitDemand();
+							}
 						}
 					} catch (error) {
 						let switched = false;
@@ -235,8 +272,14 @@ export function withStreamingFailover(
 				}
 			});
 		},
+		pull() {
+			signalDemand();
+		},
 		cancel() {
 			closed = true;
+			// Release a parked pump so it observes `closed` and unwinds instead
+			// of holding the upstream reader open for a demand that never comes.
+			signalDemand();
 			if (releaseCurrentReaderForCancel) {
 				void releaseCurrentReaderForCancel();
 			}

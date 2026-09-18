@@ -1,5 +1,6 @@
 import { HTTP_STATUS, MAX_RATE_LIMIT_DELAY_MS } from "../constants.js";
 import type { ExhaustionReason } from "../runtime/rotation-server-types.js";
+import type { CooldownReason } from "../storage/public-types.js";
 import type { TokenResult } from "../types.js";
 import { isRecord } from "../utils.js";
 
@@ -210,7 +211,199 @@ export interface PinnedUnavailableContext {
 	pinSource?: "forced" | "manual" | null;
 	/** Epoch ms when the blocking record ends (rate limit or cooldown). */
 	resetAtMs?: number | null;
+	/**
+	 * Which class of record supplies `resetAtMs`. That deadline is the max
+	 * across every gating record, so a `rate-limited` skip reason can carry a
+	 * deadline supplied by a breaker or cooldown that ends later, and the
+	 * quota phrasing is only true when the rate limit itself is that bound.
+	 *
+	 * - `"rate-limit"` — the rate-limit records bound it; word it as a reset.
+	 * - `"other"` — a cooldown or breaker ends later and bounds it instead.
+	 * - `"unknown"` (the default) — the caller did not measure; trust the
+	 *   skip reason.
+	 *
+	 * Deliberately a value rather than the presence of a second deadline
+	 * field. The previous shape branched on `"rateLimitResetAtMs" in context`,
+	 * so a caller that spread the key with an `undefined` value got the
+	 * opposite wording from one that omitted it — a contract no type could
+	 * express and no compiler could check.
+	 */
+	recoveryBound?: "rate-limit" | "other" | "unknown";
+	/**
+	 * The pin's CURRENT runtime skip reason, re-read from account state at the
+	 * moment the 503 is built. `accountSkipReasons` holds the most recent
+	 * selection or attempt verdict, which can be less specific than a cooldown
+	 * or breaker created later in the same pass. Omitted when the caller did not
+	 * re-read runtime state.
+	 */
+	currentSkipReason?: string | null;
 	now?: number;
+}
+
+/**
+ * The human sentence derives its parenthetical and its deadline noun from the
+ * blocker class. The deadline is max(rate-limit reset, cooldown end, breaker
+ * next-attempt), so calling it a "limit" is only true for the rate-limit
+ * class: during a provider outage a tripped breaker or a server-error
+ * cooldown printed "the recorded limit resets at …", and operators read a
+ * backend incident as a blown subscription quota. Only the message changes —
+ * the machine-readable `reason` keeps the raw skip token.
+ */
+type DeadlineNoun =
+	| "available-again"
+	| "next-attempt"
+	| "cooldown-ends"
+	| "rate-limit-reset";
+
+const DEADLINE_SENTENCES: Record<DeadlineNoun, (resetAt: string) => string> = {
+	"available-again": (resetAt) =>
+		`the account is expected to be available again at ${resetAt}`,
+	"next-attempt": (resetAt) => `the next attempt is allowed at ${resetAt}`,
+	"cooldown-ends": (resetAt) => `the cooldown ends at ${resetAt}`,
+	"rate-limit-reset": (resetAt) => `the rate limit resets at ${resetAt}`,
+};
+
+interface BlockerDescription {
+	parenthetical: string;
+	deadlineNoun: DeadlineNoun;
+}
+
+/**
+ * Every cooldown variant is bounded by the same `coolingDownUntil` field, so
+ * they all word their deadline the same way. Two of them used to say "the next
+ * attempt is allowed at" while the rest said "the cooldown ends at", which
+ * reads as two different mechanisms to an operator comparing two 503s.
+ *
+ * `satisfies` is what keeps this honest: a new CooldownReason becomes a
+ * compile error here rather than falling through to the verbatim arm below,
+ * which would print the raw `cooling-down:<reason>` token in the sentence —
+ * the internal-token leak issue #675 was filed about.
+ */
+const COOLDOWN_DESCRIPTIONS = {
+	"auth-failure": {
+		parenthetical: "cooling down after authentication failures",
+		deadlineNoun: "cooldown-ends",
+	},
+	"network-error": {
+		parenthetical: "cooling down after network errors",
+		deadlineNoun: "cooldown-ends",
+	},
+	"server-error": {
+		parenthetical: "cooling down after upstream server errors",
+		deadlineNoun: "cooldown-ends",
+	},
+	"rate-limit": {
+		parenthetical: "cooling down after a rate limit",
+		deadlineNoun: "cooldown-ends",
+	},
+} satisfies Record<CooldownReason, BlockerDescription>;
+
+const BLOCKER_DESCRIPTIONS: ReadonlyMap<string, BlockerDescription> = new Map<
+	string,
+	BlockerDescription
+>([
+	[
+		"rate-limited",
+		// Upgraded to "rate-limit-reset" below when the caller confirms the
+		// rate limit is what bounds the advertised deadline.
+		{ parenthetical: "rate-limited", deadlineNoun: "available-again" },
+	],
+	[
+		"circuit-open",
+		{
+			parenthetical: "paused after repeated upstream errors",
+			deadlineNoun: "next-attempt",
+		},
+	],
+	["cooling-down", { parenthetical: "cooling down", deadlineNoun: "cooldown-ends" }],
+	...Object.entries(COOLDOWN_DESCRIPTIONS).map(
+		([reason, description]): [string, BlockerDescription] => [
+			`cooling-down:${reason}`,
+			description,
+		],
+	),
+]);
+
+// Retry-budget exhaustion can end immediately after an upstream attempt,
+// before selection gets another pass to translate that attempt into a live
+// cooldown or breaker. Keep these final verdicts operator-facing without
+// treating them as live blockers: a concurrently opened circuit or cooldown
+// must still take precedence in buildPinnedUnavailableErrorBody below.
+const ATTEMPT_VERDICT_DESCRIPTIONS: ReadonlyMap<string, BlockerDescription> =
+	new Map([
+		[
+			"auth-failure",
+			{
+				parenthetical: "authentication failure",
+				deadlineNoun: "available-again",
+			},
+		],
+		[
+			"network-error",
+			{
+				parenthetical: "upstream network error",
+				deadlineNoun: "available-again",
+			},
+		],
+		[
+			"server-error",
+			{
+				parenthetical: "upstream server error",
+				deadlineNoun: "available-again",
+			},
+		],
+	]);
+
+/** Whether the sentence has real wording for this token, or must echo it raw. */
+function isDescribedBlocker(skipReason: string): boolean {
+	return BLOCKER_DESCRIPTIONS.has(skipReason);
+}
+
+/**
+ * The human sentence derives its parenthetical and its deadline noun from the
+ * blocker class. The deadline is max(rate-limit reset, cooldown end, breaker
+ * next-attempt), so calling it a "limit" is only true for the rate-limit
+ * class: during a provider outage a tripped breaker or a server-error
+ * cooldown printed "the recorded limit resets at …", and operators read a
+ * backend incident as a blown subscription quota. Only the message changes —
+ * the machine-readable `reason` keeps the raw skip token.
+ */
+function describePinnedBlocker(
+	skipReason: string | null,
+	rateLimitBoundsRecovery: boolean,
+): {
+	parenthetical: string | null;
+	deadline: (resetAt: string) => string;
+} {
+	if (skipReason === null) {
+		return {
+			parenthetical: null,
+			deadline: DEADLINE_SENTENCES["available-again"],
+		};
+	}
+	const described =
+		BLOCKER_DESCRIPTIONS.get(skipReason) ??
+		ATTEMPT_VERDICT_DESCRIPTIONS.get(skipReason);
+	if (described === undefined) {
+		// Permanent blockers never reach the deadline clause (the call site
+		// suppresses their reset time), and future or internal tokens stay
+		// legible verbatim.
+		return {
+			parenthetical: skipReason,
+			deadline: DEADLINE_SENTENCES["available-again"],
+		};
+	}
+	// A breaker or cooldown can outlive the rate limit; the deadline is the max
+	// of every gating record, so it is only worded as the limit's own reset
+	// when the rate limit actually supplies it.
+	const deadlineNoun: DeadlineNoun =
+		skipReason === "rate-limited" && rateLimitBoundsRecovery
+			? "rate-limit-reset"
+			: described.deadlineNoun;
+	return {
+		parenthetical: described.parenthetical,
+		deadline: DEADLINE_SENTENCES[deadlineNoun],
+	};
 }
 
 export function buildPinnedUnavailableErrorBody(
@@ -224,7 +417,6 @@ export function buildPinnedUnavailableErrorBody(
 		normalizedPinnedIndex !== null
 			? accountSkipReasons.get(normalizedPinnedIndex) ?? null
 			: null;
-	const reasonSuffix = skipReason ? ` (${skipReason})` : "";
 	// On the desync path the pin index is unknown (null); claiming "account 1"
 	// there would contradict the machine-readable pinnedAccountIndex: null.
 	const accountPhrase =
@@ -250,8 +442,31 @@ export function buildPinnedUnavailableErrorBody(
 	const now = context?.now ?? Date.now();
 	const retryAfterMs = resetAtMs !== null ? Math.max(0, resetAtMs - now) : null;
 	const resetAt = resetAtMs !== null ? new Date(resetAtMs).toISOString() : null;
-	const waitSuffix =
-		resetAt !== null ? `; the recorded limit resets at ${resetAt}` : "";
+	// "unknown" (the default) means the caller did not measure which record
+	// bounds the deadline — older callers and unit seams — so trust the skip
+	// reason. Only a measured "other" demotes to the neutral phrasing, which
+	// stays true for a live rate limit either way.
+	const rateLimitBoundsRecovery = (context?.recoveryBound ?? "unknown") !== "other";
+	// The machine-readable `reason` below stays the recorded SELECTION verdict;
+	// only the human sentence follows the blocker actually gating the pin. A
+	// recorded verdict that names a real blocker class wins, because the
+	// selection-only classes ("missing", "policy-blocked") have no
+	// runtime-state equivalent and would be lost. Otherwise the re-read runtime
+	// state is the truth and the recorded token is only the earlier attempt
+	// verdict. This also preserves compatibility with legacy callers that may
+	// still supply an internal bookkeeping token.
+	const describedSkipReason =
+		skipReason !== null && isDescribedBlocker(skipReason)
+			? skipReason
+			: context?.currentSkipReason ?? skipReason;
+	const blocker = describePinnedBlocker(
+		describedSkipReason,
+		rateLimitBoundsRecovery,
+	);
+	const reasonSuffix = blocker.parenthetical
+		? ` (${blocker.parenthetical})`
+		: "";
+	const waitSuffix = resetAt !== null ? `; ${blocker.deadline(resetAt)}` : "";
 	// A forced pin belongs to the launching process, not to the persisted pin
 	// state, so `unpin` would clear nothing — say what actually helps.
 	const remedy =

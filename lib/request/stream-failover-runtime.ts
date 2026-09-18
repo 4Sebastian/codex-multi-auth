@@ -146,12 +146,21 @@ export async function forwardStreamingResponse(
 	status: RuntimeRotationProxyStatus,
 	onStreamError: () => void,
 	streamStallTimeoutMs: number,
+	/**
+	 * Observe each forwarded chunk. Used to recover the upstream `usage` totals
+	 * for the usage ledger without buffering the body; it must not mutate the
+	 * chunk and is called before the write, so a slow observer delays the
+	 * forward. Implementations are expected to swallow their own errors.
+	 */
+	onChunk?: (chunk: Uint8Array) => void,
+	/** Additional response headers, applied after (so they can override) the forwarded upstream ones. */
+	extraHeaders?: Record<string, string>,
 ): Promise<boolean> {
 	status.streamsStarted += 1;
-	res.writeHead(
-		upstream.status,
-		responseHeadersForClient(upstream.headers),
-	);
+	res.writeHead(upstream.status, {
+		...responseHeadersForClient(upstream.headers),
+		...extraHeaders,
+	});
 	if (!upstream.body) {
 		res.end();
 		return true;
@@ -175,6 +184,7 @@ export async function forwardStreamingResponse(
 			);
 			if (done) break;
 			if (value && value.byteLength > 0) {
+				onChunk?.(value);
 				// If the response is already finished (clean end by a concurrent
 				// close-then-reader-cancel path), stop writing. Do NOT guard on
 				// res.destroyed here: a socket-error-during-backpressure scenario sets

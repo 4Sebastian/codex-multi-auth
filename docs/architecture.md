@@ -60,7 +60,7 @@ The standalone manager normalizes bare account-manager commands, so both `codex-
 - Handles multi-auth `auth` subcommands locally.
 - Forwards non-auth commands to official Codex.
 - For request-bearing sessions with runtime rotation enabled, creates a temporary shadow `CODEX_HOME`, writes a local provider (`codex-multi-auth-runtime-proxy`), and starts a loopback proxy for that process.
-- For interactive TUI sessions, `resume`/`fork`, and `codex app-server`, keeps the canonical `CODEX_HOME` and passes the same provider as `-c` overrides instead, so session history and SQLite state are not copied into a shadow and reindexed on every launch. A resident `app-server` needs the canonical home for a stronger reason than convenience: it cannot start at all on a shadow home whose `app-server-control` is a symlink, and a shadow thread index would stay frozen for the life of the process (#659).
+- For interactive TUI sessions (with or without the optional initial `[PROMPT]`), `resume`/`fork`, and `codex app-server`, keeps the canonical `CODEX_HOME` and passes the same provider as `-c` overrides instead, so session history and SQLite state are not copied into a shadow and reindexed on every launch. A resident `app-server` needs the canonical home for a stronger reason than convenience: it cannot start at all on a shadow home whose `app-server-control` is a symlink, and a shadow thread index would stay frozen for the life of the process (#659).
 - Keeps forwarded sessions on file-backed auth state unless the caller opts out.
 - Supports ephemeral force-pin: `codex-multi-auth-codex --account <index|email|id>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) for a single invocation only — never mutates the persisted `switch` pin.
 
@@ -76,7 +76,8 @@ The proxy:
 
 - accepts only local authenticated client requests (per-process client token)
 - forwards Responses API, model discovery, and thread-goal routes (`/responses`, `/models`, `/thread/goal/*`, and `/codex/...` variants)
-- accepts persistent local Codex WebSocket connections and opens account-authenticated upstream Codex WebSockets, replacing the upstream connection without dropping the local client when an idle connection closes, a bound account exhausts request tokens, or a transport fails before response events begin, provided the pending request is replayable; connection-scoped continuations receive `previous_response_not_found` so the client resets cached socket state and retries with full context
+- accepts persistent local Codex WebSocket connections and opens account-authenticated upstream Codex WebSockets, replacing the upstream connection without dropping the local client when an idle connection closes, an account becomes unavailable, or a transport fails before response events begin, provided the pending request is replayable; connection-scoped continuations receive `previous_response_not_found` so the client resets cached socket state and retries with full context
+- forwards authenticated [image generation/edit routes](reference/image-routes.md), including `/v1` aliases, through the same account and policy machinery
 - authenticates local clients with a per-process token via `Authorization: Bearer` or `x-api-key` (timing-safe compare); refuses non-loopback binds
 - caps request bodies at 64 MiB
 - replaces upstream auth headers with the selected managed account (no account emails in client-facing headers)
@@ -88,6 +89,7 @@ The proxy:
 - strips hop-by-hop and stale decoded response headers before returning data to the local Codex client
 - records runtime status for `codex-multi-auth status`, `codex-multi-auth report`, and `codex-multi-auth rotation status`
 - appends redacted usage ledger rows after each HTTP/SSE request or WebSocket `response.create` completes, fails, or is cancelled
+- when the experimental **context budget guard** is enabled (`contextBudgetGuardEnabled`, disabled by default), pauses the next request on a session that has crossed a hard context-usage threshold, before it reaches upstream — see [features.md](features.md#context-budget-guard-experimental)
 
 ### 4. Local governance
 
