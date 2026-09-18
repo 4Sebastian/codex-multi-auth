@@ -2256,15 +2256,10 @@ function bridgeWebSocketConnection(
 							reportConnectionScopedContinuationLoss();
 							return;
 						}
-						void interrupted.request.usageRecorder.record({
-							outcome: "failure",
-							statusCode: HTTP_STATUS.BAD_GATEWAY,
-							errorCode: "upstream_websocket_closed",
-							account: interrupted.account,
-						});
 						pending.unshift({
 							...interrupted.frame,
 							recoveryAttempts: interrupted.frame.recoveryAttempts ?? 0,
+							request: interrupted.request,
 						});
 						void initialize();
 						return;

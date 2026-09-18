@@ -2099,6 +2099,133 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("records one final outcome after a pre-event WebSocket disconnect", async () => {
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				const connectionNumber = connectionCount;
+				socket.once("message", () => {
+					if (connectionNumber === 1) {
+						socket.terminate();
+						return;
+					}
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const response = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await response)).toMatchObject({ type: "response.completed" });
+			expect(usageRecorder).toHaveBeenCalledTimes(1);
+			expect(usageRecords).toEqual([
+				expect.objectContaining({
+					outcome: "success",
+					account: expect.objectContaining({ index: 1 }),
+				}),
+			]);
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+		}
+	});
+
+	it("preserves a prepared request across a pre-event disconnect", async () => {
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		let connectionCount = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				connectionCount += 1;
+				const connectionNumber = connectionCount;
+				socket.once("message", () => {
+					if (connectionNumber === 1) {
+						socket.send(JSON.stringify({
+							type: "response.failed",
+							status_code: HTTP_STATUS.INTERNAL_SERVER_ERROR,
+							response: { error: { code: "server_error" } },
+						}));
+						return;
+					}
+					if (connectionNumber === 2) {
+						socket.terminate();
+						return;
+					}
+					socket.send(JSON.stringify({ type: "response.completed", response: {} }));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 3));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			const firstResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await firstResponse)).toMatchObject({ type: "response.failed" });
+
+			const recoveredResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await recoveredResponse)).toMatchObject({
+				type: "response.completed",
+			});
+			expect(usageRecorder).toHaveBeenCalledTimes(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords[1]).toMatchObject({
+				outcome: "success",
+				account: expect.objectContaining({ index: 2 }),
+			});
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+		}
+	});
+
 	it("rejects unauthenticated WebSocket upgrades before accepting a client", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
