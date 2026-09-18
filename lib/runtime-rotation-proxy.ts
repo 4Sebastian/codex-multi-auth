@@ -56,7 +56,10 @@ import {
 	type RuntimePolicyDecision,
 	type RuntimeUsageRecorder,
 } from "./policy/runtime-policy.js";
-import { createUsageStreamScanner } from "./usage/usage-extraction.js";
+import {
+	createUsageStreamScanner,
+	extractUsageTokenCounts,
+} from "./usage/usage-extraction.js";
 import {
 	isModelAtCapacityError,
 	isWorkspaceDisabledError,
@@ -1228,13 +1231,7 @@ function websocketTerminalUsage(
 		return null;
 	}
 	const response = isRecord(parsed.response) ? parsed.response : null;
-	const usage = response && isRecord(response.usage) ? response.usage : null;
-	const inputDetails = usage && isRecord(usage.input_tokens_details)
-		? usage.input_tokens_details
-		: null;
-	const outputDetails = usage && isRecord(usage.output_tokens_details)
-		? usage.output_tokens_details
-		: null;
+	const usage = extractUsageTokenCounts(response?.usage);
 	const error = response && isRecord(response.error)
 		? response.error
 		: isRecord(parsed.error)
@@ -1272,11 +1269,7 @@ function websocketTerminalUsage(
 			outcome,
 			statusCode,
 			errorCode,
-			inputTokens: readFiniteNumber(usage, "input_tokens"),
-			outputTokens: readFiniteNumber(usage, "output_tokens"),
-			cachedInputTokens: readFiniteNumber(inputDetails, "cached_tokens"),
-			reasoningTokens: readFiniteNumber(outputDetails, "reasoning_tokens"),
-			totalTokens: readFiniteNumber(usage, "total_tokens"),
+			...(usage ?? {}),
 		},
 		rawBody,
 		retryAfterMs:

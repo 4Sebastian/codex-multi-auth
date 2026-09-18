@@ -693,6 +693,78 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
+	it("normalizes WebSocket reasoning usage before accounting and context tracking", async () => {
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
+		const usageRecords: Array<Record<string, unknown>> = [];
+		const usageRecorder = vi
+			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockImplementation(() => {
+				let recorded = false;
+				return {
+					hasRecorded: () => recorded,
+					record: async (input) => {
+						if (recorded) return;
+						recorded = true;
+						usageRecords.push(input as Record<string, unknown>);
+					},
+				};
+			});
+		let upstreamFrames = 0;
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket) => {
+				socket.on("message", () => {
+					upstreamFrames += 1;
+					socket.send(JSON.stringify({
+						type: "response.completed",
+						response: {
+							usage: {
+								input_tokens: 20_000,
+								output_tokens: 27_000,
+								output_tokens_details: { reasoning_tokens: 25_000 },
+								total_tokens: 47_000,
+							},
+						},
+					}));
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const socket = await connectWebSocket(
+			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
+		);
+		try {
+			for (let turn = 0; turn < 2; turn += 1) {
+				const response = nextWebSocketMessage(socket);
+				socket.send(JSON.stringify({
+					type: "response.create",
+					model: "gpt-5.5",
+					prompt_cache_key: "reasoning-budget-session",
+					input: [],
+				}));
+				await response;
+			}
+			expect(upstreamFrames).toBe(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords[0]).toMatchObject({
+				inputTokens: 20_000,
+				outputTokens: 2_000,
+				reasoningTokens: 25_000,
+				totalTokens: 47_000,
+			});
+		} finally {
+			socket.terminate();
+			await upstream.close();
+			usageRecorder.mockRestore();
+		}
+	});
+
 	it("does not enforce context budgets when the guard is disabled", async () => {
 		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
 		let upstreamFrames = 0;
