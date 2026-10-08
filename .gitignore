@@ -1,5 +1,7 @@
 node_modules/
 *.tsbuildinfo
+__pycache__/
+*.pyc
 bun.lockb
 pnpm-lock.yaml
 dist/
