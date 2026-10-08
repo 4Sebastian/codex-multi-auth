@@ -1,6 +1,9 @@
+import { mergeAccountCooldown, mergeAccountSnapshot, mergeAccountRuntimeObservations } from "./storage/snapshot-merge.js";
 import type { Auth } from "@codex-ai/sdk";
-import { createHash } from "node:crypto";
 import { decodeJWT } from "./auth/auth.js";
+import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-identity.js";
+export { resolveAccountRecordId } from "./storage/record-identity.js";
+import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
 import { createLogger } from "./logger.js";
 import {
@@ -13,9 +16,11 @@ import {
 	type RateLimitStateV3,
 	findMatchingAccountIndex,
 	withAccountStorageTransaction,
+	ACCOUNT_STORAGE_UNREADABLE,
+	recordPendingAuth,
 } from "./storage.js";
 import type { AccountIdSource, OAuthAuthDetails } from "./types.js";
-import type { Workspace } from "./storage/public-types.js";
+import type { CodexCliMirror, Workspace } from "./storage/public-types.js";
 import { MODEL_FAMILIES, type ModelFamily } from "./request/helpers/model-map.js";
 import {
 	getHealthTracker,
@@ -85,6 +90,7 @@ export {
 } from "./codex-cli/state.js";
 
 import {
+	codexCliAccountIdFor,
 	extractAccountId,
 	extractAccountEmail,
 	shouldUpdateAccountIdFromToken,
@@ -133,36 +139,6 @@ function getAccountCircuitKey(account: ManagedAccount): string {
 			getAccountIdentityKey(account) ?? `circuit:${nextRuntimeCircuitKeyId++}`;
 	}
 	return account.circuitKeyId;
-}
-
-function deriveAccountRecordId(
-	account: {
-		accountId?: string;
-		email?: string;
-		refreshToken: string;
-		addedAt: number;
-	},
-): string {
-	const seed = [
-		account.addedAt,
-		account.accountId?.trim() ?? "",
-		account.email?.trim().toLowerCase() ?? "",
-		account.refreshToken.trim(),
-	].join("\u0000");
-	return `record:${createHash("sha256").update(seed).digest("hex")}`;
-}
-
-function resolveAccountRecordId(
-	account: {
-		recordId?: string;
-		accountId?: string;
-		email?: string;
-		refreshToken: string;
-		addedAt: number;
-	},
-): string {
-	const stored = account.recordId?.trim();
-	return stored || deriveAccountRecordId(account);
 }
 
 export function getRuntimeTrackerKey(account: ManagedAccount): string | number {
@@ -352,10 +328,15 @@ export interface ManagedAccount {
 	consecutiveAuthFailures?: number;
 	workspaces?: Workspace[];
 	currentWorkspaceIndex?: number;
+	codexCliMirror?: CodexCliMirror;
 }
 
 export class AccountManager {
+	private persistenceBaseline: AccountStorageV3 | null = null;
 	private accounts: ManagedAccount[] = [];
+	private readonly persistedWorkspaceSelections = new WeakMap<ManagedAccount, string | undefined>();
+	private readonly persistedWorkspaces = new WeakMap<ManagedAccount, Workspace[] | undefined>();
+	private hadPersistedStorage = false;
 	private cursorByFamily: Record<ModelFamily, number> = initFamilyState(0);
 	private currentAccountIndexByFamily: Record<ModelFamily, number> =
 		initFamilyState(-1);
@@ -504,6 +485,7 @@ export class AccountManager {
 		stored?: AccountStorageV3 | null,
 	) {
 		this.storagePathState = { ...getStoragePathState() };
+		this.hadPersistedStorage = existsSync(this.resolveSelectionStoragePath());
 		const fallbackAccountId =
 			extractAccountId(authFallback?.access)?.trim() || undefined;
 		const fallbackAccountEmail = sanitizeEmail(
@@ -592,7 +574,7 @@ export class AccountManager {
 					const managedAccount: ManagedAccount = {
 						index,
 						recordId: resolveAccountRecordId(
-							{ ...account, refreshToken },
+							account,
 						),
 						accountId: matchesFallback
 							? (fallbackAccountId ?? account.accountId)
@@ -622,6 +604,7 @@ export class AccountManager {
 						authInvalidationErrorCode: account.authInvalidationErrorCode,
 						workspaces: account.workspaces,
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
+						codexCliMirror: account.codexCliMirror,
 					};
 					this.clearSupersededAuthInvalidation(managedAccount);
 					return managedAccount;
@@ -669,6 +652,8 @@ export class AccountManager {
 					this.cursorByFamily[family] = nextIndex;
 				}
 			}
+			this.persistenceBaseline = stored ? structuredClone(stored) : null;
+			this.rememberWorkspaceSelections();
 			return;
 		}
 
@@ -703,6 +688,61 @@ export class AccountManager {
 				this.cursorByFamily[family] = 0;
 			}
 		}
+		this.persistenceBaseline = stored ? structuredClone(stored) : null;
+		this.rememberWorkspaceSelections();
+	}
+
+	/** Reconcile external workspace policy by ID, preserving health changes not superseded on disk. */
+	syncWorkspaceSelections(current: AccountStorageV3 | null): boolean {
+		if (!current) return false;
+		let changed = false;
+		for (const account of this.accounts) {
+			const matches = current.accounts.filter(disk => disk.recordId && disk.recordId === account.recordId);
+			const key = getAccountIdentityKey(account);
+			const candidates = matches.length ? matches : current.accounts.filter(disk => key && getAccountIdentityKey(disk) === key);
+			if (candidates.length !== 1) continue;
+			const disk = candidates[0];
+			if (!disk) continue;
+			const localSelectedId = account.workspaces?.[account.currentWorkspaceIndex ?? 0]?.id;
+			const baseline = this.persistedWorkspaces.get(account);
+			if (JSON.stringify(disk.workspaces) !== JSON.stringify(baseline)) {
+				account.workspaces = disk.workspaces?.map(workspace => {
+					const previous = baseline?.find(item => item.id === workspace.id);
+					const local = account.workspaces?.find(item => item.id === workspace.id);
+					return previous && local && workspace.enabled === previous.enabled && workspace.disabledAt === previous.disabledAt
+						? {...workspace, enabled: local.enabled, disabledAt: local.disabledAt}
+						: {...workspace};
+				});
+				this.persistedWorkspaces.set(account, structuredClone(disk.workspaces));
+				changed = true;
+			}
+			const selectedId = disk.workspaces?.[disk.currentWorkspaceIndex ?? 0]?.id;
+			const preferredId = selectedId !== this.persistedWorkspaceSelections.get(account) ? selectedId : localSelectedId;
+			let index = account.workspaces?.findIndex(workspace => workspace.id === preferredId) ?? -1;
+			if (index < 0) index = account.workspaces?.findIndex(workspace => workspace.id === selectedId) ?? -1;
+			if (index < 0) index = 0;
+			if (account.workspaces?.length && account.currentWorkspaceIndex !== index) {
+				account.currentWorkspaceIndex = index;
+				changed = true;
+			}
+			this.persistedWorkspaceSelections.set(account, selectedId);
+		}
+		return changed;
+	}
+
+	private rememberWorkspaceSelections(snapshot?: AccountStorageV3): void {
+		this.accounts.forEach(account => {
+			// recordId first; the identity key only when defined and unique, since
+			// duplicate identities (or two missing ones) would pick another row's baseline.
+			const rows = snapshot?.accounts ?? [];
+			const byRecord = account.recordId ? rows.filter(row => row.recordId === account.recordId) : [];
+			const key = getAccountIdentityKey(account);
+			const matches = byRecord.length ? byRecord : key ? rows.filter(row => getAccountIdentityKey(row) === key) : [];
+			const saved = (matches.length === 1 ? matches[0] : undefined) ?? account;
+			this.persistedWorkspaceSelections.set(account, saved.workspaces?.[saved.currentWorkspaceIndex ?? 0]?.id);
+			this.persistedWorkspaces.set(account, structuredClone(saved.workspaces));
+		});
+		this.hadPersistedStorage ||= existsSync(this.resolveSelectionStoragePath());
 	}
 
 	getAccountCount(): number {
@@ -901,7 +941,7 @@ export class AccountManager {
 		const account = this.accounts[index];
 		if (!account) return;
 		await setCodexCliActiveSelection({
-			accountId: account.accountId,
+			accountId: codexCliAccountIdFor(account, account.access),
 			email: account.email,
 			accessToken: account.access,
 			refreshToken: account.refreshToken,
@@ -1202,12 +1242,11 @@ export class AccountManager {
 		_model?: string | null,
 		_options: { bypassTokenBucket?: boolean } = {},
 	): { ok: true } | { ok: false; reason: "circuit-open" } {
-		try {
-			getCircuitBreaker(getAccountCircuitKey(account)).canExecute();
-			return { ok: true };
-		} catch {
+		const admission = getCircuitBreaker(getAccountCircuitKey(account)).tryCanExecute();
+		if (!admission.ok) {
 			return { ok: false, reason: "circuit-open" };
 		}
+		return { ok: true };
 	}
 
 	/**
@@ -1734,6 +1773,7 @@ export class AccountManager {
 						: undefined,
 					workspaces: account.workspaces,
 					currentWorkspaceIndex: account.currentWorkspaceIndex,
+					codexCliMirror: account.codexCliMirror,
 				};
 			}),
 			activeIndex,
@@ -1759,6 +1799,8 @@ export class AccountManager {
 		const nextEmail = sanitizeEmail(extractAccountEmail(auth.access));
 		try {
 			return await withAccountStorageTransaction(async (_current, persist) => {
+				if (!_current && this.hadPersistedStorage) throw Object.assign(new Error("Account storage was removed; reload before saving."), {code:"ESTALE"});
+				this.syncWorkspaceSelections(_current);
 				// Snapshot the live in-memory pool under the storage lock so refresh
 				// persistence merges against the latest account state. Reconcile the
 				// selection first for the same reason `saveToDisk` does: this write
@@ -1766,7 +1808,7 @@ export class AccountManager {
 				// pair here would clobber a `switch` that landed since the last save.
 				this.reconcileSelectionFromDisk();
 				const nextStorage = structuredClone(
-					this.buildStorageSnapshot(),
+                    this.reconcileTokensFromDisk(this.buildStorageSnapshot(), _current),
 				) as AccountStorageV3;
 				const storageIndex = findAccountIndexByIdentity(
 					nextStorage.accounts,
@@ -1831,7 +1873,8 @@ export class AccountManager {
 					this.clearAuthFailures(liveAccount);
 
 					try {
-						await persist(nextStorage);
+						await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
+						this.rememberWorkspaceSelections(nextStorage);
 					} catch (error) {
 						liveAccount.access = previousLiveAccountState.access;
 						liveAccount.refreshToken = previousLiveAccountState.refreshToken;
@@ -1875,13 +1918,59 @@ export class AccountManager {
 					return liveAccount;
 				}
 
-				await persist(nextStorage);
+				await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
+				this.rememberWorkspaceSelections(nextStorage);
 				log.warn("Unable to resolve refreshed live account after persistence", {
 					sourceIndex: source.index,
 				});
 				return null;
 			});
 		} catch (error) {
+			// The refresh already rotated the token upstream; the old one is spent.
+			// A locked or unreadable accounts file must not discard the only valid
+			// credential, so keep it live and let the retrying debounced save
+			// persist it once the file can be read.
+			// A write that still fails after the storage retries (e.g. a Windows lock)
+			// spends the old token just the same, so it is rescued like an unreadable file.
+			const live = [ACCOUNT_STORAGE_UNREADABLE, "ELOCKED", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "") || isRetryableAuthPersistenceError(error)
+				? this.getAccountByIdentity(source, auth)
+				: null;
+			if (live) {
+				const priorRefreshToken = live.refreshToken;
+				this.updateFromAuth(live, auth);
+				live.enabled = true;
+				if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
+				this.clearAuthFailures(live);
+				// The debounced save needs this process to survive and the file to
+				// unlock. Journal the rotated credential beside the pool so the next
+				// load (any process) applies it even if neither happens.
+				try {
+					await runWithStoragePathState(this.storagePathState, () =>
+						recordPendingAuth(getStoragePath(), {
+							priorRefreshToken,
+							recordId: live.recordId,
+							refreshToken: auth.refresh,
+							accessToken: auth.access,
+							expiresAt: auth.expires,
+							at: nowMs(),
+						}),
+					);
+					// Loads now see the journaled token, so it is the persisted state
+					// that later merges (and a further rotation) compare against.
+					const baselineRow = this.persistenceBaseline?.accounts.find(row => row.refreshToken === priorRefreshToken);
+					if (baselineRow) Object.assign(baselineRow, { refreshToken: auth.refresh, accessToken: auth.access, expiresAt: auth.expires });
+					log.warn("Account storage could not be read or written; rotated credential journaled until it can be saved", {
+						sourceIndex: source.index,
+					});
+				} catch (journalError) {
+					log.error("Account storage could not be read or written and the rotated credential could not be journaled; it is only in memory. Keep this process running until the accounts file is readable, or the account will need a re-login.", {
+						sourceIndex: source.index,
+						code: typeof (journalError as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((journalError as NodeJS.ErrnoException).code ?? "") ? (journalError as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
+					});
+				}
+				this.saveToDiskDebounced();
+				return live;
+			}
 			throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
 				retryable: isRetryableAuthPersistenceError(error),
 				cause: error,
@@ -2175,16 +2264,80 @@ export class AccountManager {
 		return account;
 	}
 
-	async saveToDisk(): Promise<void> {
+ private async persistSnapshot(current: AccountStorageV3 | null, proposed: AccountStorageV3, persist: (storage: AccountStorageV3) => Promise<void>, refreshed?: AccountStorageV3["accounts"][number], runtimeOnConflict = false): Promise<void> {
+  // Preserve initial/missing-store creation. An intentionally cleared store has
+  // distinct metadata and must still win over this manager's stale inventory.
+  let merged: AccountStorageV3;
+  let rescuedBaseline: AccountStorageV3 | undefined;
+  try {
+   merged = current ? mergeAccountSnapshot(this.persistenceBaseline, current, proposed) : proposed;
+  } catch (error) {
+   if (runtimeOnConflict && (error as NodeJS.ErrnoException).code === "ESTALE" && current && this.persistenceBaseline) {
+    await persist(mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed));
+    log.warn("Saved runtime observations; conflicting account edits remain pending and require reload or reconciliation.");
+    return;
+   }
+   if ((error as NodeJS.ErrnoException).code !== "ESTALE" || !refreshed?.recordId || !current) throw error;
+   // A rotated credential must not be discarded because an unrelated user edit
+   // conflicts. Persist only its auth delta under this same transaction lock.
+   const matches = (row: AccountStorageV3["accounts"][number]) => resolveAccountRecordId(row) === refreshed.recordId;
+   const prior = this.persistenceBaseline?.accounts.find(matches);
+   const index = current.accounts.findIndex(matches);
+   const disk = current.accounts[index];
+   if (!prior || !disk || disk.refreshToken !== prior.refreshToken || disk.enabled === false || disk.authInvalidatedAt) throw error;
+   merged = structuredClone(current);
+   const row = merged.accounts[index];
+   if (!row || !this.persistenceBaseline) throw error;
+   rescuedBaseline = structuredClone(this.persistenceBaseline);
+   const baselineRow = rescuedBaseline.accounts.find(matches);
+   if (!baselineRow) throw error;
+   const cooldown = mergeAccountCooldown(prior, disk, refreshed);
+   // Persist the stable identity before rotating a legacy row's identity material.
+   row.recordId = refreshed.recordId;
+   baselineRow.recordId = refreshed.recordId;
+   // Only authentication was committed. Pending additions, removals and user
+   // edits must still differ from their old baseline on the next save. The
+   // refresh can also move the identity and clears auth blockers; a restart
+   // must not bring the old identity or cooldown back.
+   for (const field of ["accessToken", "refreshToken", "expiresAt", "accountId", "accountIdSource", "email", "authInvalidatedAt", "authInvalidationErrorCode", "coolingDownUntil", "cooldownReason"] as const) {
+    const value = refreshed[field];
+    if (value === undefined) {delete row[field];delete baselineRow[field];}
+    else {Object.assign(row, { [field]: value });Object.assign(baselineRow, { [field]: value });}
+   }
+   Object.assign(row, cooldown);
+  }
+  await persist(merged);
+  if (refreshed) {
+   const saved = merged.accounts.find(row => row.recordId === refreshed.recordId);
+   const live = this.accounts.find(row => row.recordId === refreshed.recordId);
+   // A successful refresh must retain blockers learned by another request,
+   // including an observation made while the storage write was pending.
+   if (saved && live) Object.assign(live, mergeAccountCooldown(refreshed, saved, live));
+  }
+  // Keep the baseline in this manager's inventory/intent space. Adopting added
+  // disk records here would misread their absence in the next save as deletion.
+  this.persistenceBaseline = rescuedBaseline ?? structuredClone(proposed);
+  if (refreshed) {
+   const saved = merged.accounts.find(row => row.recordId === refreshed.recordId);
+   const baseline = this.persistenceBaseline.accounts.find(row => row.recordId === refreshed.recordId);
+   // The adopted blocker is now known persisted state, so a later explicit
+   // clear must compare against it rather than the pre-refresh clear.
+   if (saved && baseline) Object.assign(baseline, { coolingDownUntil: saved.coolingDownUntil, cooldownReason: saved.cooldownReason });
+  }
+ }
+
+	async saveToDisk(runtimeOnConflict = false): Promise<void> {
 		await runWithStoragePathState(this.storagePathState, async () => {
 			await withAccountStorageTransaction(async (current, persist) => {
+				if (!current && this.hadPersistedStorage) throw Object.assign(new Error("Account storage was removed; reload before saving."), {code:"ESTALE"});
 				// Reconcile against the disk state loaded under the storage lock so a
 				// routine save does not clobber a token another process just rotated
 				// (stress audit H3) or a pin the CLI just wrote (#474).
 				this.reconcileSelectionFromDisk();
-				await persist(
-					this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current),
-				);
+				this.syncWorkspaceSelections(current);
+				const snapshot = this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current);
+				await this.persistSnapshot(current, snapshot, persist, undefined, runtimeOnConflict);
+				this.rememberWorkspaceSelections(snapshot);
 			});
 		});
 	}
@@ -2200,7 +2353,7 @@ export class AccountManager {
 					if (this.pendingSave) {
 						await this.pendingSave;
 					}
-					this.pendingSave = this.saveToDisk().finally(() => {
+					this.pendingSave = this.saveToDisk(true).finally(() => {
 						this.pendingSave = null;
 					});
 					await this.pendingSave;
@@ -2245,7 +2398,7 @@ export class AccountManager {
 			if (this.saveDebounceTimer) {
 				clearTimeout(this.saveDebounceTimer);
 				this.saveDebounceTimer = null;
-				await this.saveToDisk();
+				await this.saveToDisk(true);
 			}
 			if (this.pendingSave) {
 				await this.pendingSave;
@@ -2268,11 +2421,16 @@ export class AccountManager {
 		);
 
 		for (const workspace of account.workspaces) {
-			workspace.enabled = true;
-			delete workspace.disabledAt;
+			// Only undo runtime health disablement, never an explicit workspace exclusion.
+			if (workspace.disabledAt !== undefined) {
+				workspace.enabled = true;
+				delete workspace.disabledAt;
+			}
 		}
 
-		account.currentWorkspaceIndex = resetIndex >= 0 ? resetIndex : 0;
+		if (!account.workspaces[account.currentWorkspaceIndex ?? -1]) {
+			account.currentWorkspaceIndex = resetIndex >= 0 ? resetIndex : 0;
+		}
 	}
 
 	getCurrentWorkspace(account: ManagedAccount): Workspace | null {
@@ -2282,6 +2440,15 @@ export class AccountManager {
 		const idx = account.currentWorkspaceIndex ?? 0;
 		return account.workspaces[idx] ?? null;
 	}
+
+ /** Disable a specific request workspace without changing the interactive selection. */
+ disableWorkspace(account: ManagedAccount, workspaceId: string): boolean {
+  const workspace = account.workspaces?.find(item=>item.id===workspaceId);
+  if(!workspace || workspace.enabled===false) return false;
+  workspace.enabled=false;
+  workspace.disabledAt=nowMs();
+  return true;
+ }
 
 	disableCurrentWorkspace(
 		account: ManagedAccount,
@@ -2418,6 +2585,7 @@ export function formatWorkspaceLines(
 		| { workspaces?: Workspace[]; currentWorkspaceIndex?: number }
 		| undefined,
 	indent = "   ",
+	selectionLabel = "active",
 ): string[] {
 	const workspaces = account?.workspaces;
 	if (!workspaces || workspaces.length === 0) return [];
@@ -2428,7 +2596,7 @@ export function formatWorkspaceLines(
 		const id = workspace.id?.trim() ?? "";
 		const idSuffix = id.length > 6 ? id.slice(-6) : id;
 		const tags: string[] = [];
-		if (isActive) tags.push("active");
+		if (isActive) tags.push(selectionLabel);
 		if (workspace.enabled === false) tags.push("disabled");
 		const tagLabel = tags.length > 0 ? ` (${tags.join(", ")})` : "";
 		const idLabel = idSuffix ? ` id:${idSuffix}` : "";

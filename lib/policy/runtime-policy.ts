@@ -2,29 +2,33 @@ import type { CapabilityPolicyStore } from "../capability-policy.js";
 import { resolveEntitlementAccountKey } from "../entitlement-cache.js";
 import {
 	getAccountPolicyKey,
-	loadAccountPolicyStore,
 	type AccountPolicyStore,
 } from "../account-policy.js";
 import {
 	evaluateBudgetGuard,
 	getBudgetWindowStart,
-	loadBudgetGuardStore,
 	normalizeBudgetKey,
 	type BudgetGuardEvaluation,
 	type BudgetGuardStore,
+	type BudgetLimit,
+	type BudgetWindow,
 } from "../budget-guard.js";
+import type { ProjectRoutingProfileContext } from "../routing-profiles.js";
 import {
-	resolveProjectRoutingProfile,
-	type ProjectRoutingProfileContext,
-} from "../routing-profiles.js";
+	loadAccountPolicyStoreCached,
+	loadBudgetGuardStoreCached,
+	resolveProjectRoutingProfileCached,
+} from "./runtime-policy-cache.js";
 import {
 	appendUsageLedgerRow,
-	summarizeUsageLedger,
+	readUsageLedgerRows,
+	summarizeUsageRows,
 	type UsageLedgerAppendInput,
 	type UsageLedgerOperation,
 	type UsageLedgerOutcome,
 	type UsageLedgerSource,
 	type UsageServiceTier,
+	type UsageSummary,
 } from "../usage/index.js";
 
 export interface RuntimePolicyAccount {
@@ -49,6 +53,7 @@ export interface RuntimePolicyDecision {
 	blockedAccountIndexes: Set<number>;
 	blockedAccountReasons?: Record<number, string>;
 	scoreBoostByAccount: Record<number, number>;
+	priorityByAccount?: Record<number, number>;
 	budgetEvaluations: BudgetGuardEvaluation[];
 }
 
@@ -87,12 +92,22 @@ export interface RuntimeUsageRecordInput {
 export async function loadRuntimePolicyState(
 	startDir = process.cwd(),
 ): Promise<RuntimePolicyState> {
+	// Cached loaders: each proxied request costs a few statSync calls instead of
+	// three file reads + JSON parses + the project-root ancestor walk. Stores
+	// re-read whenever their file's mtime/size changes (or within the mtime
+	// settle window, or past the cache TTL), and the project context
+	// re-resolves when the startDir context or `.git` entry changes — so
+	// CLI-side writes are honored without per-request reparsing. See
+	// lib/policy/runtime-policy-cache.ts.
 	const [accountPolicies, budgets, project] = await Promise.all([
-		loadAccountPolicyStore(),
-		loadBudgetGuardStore(),
-		resolveProjectRoutingProfile(startDir),
+		loadAccountPolicyStoreCached(),
+		loadBudgetGuardStoreCached(),
+		resolveProjectRoutingProfileCached(startDir),
 	]);
-	return { accountPolicies, budgets, project };
+	// The caches share store objects across calls. Every caller previously
+	// received a private parse, so hand out a private clone: a caller mutating
+	// its state must not poison the cache for the next request.
+	return structuredClone({ accountPolicies, budgets, project });
 }
 
 function normalizeToken(value: string | null | undefined): string | null {
@@ -137,18 +152,34 @@ async function evaluateBudgets(input: {
 		const budgetKey = normalizeBudgetKey(input.state.project.profile.budgetKey);
 		if (budgetKey) keys.add(budgetKey);
 	}
-	const evaluations: BudgetGuardEvaluation[] = [];
+	const matchingLimits: BudgetLimit[] = [];
 	for (const key of keys) {
 		const limit = input.state.budgets.limits[key];
-		if (!limit) continue;
-		const summary = await summarizeUsageLedger({
-			since: getBudgetWindowStart(limit.window, input.now),
-			until: input.now,
-			// Budget windows (e.g. monthly) can span a ledger rotation. Without archives,
-			// rotated-out rows are dropped from the sum, under-counting spend and letting
-			// usage exceed the limit within the active window (quota-forecast-03).
-			includeArchives: true,
-		});
+		if (limit) matchingLimits.push(limit);
+	}
+	if (matchingLimits.length === 0) return [];
+	// Read + parse the ledger ONCE per evaluation, not once per matching key —
+	// each summarizeUsageLedger call used to reparse every usage-ledger*.jsonl
+	// line, making the request path O(ledger rows x budget keys). Budget
+	// windows (e.g. monthly) can span a ledger rotation, so archives are
+	// included; without them rotated-out rows are dropped from the sum,
+	// under-counting spend and letting usage exceed the limit within the
+	// active window (quota-forecast-03). Distinct windows still need distinct
+	// `since` filters, so rows are summarized per window in memory — the same
+	// summarizeUsageRows that summarizeUsageLedger applied to the same rows
+	// and query produces an identical UsageSummary.
+	const rows = await readUsageLedgerRows({ includeArchives: true });
+	const summariesByWindow = new Map<BudgetWindow, UsageSummary>();
+	const evaluations: BudgetGuardEvaluation[] = [];
+	for (const limit of matchingLimits) {
+		let summary = summariesByWindow.get(limit.window);
+		if (!summary) {
+			summary = summarizeUsageRows(rows, {
+				since: getBudgetWindowStart(limit.window, input.now),
+				until: input.now,
+			});
+			summariesByWindow.set(limit.window, summary);
+		}
 		evaluations.push(evaluateBudgetGuard(limit, summary));
 	}
 	return evaluations;
@@ -166,6 +197,7 @@ export async function evaluateRuntimePolicy(input: {
 	const blockedAccountIndexes = new Set<number>();
 	const blockedAccountReasons: Record<number, string> = {};
 	const scoreBoostByAccount: Record<number, number> = {};
+	const priorityByAccount: Record<number, number> = {};
 	const profile = input.state.project.profile;
 
 	if (profile?.modelDenylist.length && matchesModel(profile.modelDenylist, input.model)) {
@@ -205,6 +237,7 @@ export async function evaluateRuntimePolicy(input: {
 			account.index,
 		);
 		const accountPolicy = input.state.accountPolicies.accounts[accountKey];
+		priorityByAccount[account.index] = accountPolicy?.priority ?? 1;
 		let boost = 0;
 		if (accountPolicy?.paused) {
 			blockedAccountIndexes.add(account.index);
@@ -267,6 +300,7 @@ export async function evaluateRuntimePolicy(input: {
 		blockedAccountIndexes,
 		blockedAccountReasons,
 		scoreBoostByAccount,
+		priorityByAccount,
 		budgetEvaluations,
 	};
 }

@@ -1,3 +1,5 @@
+import { withNativeBindingLock } from "../runtime/native-binding-lock.js";
+import { hasNativeProviderConfig } from "../runtime-constants.js";
 import { existsSync, promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { createLogger } from "../logger.js";
@@ -13,6 +15,12 @@ import {
 	makeAccountFingerprint,
 } from "./observability.js";
 import { tempPathFor } from "../temp-path.js";
+import { decodeJWT } from "../auth/auth.js";
+import {
+	extractAccountId,
+	getAccountIdCandidates,
+	resolveCodexAuthAccountId,
+} from "../auth/token-utils.js";
 
 const log = createLogger("codex-cli-writer");
 let lastCodexCliSelectionWriteAt = 0;
@@ -450,12 +458,53 @@ async function writeCodexAuthState(
 	}
 	nextTokens.access_token = accessToken;
 	nextTokens.refresh_token = refreshToken;
-	if (selection.accountId?.trim()) {
-		nextTokens.account_id = selection.accountId.trim();
-	}
 	const selectedIdToken = readTrimmedString(selection.idToken);
 	const existingIdToken = readTrimmedString(existingTokens.id_token);
-	const fallbackIdToken = selectedTokenPair ? accessToken : (existingIdToken ?? accessToken);
+	// A stale "org-..." id already in auth.json is sanitised too, not only a
+	// selected one. With no chatgpt_account_id claim, drop the field so Codex
+	// derives it from the tokens.
+	const selectedAccountId = selection.accountId?.trim();
+	let rawAccountId =
+		selectedAccountId || readTrimmedString(existingTokens.account_id);
+	if (!selectedAccountId && selectedTokenPair && rawAccountId) {
+		// New tokens without an accountId: the previous file's id may belong to
+		// another account. Keep it only when the new tokens still carry it as a
+		// workspace; otherwise follow the new token's claim.
+		const tokenClaim =
+			extractAccountId(accessToken) ?? extractAccountId(selectedIdToken);
+		const tokenWorkspaces = getAccountIdCandidates(accessToken, selectedIdToken).map(
+			(candidate) => candidate.accountId,
+		);
+		if (tokenClaim && !tokenWorkspaces.includes(rawAccountId)) {
+			rawAccountId = tokenClaim;
+		}
+	}
+	if (rawAccountId) {
+		const accountId = resolveCodexAuthAccountId(
+			rawAccountId,
+			accessToken,
+			selectedIdToken,
+		);
+		if (accountId) {
+			nextTokens.account_id = accountId;
+		} else {
+			delete nextTokens.account_id;
+		}
+	}
+	// Without a selected id_token, keep the existing one when it belongs to the
+	// same user and workspace as the new access token (a same-account resync);
+	// only another account's id_token is replaced by the access-token fallback.
+	const existingIdClaims = existingIdToken ? decodeJWT(existingIdToken) : null;
+	const accessClaims = decodeJWT(accessToken);
+	const existingIdTokenMatches =
+		typeof existingIdClaims?.sub === "string" &&
+		existingIdClaims.sub === accessClaims?.sub &&
+		!!extractAccountId(existingIdToken) &&
+		extractAccountId(existingIdToken) === extractAccountId(accessToken);
+	const fallbackIdToken =
+		selectedTokenPair && !existingIdTokenMatches
+			? accessToken
+			: (existingIdToken ?? accessToken);
 	if (selectedIdToken) {
 		nextTokens.id_token = selectedIdToken;
 	} else if (fallbackIdToken) {
@@ -494,8 +543,14 @@ async function enqueueActiveSelectionWrite<T>(task: () => Promise<T>): Promise<T
 export async function setCodexCliActiveSelection(
 	selection: ActiveSelection,
 ): Promise<boolean> {
-	return enqueueActiveSelectionWrite(async () => {
-		if (!isCodexCliSyncEnabled()) return false;
+	if (!isCodexCliSyncEnabled()) return false;
+	return enqueueActiveSelectionWrite(() => withNativeBindingLock(getCodexCliConfigPath(), async () => {
+		// Native app binding deliberately separates desktop identity from inference selection.
+		try {
+			if (hasNativeProviderConfig(await fs.readFile(getCodexCliConfigPath(), "utf8"))) return false;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+		}
 
 		incrementCodexCliMetric("writeAttempts");
 		const accountsPath = getCodexCliAccountsPath();
@@ -689,7 +744,14 @@ export async function setCodexCliActiveSelection(
 			});
 			return false;
 		}
-	});
+	}).catch((error: unknown) => {
+        incrementCodexCliMetric("writeFailures");
+        log.warn("Failed to persist Codex CLI active selection", {
+            operation: "write-active-selection", outcome: "native-bind-lock-unavailable",
+            code: (error as NodeJS.ErrnoException)?.code ?? "unknown",
+        });
+        return false;
+    }));
 }
 
 export function getLastCodexCliSelectionWriteTimestamp(): number {

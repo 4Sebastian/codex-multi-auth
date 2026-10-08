@@ -3,6 +3,7 @@ import {
 	extractAccountId,
 	sanitizeEmail,
 } from "../accounts.js";
+import { codexCliAccountIdFor } from "../auth/token-utils.js";
 import { setCodexCliActiveSelection } from "../codex-cli/writer.js";
 import { MODEL_FAMILIES } from "../prompts/codex.js";
 import { queuedRefresh } from "../refresh-queue.js";
@@ -154,7 +155,7 @@ export async function persistAndSyncSelectedAccount({
 	await saveAccountsWithRetry(storage, saveAccounts);
 
 	const synced = await setCodexCliActiveSelection({
-		accountId: account.accountId,
+		accountId: codexCliAccountIdFor(account, syncAccessToken, syncIdToken),
 		email: account.email,
 		accessToken: syncAccessToken,
 		refreshToken: syncRefreshToken,

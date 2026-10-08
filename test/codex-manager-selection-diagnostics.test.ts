@@ -56,7 +56,7 @@ function createStorage(now: number): AccountStorageV3 {
 				addedAt: now,
 				lastUsed: now,
 				rateLimitResetTimes: {
-					"codex:gpt-5.3-codex": now + 60_000,
+					"codex:gpt-5.6-sol": now + 60_000,
 				},
 			},
 			{
@@ -129,9 +129,9 @@ describe("codex-manager selection diagnostics", () => {
 		const circuitManager = new AccountManager(undefined, storage);
 		const circuitAccount = circuitManager.getAccountByIndex(5);
 		if (!circuitAccount) throw new Error("circuit fixture account missing");
-		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.3-codex");
-		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.3-codex");
-		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.3-codex");
+		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.6-sol");
+		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.6-sol");
+		circuitManager.recordFailure(circuitAccount, "codex", "gpt-5.6-sol");
 
 		const trace = await buildSelectAccountTraced()(storage);
 		const candidates = new Map(

@@ -1,5 +1,6 @@
 import type { DashboardDisplaySettings } from "../../dashboard-settings.js";
 import { extractAccountEmail, sanitizeEmail } from "../../accounts.js";
+import { shouldUpdateAccountIdFromToken } from "../../auth/token-utils.js";
 import {
 	buildForecastExplanation,
 	type ForecastAccountResult,
@@ -53,7 +54,7 @@ export interface ForecastCommandDeps {
 	loadDashboardDisplaySettings?: () => Promise<DashboardDisplaySettings>;
 	resolveActiveIndex: (storage: AccountStorageV3, family?: "codex") => number;
 	loadQuotaCache: () => Promise<QuotaCacheData | null>;
-	saveQuotaCache: (cache: QuotaCacheData) => Promise<void>;
+	saveQuotaCache: (cache: QuotaCacheData, baseline?: QuotaCacheData) => Promise<void>;
 	cloneQuotaCacheData: (cache: QuotaCacheData) => QuotaCacheData;
 	buildQuotaEmailFallbackState: (
 		accounts: readonly Pick<AccountMetadataV3, "accountId" | "email">[],
@@ -300,7 +301,12 @@ export async function runForecastCommand(
 			if (refreshedEmail) {
 				refreshPatch.email = refreshedEmail;
 			}
-			if (refreshedAccountId) {
+			// Only a token-derived id follows the new token (as on every other
+			// refresh path); an explicit (manual) or org binding stays.
+			if (
+				refreshedAccountId &&
+				shouldUpdateAccountIdFromToken(account.accountIdSource, account.accountId)
+			) {
 				refreshPatch.accountId = refreshedAccountId;
 				refreshPatch.accountIdSource = "token";
 			}
@@ -409,7 +415,7 @@ export async function runForecastCommand(
 	if (options.json) {
 		if (workingQuotaCache && quotaCacheChanged) {
 			try {
-				await deps.saveQuotaCache(workingQuotaCache);
+				await deps.saveQuotaCache(workingQuotaCache, quotaCache ?? undefined);
 			} catch (error) {
 				// Quota cache is a derived artifact; a transient Windows EBUSY/
 				// EPERM here must not abort the JSON forecast output.
@@ -581,7 +587,7 @@ export async function runForecastCommand(
 	}
 	if (workingQuotaCache && quotaCacheChanged) {
 		try {
-			await deps.saveQuotaCache(workingQuotaCache);
+			await deps.saveQuotaCache(workingQuotaCache, quotaCache ?? undefined);
 		} catch (error) {
 			// Quota cache is a derived artifact; tolerate transient Windows
 			// EBUSY/EPERM rather than aborting the forecast.

@@ -1,8 +1,20 @@
 import type {
 	AccountMetadataV3,
+	CodexCliMirror,
 	FlaggedAccountMetadataV1,
 	FlaggedAccountStorageV1,
 } from "./public-types.js";
+
+function normalizeCodexCliMirror(value: unknown): CodexCliMirror | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const { forAccountId, accountId } = value as Record<string, unknown>;
+	return typeof forAccountId === "string" &&
+		forAccountId.trim() &&
+		typeof accountId === "string" &&
+		accountId.trim()
+		? { forAccountId, accountId }
+		: undefined;
+}
 
 export function normalizeFlaggedStorage(
 	data: unknown,
@@ -146,6 +158,7 @@ export function normalizeFlaggedStorage(
 				typeof rawAccount.currentWorkspaceIndex === "number"
 					? rawAccount.currentWorkspaceIndex
 					: undefined,
+			codexCliMirror: normalizeCodexCliMirror(rawAccount.codexCliMirror),
 			flaggedAt,
 			flaggedReason:
 				typeof rawAccount.flaggedReason === "string"

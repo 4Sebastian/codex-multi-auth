@@ -165,53 +165,71 @@ describe("CI workflow parity", () => {
 	});
 
 	// scripts/codex-multi-auth.js dynamically imports ../dist/lib/codex-manager.js
-	// and tsconfig.scripts.json typechecks it with checkJs, so `typecheck:scripts`
-	// fails with TS2307 whenever dist has not been generated. The build belongs in
-	// the script itself rather than in individual CI steps: that covers CI jobs,
-	// clean local checkouts and git hooks in one place, and it matches every other
-	// dist-dependent script here (pack:check, coverage, bench:runtime-path,
-	// generate:schema all start with `npm run build &&`).
-	it("builds generated dist inside the typecheck:scripts script", () => {
+	// and tsconfig.scripts.json typechecks it with checkJs. With a literal
+	// specifier that import forced module resolution against generated dist, so
+	// `typecheck:scripts` used to need `npm run build` first (v2.9.2). The
+	// specifier now lives in a variable, making it unresolvable at check time,
+	// so the script typechecks standalone on a clean checkout — and the build
+	// must stay out of it, or every CI call site reverts to paying a full emit.
+	it("keeps typecheck:scripts standalone (no generated-dist dependency)", () => {
 		const scripts = readPackageScripts();
 		const typecheckScripts = scripts["typecheck:scripts"] ?? "";
 
 		expect(typecheckScripts).toContain("tsc -p tsconfig.scripts.json");
 		expect(
 			buildsGeneratedDist(typecheckScripts),
-			"typecheck:scripts must build generated dist before running tsc",
-		).toBe(true);
+			"typecheck:scripts must stay standalone — keep `npm run build` out of it",
+		).toBe(false);
+	});
+
+	// Mechanism guard for the test above: any literal "../dist/**" specifier —
+	// static `from` clause or `import("literal")` — inside a file covered by
+	// tsconfig.scripts.json reintroduces the dist resolution requirement.
+	// Computed specifiers (variables) stay opaque to tsc and are fine.
+	it("keeps literal dist/ specifiers out of scripts tsconfig inputs", () => {
+		const tsconfigRaw = readFileSync(
+			join(projectRoot, "tsconfig.scripts.json"),
+			"utf-8",
+		);
+		const tsconfig = JSON.parse(
+			tsconfigRaw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, ""),
+		) as { include?: string[] };
+		const literalDistSpecifier =
+			/(?:import|export)[^"'`\n]*from\s*["']\.\.\/dist\/|import\(\s*["'`]\.\.\/dist\//;
+		for (const rel of tsconfig.include ?? []) {
+			const source = readFileSync(join(projectRoot, rel), "utf-8");
+			expect(
+				literalDistSpecifier.test(source),
+				`${rel}: a literal ../dist/ specifier forces typecheck:scripts to resolve generated dist`,
+			).toBe(false);
+		}
 	});
 
 	// Backstop for the guard above, derived over every job rather than a fixed
 	// list, so a new job (or a reordered `validate`) is covered automatically.
-	// While typecheck:scripts self-builds this holds trivially; it becomes the
-	// load-bearing check the moment that build is removed from the script.
-	it("guarantees generated dist at every ci.yml script typecheck call site", () => {
+	// typecheck:scripts no longer consumes generated dist, so there is no build
+	// to order call sites against; what remains load-bearing is that the script
+	// stays standalone (a literal dist import or an embedded build would undo
+	// it) and that the call sites themselves still exist.
+	it("keeps typecheck:scripts standalone at every ci.yml call site", () => {
 		const ci = readWorkflow("ci.yml");
-		const selfBuilds = buildsGeneratedDist(
-			readPackageScripts()["typecheck:scripts"] ?? "",
-		);
+		const typecheckScripts =
+			readPackageScripts()["typecheck:scripts"] ?? "";
+		expect(
+			buildsGeneratedDist(typecheckScripts),
+			"typecheck:scripts must not self-build; it typechecks without dist",
+		).toBe(false);
 
 		let callSites = 0;
 		for (const jobName of listJobs(ci)) {
 			const steps = extractSteps(extractJobBlock(ci, jobName));
-			const typecheckAt = steps.findIndex((step) =>
-				step.run.includes("npm run typecheck:scripts"),
-			);
-			if (typecheckAt === -1) {
-				continue;
+			if (
+				steps.some((step) =>
+					step.run.includes("npm run typecheck:scripts"),
+				)
+			) {
+				callSites += 1;
 			}
-			callSites += 1;
-			if (selfBuilds) {
-				continue;
-			}
-			const builtEarlier = steps
-				.slice(0, typecheckAt)
-				.some((step) => !step.conditional && buildsGeneratedDist(step.run));
-			expect(
-				builtEarlier,
-				`${jobName}: typecheck:scripts runs without a preceding unconditional build`,
-			).toBe(true);
 		}
 
 		// Proves the parser actually reached the call sites: release-harness,
@@ -223,18 +241,18 @@ describe("CI workflow parity", () => {
 		).toBeGreaterThanOrEqual(3);
 	});
 
-	// Issue #523: validate the engines floor (node >=18) with a runtime smoke
-	// job that installs the packed tarball on Node 18 without devDependencies.
-	it("smoke-tests the packed CLI on the Node 18 engines floor", () => {
+	// Issue #523: validate the engines floor (node >=22.19) with a runtime smoke
+	// job that installs the packed tarball on Node 22 without devDependencies.
+	it("smoke-tests the packed CLI on the Node 22 engines floor", () => {
 		const ci = readWorkflow("ci.yml");
 		const builderJob = extractJobBlock(ci, "build-package");
-		const smokeJob = extractJobBlock(ci, "node18-smoke");
+		const smokeJob = extractJobBlock(ci, "node22-smoke");
 
 		expect(builderJob).toContain("npm pack");
 		expect(builderJob).toContain("actions/upload-artifact@");
 
 		expect(smokeJob).toContain("needs: build-package");
-		expect(smokeJob).toContain("node-version: 18.17.x");
+		expect(smokeJob).toContain("node-version: 22.19.x");
 		expect(smokeJob).toContain("actions/download-artifact@");
 		expect(smokeJob).toContain("npm install -g ./codex-multi-auth-*.tgz");
 		expect(smokeJob).toContain("codex-multi-auth --help");

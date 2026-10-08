@@ -21,6 +21,21 @@ export class CircuitOpenError extends Error {
 	}
 }
 
+/**
+ * Non-throwing admission result, for hot paths that would otherwise pay for a
+ * {@link CircuitOpenError} allocation on every rejection during a storm.
+ * `reason` names the gate that rejected so callers can keep their own error
+ * taxonomy without parsing exception messages.
+ */
+export type CircuitAdmissionResult =
+	| { ok: true }
+	| {
+			ok: false;
+			reason: "open" | "half-open";
+			/** Milliseconds until a fresh attempt may be admitted. */
+			retryAfterMs: number;
+	  };
+
 export class CircuitBreaker {
 	private state: CircuitState = "closed";
 	private failures: number[] = [];
@@ -32,14 +47,26 @@ export class CircuitBreaker {
 		this.config = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...config };
 	}
 
-	canExecute(): boolean {
+	/**
+	 * Same admission decision as {@link canExecute} but returns a result
+	 * object instead of throwing, so reject-heavy callers stay exception-free.
+	 * Admitting a probe still consumes the half-open attempt slot.
+	 */
+	tryCanExecute(): CircuitAdmissionResult {
 		const now = Date.now();
 
 		if (this.state === "open") {
 			if (now - this.lastStateChange >= this.config.resetTimeoutMs) {
 				this.transitionToHalfOpen(now);
 			} else {
-				throw new CircuitOpenError();
+				return {
+					ok: false,
+					reason: "open",
+					retryAfterMs: Math.max(
+						0,
+						this.config.resetTimeoutMs - (now - this.lastStateChange),
+					),
+				};
 			}
 		}
 
@@ -48,14 +75,29 @@ export class CircuitBreaker {
 				if (this.hasHalfOpenProbeWaitElapsed(now)) {
 					this.resetHalfOpenProbeWindow(now);
 				} else {
-					throw new CircuitOpenError("Circuit is half-open");
+					return {
+						ok: false,
+						reason: "half-open",
+						retryAfterMs: Math.max(
+							0,
+							this.config.resetTimeoutMs - (now - this.lastStateChange),
+						),
+					};
 				}
 			}
 			this.halfOpenAttempts += 1;
-			return true;
+			return { ok: true };
 		}
 
-		return true;
+		return { ok: true };
+	}
+
+	canExecute(): boolean {
+		const result = this.tryCanExecute();
+		if (result.ok) return true;
+		throw new CircuitOpenError(
+			result.reason === "half-open" ? "Circuit is half-open" : "Circuit is open",
+		);
 	}
 
 	isAvailable(now = Date.now()): boolean {

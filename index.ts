@@ -227,6 +227,7 @@ import {
 	normalizeRequestInit,
 	parseRequestBodyFromInit,
 } from "./lib/request/request-init.js";
+import { CURRENT_CODEX_MODEL } from "./lib/request/helpers/model-map.js";
 import { applyFastSessionDefaults } from "./lib/request/request-transformer.js";
 import { applyResponseCompaction } from "./lib/request/response-compaction.js";
 import { isEmptyResponse } from "./lib/request/response-handler.js";
@@ -301,6 +302,7 @@ import {
 } from "./lib/runtime/ui-runtime.js";
 import { verifyRuntimeFlaggedAccounts } from "./lib/runtime/verify-flagged.js";
 import { SessionAffinityStore } from "./lib/session-affinity.js";
+import { clearAccountsAndCredentialSidecars } from "./lib/storage/credential-sidecars.js";
 import { registerCleanup } from "./lib/shutdown.js";
 import {
 	type AccountStorageV3,
@@ -1682,7 +1684,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											let response: Response;
 											const fetchStart = performance.now();
 
-											// Merge user AbortSignal with timeout (Node 18 compatible - no AbortSignal.any)
+											// Merge user AbortSignal with timeout without AbortSignal.any (keeps listeners bounded)
 											const fetchController = new AbortController();
 											const requestTimeoutMs = fetchTimeoutMs;
 											let requestTimedOut = false;
@@ -1947,7 +1949,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													});
 
 												if (fallbackModel) {
-													const previousModel = model ?? "gpt-5.3-codex";
+													const previousModel = model ?? CURRENT_CODEX_MODEL;
 													const previousModelFamily = modelFamily;
 													attemptedUnsupportedFallbackModels.add(previousModel);
 													attemptedUnsupportedFallbackModels.add(fallbackModel);
@@ -3340,13 +3342,17 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								if (menuResult.mode === "fresh") {
 									startFresh = true;
 									if (menuResult.deleteAll) {
-										await clearAccounts();
-										await clearFlaggedAccounts();
+										// Raw sk- API keys and per-account runtime state live beside the
+										// pool; they are removed even if the pool clear fails.
+										await clearAccountsAndCredentialSidecars(async () => {
+											await clearAccounts();
+											await clearFlaggedAccounts();
+										});
 										invalidateRuntimeAccountManagerCache(
 											accountManagerCacheInvalidationDeps,
 										);
 										console.log(
-											"\nCleared saved accounts from active storage. Recovery snapshots remain available. Starting fresh.\n",
+											"\nCleared saved accounts and API credentials. Account recovery snapshots remain available. Starting fresh.\n",
 										);
 									}
 									break;

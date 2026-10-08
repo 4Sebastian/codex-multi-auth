@@ -193,6 +193,9 @@ export const AccountMetadataV3Schema = z.object({
 	// silently vanish after one read/write round-trip.
 	workspaces: z.array(WorkspaceSchema).optional(),
 	currentWorkspaceIndex: z.number().optional(),
+	codexCliMirror: z
+		.object({ forAccountId: z.string().min(1), accountId: z.string().min(1) })
+		.optional(),
 });
 
 /**
@@ -227,31 +230,48 @@ export type AccountStorageV3FromSchema = z.infer<typeof AccountStorageV3Schema>;
 
 /**
  * Legacy V1 account metadata for migration support.
+ *
+ * Uses `passthrough` so V3-compatible extra fields (workspaces,
+ * rateLimitResetTimes, authInvalidatedAt, …) survive the schema boundary:
+ * version:1 files with V3-era rows are real (the flagged-accounts store is
+ * `version: 1` with full V3 rows) and migrateV1ToV3 now carries unknown
+ * fields forward — stripping them here would make that preservation a no-op
+ * for every schema-valid file. Same rationale as FlaggedAccountMetadataV1Schema.
  */
-const AccountMetadataV1Schema = z.object({
-	accountId: z.string().optional(),
-	accountIdSource: AccountIdSourceSchema.optional(),
-	accountLabel: z.string().optional(),
-	email: z.string().optional(),
-	refreshToken: z.string().min(1),
-	accessToken: z.string().optional(),
-	expiresAt: z.number().optional(),
-	enabled: z.boolean().optional(),
-	addedAt: z.number(),
-	lastUsed: z.number(),
-	lastSwitchReason: SwitchReasonSchema.optional(),
-	rateLimitResetTime: z.number().optional(), // V1 used single value
-	coolingDownUntil: z.number().optional(),
-	cooldownReason: CooldownReasonSchema.optional(),
-});
+const AccountMetadataV1Schema = z
+	.object({
+		accountId: z.string().optional(),
+		accountIdSource: AccountIdSourceSchema.optional(),
+		accountLabel: z.string().optional(),
+		email: z.string().optional(),
+		refreshToken: z.string().min(1),
+		accessToken: z.string().optional(),
+		expiresAt: z.number().optional(),
+		enabled: z.boolean().optional(),
+		addedAt: z.number(),
+		lastUsed: z.number(),
+		lastSwitchReason: SwitchReasonSchema.optional(),
+		rateLimitResetTime: z.number().optional(), // V1 used single value
+		coolingDownUntil: z.number().optional(),
+		cooldownReason: CooldownReasonSchema.optional(),
+	})
+	.passthrough();
 
 /**
  * Legacy V1 storage format for migration support.
+ *
+ * The V3-era top-level fields are accepted too: a hybrid file (version:1 but
+ * written by newer code) must not lose `activeIndexByFamily` /
+ * `pinnedAccountIndex` / `affinityGeneration` at the schema boundary before
+ * normalizeAccountStorage can consume them.
  */
 export const AccountStorageV1Schema = z.object({
 	version: z.literal(1),
 	accounts: z.array(AccountMetadataV1Schema),
 	activeIndex: z.number().min(0),
+	activeIndexByFamily: ActiveIndexByFamilySchema.optional(),
+	pinnedAccountIndex: z.number().int().min(0).optional(),
+	affinityGeneration: z.number().int().min(0).optional(),
 });
 
 /**

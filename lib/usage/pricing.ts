@@ -1,3 +1,7 @@
+import {
+	getNormalizedModel,
+	RETIRED_MODEL_REPLACEMENTS,
+} from "../request/helpers/model-map.js";
 import type { UsageServiceTier, UsageTokenCounts } from "./types.js";
 
 export interface UsageModelPricing {
@@ -13,14 +17,32 @@ export interface UsageModelPricing {
 	 * row under-counts it by half and lets a `maxCostUsd` cap overrun.
 	 *
 	 * A tier absent from this map is deliberately NOT approximated from the
-	 * standard rate. Only Astra's Fast multiplier is published; inventing one for
+	 * standard rate. Only the GPT-6 Fast rates are published; inventing one for
 	 * the rest would move a budget's trip point on a guess, which is the failure
 	 * this file exists to avoid. `estimateUsageCostUsd` reports an unlisted tier
 	 * as unknown cost instead, so a budget fails closed the same way it does for
 	 * an unpriced model.
 	 */
 	serviceTiers?: Partial<Record<UsageServiceTier, UsageModelPricing>>;
+	/**
+	 * Rates once a response's input exceeds `SHORT_CONTEXT_MAX_INPUT_TOKENS`.
+	 *
+	 * OpenAI bills a GPT-6 request whose context crosses 272K at a separate,
+	 * higher rate. A row that declares this block (every tier inside it too) is
+	 * priced from it past the threshold. A row that declares it but whose
+	 * resolved service tier does not reports unknown cost there instead of the
+	 * cheaper short-context figure, for the same fail-closed reason as an
+	 * unlisted tier. Rows with no long-context data at all are unchanged.
+	 */
+	longContext?: UsageModelPricing;
 }
+
+/**
+ * Largest input still billed at the short-context rate. OpenAI's GPT-6 model
+ * pages say "Prompts with more than 272K input tokens are priced at 2x input
+ * and cache rates", so exactly 272,000 is short and 272,001 is long.
+ */
+export const SHORT_CONTEXT_MAX_INPUT_TOKENS = 272_000;
 
 const MODEL_PRICING: Record<string, UsageModelPricing> = {
 	// GPT-6 Astra, published at the 2026-09-03 launch: $10 / 1M input,
@@ -40,54 +62,116 @@ const MODEL_PRICING: Record<string, UsageModelPricing> = {
 		outputUsdPerMillion: 50,
 		cachedInputUsdPerMillion: 1,
 		reasoningUsdPerMillion: 50,
+		// Long-context rows from the same page (read 2026-09-23).
+		longContext: {
+			inputUsdPerMillion: 20,
+			outputUsdPerMillion: 75,
+			cachedInputUsdPerMillion: 2,
+			reasoningUsdPerMillion: 75,
+		},
 		serviceTiers: {
 			// Published at launch alongside the standard rate: Fast mode is up to
-			// 2.5x the speed at 2x the price, $20 / $100 per 1M. This is the only
-			// tier multiplier OpenAI has published for any model in this table,
-			// which is why it is the only one listed anywhere in this file.
+			// 2.5x the speed at 2x the price, $20 / $100 per 1M. Only the GPT-6
+			// rows list a Fast tier, because only GPT-6 has a published Fast rate.
 			priority: {
 				inputUsdPerMillion: 20,
 				outputUsdPerMillion: 100,
 				cachedInputUsdPerMillion: 2,
 				reasoningUsdPerMillion: 100,
+				longContext: {
+					inputUsdPerMillion: 40,
+					outputUsdPerMillion: 150,
+					cachedInputUsdPerMillion: 4,
+					reasoningUsdPerMillion: 150,
+				},
 			},
 		},
 	},
-	"gpt-5-codex": {
-		inputUsdPerMillion: 1.25,
-		outputUsdPerMillion: 10,
-		cachedInputUsdPerMillion: 0.125,
-		reasoningUsdPerMillion: 10,
-	},
-	"gpt-5.1-codex": {
-		inputUsdPerMillion: 1.25,
-		outputUsdPerMillion: 10,
-		cachedInputUsdPerMillion: 0.125,
-		reasoningUsdPerMillion: 10,
-	},
-	"gpt-5.2": {
-		inputUsdPerMillion: 1.25,
-		outputUsdPerMillion: 10,
-		cachedInputUsdPerMillion: 0.125,
-		reasoningUsdPerMillion: 10,
-	},
-	"gpt-5.3-codex": {
-		inputUsdPerMillion: 1.25,
-		outputUsdPerMillion: 10,
-		cachedInputUsdPerMillion: 0.125,
-		reasoningUsdPerMillion: 10,
-	},
-	"gpt-5.4": {
+	// GPT-6.1 Sol, published with the model on 2026-09-29: same $2 / $10 shape
+	// as 6 Sol but a cheaper cached-input rate ($0.10 vs $0.20) and a separate
+	// cache-write rate this table has no field for — cache writes bill as input
+	// here. Long-context (>272K input) doubles input and cache rates and
+	// multiplies output 1.5x; the Fast tier is the usual 2x.
+	"gpt-6.1-sol": {
 		inputUsdPerMillion: 2,
-		outputUsdPerMillion: 12,
-		cachedInputUsdPerMillion: 0.2,
-		reasoningUsdPerMillion: 12,
+		outputUsdPerMillion: 10,
+		cachedInputUsdPerMillion: 0.1,
+		reasoningUsdPerMillion: 10,
+		longContext: {
+			inputUsdPerMillion: 4,
+			outputUsdPerMillion: 15,
+			cachedInputUsdPerMillion: 0.2,
+			reasoningUsdPerMillion: 15,
+		},
+		serviceTiers: {
+			priority: {
+				inputUsdPerMillion: 4,
+				outputUsdPerMillion: 20,
+				cachedInputUsdPerMillion: 0.2,
+				reasoningUsdPerMillion: 20,
+				longContext: {
+					inputUsdPerMillion: 8,
+					outputUsdPerMillion: 30,
+					cachedInputUsdPerMillion: 0.4,
+					reasoningUsdPerMillion: 30,
+				},
+			},
+		},
 	},
-	"gpt-5.5": {
+	// GPT-6 Sol and Luna, from the OpenAI API pricing page (read 2026-09-23;
+	// short- and long-context rows). Both publish a Fast tier at exactly 2x,
+	// like Astra.
+	"gpt-6-sol": {
 		inputUsdPerMillion: 2,
-		outputUsdPerMillion: 12,
+		outputUsdPerMillion: 10,
 		cachedInputUsdPerMillion: 0.2,
-		reasoningUsdPerMillion: 12,
+		reasoningUsdPerMillion: 10,
+		longContext: {
+			inputUsdPerMillion: 4,
+			outputUsdPerMillion: 15,
+			cachedInputUsdPerMillion: 0.4,
+			reasoningUsdPerMillion: 15,
+		},
+		serviceTiers: {
+			priority: {
+				inputUsdPerMillion: 4,
+				outputUsdPerMillion: 20,
+				cachedInputUsdPerMillion: 0.4,
+				reasoningUsdPerMillion: 20,
+				longContext: {
+					inputUsdPerMillion: 8,
+					outputUsdPerMillion: 30,
+					cachedInputUsdPerMillion: 0.8,
+					reasoningUsdPerMillion: 30,
+				},
+			},
+		},
+	},
+	"gpt-6-luna": {
+		inputUsdPerMillion: 0.1,
+		outputUsdPerMillion: 0.5,
+		cachedInputUsdPerMillion: 0.01,
+		reasoningUsdPerMillion: 0.5,
+		longContext: {
+			inputUsdPerMillion: 0.2,
+			outputUsdPerMillion: 0.75,
+			cachedInputUsdPerMillion: 0.02,
+			reasoningUsdPerMillion: 0.75,
+		},
+		serviceTiers: {
+			priority: {
+				inputUsdPerMillion: 0.2,
+				outputUsdPerMillion: 1,
+				cachedInputUsdPerMillion: 0.02,
+				reasoningUsdPerMillion: 1,
+				longContext: {
+					inputUsdPerMillion: 0.4,
+					outputUsdPerMillion: 1.5,
+					cachedInputUsdPerMillion: 0.04,
+					reasoningUsdPerMillion: 1.5,
+				},
+			},
+		},
 	},
 	"gpt-5.6-sol": {
 		inputUsdPerMillion: 5,
@@ -124,23 +208,10 @@ const MODEL_PRICING: Record<string, UsageModelPricing> = {
  * in neither list.
  */
 export const UNPRICED_ROUTABLE_MODELS = [
-	// OpenAI published a rate for the Astra flagship at launch but not for the
-	// long-horizon `aeon` variant, and the Daybreak cyber models are sold under
-	// a separate controlled-access agreement with no public per-token rate.
-	// Pricing `aeon` off the flagship would be a guess on the model whose whole
-	// purpose is running for days, which is exactly where a wrong rate does the
-	// most damage.
-	"gpt-6-astra-aeon",
+	// The Daybreak cyber models are sold under a separate controlled-access
+	// agreement with no public per-token rate.
 	"gpt-daybreak-blue-latest",
 	"gpt-daybreak-red-latest",
-	"gpt-5.1",
-	"gpt-5.2-pro",
-	"gpt-5.4-mini",
-	"gpt-5.4-nano",
-	"gpt-5.4-pro",
-	"gpt-5.5-pro",
-	"gpt-5-mini",
-	"gpt-5-nano",
 ] as const;
 
 function normalizeModelName(model: string | null | undefined): string | null {
@@ -151,7 +222,7 @@ function normalizeModelName(model: string | null | undefined): string | null {
 export function getUsageModelPricing(
 	model: string | null | undefined,
 ): UsageModelPricing | null {
-	const normalized = normalizeModelName(model);
+	const normalized = normalizeModelName(model?.replace(/^(api|zdr)\//, ""));
 	if (!normalized) {
 		return null;
 	}
@@ -163,10 +234,25 @@ export function getUsageModelPricing(
 	// `NaN` instead of `null`. A NaN cost is worse than an unknown one, because
 	// `NaN >= limit` is false, so it silently makes a `maxCostUsd` budget
 	// unenforceable rather than failing closed the way an unpriced model does.
-	if (!Object.hasOwn(MODEL_PRICING, normalized)) {
+	//
+	// A retired id is priced as the model it now runs on. The proxy records the
+	// raw client model string, so a new `gpt-5-codex` row is really a
+	// `gpt-5.6-sol` request; pricing it at the retired model's old rate would
+	// under-count a `maxCostUsd` budget. Rows already on disk are unaffected:
+	// the ledger stores `costUsd` when a row is written and never re-prices it.
+	const effective = !/^(api|zdr)\//.test(model ?? "") && Object.hasOwn(RETIRED_MODEL_REPLACEMENTS, normalized)
+		? RETIRED_MODEL_REPLACEMENTS[normalized]
+		: // Bare aliases (`gpt-6.1`, `gpt-6`, `gpt-5.6`, `astra`) and
+			// effort-suffixed ids (`gpt-6.1-sol-max`) reach the ledger raw too;
+			// `getNormalizedModel` is the exact/alias-only resolver — NOT
+			// `resolveNormalizedModel`, which hands back DEFAULT_MODEL for
+			// anything unrecognized and would price an unknown model at the
+			// default's rate.
+			(getNormalizedModel(normalized) ?? normalized);
+	if (!effective || !Object.hasOwn(MODEL_PRICING, effective)) {
 		return null;
 	}
-	return MODEL_PRICING[normalized] ?? null;
+	return MODEL_PRICING[effective] ?? null;
 }
 
 /**
@@ -186,6 +272,22 @@ function resolveServiceTierPricing(
 	return pricing.serviceTiers?.[serviceTier] ?? null;
 }
 
+function resolveContextLengthPricing(
+	basePricing: UsageModelPricing,
+	tierPricing: UsageModelPricing,
+	inputTokens: number,
+): UsageModelPricing | null {
+	if (inputTokens <= SHORT_CONTEXT_MAX_INPUT_TOKENS) {
+		return tierPricing;
+	}
+	if (tierPricing.longContext) {
+		return tierPricing.longContext;
+	}
+	// The model has long-context rates but not for this tier: unknown, never
+	// the cheaper short-context rate.
+	return basePricing.longContext ? null : tierPricing;
+}
+
 export function estimateUsageCostUsd(
 	model: string | null | undefined,
 	tokens: UsageTokenCounts,
@@ -199,7 +301,15 @@ export function estimateUsageCostUsd(
 	// table has no rate for must report unknown cost, not a standard-tier
 	// figure: under-counting is what lets a `maxCostUsd` cap overrun, and
 	// `evaluateBudgetGuard` already knows how to fail closed on `null`.
-	const pricing = resolveServiceTierPricing(basePricing, tokens.serviceTier);
+	const tierPricing = resolveServiceTierPricing(basePricing, tokens.serviceTier);
+	if (!tierPricing) {
+		return null;
+	}
+	const pricing = resolveContextLengthPricing(
+		basePricing,
+		tierPricing,
+		tokens.inputTokens,
+	);
 	if (!pricing) {
 		return null;
 	}

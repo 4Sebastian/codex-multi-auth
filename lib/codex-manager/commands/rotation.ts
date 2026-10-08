@@ -27,6 +27,7 @@ function redactedResetRateLimitsLabel(
 }
 import {
 	formatAppBindStatus,
+	type AppBindOptions,
 	type AppBindResult,
 	type AppBindStatus,
 } from "../../runtime/app-bind.js";
@@ -85,7 +86,7 @@ export interface RotationCommandDeps {
 	resolveActiveIndex: (storage: AccountStorageV3) => number;
 	getStoragePath: () => string | null;
 	setStoragePath: (path: string | null) => void;
-	bindCodexApp?: () => Promise<AppBindResult>;
+	bindCodexApp?: (options?: AppBindOptions) => Promise<AppBindResult>;
 	unbindCodexApp?: () => Promise<AppBindResult>;
 	getCodexAppBindStatus?: () => Promise<AppBindStatus>;
 	loadRuntimeObservabilitySnapshot?: () => Promise<RuntimeObservabilitySnapshot | null>;
@@ -102,7 +103,7 @@ function printRotationUsage(logInfo: (message: string) => void): void {
 			"  codex-multi-auth rotation enable",
 			"  codex-multi-auth rotation disable",
 			"  codex-multi-auth rotation status",
-			"  codex-multi-auth rotation bind-app",
+			"  codex-multi-auth rotation bind-app [--native [--catalog-account <idx>] | --custom-provider]",
 			"  codex-multi-auth rotation unbind-app",
 			"  codex-multi-auth rotation reset-rate-limits [--all | --account <idx>] [--dry-run] [--json]",
 			"  codex-multi-auth rotation reset-runtime [--json]",
@@ -142,8 +143,14 @@ async function runResetRuntime(
 	let appBindRestarted = false;
 	if (deps.unbindCodexApp && deps.bindCodexApp) {
 		try {
+			const previous = await deps.getCodexAppBindStatus?.();
 			unbind = await deps.unbindCodexApp();
-			bind = await deps.bindCodexApp();
+			bind = previous?.state?.nativeOpenai
+				? await deps.bindCodexApp({
+					nativeOpenai: true,
+					catalogAccount: previous.state.catalogAccount,
+				})
+				: await deps.bindCodexApp(...(previous?.state ? [{ nativeOpenai: false }] : []));
 			appBindRestarted = true;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -785,6 +792,55 @@ export async function runRotationCommand(
 	if (subcommand === "reset-runtime") {
 		return runResetRuntime(rest, deps);
 	}
+	if (subcommand === "bind-app") {
+		if (!deps.bindCodexApp) {
+			logError("Codex app bind is unavailable in this build.");
+			return 1;
+		}
+		const options: AppBindOptions = {};
+		let catalogIndex: number | undefined;
+		for (let i = 0;i < rest.length;i += 1) {
+			const arg = rest[i];
+			if (arg === "--native" || arg === "--custom-provider") {
+				if (options.nativeOpenai !== undefined) {
+					logError("Choose one app bind mode.");
+					return 1;
+				}
+				options.nativeOpenai = arg === "--native";
+			} else if (arg === "--catalog-account" && catalogIndex === undefined) {
+				const value = rest[++i] ?? "";
+				if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+					logError("Catalog account must be a positive account index.");
+					return 1;
+				}
+				catalogIndex = Number(value) - 1;
+			} else {
+				logError(`Unknown app bind option: ${arg}`);
+				return 1;
+			}
+		}
+		if (catalogIndex !== undefined) {
+			if (options.nativeOpenai !== true) {
+				logError("--catalog-account requires --native.");
+				return 1;
+			}
+			const previousStoragePath = deps.getStoragePath();
+            deps.setStoragePath(null);
+            let catalogStorage: Awaited<ReturnType<typeof deps.loadAccounts>>;
+            try { catalogStorage = await deps.loadAccounts(); }
+            finally { deps.setStoragePath(previousStoragePath); }
+            const account = catalogStorage?.accounts[catalogIndex];
+			if (!account?.email || !account.accountId || account.enabled === false) {
+				logError("Catalog account must be an enabled account with an email and account ID.");
+				return 1;
+			}
+			options.catalogAccount = { email: account.email, accountId: account.accountId };
+		}
+		const result = rest.length ? await deps.bindCodexApp(options) : await deps.bindCodexApp();
+		logInfo(result.message);
+		logInfo(formatAppBindStatus(result.status));
+		return 0;
+	}
 	if (rest.length > 0) {
 		logError(`Unknown rotation option: ${rest[0]}`);
 		return 1;
@@ -820,16 +876,6 @@ export async function runRotationCommand(
 				return 1;
 			}
 		}
-		return 0;
-	}
-	if (subcommand === "bind-app") {
-		if (!deps.bindCodexApp) {
-			logError("Codex app bind is unavailable in this build.");
-			return 1;
-		}
-		const result = await deps.bindCodexApp();
-		logInfo(result.message);
-		logInfo(formatAppBindStatus(result.status));
 		return 0;
 	}
 	if (subcommand === "unbind-app") {

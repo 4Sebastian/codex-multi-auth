@@ -1,7 +1,11 @@
+import { withNativeBindingLock } from "./native-binding-lock.js";
+import { isRecord } from "../utils.js";
+import { hasNativeProviderConfig, rewriteNativeProviderConfig, restoreNativeProviderConfig } from "./native-provider-config.js";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
+import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import process from "node:process";
@@ -59,6 +63,8 @@ interface AppBindBackup {
 }
 
 export interface AppBindState {
+	nativeOpenai?: boolean;
+	catalogAccount?: { email: string; accountId: string; };
 	version: 1;
 	platform: NodeJS.Platform;
 	host: string;
@@ -128,6 +134,8 @@ export type ProcessIdentityVerifier = (
 ) => boolean | Promise<boolean>;
 
 export interface AppBindOptions {
+	nativeOpenai?: boolean;
+	catalogAccount?: { email: string; accountId: string; };
 	env?: NodeJS.ProcessEnv;
 	platform?: NodeJS.Platform;
 	home?: string;
@@ -152,6 +160,8 @@ export interface DetachedProcessStopOptions {
 	/** Expected per-process nonce when verifying a persisted PID. */
 	identityToken?: string;
 	verifyProcessIdentity?: ProcessIdentityVerifier;
+	/** Called once the recorded PID is verified as this router, before it is stopped. */
+	onOwnershipVerified?: () => void;
 }
 
 export interface RuntimeRotationAppHelperStatus {
@@ -203,7 +213,9 @@ export function rewriteConfigTomlForAppBind(
 	rawConfig: string,
 	baseUrl: string,
 	clientApiKey = "",
+	nativeOpenai = false,
 ): string {
+	if (nativeOpenai) return rewriteNativeProviderConfig(rawConfig, baseUrl);
 	return rewriteConfigTomlForRuntimeRotationProvider(
 		rawConfig,
 		baseUrl,
@@ -213,7 +225,7 @@ export function rewriteConfigTomlForAppBind(
 
 export function restoreConfigTomlFromAppBind(currentConfig: string, originalConfig: string): string {
 	return restoreConfigTomlFromRuntimeRotationProvider(
-		currentConfig,
+		restoreNativeProviderConfig(currentConfig, originalConfig),
 		originalConfig,
 	);
 }
@@ -356,6 +368,8 @@ function readAppBindStateRecord(record: Record<string, unknown>): AppBindState |
 		nodePath,
 		routerScriptPath,
 		clientApiKey,
+		nativeOpenai: record.nativeOpenai === true,
+		catalogAccount: isRecord(record.catalogAccount) && typeof record.catalogAccount.email === "string" && typeof record.catalogAccount.accountId === "string" ? { email: record.catalogAccount.email, accountId: record.catalogAccount.accountId } : undefined,
 		identityToken: identityToken ?? undefined,
 		startupPath: readString(record, "startupPath"),
 		launchAgentPath: readString(record, "launchAgentPath"),
@@ -630,6 +644,25 @@ function spawnRouter(state: AppBindState): void {
 	}
 }
 
+/**
+ * Whether anything still accepts connections at a recorded router address.
+ * Only "refused" is proof that no router serves it; a timeout or an unusable
+ * address is "unknown".
+ */
+export async function probeRouterAddress(baseUrl: string | null | undefined, platform: NodeJS.Platform = process.platform, timeoutMs = platform === "win32" ? WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_MS : 1000): Promise<"refused" | "listening" | "unknown"> {
+	let url: URL;
+	try { url = new URL(baseUrl ?? ""); } catch { return "unknown"; }
+	const port = Number(url.port);
+	if (!Number.isInteger(port) || port <= 0) return "unknown";
+	return new Promise((resolve) => {
+		const socket = connect({ host: url.hostname.replace(/^\[|\]$/g, ""), port });
+		const done = (result: "refused" | "listening" | "unknown") => { clearTimeout(timer); socket.destroy(); resolve(result); };
+		const timer = setTimeout(() => done("unknown"), timeoutMs);
+		socket.once("connect", () => done("listening"));
+		socket.once("error", (error: NodeJS.ErrnoException) => done(error.code === "ECONNREFUSED" ? "refused" : "unknown"));
+	});
+}
+
 async function maybeStartRouter(state: AppBindState, options: AppBindOptions): Promise<boolean> {
 	if (options.spawnDetached === false) return false;
 	const router = await readRouterStatus(state.statusPath);
@@ -745,6 +778,7 @@ export async function stopRuntimeRotationRouterProcess(
 	if (!verified) {
 		return false;
 	}
+	options.onOwnershipVerified?.();
 	return stopDetachedProcess(router.pid, platform, options);
 }
 
@@ -794,10 +828,22 @@ interface ProcessIdentitySnapshot {
 	commandLine: string;
 }
 
+// `ps -o lstart=` is locale-sensitive: under a non-English LC_TIME it prints
+// localized day/month names that parsePosixProcessStartTime cannot read, so
+// every POSIX identity probe would fail and unbind would leak live routers.
+const POSIX_IDENTITY_PROBE_ENV: NodeJS.ProcessEnv = {
+	...process.env,
+	LC_ALL: "C",
+};
+
 async function runProcessIdentityProbe(
 	command: string,
 	args: string[],
-	options: { timeoutMs?: number; log?: (message: string) => void } = {},
+	options: {
+		timeoutMs?: number;
+		env?: NodeJS.ProcessEnv;
+		log?: (message: string) => void;
+	} = {},
 ): Promise<string | null> {
 	return new Promise((resolve) => {
 		let output = "";
@@ -828,6 +874,7 @@ async function runProcessIdentityProbe(
 			child = spawn(command, args, {
 				stdio: ["ignore", "pipe", "ignore"],
 				windowsHide: true,
+				...(options.env ? { env: options.env } : {}),
 			});
 			child.stdout?.setEncoding("utf8");
 			child.stdout?.on("data", (chunk: string) => {
@@ -894,12 +941,12 @@ async function readProcessIdentity(
 		runProcessIdentityProbe(
 			"ps",
 			["-p", String(pid), "-o", "lstart="],
-			{ log },
+			{ env: POSIX_IDENTITY_PROBE_ENV, log },
 		),
 		runProcessIdentityProbe(
 			"ps",
 			["-p", String(pid), "-o", "command="],
-			{ log },
+			{ env: POSIX_IDENTITY_PROBE_ENV, log },
 		),
 	]);
 	if (!startedAtRaw || !commandLineRaw) {
@@ -1383,7 +1430,7 @@ export async function getAppBindStatus(options: AppBindOptions = {}): Promise<Ap
 	if (state === null) {
 		const current = await readConfigIfExists(paths.configPath);
 		unmanagedBind =
-			current.existed && configHasRuntimeRotationProvider(current.content);
+			current.existed && (configHasRuntimeRotationProvider(current.content) || hasNativeProviderConfig(current.content));
 	}
 	return {
 		bound: state !== null || unmanagedBind,
@@ -1400,7 +1447,7 @@ export async function bindCodexAppRuntimeRotation(
 ): Promise<AppBindResult> {
 	const paths = resolveAppBindPaths(options);
 	return withAppBindLock(paths.bindDir, () =>
-		bindCodexAppRuntimeRotationLocked(options, paths),
+		withNativeBindingLock(paths.configPath, () => bindCodexAppRuntimeRotationLocked(options, paths)),
 	);
 }
 
@@ -1411,6 +1458,38 @@ async function bindCodexAppRuntimeRotationLocked(
 	const platform = options.platform ?? process.platform;
 	const now = options.now?.() ?? Date.now();
 	const existingState = await readAppBindState(paths.statePath);
+	const nativeOpenai = options.nativeOpenai ?? existingState?.nativeOpenai ??
+		((options.env ?? process.env).CODEX_MULTI_AUTH_NATIVE_OPENAI === "1");
+	const catalogAccount = options.nativeOpenai === false ? undefined : options.catalogAccount ?? existingState?.catalogAccount;
+	if (existingState && (!!existingState.nativeOpenai !== nativeOpenai || JSON.stringify(catalogAccount) !== JSON.stringify(existingState.catalogAccount))) {
+		const router = await readRouterStatus(paths.statusPath);
+		let ownRouter = false;
+		await stopRouter(router, platform, existingState.routerScriptPath, {
+			log: options.log, identityToken: existingState.identityToken, verifyProcessIdentity: options.verifyProcessIdentity,
+			onOwnershipVerified: () => { ownRouter = true; },
+		});
+		// Refuse only when the recorded PID is verifiably our router and it survived
+		// the stop. A recycled PID now owned by another process must not block
+		// mode changes forever (unbind treats the same case as a warning).
+		if (router?.pid && isProcessAlive(router.pid)) {
+			if (ownRouter) throw new Error("Stop the existing app router before changing provider mode");
+			// A failed identity check is not proof: a slow or failing process probe
+			// (common on Windows) also returns false for a live router. Treat the pid
+			// as recycled only when nothing answers at the recorded router address.
+			const address = await probeRouterAddress(router.baseUrl ?? existingState.baseUrl, options.platform ?? process.platform);
+			if (address !== "refused") {
+				throw new Error(
+					`Could not confirm that the app router recorded as pid ${router.pid} has stopped (its address ${address === "listening" ? "still accepts connections" : "could not be checked"}). Stop it before changing provider mode.`,
+				);
+			}
+			options.log?.(`Warning: recorded router pid ${router.pid} is not the app router; continuing`);
+			// The record describes a router that no longer exists. Drop it so
+			// maybeStartRouter starts a replacement instead of trusting the live
+			// (recycled) pid and leaving the new mode pointed at a dead address.
+			await unlinkIfExists(paths.statusPath);
+		}
+	}
+
 	const host = existingState?.host ?? "127.0.0.1";
 	let port = existingState && existingState.port > 0 ? existingState.port : 0;
 	let baseUrl = existingState?.baseUrl ?? formatBaseUrl(host, port);
@@ -1426,8 +1505,13 @@ async function bindCodexAppRuntimeRotationLocked(
 		content,
 		createdAt: now,
 	};
-	let boundConfig = rewriteConfigTomlForAppBind(content, baseUrl, clientApiKey);
+	const bindingContent = nativeOpenai
+		? restoreConfigTomlFromAppBind(content, backup.content)
+		: restoreNativeProviderConfig(content, backup.content);
+	let boundConfig = rewriteConfigTomlForAppBind(bindingContent, baseUrl, clientApiKey, nativeOpenai);
 	let state: AppBindState = {
+		nativeOpenai,
+		catalogAccount,
 		version: 1,
 		platform,
 		host,
@@ -1499,7 +1583,7 @@ async function bindCodexAppRuntimeRotationLocked(
 			"Codex app bind could not resolve a runtime router port; refusing to write config.toml with port=0.",
 		);
 	}
-	boundConfig = rewriteConfigTomlForAppBind(content, baseUrl, clientApiKey);
+	boundConfig = rewriteConfigTomlForAppBind(bindingContent, baseUrl, clientApiKey, nativeOpenai);
 	state = {
 		...state,
 		port,
@@ -1525,7 +1609,7 @@ export async function unbindCodexAppRuntimeRotation(
 ): Promise<AppBindResult> {
 	const paths = resolveAppBindPaths(options);
 	return withAppBindLock(paths.bindDir, () =>
-		unbindCodexAppRuntimeRotationLocked(options, paths),
+		withNativeBindingLock(paths.configPath, () => unbindCodexAppRuntimeRotationLocked(options, paths)),
 	);
 }
 
@@ -1741,11 +1825,11 @@ async function unbindCodexAppRuntimeRotationLocked(
 		// above can't see this, so consult the config directly and self-heal it
 		// back to a working provider when it is bound.
 		const current = await readConfigIfExists(paths.configPath);
-		if (current.existed && configHasRuntimeRotationProvider(current.content)) {
+		if (current.existed && (configHasRuntimeRotationProvider(current.content) || hasNativeProviderConfig(current.content))) {
 			await atomicWriteFile(
 				paths.configPath,
 				restoreConfigTomlFromRuntimeRotationProviderWithoutBackup(
-					current.content,
+					restoreNativeProviderConfig(current.content, ""),
 				),
 			);
 			selfHealed = true;
@@ -1811,6 +1895,7 @@ export function formatAppBindStatus(status: AppBindStatus): string {
 	} else if (status.router?.lastAccountIndex !== null && status.router?.lastAccountIndex !== undefined) {
 		parts.push(`lastAccount=Account ${status.router.lastAccountIndex + 1}`);
 	}
+	if (status.state.nativeOpenai) return `Codex app bind: ${parts.join(", ")}, native OpenAI, live account catalogs`;
 	return [
 		`Codex app bind: ${parts.join(", ")}`,
 		[

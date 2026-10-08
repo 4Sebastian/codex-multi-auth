@@ -24,20 +24,12 @@ import { getNormalizedModel } from "../request/helpers/model-map.js";
  * in doubt about a model's real ceiling, leave it out of this table and add
  * it to UNESTIMATED_ROUTABLE_MODELS instead.
  */
-const ESTIMATED_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-	"gpt-5.1": 260_000,
-	"gpt-5.2": 260_000,
-	"gpt-5.2-pro": 260_000,
-	"gpt-5.3-codex": 260_000,
-	"gpt-5.4": 260_000,
-	"gpt-5.4-mini": 260_000,
-	"gpt-5.4-nano": 260_000,
-	"gpt-5.4-pro": 260_000,
-	"gpt-5.5": 260_000,
-	"gpt-5.5-pro": 260_000,
-	"gpt-5-mini": 260_000,
-	"gpt-5-nano": 260_000,
-};
+//
+// Retired models (`gpt-5.1` through `gpt-5.5-pro`, `gpt-5-mini`/`nano`, the
+// codex models) are deliberately absent. Their ids now route to a
+// replacement, and estimating the window from the retired name would
+// evaluate a request against a model it no longer runs on.
+const ESTIMATED_MODEL_CONTEXT_WINDOWS: Record<string, number> = {};
 
 /**
  * Routable models this guard consciously does not estimate a window for.
@@ -60,7 +52,11 @@ export const UNESTIMATED_ROUTABLE_MODELS = [
 	// measured ceiling for this transport, so it stays unestimated too. Set
 	// `contextBudgetGuardModelWindowOverrides` once you know your real ceiling.
 	"gpt-6-astra",
-	"gpt-6-astra-aeon",
+	// Sol, Luna and 6.1 Sol carry the same 272K Codex / 872K max split in the
+	// upstream catalog as Astra, so the same reasoning keeps them unestimated.
+	"gpt-6-sol",
+	"gpt-6-luna",
+	"gpt-6.1-sol",
 	"gpt-daybreak-blue-latest",
 	"gpt-daybreak-red-latest",
 ] as const;
@@ -85,8 +81,8 @@ function normalizeModelName(model: string | null | undefined): string | null {
  * the way they type the model still wins, then the catalog's canonical id for
  * it. `getNormalizedModel` is deliberately the exact/alias-only resolver —
  * `resolveNormalizedModel` falls back to `DEFAULT_MODEL` for anything it does
- * not recognize, which would hand an unknown model gpt-5.5's window and
- * evaluate a real session against a fabricated number.
+ * not recognize, which would hand an unknown model the default model's
+ * window and evaluate a real session against a fabricated number.
  */
 function windowLookupCandidates(model: string | null | undefined): string[] {
 	const raw = normalizeModelName(model);

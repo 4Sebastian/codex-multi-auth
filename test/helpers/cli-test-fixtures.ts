@@ -141,8 +141,10 @@ export type QuotaCacheMocks = ReturnType<typeof createQuotaCacheMocks>;
 
 export function quotaCacheModuleMock(
 	mocks: QuotaCacheMocks,
+	actual?: Record<string, unknown>,
 ): Record<string, unknown> {
 	return {
+		...actual,
 		loadQuotaCache: mocks.loadQuotaCache,
 		saveQuotaCache: mocks.saveQuotaCache,
 	};
@@ -200,13 +202,15 @@ export function appBindModuleMock(
 // ---------------------------------------------------------------------------
 
 export function createCodexCliStateMocks(
-	paths: { authPath?: string; configPath?: string } = {},
+	paths: { authPath?: string; configPath?: string; accountsPath?: string } = {},
 ) {
 	const authPath = paths.authPath ?? "/mock/.codex/auth.json";
 	const configPath = paths.configPath ?? "/mock/.codex/config.toml";
+	const accountsPath = paths.accountsPath ?? "/mock/.codex/accounts.json";
 	return {
 		getCodexCliAuthPath: vi.fn(() => authPath),
 		getCodexCliConfigPath: vi.fn(() => configPath),
+		getCodexCliAccountsPath: vi.fn(() => accountsPath),
 		loadCodexCliState: vi.fn(),
 	};
 }
@@ -219,6 +223,7 @@ export function codexCliStateModuleMock(
 	return {
 		getCodexCliAuthPath: mocks.getCodexCliAuthPath,
 		getCodexCliConfigPath: mocks.getCodexCliConfigPath,
+		getCodexCliAccountsPath: mocks.getCodexCliAccountsPath,
 		loadCodexCliState: mocks.loadCodexCliState,
 	};
 }

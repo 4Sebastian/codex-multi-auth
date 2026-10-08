@@ -16,6 +16,8 @@ import {
 import { tmpdir } from "node:os";
 import {
 	delimiter,
+	posix,
+	win32,
 	dirname,
 	isAbsolute,
 	join,
@@ -23,7 +25,7 @@ import {
 	resolve,
 } from "node:path";
 import process from "node:process";
-import { withDeadPid, withDeadPids } from "./helpers/owned-pids.js";
+import { withDeadPid, withDeadPids, withLivePid } from "./helpers/owned-pids.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -479,18 +481,41 @@ function writeAccountsFixture(codexHome: string, count: number): void {
 	);
 }
 
+// Windows stand-in for a real Codex install, laid out the way `npm i -g
+// @openai/codex` lays out its prefix: `codex.cmd` and an extensionless sh shim
+// next to `node_modules\@openai\codex\bin\codex.js`. The entry echoes whatever
+// argv it receives, so the wrapper's injected leading `-c key=value` pair is
+// accepted the way real Codex accepts it. Returns the package entry path.
+function createWindowsNpmPrefixCodexFixture(prefixDir: string, marker: string): string {
+	const entryPath = join(prefixDir, "node_modules", "@openai", "codex", "bin", "codex.js");
+	mkdirSync(dirname(entryPath), { recursive: true });
+	writeFileSync(
+		entryPath,
+		[
+			`console.log(\`${marker}:\${process.argv.slice(2).join(" ")}\`);`,
+			"process.exit(0);",
+		].join("\n"),
+		"utf8",
+	);
+	writeFileSync(
+		join(prefixDir, "codex.cmd"),
+		'@ECHO off\r\n"node" "%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
+		"utf8",
+	);
+	writeFileSync(
+		join(prefixDir, "codex"),
+		'#!/bin/sh\nexec node "$(dirname "$0")/node_modules/@openai/codex/bin/codex.js" "$@"\n',
+		"utf8",
+	);
+	return entryPath;
+}
+
 function createFakeNativeCodexBin(rootDir: string): string {
 	if (process.platform === "win32") {
-		const fakeBin = join(rootDir, `fake-native-codex-${createdDirs.length}.ps1`);
-		writeFileSync(
-			fakeBin,
-			[
-				'Write-Output ("FORWARDED_NATIVE:" + ($args -join " "))',
-				"exit 0",
-			].join("\r\n"),
-			"utf8",
+		return createWindowsNpmPrefixCodexFixture(
+			join(rootDir, `fake-native-codex-${createdDirs.length}`),
+			"FORWARDED_NATIVE",
 		);
-		return fakeBin;
 	}
 
 	const fakeBin = join(rootDir, `fake-native-codex-${createdDirs.length}`);
@@ -507,11 +532,6 @@ function createFakeNativeCodexBin(rootDir: string): string {
 	return fakeBin;
 }
 
-function resolveWindowsPowerShellPath(): string {
-	const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
-	return join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-
 function createPathDiscoveredNativeCodexFixture(rootDir: string): {
 	args: string[];
 	binDir: string;
@@ -520,23 +540,11 @@ function createPathDiscoveredNativeCodexFixture(rootDir: string): {
 	const binDir = join(rootDir, `native-codex-bin-${createdDirs.length}`);
 	mkdirSync(binDir, { recursive: true });
 	if (process.platform === "win32") {
-		const scriptPath = join(binDir, "native-codex-marker.js");
-		writeFileSync(
-			scriptPath,
-			[
-				'console.log(`FORWARDED_NATIVE_PATH:${process.argv.slice(2).join(" ")}`);',
-				"process.exit(0);",
-			].join("\n"),
-			"utf8",
-		);
-		const nativeExePath = join(binDir, "codex.exe");
-		// A hard link to the test runner's node.exe cannot be removed on Windows
-		// while this process is still running. Use an independent image so the
-		// fixture teardown exercises the resolver without leaking a locked file.
-		copyFileSync(process.execPath, nativeExePath);
+		// The npm-installed codex.cmd a Windows user actually has on PATH.
+		createWindowsNpmPrefixCodexFixture(binDir, "FORWARDED_NATIVE_PATH");
 		return {
 			binDir,
-			args: [scriptPath, "--version"],
+			args: ["--version"],
 			expectedOutput: "FORWARDED_NATIVE_PATH:--version",
 		};
 	}
@@ -1173,6 +1181,51 @@ describe("codex bin wrapper", () => {
 		expect(output).not.toContain("--account");
 	});
 
+	// Cross-provider session discovery is optional: a Codex build without
+	// `thread/list` (or one that rejects, exits or times out) must still reach
+	// native `codex resume` instead of failing the whole launch.
+	it("falls back to native resume when the session picker fails", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const runtimeDir = join(fixtureRoot, "dist", "lib", "runtime");
+		mkdirSync(runtimeDir, { recursive: true });
+		writeFileSync(
+			join(runtimeDir, "resume-picker.js"),
+			'export async function pickResumeThread() { throw new Error("thread/list is unsupported"); }\n',
+			"utf8",
+		);
+		// The picker only runs on an interactive terminal; spawnSync pipes stdio.
+		const ttyPreload = join(fixtureRoot, "force-tty.mjs");
+		writeFileSync(
+			ttyPreload,
+			"process.stdin.isTTY = true;\nprocess.stdout.isTTY = true;\n",
+			"utf8",
+		);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["resume", "--all"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			NODE_OPTIONS: `--import=${pathToFileURL(ttyPreload).href}`,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		expect(output).toContain(
+			"Could not list saved Codex sessions: thread/list is unsupported",
+		);
+		expect(result.status).toBe(0);
+		expect(output).toContain("FORWARDED:resume --all");
+	});
+
 	it.each([
 		["email", ["exec", "--account", "account-2@example.com", "status"], {}, "1"],
 		["account id", ["exec", "--account", "acc_2", "status"], {}, "1"],
@@ -1525,6 +1578,58 @@ describe("codex bin wrapper", () => {
 		expect(index).not.toContain("SHOULD_NOT_BE_REPAIRED");
 	});
 
+	it("indexes forked rollouts under their own session_meta id", () => {
+		const fixtureRoot = createWrapperFixture();
+		const codexHome = join(fixtureRoot, "codex-home");
+		const parentSessionId = "019ddf58-f831-7e12-bf4a-fae1ed000021";
+		const forkedSessionId = "019ddf58-f831-7e12-bf4a-fae1ed000022";
+		mkdirSync(codexHome, { recursive: true });
+		writeFileSync(
+			join(codexHome, "session_index.jsonl"),
+			`${JSON.stringify({
+				id: parentSessionId,
+				thread_name: "Parent session",
+				updated_at: "2026-04-30T17:20:00.000Z",
+			})}\n`,
+			"utf8",
+		);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"const { mkdirSync, writeFileSync } = require('node:fs');",
+			"const { join } = require('node:path');",
+			`const parentSessionId = ${JSON.stringify(parentSessionId)};`,
+			`const forkedSessionId = ${JSON.stringify(forkedSessionId)};`,
+			"const codexHome = process.env.CODEX_HOME;",
+			"const sessionDir = join(codexHome, 'sessions', '2026', '05', '01');",
+			"mkdirSync(sessionDir, { recursive: true });",
+			"writeFileSync(",
+			"  join(sessionDir, `rollout-2026-05-01T01-21-00-${forkedSessionId}.jsonl`),",
+			"  [",
+			"    JSON.stringify({ timestamp: '2026-04-30T17:21:00.000Z', type: 'session_meta', payload: { id: forkedSessionId, forked_from_id: parentSessionId } }),",
+			"    JSON.stringify({ timestamp: '2026-04-30T17:21:00.000Z', type: 'session_meta', payload: { id: parentSessionId } }),",
+			"    JSON.stringify({ timestamp: '2026-04-30T17:21:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'FORKED_SESSION' } }),",
+			"    '',",
+			"  ].join('\\n'),",
+			"  'utf8',",
+			");",
+			"process.exit(0);",
+		]);
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_HOME: codexHome,
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+		});
+
+		expect(result.status).toBe(0);
+		const entries = readFileSync(join(codexHome, "session_index.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { id: string; thread_name: string });
+		expect(entries).toContainEqual(
+			expect.objectContaining({ id: forkedSessionId, thread_name: "FORKED_SESSION" }),
+		);
+		expect(entries.filter((entry) => entry.id === parentSessionId)).toHaveLength(1);
+	});
+
 	it("serializes concurrent local session index repairs", async () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
@@ -1590,13 +1695,8 @@ describe("codex bin wrapper", () => {
 	it("forwards non-auth commands to native codex executables", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createFakeNativeCodexBin(fixtureRoot);
-		const nativeBin = process.platform === "win32" ? resolveWindowsPowerShellPath() : fakeBin;
-		const args =
-			process.platform === "win32"
-				? ["-NoProfile", "-File", fakeBin, "--version"]
-				: ["--version"];
-		const result = runWrapper(fixtureRoot, args, {
-			CODEX_MULTI_AUTH_REAL_CODEX_BIN: nativeBin,
+		const result = runWrapper(fixtureRoot, ["--version"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 		});
 
 		expect(result.status).toBe(0);
@@ -2249,6 +2349,187 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("simulated SQLite sidecar placeholder failure");
 	});
 
+	it("does not read linked sqlite files when snapshotting or syncing the shadow home", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const readLogPath = join(fixtureRoot, "sqlite-reads.log");
+		const readSpyPath = join(fixtureRoot, "sqlite-read-spy.mjs");
+		writeFileSync(
+			readSpyPath,
+			[
+				'import fs from "node:fs";',
+				'import { syncBuiltinESMExports } from "node:module";',
+				"const logPath = process.env.CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG ?? '';",
+				"const originalReadFileSync = fs.readFileSync;",
+				"fs.readFileSync = function (path, ...rest) {",
+				"  if (logPath && /\\.sqlite(?:-wal|-shm)?$/i.test(String(path))) {",
+				"    fs.appendFileSync(logPath, `${String(path)}\\n`, 'utf8');",
+				"  }",
+				"  return originalReadFileSync.call(this, path, ...rest);",
+				"};",
+				"syncBuiltinESMExports();",
+			].join("\n"),
+			"utf8",
+		);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'const historyPath = path.join(process.env.CODEX_HOME ?? "", "thread_history_1.sqlite");',
+			'console.log(`HISTORY_MIRRORED:${fs.existsSync(historyPath)}`);',
+			'fs.appendFileSync(historyPath, "shadow-history\\n", "utf8");',
+			'fs.appendFileSync(`${historyPath}-wal`, "shadow-history-wal\\n", "utf8");',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "thread_history_1.sqlite"), "history\n", "utf8");
+		writeFileSync(join(originalHome, "thread_history_1.sqlite-wal"), "history wal\n", "utf8");
+		writeFileSync(join(originalHome, "thread_history_1.sqlite-shm"), "history shm\n", "utf8");
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "proxy-marker.txt"),
+			CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG: readLogPath,
+			NODE_OPTIONS: `--import ${pathToFileURL(readSpyPath).href}`,
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(0);
+		expect(combinedOutput(result)).toContain("HISTORY_MIRRORED:true");
+		expect(existsSync(readLogPath) ? readFileSync(readLogPath, "utf8") : "").toBe("");
+		expect(readFileSync(join(originalHome, "thread_history_1.sqlite"), "utf8")).toBe(
+			"history\nshadow-history\n",
+		);
+		expect(readFileSync(join(originalHome, "thread_history_1.sqlite-wal"), "utf8")).toBe(
+			"history wal\nshadow-history-wal\n",
+		);
+	});
+
+	it("does not read a linked sqlite file whose original was replaced during the launch", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const readLogPath = join(fixtureRoot, "sqlite-reads.log");
+		const readSpyPath = join(fixtureRoot, "sqlite-read-spy.mjs");
+		writeFileSync(
+			readSpyPath,
+			[
+				'import fs from "node:fs";',
+				'import { syncBuiltinESMExports } from "node:module";',
+				"const logPath = process.env.CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG ?? '';",
+				"const originalReadFileSync = fs.readFileSync;",
+				"fs.readFileSync = function (path, ...rest) {",
+				"  if (logPath && /\\.sqlite(?:-wal|-shm)?$/i.test(String(path))) {",
+				"    fs.appendFileSync(logPath, `${String(path)}\\n`, 'utf8');",
+				"  }",
+				"  return originalReadFileSync.call(this, path, ...rest);",
+				"};",
+				"syncBuiltinESMExports();",
+			].join("\n"),
+			"utf8",
+		);
+		// Simulate the hard-link fallback: the shadow entry becomes a hard link to the
+		// launch-time inode, then another process atomically replaces the original.
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'const shadowPath = path.join(process.env.CODEX_HOME ?? "", "thread_history_1.sqlite");',
+			'const originalPath = process.env.CODEX_MULTI_AUTH_TEST_ORIGINAL_HISTORY;',
+			"fs.unlinkSync(shadowPath);",
+			"fs.linkSync(originalPath, shadowPath);",
+			'fs.writeFileSync(`${originalPath}.next`, "replaced history\\n", "utf8");',
+			"fs.renameSync(`${originalPath}.next`, originalPath);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const originalHistoryPath = join(originalHome, "thread_history_1.sqlite");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(originalHistoryPath, "history\n", "utf8");
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "proxy-marker.txt"),
+			CODEX_MULTI_AUTH_TEST_ORIGINAL_HISTORY: originalHistoryPath,
+			CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG: readLogPath,
+			NODE_OPTIONS: `--import ${pathToFileURL(readSpyPath).href}`,
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(0);
+		expect(existsSync(readLogPath) ? readFileSync(readLogPath, "utf8") : "").toBe("");
+		expect(readFileSync(originalHistoryPath, "utf8")).toBe("replaced history\n");
+	});
+
+	it("does not read linked sqlite sidecars whose originals were replaced during the launch", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const readLogPath = join(fixtureRoot, "sqlite-reads.log");
+		const readSpyPath = join(fixtureRoot, "sqlite-read-spy.mjs");
+		writeFileSync(
+			readSpyPath,
+			[
+				'import fs from "node:fs";',
+				'import { syncBuiltinESMExports } from "node:module";',
+				"const logPath = process.env.CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG ?? '';",
+				"const originalReadFileSync = fs.readFileSync;",
+				"fs.readFileSync = function (path, ...rest) {",
+				"  if (logPath && /\\.sqlite(?:-wal|-shm)?$/i.test(String(path))) {",
+				"    fs.appendFileSync(logPath, `${String(path)}\\n`, 'utf8');",
+				"  }",
+				"  return originalReadFileSync.call(this, path, ...rest);",
+				"};",
+				"syncBuiltinESMExports();",
+			].join("\n"),
+			"utf8",
+		);
+		// Sidecars are linked while the main file materializes, so their own readdir
+		// entries are skipped. Hard-link them and replace the originals mid-launch.
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'const shadowPath = path.join(process.env.CODEX_HOME ?? "", "thread_history_1.sqlite");',
+			'const originalPath = process.env.CODEX_MULTI_AUTH_TEST_ORIGINAL_HISTORY;',
+			'for (const suffix of ["-wal", "-shm"]) {',
+			"  fs.unlinkSync(`${shadowPath}${suffix}`);",
+			"  fs.linkSync(`${originalPath}${suffix}`, `${shadowPath}${suffix}`);",
+			"  fs.writeFileSync(`${originalPath}${suffix}.next`, `replaced${suffix}\\n`, \"utf8\");",
+			"  fs.renameSync(`${originalPath}${suffix}.next`, `${originalPath}${suffix}`);",
+			"}",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const originalHistoryPath = join(originalHome, "thread_history_1.sqlite");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(originalHistoryPath, "history\n", "utf8");
+		writeFileSync(`${originalHistoryPath}-wal`, "history wal\n", "utf8");
+		writeFileSync(`${originalHistoryPath}-shm`, "history shm\n", "utf8");
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "proxy-marker.txt"),
+			CODEX_MULTI_AUTH_TEST_ORIGINAL_HISTORY: originalHistoryPath,
+			CODEX_MULTI_AUTH_TEST_SQLITE_READ_LOG: readLogPath,
+			NODE_OPTIONS: `--import ${pathToFileURL(readSpyPath).href}`,
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(0);
+		expect(existsSync(readLogPath) ? readFileSync(readLogPath, "utf8") : "").toBe("");
+		expect(readFileSync(`${originalHistoryPath}-wal`, "utf8")).toBe("replaced-wal\n");
+		expect(readFileSync(`${originalHistoryPath}-shm`, "utf8")).toBe("replaced-shm\n");
+	});
+
 	it("inserts the runtime model provider before TOML array tables", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
@@ -2788,17 +3069,18 @@ describe("codex bin wrapper", () => {
 		const controlledTmp = join(fixtureRoot, "tmp");
 		mkdirSync(originalHome, { recursive: true });
 		mkdirSync(controlledTmp, { recursive: true });
-		// `--model gpt-5.1` coerces `xhigh` down to `high`, which is the only thing
-		// that makes `createCompatibilityCodexHome` build a shadow mirror at all.
+		// `--model gpt-6-luna` coerces `ultra` down to `max` (Luna's ladder stops
+		// at max), which is the only thing that makes
+		// `createCompatibilityCodexHome` build a shadow mirror at all.
 		writeFileSync(
 			join(originalHome, "config.toml"),
-			'model_provider = "openai"\nmodel_reasoning_effort = "xhigh"\n',
+			'model_provider = "openai"\nmodel_reasoning_effort = "ultra"\n',
 			"utf8",
 		);
 
 		const result = runWrapper(
 			fixtureRoot,
-			["app-server", "--listen", "stdio://", "--model", "gpt-5.1"],
+			["app-server", "--listen", "stdio://", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -3137,7 +3419,7 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("SHADOW_PLUGINS_EXISTS:true");
 		expect(output).toContain("SHADOW_SKILLS_EXISTS:true");
 		expect(output).toContain("SHADOW_MEMORY_EXISTS:true");
-		expect(output).toContain("APP_SERVER_SHIM_STATUS:0");
+		expect(output, output).toContain("APP_SERVER_SHIM_STATUS:0");
 		expect(output).toContain(
 			"APP_SERVER_SHIM_STDOUT:APP_SERVER_FORWARDED:app-server --shim-probe",
 		);
@@ -4388,7 +4670,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["app", ".", "--model", "gpt-5.5"],
+			["app", ".", "--model", "gpt-5.6-sol"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -4407,8 +4689,8 @@ describe("codex bin wrapper", () => {
 		if (result.status !== 0) {
 			throw new Error(output);
 		}
-		expect(output).toContain("Retrying with gpt-5.4");
-		expect(output).toContain("FORWARDED:app . --model gpt-5.4");
+		expect(output).toContain("Retrying with gpt-6-luna");
+		expect(output).toContain("FORWARDED:app . --model gpt-6-luna");
 		const markerAfterRetry = readFileSync(markerPath, "utf8")
 			.trim()
 			.split(/\r?\n/);
@@ -4456,11 +4738,11 @@ describe("codex bin wrapper", () => {
 		mkdirSync(originalHome, { recursive: true });
 		writeFileSync(
 			join(originalHome, "config.toml"),
-			'model_reasoning_effort = "xhigh"\n',
+			'model_reasoning_effort = "ultra"\n',
 			"utf8",
 		);
 
-		const result = runWrapper(fixtureRoot, ["app", ".", "--model", "gpt-5.1"], {
+		const result = runWrapper(fixtureRoot, ["app", ".", "--model", "gpt-6-luna"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
@@ -4474,7 +4756,7 @@ describe("codex bin wrapper", () => {
 		if (result.status !== 0) {
 			throw new Error(output);
 		}
-		expect(output).toContain("FORWARDED:app . --model gpt-5.1");
+		expect(output).toContain("FORWARDED:app . --model gpt-6-luna");
 		expect(output).toContain(
 			`CODEX_MULTI_AUTH_DIR:${join(originalHome, "multi-auth")}`,
 		);
@@ -4569,7 +4851,7 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("TUI_HAS_WIRE_OVERRIDE:true");
 		expect(output).toContain("TUI_HAS_STORAGE_OVERRIDE:true");
 		expect(output).toContain("TUI_KEY_IN_ARGS:false");
-		expect(output).toContain("TUI_SHIM_STATUS:0");
+		expect(output, output).toContain("TUI_SHIM_STATUS:0");
 		expect(output).toContain(
 			"APP_SERVER_FORWARDED:app-server --canonical-shim",
 		);
@@ -5764,7 +6046,7 @@ describe("codex bin wrapper", () => {
 		expect(combinedOutput(result)).toContain("EPERM: locked auth store");
 	});
 
-	it("creates a compatibility CODEX_HOME shadow when the requested model cannot accept xhigh defaults", () => {
+	it("creates a compatibility CODEX_HOME shadow when the requested model cannot accept the configured effort", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
@@ -5792,17 +6074,17 @@ describe("codex bin wrapper", () => {
 		writeFileSync(
 			join(originalHome, "config.toml"),
 			[
-				'model_reasoning_effort = "xhigh"',
+				'model_reasoning_effort = "ultra"',
 				'profile = "legacy-full-access"',
 				"",
 				'[profiles."legacy-full-access"]',
-				'model_reasoning_effort = "xhigh"',
+				'model_reasoning_effort = "ultra"',
 				"",
 			].join("\n"),
 			"utf8",
 		);
 
-		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.1"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-6-luna"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
 			CODEX_MULTI_AUTH_DIR: undefined,
@@ -5810,15 +6092,15 @@ describe("codex bin wrapper", () => {
 
 		expect(result.status).toBe(0);
 		const output = combinedOutput(result);
-		expect(output).toContain('FORWARDED:exec status --model gpt-5.1 -c cli_auth_credentials_store="file"');
+		expect(output).toContain('FORWARDED:exec status --model gpt-6-luna -c cli_auth_credentials_store="file"');
 		expect(output).not.toContain(`CODEX_HOME:${originalHome}`);
 		expect(output).toContain("CODEX_MULTI_AUTH_DIR_JSON:null");
 		expect(output).toContain("AUTH_EXISTS:true");
 		expect(output).toContain("AUTH_JSON:{}");
 		expect(output).toContain("AUTH_MODE:");
-		expect(output).toContain('model_reasoning_effort = "high"');
+		expect(output).toContain('model_reasoning_effort = "max"');
 		expect(output).toContain("CONFIG_MODE:");
-		expect(output).not.toContain('model_reasoning_effort = "xhigh"');
+		expect(output).not.toContain('model_reasoning_effort = "ultra"');
 		if (process.platform !== "win32") {
 			expect(output).toContain("AUTH_MODE:600");
 			expect(output).toContain("CONFIG_MODE:600");
@@ -5837,13 +6119,13 @@ describe("codex bin wrapper", () => {
 		mkdirSync(join(originalHome, "accounts.json"), { recursive: true });
 		writeFileSync(
 			join(originalHome, "config.toml"),
-			'model_reasoning_effort = "xhigh"\n',
+			'model_reasoning_effort = "ultra"\n',
 			"utf8",
 		);
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -5879,9 +6161,9 @@ describe("codex bin wrapper", () => {
 		mkdirSync(join(originalHome, "sessions"), { recursive: true });
 		mkdirSync(controlledTmp, { recursive: true });
 		writeFileSync(join(originalHome, "sessions", "existing.jsonl"), "existing\n", "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
-		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.1"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-6-luna"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
 			TMP: controlledTmp,
@@ -5917,11 +6199,11 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -5939,6 +6221,57 @@ describe("codex bin wrapper", () => {
 		readdirSync(controlledTmp).filter((entry) =>
 			entry.startsWith("codex-multi-auth-home-"),
 		),
+		).toEqual([]);
+	});
+
+	it("never syncs the shadow-home owner marker into the real CODEX_HOME", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'const home = process.env.CODEX_HOME ?? "";',
+			// Prove the marker really sat inside the shadow during the run —
+			// otherwise the absence assertion below cannot regress.
+			'console.log(`OWNER_MARKER:${fs.existsSync(path.join(home, ".codex-multi-auth-owner.json"))}`);',
+			'console.log(`HOME_NAME:${path.basename(home)}`);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const controlledTmp = join(fixtureRoot, "tmp");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(controlledTmp, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_reasoning_effort = "ultra"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["exec", "status", "--model", "gpt-6-luna"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				TMP: controlledTmp,
+				TEMP: controlledTmp,
+				TMPDIR: controlledTmp,
+			},
+		);
+
+		expect(result.status).toBe(0);
+		const output = combinedOutput(result);
+		expect(output).toContain("OWNER_MARKER:true");
+		expect(output).toContain("HOME_NAME:codex-multi-auth-home-");
+		// The marker is sweep housekeeping for the shadow dir only; the
+		// sync-back must not leave stale wrapper-PID metadata in the real home.
+		expect(
+			existsSync(join(originalHome, ".codex-multi-auth-owner.json")),
+		).toBe(false);
+		expect(
+			readdirSync(controlledTmp).filter((entry) =>
+				entry.startsWith("codex-multi-auth-home-"),
+			),
 		).toEqual([]);
 	});
 
@@ -5971,7 +6304,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
 		const commonEnv = {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
@@ -5983,7 +6316,7 @@ describe("codex bin wrapper", () => {
 		};
 		const first = runWrapperAsync(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				...commonEnv,
 				CODEX_MULTI_AUTH_TEST_SESSION_ID: "first",
@@ -5992,7 +6325,7 @@ describe("codex bin wrapper", () => {
 		);
 		const second = runWrapperAsync(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				...commonEnv,
 				CODEX_MULTI_AUTH_TEST_SESSION_ID: "second",
@@ -6050,13 +6383,13 @@ describe("codex bin wrapper", () => {
 		);
 		writeFileSync(
 			join(originalHome, "config.toml"),
-			'model_reasoning_effort = "xhigh"\n',
+			'model_reasoning_effort = "ultra"\n',
 			"utf8",
 		);
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6092,12 +6425,12 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6134,12 +6467,12 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6176,7 +6509,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const staleOwner = spawnSync(process.execPath, ["-e", "process.exit(0)"], {
 			encoding: "utf8",
 			windowsHide: true,
@@ -6192,7 +6525,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6231,7 +6564,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 		mkdirSync(lockDir, { recursive: true });
 		if (ownerContent !== undefined) {
@@ -6241,7 +6574,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6277,7 +6610,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 		mkdirSync(lockDir, { recursive: true });
 		writeFileSync(
@@ -6288,7 +6621,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6319,7 +6652,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 		mkdirSync(lockDir, { recursive: true });
 		writeFileSync(
@@ -6330,7 +6663,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6372,14 +6705,14 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 		const lockDir = join(originalHome, ".codex-multi-auth-shadow-sync.lock");
 		mkdirSync(lockDir, { recursive: true });
 
 		const startedAt = Date.now();
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6420,11 +6753,11 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6492,11 +6825,11 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6539,11 +6872,11 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
 		writeFileSync(join(originalHome, "accounts.json"), '{"accounts":["original"]}\n', "utf8");
 		writeFileSync(join(originalHome, ".codex-global-state.json"), '{"last":"original"}\n', "utf8");
-		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "xhigh"\n', "utf8");
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n', "utf8");
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.1"],
+			["exec", "status", "--model", "gpt-6-luna"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -6561,7 +6894,7 @@ describe("codex bin wrapper", () => {
 		expect(readFileSync(join(originalHome, ".codex-global-state.json"), "utf8").trim()).toBe('{"last":"shadow"}');
 	});
 
-	it("keeps xhigh config reasoning when deprecated mini aliases route to current Codex", () => {
+	it("keeps xhigh config reasoning when retired mini aliases route to gpt-5.6-terra", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
@@ -6622,9 +6955,9 @@ describe("codex bin wrapper", () => {
 				"exec",
 				"status",
 				"--model",
-				"gpt-5.1",
+				"gpt-6-luna",
 				"-c",
-				'model_reasoning_effort="xhigh"',
+				'model_reasoning_effort="ultra"',
 			],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
@@ -6634,12 +6967,12 @@ describe("codex bin wrapper", () => {
 
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain(
-			'FORWARDED:exec status --model gpt-5.1 -c model_reasoning_effort="high" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-6-luna -c model_reasoning_effort="max" -c cli_auth_credentials_store="file"',
 		);
-		expect(result.stdout).not.toContain('model_reasoning_effort="xhigh"');
+		expect(result.stdout).not.toContain('model_reasoning_effort="ultra"');
 	});
 
-	it("keeps explicit xhigh reasoning for deprecated mini aliases routed to current Codex", () => {
+	it("keeps explicit xhigh reasoning for retired mini aliases routed to gpt-5.6-terra", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createFakeCodexBin(fixtureRoot);
 		const originalHome = join(fixtureRoot, "codex-home");
@@ -6669,7 +7002,7 @@ describe("codex bin wrapper", () => {
 	);
 	});
 
-	it("keeps xhigh overrides for stale bare GPT-5 aliases routed to GPT-5.5", () => {
+	it("keeps xhigh overrides for stale bare GPT-5 aliases routed to their replacements", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createFakeCodexBin(fixtureRoot);
 		const originalHome = join(fixtureRoot, "codex-home");
@@ -6748,11 +7081,11 @@ describe("codex bin wrapper", () => {
 
 		expect(proResult.status).toBe(0);
 		expect(proResult.stdout).toContain(
-			'FORWARDED:exec status --model gpt-5.5-pro -c model_reasoning_effort="medium" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-5.5-pro -c model_reasoning_effort="low" -c cli_auth_credentials_store="file"',
 		);
 	});
 
-	it("retries GPT-5.5 aliases with gpt-5.4 after unsupported-model failures", () => {
+	it("retries GPT-5.6 Sol with gpt-6-luna after unsupported-model failures", () => {
 		const fixtureRoot = createWrapperFixture();
 		const stateDir = join(fixtureRoot, "retry-state");
 		mkdirSync(stateDir, { recursive: true });
@@ -6783,7 +7116,7 @@ describe("codex bin wrapper", () => {
 				"exec",
 				"status",
 				"--model",
-				"gpt-5.5-pro",
+				"gpt-5.6-sol",
 				"-c",
 				'model_reasoning_effort="low"',
 			],
@@ -6797,15 +7130,15 @@ describe("codex bin wrapper", () => {
 		const output = combinedOutput(result);
 		expect(result.status).toBe(0);
 		expect(output).toContain(
-			"The 'gpt-5.5-pro' model is not supported when using Codex with a ChatGPT account.",
+			"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
 		);
-		expect(output).toContain("Retrying with gpt-5.4");
+		expect(output).toContain("Retrying with gpt-6-luna");
 		expect(output).toContain(
-			'FORWARDED:exec status --model gpt-5.4 -c model_reasoning_effort="low" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-6-luna -c model_reasoning_effort="low" -c cli_auth_credentials_store="file"',
 		);
 	});
 
-	it("retries stale bare GPT-5 aliases with GPT-5.5 after unsupported-model failures", () => {
+	it("retries stale bare GPT-5 aliases with GPT-5.6 Sol after unsupported-model failures", () => {
 		const fixtureRoot = createWrapperFixture();
 		const stateDir = join(fixtureRoot, "retry-state-bare-gpt5");
 		mkdirSync(stateDir, { recursive: true });
@@ -6845,13 +7178,13 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain(
 			"The 'gpt-5' model is not supported when using Codex with a ChatGPT account.",
 		);
-		expect(output).toContain("Retrying with gpt-5.5");
+		expect(output).toContain("Retrying with gpt-5.6-sol");
 		expect(output).toContain(
-			'FORWARDED:exec status --model gpt-5.5 -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-5.6-sol -c cli_auth_credentials_store="file"',
 		);
 	});
 
-	it("retries legacy Codex aliases with the current Codex model after unsupported-model failures", () => {
+	it("retries retired Codex aliases with their replacement after unsupported-model failures", () => {
 		const fixtureRoot = createWrapperFixture();
 		const stateDir = join(fixtureRoot, "retry-state-legacy-codex");
 		mkdirSync(stateDir, { recursive: true });
@@ -6899,9 +7232,9 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain(
 			"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
 		);
-		expect(output).toContain("Retrying with gpt-5.3-codex");
+		expect(output).toContain("Retrying with gpt-5.6-sol");
 		expect(output).toContain(
-			'FORWARDED:exec status -m gpt-5.3-codex -c model_reasoning_effort="xhigh" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status -m gpt-5.6-sol -c model_reasoning_effort="xhigh" -c cli_auth_credentials_store="file"',
 		);
 	});
 
@@ -6930,7 +7263,7 @@ describe("codex bin wrapper", () => {
 		writeFileSync(join(originalHome, "auth.json"), "{}\n", "utf8");
 		writeFileSync(join(originalHome, "config.toml"), "", "utf8");
 
-		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.5"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.6-sol"], {
 			CODEX_MULTI_AUTH_CAPTURE_FORWARD_OUTPUT: "1",
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_MULTI_AUTH_TEST_STATE_DIR: stateDir,
@@ -6940,9 +7273,9 @@ describe("codex bin wrapper", () => {
 		const output = combinedOutput(result);
 		expect(result.status).toBe(0);
 		expect(readFileSync(join(stateDir, "attempt.txt"), "utf8")).toBe("2");
-		expect(output).toContain("Retrying with gpt-5.4");
+		expect(output).toContain("Retrying with gpt-6-luna");
 		expect(output).toContain(
-			'FORWARDED:exec status --model gpt-5.4 -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-6-luna -c cli_auth_credentials_store="file"',
 		);
 	});
 
@@ -6959,11 +7292,11 @@ describe("codex bin wrapper", () => {
 			"const counterPath = path.join(process.env.CODEX_MULTI_AUTH_TEST_STATE_DIR, 'attempt.txt');",
 			"const attempt = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) : 0;",
 			"fs.writeFileSync(counterPath, String(attempt + 1), 'utf8');",
-			"console.error(\"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.\");",
+			"console.error(\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\");",
 			"process.exit(1);",
 		]);
 
-		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.5"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.6-sol"], {
 			CODEX_MULTI_AUTH_CAPTURE_FORWARD_OUTPUT: "0",
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_MULTI_AUTH_TEST_STATE_DIR: stateDir,
@@ -6974,12 +7307,12 @@ describe("codex bin wrapper", () => {
 		expect(result.status).toBe(1);
 		expect(readFileSync(join(stateDir, "attempt.txt"), "utf8")).toBe("1");
 		expect(output).toContain(
-			"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+			"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
 		);
-		expect(output).not.toContain("Retrying with gpt-5.4");
+		expect(output).not.toContain("Retrying with");
 	});
 
-	it("retries GPT-5.5 after access-denied style model errors", () => {
+	it("retries GPT-5.6 Sol after access-denied style model errors", () => {
 		const fixtureRoot = createWrapperFixture();
 		const stateDir = join(fixtureRoot, "retry-state-access");
 		mkdirSync(stateDir, { recursive: true });
@@ -7010,7 +7343,7 @@ describe("codex bin wrapper", () => {
 				"exec",
 				"status",
 				"--model",
-				"gpt-5.5",
+				"gpt-5.6-sol",
 				"-c",
 				'model_reasoning_effort="minimal"',
 			],
@@ -7024,11 +7357,11 @@ describe("codex bin wrapper", () => {
 		const output = combinedOutput(result);
 		expect(result.status).toBe(0);
 		expect(output).toContain(
-			"The model `gpt-5.5` does not exist or you do not have access to it.",
+			"The model `gpt-5.6-sol` does not exist or you do not have access to it.",
 		);
-		expect(output).toContain("Retrying with gpt-5.4");
+		expect(output).toContain("Retrying with gpt-6-luna");
 		expect(output).toContain(
-			'FORWARDED:exec status --model gpt-5.4 -c model_reasoning_effort="low" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-6-luna -c model_reasoning_effort="low" -c cli_auth_credentials_store="file"',
 		);
 	});
 
@@ -7046,7 +7379,7 @@ describe("codex bin wrapper", () => {
 				"exec",
 				"status",
 				"--model",
-				"gpt-5.4",
+				"gpt-6-luna",
 				"-c",
 				'model_reasoning_effort="xhigh"',
 			],
@@ -7058,7 +7391,7 @@ describe("codex bin wrapper", () => {
 
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain(
-			'FORWARDED:exec status --model gpt-5.4 -c model_reasoning_effort="xhigh" -c cli_auth_credentials_store="file"',
+			'FORWARDED:exec status --model gpt-6-luna -c model_reasoning_effort="xhigh" -c cli_auth_credentials_store="file"',
 		);
 	});
 
@@ -7091,7 +7424,7 @@ describe("codex bin wrapper", () => {
 
 		const result = runWrapper(
 			fixtureRoot,
-			["exec", "status", "--model", "gpt-5.4-pro"],
+			["exec", "status", "--model", "gpt-5.5-pro"],
 			{
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: originalHome,
@@ -7100,7 +7433,7 @@ describe("codex bin wrapper", () => {
 
 		expect(result.status).toBe(0);
 		expect(result.stdout).not.toContain(`CODEX_HOME:${originalHome}`);
-		expect(result.stdout).toContain('model_reasoning_effort = "medium"');
+		expect(result.stdout).toContain('model_reasoning_effort = "low"');
 		expect(result.stdout).not.toContain('model_reasoning_effort = "none"');
 	});
 
@@ -7196,8 +7529,8 @@ describe("codex bin wrapper", () => {
 	});
 
 	it("accepts Windows native codex paths without an .exe suffix", () => {
-		const pathEntry = join("C:", "custom", "bin");
-		const nativeCodexPath = join(pathEntry, "codex");
+		const pathEntry = win32.join("C:\\", "custom", "bin");
+		const nativeCodexPath = win32.join(pathEntry, "codex");
 		const resolved = resolveRealCodexBin({
 			env: {
 				PATH: pathEntry,
@@ -7217,9 +7550,9 @@ describe("codex bin wrapper", () => {
 	});
 
 	it("prefers Windows codex.exe over extensionless codex when both exist", () => {
-		const pathEntry = join("C:", "custom", "bin");
-		const nativeCodexExePath = join(pathEntry, "codex.exe");
-		const nativeCodexPath = join(pathEntry, "codex");
+		const pathEntry = win32.join("C:\\", "custom", "bin");
+		const nativeCodexExePath = win32.join(pathEntry, "codex.exe");
+		const nativeCodexPath = win32.join(pathEntry, "codex");
 		const resolved = resolveRealCodexBin({
 			env: {
 				PATH: pathEntry,
@@ -7239,9 +7572,182 @@ describe("codex bin wrapper", () => {
 		});
 	});
 
+	it("launches the npm package entry behind Windows codex.cmd shims on PATH", () => {
+		// npm's Windows prefix layout: codex.cmd and an extensionless sh shim, with
+		// the package under node_modules. spawn() can run neither shim without a
+		// shell, so the resolver must return the codex.js they point at.
+		const pathEntry = win32.join("C:\\", "npm-prefix");
+		const shimCmdPath = win32.join(pathEntry, "codex.cmd");
+		const shimShPath = win32.join(pathEntry, "codex");
+		const packageEntryPath = win32.join(
+			pathEntry,
+			"node_modules",
+			"@openai",
+			"codex",
+			"bin",
+			"codex.js",
+		);
+		const resolved = resolveRealCodexBin({
+			env: {
+				PATH: pathEntry,
+			},
+			argv: [process.execPath, join(repoRootDir, "scripts", "codex.js")],
+			platform: "win32",
+			moduleUrl: pathToFileURL(join(repoRootDir, "scripts", "codex.js")).href,
+			resolvePackageBin: () => null,
+			spawnSyncImpl: () => createSpawnSyncSuccess("") as SpawnSyncReturns<string>,
+			existsSyncImpl: (candidate) =>
+				candidate === shimCmdPath ||
+				candidate === shimShPath ||
+				candidate === packageEntryPath,
+		});
+
+		expect(resolved).toEqual({
+			path: packageEntryPath,
+			launchWithNode: true,
+		});
+	});
+
+	it.each([["codex.cmd"], ["codex"]])(
+		"resolves a Windows %s override to the npm package entry it shims",
+		(shimName) => {
+			const prefix = win32.join("C:\\", "npm-prefix");
+			const shimPath = win32.join(prefix, shimName);
+			const packageEntryPath = win32.join(
+				prefix,
+				"node_modules",
+				"@openai",
+				"codex",
+				"bin",
+				"codex.js",
+			);
+			const resolve = (entryExists: boolean) =>
+				resolveRealCodexBin({
+					env: { CODEX_MULTI_AUTH_REAL_CODEX_BIN: shimPath },
+					platform: "win32",
+					existsSyncImpl: (candidate) =>
+						candidate === shimPath || (entryExists && candidate === packageEntryPath),
+				});
+
+			expect(resolve(true)).toEqual({
+				path: packageEntryPath,
+				launchWithNode: true,
+			});
+			// Without a package entry there is nothing spawn() can run, so the
+			// override must not be handed to it.
+			expect(resolve(false)).toBeNull();
+		},
+	);
+
+	it.each(["linux", "darwin", "win32"] as const)(
+		"rejects a relative CODEX_MULTI_AUTH_REAL_CODEX_BIN override on %s",
+		(platform) => {
+			// The override names the binary every forwarded command execs. A
+			// relative value would resolve against the caller's cwd — a planted
+			// same-named file could be executed instead — so it is refused even
+			// when a file exists at that relative path.
+			const resolved = resolveRealCodexBin({
+				env: { CODEX_MULTI_AUTH_REAL_CODEX_BIN: join("bin", "codex.js") },
+				platform,
+				resolvePackageBin: () => null,
+				spawnSyncImpl: () => createSpawnSyncSuccess(""),
+				existsSyncImpl: () => true,
+			});
+
+			expect(resolved).toBeNull();
+		},
+	);
+
+	it.each(["\\bin\\codex.exe", "/bin/codex.exe", "\\", "/"])(
+		"rejects a Windows root-relative CODEX_MULTI_AUTH_REAL_CODEX_BIN override %s",
+		(override) => {
+			// win32.isAbsolute() accepts these, but a root-relative path resolves
+			// against the cwd's DRIVE — "<drive>:\bin\codex.exe" could be a planted
+			// file (CWE-426). The existence check does not make it drive-qualified.
+			const resolved = resolveRealCodexBin({
+				env: { CODEX_MULTI_AUTH_REAL_CODEX_BIN: override },
+				platform: "win32",
+				resolvePackageBin: () => null,
+				spawnSyncImpl: () => createSpawnSyncSuccess(""),
+				existsSyncImpl: () => true,
+			});
+
+			expect(resolved).toBeNull();
+		},
+	);
+
+	it.each(["C:\\bin\\codex.exe", "C:/bin/codex.exe", "\\\\server\\share\\codex.exe"])(
+		"accepts a fully-qualified Windows CODEX_MULTI_AUTH_REAL_CODEX_BIN override %s",
+		(override) => {
+			const resolved = resolveRealCodexBin({
+				env: { CODEX_MULTI_AUTH_REAL_CODEX_BIN: override },
+				platform: "win32",
+				resolvePackageBin: () => null,
+				spawnSyncImpl: () => createSpawnSyncSuccess(""),
+				existsSyncImpl: (candidate) => candidate === override,
+			});
+
+			expect(resolved).toEqual({
+				path: override,
+				launchWithNode: false,
+			});
+		},
+	);
+
+	it("still accepts an absolute CODEX_MULTI_AUTH_REAL_CODEX_BIN override", () => {
+		const absoluteBin = posix.join("/opt", "codex", "bin", "codex.js");
+		const resolved = resolveRealCodexBin({
+			env: { CODEX_MULTI_AUTH_REAL_CODEX_BIN: absoluteBin },
+			platform: "linux",
+			resolvePackageBin: () => null,
+			spawnSyncImpl: () => createSpawnSyncSuccess(""),
+			existsSyncImpl: (candidate) => candidate === absoluteBin,
+		});
+
+		expect(resolved).toEqual({
+			path: absoluteBin,
+			launchWithNode: true,
+		});
+	});
+
+	it.skipIf(process.platform !== "win32")(
+		"forwards through a CODEX_MULTI_AUTH_REAL_CODEX_BIN codex.cmd shim on Windows",
+		() => {
+			const fixtureRoot = createWrapperFixture();
+			const entryPath = createFakeNativeCodexBin(fixtureRoot);
+			const shimPath = join(dirname(entryPath), "..", "..", "..", "..", "codex.cmd");
+			const result = runWrapper(fixtureRoot, ["--version"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: shimPath,
+			});
+
+			expect(result.status, result.stderr).toBe(0);
+			expect(result.stdout).toContain("FORWARDED_NATIVE:--version");
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"rejects a Windows codex.cmd override with no package entry and names what to use",
+		() => {
+			const fixtureRoot = createWrapperFixture();
+			const shimPath = join(fixtureRoot, "bare-shim", "codex.cmd");
+			mkdirSync(dirname(shimPath), { recursive: true });
+			writeFileSync(shimPath, "@ECHO off\r\nexit /b 0\r\n", "utf8");
+			const result = runWrapper(fixtureRoot, ["--version"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: shimPath,
+			});
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("cannot be launched directly on Windows");
+			expect(result.stderr).toContain(
+				"CODEX_MULTI_AUTH_REAL_CODEX_BIN to the full path of codex.exe or @openai/codex/bin/codex.js",
+			);
+			expect(result.stderr).not.toContain("Failed to launch real Codex CLI");
+		},
+	);
+
 	it("skips self-referential codex wrapper entries on PATH before native binaries", () => {
-		const wrapperScriptPath = join(
-			"C:\\test-root",
+		const wrapperScriptPath = posix.join(
+			"/test-root",
 			"npm",
 			"lib",
 			"node_modules",
@@ -7249,11 +7755,11 @@ describe("codex bin wrapper", () => {
 			"scripts",
 			"codex.js",
 		);
-		const wrapperBinPath = join("C:\\test-root", "npm", "bin", "codex");
-		const nativeCodexPath = join("C:\\test-root", "native", "bin", "codex");
+		const wrapperBinPath = posix.join("/test-root", "npm", "bin", "codex");
+		const nativeCodexPath = posix.join("/test-root", "native", "bin", "codex");
 		const resolved = resolveRealCodexBin({
 			env: {
-				PATH: [join("C:\\test-root", "npm", "bin"), join("C:\\test-root", "native", "bin")].join(delimiter),
+				PATH: [posix.join("/test-root", "npm", "bin"), posix.join("/test-root", "native", "bin")].join(":"),
 			},
 			argv: [process.execPath, wrapperScriptPath],
 			platform: "linux",
@@ -7285,7 +7791,7 @@ describe("codex bin wrapper", () => {
 		// codex.js realpath, so the exact-path guard misses it. The directory guard
 		// must still skip any candidate resolving inside the wrapper's own dir and
 		// fall through to the genuine native binary elsewhere on PATH.
-		const wrapperScriptPath = join(
+		const wrapperScriptPath = posix.join(
 			"/test-root",
 			"npm",
 			"lib",
@@ -7295,11 +7801,11 @@ describe("codex bin wrapper", () => {
 			"codex.js",
 		);
 		const wrapperDir = dirname(wrapperScriptPath);
-		const wrapperSiblingCodexPath = join(wrapperDir, "codex");
-		const nativeCodexPath = join("/test-root", "native", "bin", "codex");
+		const wrapperSiblingCodexPath = posix.join(wrapperDir, "codex");
+		const nativeCodexPath = posix.join("/test-root", "native", "bin", "codex");
 		const resolved = resolveRealCodexBin({
 			env: {
-				PATH: [wrapperDir, join("/test-root", "native", "bin")].join(delimiter),
+				PATH: [wrapperDir, posix.join("/test-root", "native", "bin")].join(posix.delimiter),
 			},
 			argv: [process.execPath, wrapperScriptPath],
 			platform: "linux",
@@ -7874,11 +8380,11 @@ describe("codex bin wrapper", () => {
 	it("syncs manager active selection before and after forwarded commands", () => {
 		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createFakeCodexBin(fixtureRoot);
-		const distLibDir = join(fixtureRoot, "dist", "lib");
+		const distLibDir = join(fixtureRoot, "dist", "lib", "codex-manager");
 		const markerPath = join(fixtureRoot, "sync-marker.txt");
 		mkdirSync(distLibDir, { recursive: true });
 		writeFileSync(
-			join(distLibDir, "codex-manager.js"),
+			join(distLibDir, "active-account-sync.js"),
 			[
 				'import { appendFileSync } from "node:fs";',
 				"export async function autoSyncActiveAccountToCodex() {",
@@ -8417,7 +8923,7 @@ describe("codex bin wrapper", () => {
 				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
 				OPENAI_API_KEY: undefined,
 			});
-			expect(probe.status).toBe(0);
+			expect(probe.status, `${probe.stdout}\n${probe.stderr}`).toBe(0);
 			const probeCounts = countHelperMetadata(multiAuthDir);
 			expect(probeCounts.status).toBeGreaterThan(0);
 			expect(probeCounts.owner).toBeGreaterThan(0);
@@ -8767,5 +9273,448 @@ describe("codex bin wrapper", () => {
 			});
 		},
 		240_000,
+	);
+});
+
+describe("forwarded signal relay", () => {
+	// The wrapper used to install no signal handlers on the forward path, so a
+	// signal aimed at the wrapper PID (kill, launcher, monitor) orphaned the
+	// forwarded child and skipped shadow-home cleanup entirely.
+	// Windows has no POSIX signal delivery to a wrapper PID, so `kill()` there
+	// hard-terminates the process instead of exercising the relay; these cases
+	// only make sense where kill() really sends SIGTERM/SIGINT.
+	it.skipIf(process.platform === "win32")(
+		"relays SIGTERM to the forwarded child, then runs shadow-home cleanup",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			const childPidFile = join(fixtureRoot, "child.pid");
+			const childHomeFile = join(fixtureRoot, "child.home");
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				'const { writeFileSync } = require("node:fs");',
+				'const { join: joinPath } = require("node:path");',
+				`writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));`,
+				`writeFileSync(${JSON.stringify(childHomeFile)}, String(process.env.CODEX_HOME ?? ""));`,
+				// A state write the sync-back must carry into the real home.
+				'writeFileSync(joinPath(process.env.CODEX_HOME, "auth.json"), "{\\"token\\":\\"shadow\\"}\\n");',
+				"setTimeout(() => {}, 30_000);",
+			]);
+			const originalHome = join(fixtureRoot, "codexhome");
+			const controlledTmp = join(fixtureRoot, "tmp");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(controlledTmp, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_reasoning_effort = "ultra"\n',
+				"utf8",
+			);
+			const wrapper = spawn(
+				process.execPath,
+				[
+					join(fixtureRoot, "scripts", "codex.js"),
+					"exec",
+					"status",
+					"--model",
+					"gpt-6-luna",
+				],
+				{
+					env: buildWrapperEnv({
+						HOME: join(fixtureRoot, "home"),
+						USERPROFILE: join(fixtureRoot, "home"),
+						CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+						CODEX_HOME: originalHome,
+						TMP: controlledTmp,
+						TEMP: controlledTmp,
+						TMPDIR: controlledTmp,
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			let wrapperStderr = "";
+			wrapper.stderr?.setEncoding("utf8");
+			wrapper.stderr?.on("data", (chunk: string) => {
+				wrapperStderr += chunk;
+			});
+			const closed = new Promise<{ status: number | null; signal: string | null }>(
+				(resolve) => {
+					wrapper.once("close", (status, signal) => resolve({ status, signal }));
+				},
+			);
+			try {
+				await waitForPath(childPidFile, 15_000);
+			} catch (error) {
+				wrapper.kill("SIGKILL");
+				await closed;
+				throw new Error(
+					`${String(error)}\nwrapper stderr:\n${wrapperStderr}`,
+				);
+			}
+			const childPid = Number(readFileSync(childPidFile, "utf8"));
+			const shadowHome = readFileSync(childHomeFile, "utf8");
+			expect(Number.isFinite(childPid)).toBe(true);
+			expect(isProcessAlive(childPid)).toBe(true);
+			// Sanity: the child really ran in a compatibility shadow home, so the
+			// cleanup assertions below exercise the signal path end to end.
+			expect(shadowHome).toContain("codex-multi-auth-home-");
+			expect(existsSync(shadowHome)).toBe(true);
+
+			wrapper.kill("SIGTERM");
+			const result = await closed;
+
+			// The forwarded child must be dead — not just eventually, but because the
+			// wrapper relayed the signal (grace bound is 1s + force-kill fallback).
+			const deadline = Date.now() + 5_000;
+			while (isProcessAlive(childPid) && Date.now() < deadline) {
+				await sleep(50);
+			}
+			expect(isProcessAlive(childPid)).toBe(false);
+			expect(result.status).toBe(143);
+			// Cleanup ran on the signal path: the shadow is gone, its state synced
+			// back, and the owner marker never leaks into the real CODEX_HOME.
+			expect(existsSync(shadowHome)).toBe(false);
+			expect(readFileSync(join(originalHome, "auth.json"), "utf8").trim()).toBe(
+				'{"token":"shadow"}',
+			);
+			expect(
+				existsSync(join(originalHome, ".codex-multi-auth-owner.json")),
+			).toBe(false);
+		},
+		SHUTDOWN_TEST_TIMEOUT_MS,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"force-kills a child that ignores the relayed signal",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			const childPidFile = join(fixtureRoot, "child.pid");
+			const childHomeFile = join(fixtureRoot, "child.home");
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				'const { writeFileSync } = require("node:fs");',
+				'const { join: joinPath } = require("node:path");',
+				`writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));`,
+				`writeFileSync(${JSON.stringify(childHomeFile)}, String(process.env.CODEX_HOME ?? ""));`,
+				'writeFileSync(joinPath(process.env.CODEX_HOME, "auth.json"), "{\\"token\\":\\"shadow\\"}\\n");',
+				// Swallow SIGTERM so only the wrapper's SIGKILL fallback can stop it.
+				'process.on("SIGTERM", () => {});',
+				'process.on("SIGINT", () => {});',
+				"setTimeout(() => {}, 30_000);",
+			]);
+			const originalHome = join(fixtureRoot, "codexhome");
+			const controlledTmp = join(fixtureRoot, "tmp");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(controlledTmp, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_reasoning_effort = "ultra"\n',
+				"utf8",
+			);
+			const wrapper = spawn(
+				process.execPath,
+				[
+					join(fixtureRoot, "scripts", "codex.js"),
+					"exec",
+					"status",
+					"--model",
+					"gpt-6-luna",
+				],
+				{
+					env: buildWrapperEnv({
+						HOME: join(fixtureRoot, "home"),
+						USERPROFILE: join(fixtureRoot, "home"),
+						CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+						CODEX_HOME: originalHome,
+						TMP: controlledTmp,
+						TEMP: controlledTmp,
+						TMPDIR: controlledTmp,
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			const closed = new Promise<{ status: number | null }>((resolve) => {
+				wrapper.once("close", (status) => resolve({ status }));
+			});
+			await waitForPath(childPidFile, 8_000);
+			const childPid = Number(readFileSync(childPidFile, "utf8"));
+			const shadowHome = readFileSync(childHomeFile, "utf8");
+			expect(shadowHome).toContain("codex-multi-auth-home-");
+
+			wrapper.kill("SIGTERM");
+			const result = await closed;
+
+			const deadline = Date.now() + 5_000;
+			while (isProcessAlive(childPid) && Date.now() < deadline) {
+				await sleep(50);
+			}
+			expect(isProcessAlive(childPid)).toBe(false);
+			// Still 143, not 137: the SIGKILL is the wrapper's internal fallback,
+			// and the exit result must keep reporting the signal that was relayed.
+			expect(result.status).toBe(143);
+			// Finalization waited for the child's close: the shadow home the dead
+			// child was using is removed and its state synced back on the way out.
+			expect(existsSync(shadowHome)).toBe(false);
+			expect(readFileSync(join(originalHome, "auth.json"), "utf8").trim()).toBe(
+				'{"token":"shadow"}',
+			);
+			expect(
+				existsSync(join(originalHome, ".codex-multi-auth-owner.json")),
+			).toBe(false);
+		},
+		SHUTDOWN_TEST_TIMEOUT_MS,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"keeps relaying when more signals arrive while the child ignores the first",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			const childPidFile = join(fixtureRoot, "child.pid");
+			const childHomeFile = join(fixtureRoot, "child.home");
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				'const { writeFileSync } = require("node:fs");',
+				'const { join: joinPath } = require("node:path");',
+				`writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));`,
+				`writeFileSync(${JSON.stringify(childHomeFile)}, String(process.env.CODEX_HOME ?? ""));`,
+				// Swallow every relayed signal so only the SIGKILL fallback stops it.
+				'process.on("SIGTERM", () => {});',
+				'process.on("SIGINT", () => {});',
+				'process.on("SIGHUP", () => {});',
+				"setTimeout(() => {}, 30_000);",
+			]);
+			const originalHome = join(fixtureRoot, "codexhome");
+			const controlledTmp = join(fixtureRoot, "tmp");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(controlledTmp, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_reasoning_effort = "ultra"\n',
+				"utf8",
+			);
+			const wrapper = spawn(
+				process.execPath,
+				[
+					join(fixtureRoot, "scripts", "codex.js"),
+					"exec",
+					"status",
+					"--model",
+					"gpt-6-luna",
+				],
+				{
+					env: buildWrapperEnv({
+						HOME: join(fixtureRoot, "home"),
+						USERPROFILE: join(fixtureRoot, "home"),
+						CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+						CODEX_HOME: originalHome,
+						TMP: controlledTmp,
+						TEMP: controlledTmp,
+						TMPDIR: controlledTmp,
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			const closed = new Promise<{ status: number | null }>((resolve) => {
+				wrapper.once("close", (status) => resolve({ status }));
+			});
+			await waitForPath(childPidFile, 8_000);
+			const childPid = Number(readFileSync(childPidFile, "utf8"));
+			const shadowHome = readFileSync(childHomeFile, "utf8");
+			expect(shadowHome).toContain("codex-multi-auth-home-");
+
+			wrapper.kill("SIGTERM");
+			await sleep(250);
+			// Still inside the 1s grace window with a live force-kill timer: a
+			// repeated signal must keep relaying rather than taking the default
+			// disposition and killing the wrapper before cleanup.
+			wrapper.kill("SIGTERM");
+			await sleep(250);
+			wrapper.kill("SIGINT");
+			const result = await closed;
+
+			const deadline = Date.now() + 5_000;
+			while (isProcessAlive(childPid) && Date.now() < deadline) {
+				await sleep(50);
+			}
+			expect(isProcessAlive(childPid)).toBe(false);
+			// The wrapper survived the repeat signals and exited on its own terms:
+			// 143 is the first relayed signal, not a signal death (status null).
+			expect(result.status).toBe(143);
+			expect(existsSync(shadowHome)).toBe(false);
+			expect(
+				existsSync(join(originalHome, ".codex-multi-auth-owner.json")),
+			).toBe(false);
+		},
+		SHUTDOWN_TEST_TIMEOUT_MS,
+	);
+});
+
+describe("stale shadow-home sweep", () => {
+	it("removes dead-owner and aged markerless shadow homes, keeps live ones", async () => {
+		const fixtureRoot = createWrapperFixture();
+		const codexHome = join(fixtureRoot, "codexhome");
+		const shadowRoot = join(
+			codexHome,
+			"multi-auth",
+			"runtime-shadow-homes",
+		);
+		mkdirSync(shadowRoot, { recursive: true });
+		const OWNER_FILE = ".codex-multi-auth-owner.json";
+
+		const deadOwnerDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+		const liveOwnerDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+		const markerlessOldDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+		const markerlessFreshDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+
+		writeFileSync(
+			join(liveOwnerDir, OWNER_FILE),
+			JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+		);
+		const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+		utimesSync(markerlessOldDir, old, old);
+
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		await withDeadPid(async (deadPid) => {
+			writeFileSync(
+				join(deadOwnerDir, OWNER_FILE),
+				JSON.stringify({ pid: deadPid, createdAt: Date.now() - 60_000 }),
+			);
+
+			const result = runWrapper(fixtureRoot, ["exec", "do"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: codexHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			});
+			expect(result.status).toBe(0);
+
+			expect(existsSync(deadOwnerDir)).toBe(false);
+			expect(existsSync(markerlessOldDir)).toBe(false);
+			expect(existsSync(liveOwnerDir)).toBe(true);
+			expect(existsSync(markerlessFreshDir)).toBe(true);
+		});
+	}, SHUTDOWN_TEST_TIMEOUT_MS);
+
+	it("keeps a shadow home whose owner died while its forwarded child still runs", async () => {
+		const fixtureRoot = createWrapperFixture();
+		const codexHome = join(fixtureRoot, "codexhome");
+		const shadowRoot = join(
+			codexHome,
+			"multi-auth",
+			"runtime-shadow-homes",
+		);
+		mkdirSync(shadowRoot, { recursive: true });
+		const OWNER_FILE = ".codex-multi-auth-owner.json";
+
+		const orphanedDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+		const fullyDeadDir = mkdtempSync(
+			join(shadowRoot, "codex-multi-auth-runtime-home-"),
+		);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const sweepEnv = {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: codexHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+		};
+
+		await withDeadPids(2, async ([deadOwnerPid, deadChildPid]) => {
+			await withLivePid(async (liveChildPid) => {
+				// A SIGKILLed wrapper leaves a marker whose owner PID is dead while
+				// the forwarded child — recorded beside it — is still running
+				// against the shadow home. Reaping it would delete live state.
+				writeFileSync(
+					join(orphanedDir, OWNER_FILE),
+					JSON.stringify({
+						pid: deadOwnerPid,
+						createdAt: Date.now() - 60_000,
+						childPid: liveChildPid,
+						childRecordedAt: Date.now(),
+					}),
+				);
+				// Owner and child both gone: genuinely orphaned, reap it now.
+				writeFileSync(
+					join(fullyDeadDir, OWNER_FILE),
+					JSON.stringify({
+						pid: deadOwnerPid,
+						createdAt: Date.now() - 60_000,
+						childPid: deadChildPid,
+						childRecordedAt: Date.now() - 30_000,
+					}),
+				);
+
+				const result = runWrapper(fixtureRoot, ["exec", "do"], sweepEnv);
+				expect(result.status).toBe(0);
+
+				expect(existsSync(orphanedDir)).toBe(true);
+				expect(existsSync(fullyDeadDir)).toBe(false);
+			});
+
+			// Once the orphaned child is gone too, the next launch's sweep reaps.
+			const result = runWrapper(fixtureRoot, ["exec", "do"], sweepEnv);
+			expect(result.status).toBe(0);
+			expect(existsSync(orphanedDir)).toBe(false);
+		});
+	}, SHUTDOWN_TEST_TIMEOUT_MS);
+
+	// Identity probes need `ps`; on Windows the sweep falls back to bare
+	// liveness, so a recycled live PID would be retained rather than reaped.
+	it.skipIf(process.platform === "win32")(
+		"reaps a shadow home whose owner PID was recycled by another process",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			const codexHome = join(fixtureRoot, "codexhome");
+			const shadowRoot = join(
+				codexHome,
+				"multi-auth",
+				"runtime-shadow-homes",
+			);
+			mkdirSync(shadowRoot, { recursive: true });
+			const OWNER_FILE = ".codex-multi-auth-owner.json";
+
+			const recycledOwnerDir = mkdtempSync(
+				join(shadowRoot, "codex-multi-auth-runtime-home-"),
+			);
+			const liveOwnerDir = mkdtempSync(
+				join(shadowRoot, "codex-multi-auth-runtime-home-"),
+			);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+
+			await withLivePid(async (livePid) => {
+				// The PID is live, but the marker claims it was written 10 minutes
+				// ago and this process started seconds ago — it cannot be the owner
+				// that wrote the marker, so the PID must have been recycled.
+				writeFileSync(
+					join(recycledOwnerDir, OWNER_FILE),
+					JSON.stringify({
+						pid: livePid,
+						createdAt: Date.now() - 10 * 60_000,
+					}),
+				);
+				// Control: the same live PID with a timestamp at-or-after its start
+				// is still the recorded owner, so its home is retained.
+				writeFileSync(
+					join(liveOwnerDir, OWNER_FILE),
+					JSON.stringify({ pid: livePid, createdAt: Date.now() }),
+				);
+
+				const result = runWrapper(fixtureRoot, ["exec", "do"], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+					CODEX_HOME: codexHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				});
+				expect(result.status).toBe(0);
+
+				expect(existsSync(recycledOwnerDir)).toBe(false);
+				expect(existsSync(liveOwnerDir)).toBe(true);
+			});
+		},
+		SHUTDOWN_TEST_TIMEOUT_MS,
 	);
 });

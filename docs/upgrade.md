@@ -1,260 +1,156 @@
 # Upgrade Guide
 
-Migrate legacy installs to the canonical `codex-multi-auth` workflow on the current `2.x` release line.
+How to move an older install to the canonical `codex-multi-auth` package on the current `2.x` release line, and what changed along the way that you need to know about.
 
 ---
 
-## Canonical Targets
+## What's Current
 
-- Package: `codex-multi-auth`
-- Command family: `codex-multi-auth ...`
-- Runtime root: `~/.codex/multi-auth`
-- Optional wrapper: `codex-multi-auth-codex` / `mcodex`
-- Official CLI binary name: `codex` (owned by `@openai/codex` or another official install path)
-
----
-
-## v2.1.2 Bin Migration
-
-`v2.1.2` intentionally stops publishing a global `codex` executable. That
-name belongs to the official Codex install path and can be owned by npm,
-Homebrew, or an official release binary.
-
-Use these commands after upgrading:
-
-```bash
-codex --version
-codex-multi-auth --version
-codex-multi-auth-codex --version
-codex-multi-auth status
-```
-
-If you previously ran this package through `codex`, switch account-management
-commands to `codex-multi-auth ...`. If you intentionally need the forwarding
-wrapper from this package, use `codex-multi-auth-codex ...` or `mcodex ...`.
-
----
-
-## First-Run Setup Note (Shipped)
-
-Installing the package no longer performs desktop-app detection, app bind, or
-launcher-shortcut setup during `npm install`. Postinstall is notice-only.
-That work now runs once on your first `codex-multi-auth` invocation from a
-durable global install:
-
-```bash
-npm i -g codex-multi-auth
-codex-multi-auth status
-```
-
-Expected outcome: the first command claims a one-time marker at
-`~/.codex/multi-auth/first-run-setup.json` and performs the app bind and
-launcher setup (best-effort — a failure never blocks the command). `npx` runs
-and project-local installs deliberately skip this setup and do not consume the
-marker.
-
-Opt-outs:
-
-| Variable | Effect |
+| Item | Value |
 | --- | --- |
-| `CODEX_MULTI_AUTH_APP_BIND=0` | Skip packaged Codex app bind on first run |
-| `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0` | Same bind skip (install-oriented alias used by rotation enable / self-heal paths) |
-| `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0` | Skip user-level launcher routing install |
-| CI environments | Always skip first-run setup |
-
-Either `CODEX_MULTI_AUTH_APP_BIND` or `CODEX_MULTI_AUTH_APP_BIND_INSTALL` can
-gate the app-bind step; when both are unset, bind runs when runtime rotation is
-enabled and a Codex desktop app is detected.
+| Package | `codex-multi-auth` (npm, unscoped) |
+| Command family | `codex-multi-auth …` |
+| Wrapper | `codex-multi-auth-codex`, `mcodex` |
+| Data root | `~/.codex/multi-auth` |
+| Official CLI | `codex`, owned by `@openai/codex` — this package no longer publishes that name |
 
 ---
 
-## Migration Checklist
+## Upgrade
 
-1. Install official Codex CLI:
+This release requires Node.js `22.19.0` or later. If you run Node.js 18 or 20, upgrade Node.js first — those runtimes are unsupported, and while npm may still install the package when engine checks are not enforced, it cannot run there.
 
 ```bash
-npm i -g @openai/codex
+npm i -g @openai/codex        # if the official CLI isn't installed yet
+npm i -g codex-multi-auth
+codex-multi-auth status       # runs one-time first-run setup (see below)
 ```
 
-2. Remove legacy scoped package if present:
+Then rebuild a health baseline:
+
+```bash
+codex-multi-auth check
+codex-multi-auth forecast --live
+```
+
+No storage migration step is needed — the account pool upgrades in place on first load, and older layouts migrate automatically.
+
+### Migrate From The Legacy Package
+
+The prerelease was published under the scoped name `@ndycode/codex-multi-auth`. If it is still installed:
 
 ```bash
 npm uninstall -g @ndycode/codex-multi-auth
-```
-
-3. Install canonical package:
-
-```bash
 npm i -g codex-multi-auth
 ```
 
-4. Verify routing and wrapper status:
-
-```bash
-codex --version
-codex-multi-auth --version
-codex-multi-auth-codex --version
-codex-multi-auth status
-```
-
-5. Rebuild account health baseline:
-
-```bash
-codex-multi-auth login
-codex-multi-auth check
-codex-multi-auth forecast --live --model gpt-5.6-sol
-```
+The account pool under `~/.codex/multi-auth` carries over.
 
 ---
 
-## Login Flow Upgrade Notes
+## Changes To Know About
 
-- `codex-multi-auth login` remains the default browser-first path.
-- `codex-multi-auth login --device-auth` is the preferred remote/headless path. It prints a verification URL like `https://auth.openai.com/codex/device` and a one-time code, then completes without a local browser or callback server.
-- `codex-multi-auth login --manual` and `codex-multi-auth login --no-browser` force manual callback handling for browser-restricted shells.
-- `CODEX_AUTH_NO_BROWSER=1` suppresses browser launch for automation/headless sessions. False-like values such as `0` and `false` no longer force manual mode.
-- In non-TTY/manual shells, provide the full redirect URL on stdin, for example: `echo "http://127.0.0.1:1455/auth/callback?code=..." | codex-multi-auth login --manual`.
-- No new npm scripts, storage migrations, or extra upgrade steps were introduced for this auth-flow change.
+### `codex` Is No Longer Ours (v2.1.2)
 
-For the full command/behavior reference, see [reference/commands.md](reference/commands.md).
+The package stopped publishing a global `codex` binary — that name belongs to the official Codex install path (npm, Homebrew, or a release binary). Use `codex-multi-auth …` for account management, and `codex-multi-auth-codex`/`mcodex` when you intentionally want the forwarding wrapper. If a stale shim still answers to `codex`, reinstall the official CLI.
 
----
+### First-Run Setup Moved Out Of `npm install`
 
-## Configuration Upgrade Notes
+Postinstall is notice-only — installing the package no longer touches your desktop or config. The first `codex-multi-auth` command from a durable global install performs the one-time setup instead, then claims the marker at `~/.codex/multi-auth/first-run-setup.json`:
 
-During upgrades, runtime config source precedence is:
+- best-effort bind of a detected Codex desktop app to the local rotation router
+- user-level app launcher routing where supported
+- `cli_auth_credentials_store="file"` enforcement in `~/.codex/config.toml`
 
-1. Fallback file from `CODEX_MULTI_AUTH_CONFIG_PATH` when set and the file exists.
-2. Unified settings `pluginConfig` from `settings.json` (when valid).
-3. Legacy compatibility path when unified settings are absent/invalid.
-4. Runtime defaults.
+A failure never blocks the command. `npx` runs, project-local installs, and CI always skip this. Opt-outs, set before first run:
 
-After source selection, environment variables still override individual setting values.
+| Variable | Effect |
+| --- | --- |
+| `CODEX_MULTI_AUTH_APP_BIND=0` / `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0` | Skip the packaged-app bind |
+| `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0` | Skip launcher routing install |
 
-For day-to-day operator use, prefer stable overrides documented in [configuration.md](configuration.md).
-For maintainer/debug flows, see advanced/internal controls in [development/CONFIG_FIELDS.md](development/CONFIG_FIELDS.md).
+### Runtime Rotation Is Default-On
 
----
+On the current `2.x` release line, request-bearing sessions launched through `codex-multi-auth-codex`, `mcodex`, or an installed app bind route through the loopback rotation proxy. Official app binaries are never patched, and pause/drain/budget policies are enforced on this path.
 
-## Runtime Rotation Upgrade Note
+- `codex-multi-auth rotation disable` turns the proxy off and removes the app bind; `rotation enable` restores both.
+- `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` disables it per environment.
 
-The 2.0.1 line makes runtime rotation the default for request-bearing wrapper-launched Codex sessions and keeps the packaged app bind reversible. That policy remains on the current `2.x` release line.
-
-- Current installs route request-bearing commands launched through `codex-multi-auth-codex ...` or `mcodex ...` through the localhost rotation proxy unless `codexRuntimeRotationProxy=false` or `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` is set.
-- `codex-multi-auth rotation enable` persists the setting and repairs supported packaged Codex app binds through a reversible localhost router.
-- `codex-multi-auth rotation disable` turns the setting off and removes the persistent app bind.
-- Set `CODEX_MULTI_AUTH_APP_BIND=0` or `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0` before first run or update if you only want wrapper-launched CLI/app sessions routed and do not want the packaged app bind installed.
-- Set `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0` before first run or update if you do not want supported user-level app launchers routed through the wrapper.
-- Installed wrappers may perform a best-effort daily npm version check during normal forwarded startup. If a newer package is detected, update manually with `npm install -g codex-multi-auth@latest`.
-- Official Codex app binaries are not patched.
-- Pause/drain account policies and budget/profile checks are enforced on the rotation path via `evaluateRuntimePolicy`.
-
-Pinned requests can now retry the same healthy account instead of failing on
-the first transient error. The budget is `min(retryAllAccountsMaxRetries + 1,
-4)` upstream attempts, spaced 250ms/500ms/1s apart, under an absolute
-16-selection-pass ceiling over the whole loop. A retry waives the pinned
-account's own cooldown -- and nothing else -- because every transient branch
-sets one before the next selection pass; rate limits, open circuits, disabled
-accounts and policy blocks still stop it, and a pin that was already cooling
-down when the request arrived is still refused without an upstream call.
-Pinned requests still never rotate to another account, and a pinned retry no
-longer counts toward the `rotations` statistic.
-
-`codex app-server` launched through the wrapper changed transport (#659). Three consequences worth knowing before you upgrade:
-
-- It runs against your canonical `CODEX_HOME` and no longer creates a shadow home under `<CODEX_HOME>/multi-auth/runtime-shadow-homes/`. On 0.147.0 the old path was effectively unusable: Codex refuses to start when `<CODEX_HOME>/app-server-control` is a symlink, which is what the shadow mirror made of it, and a server that did start served every attached client a frozen copy of the thread index.
-- The rotation helper is stopped when the server exits rather than left to idle out. This is the opposite of the interactive TUI, which detaches its helper on purpose — a resident server owns its proxy for its whole lifetime, and a supervisor that restarts the server would otherwise strand one helper per restart.
-- A rotation proxy that cannot start now fails the server hard with a diagnostic and exit 1, instead of silently running it without rotation. An unrotated resident server bills whatever account the official CLI resolves for every attached client, which is a billing error you would not see; a failed launch is one you would.
-
-Validate after enabling:
+Validate after upgrading:
 
 ```bash
 codex-multi-auth rotation status
 codex-multi-auth forecast --live
 ```
 
----
+### Model Defaults
 
-## Model Defaults Upgrade Note
-
-On the current `2.x` line:
-
-- `DEFAULT_MODEL` (general routing default and `gpt-5` alias target) is `gpt-5.5`.
-- Diagnostic live/quota probes (`check`, `report`, `forecast`, `best`, `fix`) lead with `DEFAULT_PROBE_MODEL` = `gpt-5.6-sol`, then fall through the probe chain for accounts without entitlement.
-
-When validating live repair or forecast after an upgrade, prefer:
+- General routing default (`DEFAULT_MODEL`): `gpt-6.1-sol`. The `gpt-5` alias targets `gpt-5.6-sol`, the newest 5.x generation still served.
+- Retired ids are rewritten before the request is sent: `gpt-5.5` → `gpt-6-sol`, `gpt-5.5-pro` → `gpt-6-astra`, `gpt-6-astra-aeon` → `gpt-6-astra`. The replacement's reasoning ladder and rate card apply, so `none` coerces to `low`, and new ledger rows are priced at the replacement rate.
+- Live diagnostic probes (`check`, `report`, `forecast`, `best`, `fix`) lead with `gpt-5.6-sol`, then fall through a chain for accounts without entitlement.
 
 ```bash
 codex-multi-auth forecast --live --model gpt-5.6-sol
-codex-multi-auth fix --live --model gpt-5.5
+codex-multi-auth fix --live --model gpt-6.1-sol
 ```
 
----
+### Login Flow
 
-## Responses Background Mode Upgrade Note
+- `codex-multi-auth login` stays browser-first. `--device-auth` is the headless path (prints `https://auth.openai.com/codex/device` and a code valid 15 minutes); `--manual` / `--no-browser` paste the callback by hand. `CODEX_AUTH_NO_BROWSER=1` suppresses the browser launch.
+- Codex CLI now refuses workspaces the backend doesn't authorize. `login` verifies its automatic workspace pick against `wham/accounts/check` (one extra request; fails open) and swaps an unauthorized auto-pick for the backend's default. Accounts saved before this check need one pass of `codex-multi-auth fix --live` to rebind org-sourced ids.
+- `login` on an empty pool opens the sign-in menu directly; when a valid named backup exists under `~/.codex/multi-auth/backups/`, the menu offers to restore it.
 
-`backgroundResponses` and `CODEX_AUTH_BACKGROUND_RESPONSES=1` are opt-in compatibility controls for callers that intentionally send Responses API `background: true`.
+### Config Precedence
 
-- Leave them disabled for existing stateless pipelines. The default routing remains `store=false`.
-- Enabling them switches background requests onto the stateful path, forces `store=true`, preserves caller-supplied input item IDs, and skips stateless-only defaults such as fast-session trimming and `reasoning.encrypted_content` injection.
-- No new npm scripts or storage migrations are required, but you should validate one known `background: true` request end to end before enabling the flag across shared automation.
+1. File from `CODEX_MULTI_AUTH_CONFIG_PATH`, when set and present.
+2. `pluginConfig` inside `~/.codex/multi-auth/settings.json`.
+3. Legacy config paths (one-time migrate warning).
+4. Built-in defaults — then environment variables override individual settings.
 
----
+`codex-multi-auth config explain [--json]` shows where each live value came from. See [configuration.md](configuration.md) for stable overrides and [development/CONFIG_FLOW.md](development/CONFIG_FLOW.md) for the full resolution flow.
 
-## Onboarding Restore Note
+### Governance Commands Shipped On 2.x
 
-`codex-multi-auth login` now opens directly into the sign-in menu when the active pool is empty, instead of opening the account dashboard first.
+`usage`, `budget`, `account` (pause/drain/tag/weight/note/priority/auto-prime), `models`, `monitor`, `resets`, `bridge token`, `history`, plus the `mcodex` launcher. All local and file-backed under `~/.codex/multi-auth` — no hosted service was added.
 
-- `Recover saved accounts` appears only when at least one valid named backup exists.
-- No new CLI flags or npm scripts were added for this flow.
-- The backup root remains `~/.codex/multi-auth/backups` by default, or `%CODEX_MULTI_AUTH_DIR%\backups` when `CODEX_MULTI_AUTH_DIR` is set.
-- `codex-multi-auth login --device-auth` starts a new device-code login directly and does not open the restore menu. Use plain `codex-multi-auth login` first when you want to recover a saved backup.
+### Uninstall Behavior
 
----
+`preuninstall.js` ships in the package but is **not** an npm lifecycle hook on modern npm, so `npm uninstall -g` alone leaves residue. Run `codex-multi-auth uninstall` *before* removing the package — see [troubleshooting.md](troubleshooting.md#uninstall-completely).
 
-## Local Governance Upgrade Note
+### Subscription Status And Pro Max Priming
 
-Local governance commands shipped on the `2.x` line and remain available after upgrade:
+Unused Pro Max (Pro 500) subscriptions now qualify for opted-in first-use priming. `status` and `check accounts` show the observed plan, selected workspace, auto-prime setting, and first-use state; `status --json` adds a per-account `subscription` object (`planType`, `planLabel`, `selectedWorkspace`, `autoPrime`, `primingState`, `primingFailure`, `automaticBlock`, `freshness`, `observedAt`). Policy read failures show an unknown auto-prime setting rather than off.
 
-- `codex-multi-auth usage` — local usage ledger summaries
-- `codex-multi-auth budget` — local budget limits and checks
-- `codex-multi-auth account pause|drain|…` — account policy controls enforced at runtime
-- `codex-multi-auth models` / `codex-multi-auth monitor` — capability and operator views
-- `codex-multi-auth bridge token …` — hashed `cma_local_*` client tokens for the optional loopback bridge
-- `codex-multi-auth history` — provider-agnostic local session list
-- `mcodex` — convenience wrapper launcher
+- Checks use the saved selected workspace; disabled or invalid selections do not fall back to the stored binding.
+- Status reads cached observations without network calls. Observations older than 30 minutes are stale, and 0% usage can still have a running reset timer.
+- Use `check accounts` to refresh observations, or add `--prime` to allow first-use completion. Existing priming policies are preserved.
 
-No remote dashboard or hosted multi-user service is introduced. Data stays under `~/.codex/multi-auth`.
+No new npm scripts or manual storage migration are required.
 
 ---
 
-## Legacy Compatibility
+## Downgrading Past 2.17.0
 
-Legacy files may still be discovered during migration-only compatibility checks.
-They are not canonical for new setups.
+Account priority tiers (`codex-multi-auth account priority <index> <0..9>`) are stored as a `priority` field in `account-policies.json`. Versions before 2.17.0 drop the unknown field on their next policy write, returning every account to the default tier — re-run `account priority` after upgrading again. The newer `api-routes.json`, `reset-credits.json`, and model-discovery files are ignored by older versions and left in place.
 
-See [reference/storage-paths.md](reference/storage-paths.md).
+---
 
-### Worktree Storage Migration
+## Worktree Storage Migration
 
-If you used `perProjectAccounts=true` before worktree identity sharing was added, older worktree-keyed account files are migrated automatically on first load:
-
-- Legacy worktree storage is merged into the canonical repo-shared project file.
-- Legacy files are removed only after a successful canonical write.
-- If canonical persistence fails, legacy files are retained to avoid data loss.
+Automatic on first load: legacy worktree-keyed pools merge into the repo-shared `projects/<project-key>/` file. Legacy files are removed only after a successful canonical write; if the write fails, they stay in place to avoid data loss.
 
 ---
 
 ## Common Upgrade Problems
 
-| Problem | Action |
+| Problem | Fix |
 | --- | --- |
-| `codex-multi-auth` not found | Run `where codex-multi-auth` (Windows) or `which codex-multi-auth` (macOS/Linux) |
-| Old package still active | Uninstall scoped package `@ndycode/codex-multi-auth` and reinstall unscoped `codex-multi-auth` |
-| Account pool appears stale | Run `codex-multi-auth doctor --fix`, then re-login impacted accounts |
-| Mixed path confusion | Check [reference/storage-paths.md](reference/storage-paths.md) |
-| Wrapper still expected as `codex` | Use `codex-multi-auth-codex` or `mcodex`; keep official `codex` for stock CLI |
-| Newest models missing after upgrade | Re-run config install paths for model pickers; see [troubleshooting.md](troubleshooting.md) |
+| `codex-multi-auth` not found | `npm ls -g codex-multi-auth`; check npm's global bin is on `PATH` |
+| Old scoped package still active | Uninstall `@ndycode/codex-multi-auth`, reinstall `codex-multi-auth` |
+| Pool looks stale | `codex-multi-auth doctor --fix`, then re-login affected accounts |
+| Still expecting this package to own `codex` | Use `codex-multi-auth-codex`/`mcodex`; `codex` is the official CLI |
+| Newest models missing from the app model picker after upgrade | Re-run the config install you originally used (it merges new template models into your config), restart the app, then `codex-multi-auth rotation bind-app` if you use the bind |
+| Residue after `npm uninstall -g` | Run `codex-multi-auth uninstall` before removing the package next time; see [troubleshooting.md](troubleshooting.md#uninstall-completely) |
 
 ---
 
@@ -262,7 +158,6 @@ If you used `perProjectAccounts=true` before worktree identity sharing was added
 
 - [getting-started.md](getting-started.md)
 - [troubleshooting.md](troubleshooting.md)
-- [architecture.md](architecture.md)
 - [features.md](features.md)
 - [reference/storage-paths.md](reference/storage-paths.md)
 - [development/CONFIG_FLOW.md](development/CONFIG_FLOW.md)

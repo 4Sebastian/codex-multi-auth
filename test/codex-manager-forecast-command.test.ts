@@ -451,3 +451,43 @@ describe("runForecastCommand", () => {
 		expect(jsonLine).not.toContain("is not supported when using Codex");
 	});
 });
+
+describe("runForecastCommand refresh keeps explicit bindings", () => {
+	it("keeps a manual id and source when the refreshed token names another workspace", async () => {
+		const storage = createStorage();
+		storage.accounts[0] = {
+			...storage.accounts[0]!,
+			accountId: "ws-team",
+			accountIdSource: "manual",
+			expiresAt: 0,
+		};
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => structuredClone(storage)),
+			hasUsableAccessToken: vi.fn(() => false),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-forecast-next",
+				refresh: "refresh-forecast-next",
+				expires: 999_999,
+			})),
+			extractAccountId: vi.fn(() => "ws-token-claim"),
+		});
+
+		expect(await runForecastCommand(["--json", "--live"], deps)).toBe(0);
+
+		expect(deps.saveAccounts).toHaveBeenCalledWith(
+			expect.objectContaining({
+				accounts: [
+					expect.objectContaining({
+						accessToken: "access-forecast-next",
+						accountId: "ws-team",
+						accountIdSource: "manual",
+					}),
+				],
+			}),
+		);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({ accountId: "ws-team" }),
+		);
+	});
+});

@@ -1,3 +1,7 @@
+import {
+	codexCliAccountIdFor,
+	shouldUpdateAccountIdFromToken,
+} from "../../auth/token-utils.js";
 import type { ForecastAccountResult } from "../../forecast.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
 import {
@@ -246,7 +250,12 @@ export async function runBestCommand(
 			account.accessToken = refreshResult.access;
 			account.expiresAt = refreshResult.expires;
 			if (refreshedEmail) account.email = refreshedEmail;
-			if (refreshedAccountId) {
+			// Same rule as every other refresh path: only a token-derived id
+			// follows the new token; an explicit (manual) or org binding stays.
+			if (
+				refreshedAccountId &&
+				shouldUpdateAccountIdFromToken(account.accountIdSource, account.accountId)
+			) {
 				account.accountId = refreshedAccountId;
 				account.accountIdSource = "token";
 			}
@@ -357,7 +366,11 @@ export async function runBestCommand(
 		});
 		if (shouldSyncCurrentBest) {
 			alreadyBestSynced = await deps.setCodexCliActiveSelection({
-				accountId: bestAccount.accountId,
+				accountId: codexCliAccountIdFor(
+					bestAccount,
+					bestAccount.accessToken,
+					probeIdTokenByIndex.get(bestIndex),
+				),
 				email: bestAccount.email,
 				accessToken: bestAccount.accessToken,
 				refreshToken: bestAccount.refreshToken,

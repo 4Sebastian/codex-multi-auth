@@ -97,10 +97,14 @@ describe("local bridge", () => {
 
 		const health = await fetch(`${server.baseUrl}/health`);
 		expect(health.status).toBe(200);
-		expect(await health.json()).toMatchObject({
+		const healthBody = await health.json();
+		expect(healthBody).toMatchObject({
 			ok: true,
 			service: "codex-multi-auth-local-bridge",
 		});
+		// /health answers unauthenticated liveness probes, so it must not echo
+		// the internal upstream routing target back to callers.
+		expect(healthBody).not.toHaveProperty("runtimeBaseUrl");
 
 		const models = await fetch(`${server.baseUrl}/v1/models`);
 		expect(models.status).toBe(200);

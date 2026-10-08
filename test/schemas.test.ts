@@ -360,12 +360,33 @@ describe("AccountStorageV1Schema", () => {
 		expect(result.success).toBe(true);
 	});
 
-	it("rejects V1 with rateLimitResetTimes (V3 field)", () => {
+	it("preserves V3-era fields on V1 rows via passthrough (hybrid files)", () => {
+		// version:1 files carrying V3-era data are real — the flagged-accounts
+		// store is `version: 1` with full V3 rows. The schema boundary must not
+		// strip them before migrateV1ToV3 can carry them forward.
 		const result = AccountStorageV1Schema.safeParse({
 			...validV1,
-			accounts: [{ ...validV1.accounts[0], rateLimitResetTimes: {} }],
+			activeIndexByFamily: { codex: 0 },
+			pinnedAccountIndex: 0,
+			accounts: [
+				{
+					...validV1.accounts[0],
+					rateLimitResetTimes: { codex: 123 },
+					workspaces: [{ id: "w1", enabled: true }],
+				},
+			],
 		});
 		expect(result.success).toBe(true);
+		if (result.success) {
+			const account = result.data.accounts[0] as unknown as Record<
+				string,
+				unknown
+			>;
+			expect(account.rateLimitResetTimes).toEqual({ codex: 123 });
+			expect(account.workspaces).toEqual([{ id: "w1", enabled: true }]);
+			expect(result.data.activeIndexByFamily).toEqual({ codex: 0 });
+			expect(result.data.pinnedAccountIndex).toBe(0);
+		}
 	});
 });
 

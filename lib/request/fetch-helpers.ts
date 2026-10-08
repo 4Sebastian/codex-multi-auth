@@ -464,7 +464,7 @@ function normalizeErrorPayload(
 								message:
 										`The model '${unsupportedModel}' is not currently available for this ChatGPT account when using Codex OAuth. ` +
 										"This is an account/workspace entitlement gate, not a temporary rate limit. " +
-										"Try 'gpt-5.3-codex' (current), or legacy aliases like 'gpt-5-codex'/'gpt-5.2-codex', or enable automatic fallback via " +
+										"Try 'gpt-6.1-sol' or 'gpt-5.6-sol', or enable automatic fallback via " +
 										'unsupportedCodexPolicy: "fallback" (or CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback). ' +
 										"(Legacy: CODEX_AUTH_FALLBACK_UNSUPPORTED_MODEL=1 or fallbackOnUnsupportedCodexModel).",
 								type: "entitlement_error",

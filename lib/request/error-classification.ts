@@ -6,6 +6,7 @@
 
 import { isRecord } from "../utils.js";
 import { HTTP_STATUS, stripModelEffortSuffix } from "../constants.js";
+import { RETIRED_MODEL_REPLACEMENTS } from "./helpers/model-map.js";
 
 export interface EntitlementError {
         isEntitlement: true;
@@ -23,57 +24,61 @@ const MODEL_ACCESS_DENIED_PATTERN =
 	/the model [`'"]([^`'"]+)[`'"] does not exist or you do not have access to it/i;
 
 export const DEFAULT_UNSUPPORTED_CODEX_FALLBACK_CHAIN: Record<string, string[]> = {
-	// GPT-6 Astra rolls out org by org, so an account that is not entitled yet
-	// gets a real unsupported-model response for it. This chain only fires when
-	// the user has opted into `fallbackOnUnsupportedCodexModel` (default
-	// `false`), and only on that response, so it never silently swaps the model
-	// out from under a request the account could have served.
+	// GPT-6 models roll out org by org, so an account that is not entitled yet
+	// gets a real unsupported-model response for them. This chain only fires
+	// when the user has opted into `fallbackOnUnsupportedCodexModel` (default
+	// `false`), and only on that response, so it never silently swaps the
+	// model out from under a request the account could have served.
 	//
 	// This table is walked ONE HOP AT A TIME, not as a per-request candidate
-	// list. index.ts reassigns `model` to whatever came back and passes that as
-	// `requestedModel` on the next unsupported response, so reaching `gpt-5.5`
-	// from Astra requires `gpt-5.6-sol` to carry its own entry below. A second
-	// element here is only ever consulted when the first is already in
-	// `attemptedModels` for that same call.
+	// list. index.ts reassigns `model` to whatever came back and passes that
+	// as `requestedModel` on the next unsupported response, so reaching the
+	// terminal models from a launch model requires every intermediate model
+	// to carry its own entry below. A second element here is only ever
+	// consulted when the first is already in `attemptedModels` for that same
+	// call.
 	//
-	// Depth is not free: every hop spends one of the shared per-request outbound
-	// attempts (`tryConsumeOutboundRequestAttempt`). A single-account balanced
-	// session gets a budget of 5, and the aeon walk needs exactly 5, so it fits
-	// with nothing spare. Spend an attempt on a retry or a stream failover and
-	// the tail hops become unreachable, ending as an attempt-budget-exhausted
-	// 503 rather than `gpt-5.4`. Hops are ordered most-valuable-first so what is
-	// lost first matters least. Do not add a hop to a GPT-6 row without
-	// re-checking that budget; `test/gpt6-astra-models.test.ts` asserts it.
-	"gpt-6-astra": ["gpt-5.6-sol", "gpt-5.5"],
-	// aeon steps to the flagship first: still GPT-6, still Astra, just without
-	// the long-horizon behaviour.
-	"gpt-6-astra-aeon": ["gpt-6-astra", "gpt-5.6-sol"],
-	// The hop that makes the Astra path reach a model every account has. GPT-5.6
-	// shipped without a chain entry, so an unsupported 5.6 response ended the
-	// walk; with Astra above it that would have stranded the fallback one rung
-	// short of the floor it documents. Terra and Luna are deliberately still
-	// absent: nothing steps into them, so giving them a hop would change 5.6
-	// behaviour beyond completing this path.
-	"gpt-5.6-sol": ["gpt-5.5"],
-	"gpt-5": ["gpt-5.5"],
-	"gpt-5-pro": ["gpt-5.5-pro"],
-	"gpt-5-chat-latest": ["gpt-5.5"],
-	"gpt-5.5": ["gpt-5.4"],
-	"gpt-5.5-pro": ["gpt-5.4"],
-	"gpt-5.5-2026-04-23": ["gpt-5.4"],
-	"gpt-5.5-pro-2026-04-23": ["gpt-5.4"],
-	"gpt-5.5-20260423": ["gpt-5.4"],
-	"gpt-5.5-pro-20260423": ["gpt-5.4"],
-	"gpt-5.3-codex-spark": ["gpt-5.3-codex", "gpt-5.2-codex"],
-	"gpt-5.3-codex": ["gpt-5.2-codex"],
-	"codex-max": ["gpt-5.3-codex"],
-	"gpt-5.1-codex-max": ["gpt-5.3-codex"],
-	"codex-mini-latest": ["gpt-5.3-codex"],
-	"gpt-5-codex-mini": ["gpt-5.3-codex"],
-	"gpt-5.1-codex-mini": ["gpt-5.3-codex"],
-	"gpt-5-codex": ["gpt-5.3-codex", "gpt-5.2-codex"],
-	"gpt-5.2-codex": ["gpt-5.3-codex"],
-	"gpt-5.1-codex": ["gpt-5.3-codex"],
+	// Depth is not free: every hop spends one of the shared per-request
+	// outbound attempts (`tryConsumeOutboundRequestAttempt`). A single-account
+	// balanced session gets a budget of 5, and the deepest walks — 6.1 Sol and
+	// the retired ids that migrate through Astra — spend all 5, the same shape
+	// the aeon walk had before `gpt-5.4` was retired as the floor. Hops are
+	// ordered most-valuable-first so what is lost first matters least. Do not
+	// add a hop to a GPT-6 row without re-checking that budget;
+	// `test/gpt6-astra-models.test.ts` asserts it.
+	"gpt-6.1-sol": ["gpt-6-sol"],
+	// Astra steps to the workhorse rather than to a smaller tier: an account
+	// without the flagship is still likelier than not to hold the standard
+	// GPT-6 tier, and `gpt-6-sol` keeps the walk inside the generation.
+	"gpt-6-astra": ["gpt-6-sol"],
+	// Sol and Luna step to the 5.6 tier they replace, never sideways into a
+	// pricier model: an account without the new tier is far likelier to lack
+	// Astra too, and Astra is the priciest hop available ($10/$50 per 1M
+	// against Luna's $0.10/$0.50). Every hop on these walks still costs more
+	// than Luna itself.
+	"gpt-6-sol": ["gpt-5.6-sol"],
+	"gpt-6-luna": ["gpt-5.6-luna"],
+	// The hop that makes every general walk reach a model almost every account
+	// has: `gpt-6-luna` ships on the most plans of any catalog model, which is
+	// why the quota-probe chain also ends on it.
+	"gpt-5.6-sol": ["gpt-6-luna"],
+	// Luna's own row crosses to Sol rather than stopping: a `gpt-5.6-luna`
+	// request whose tier is absent retries on the same-generation workhorse
+	// instead of ending on an unsupported response.
+	"gpt-5.6-luna": ["gpt-5.6-sol"],
+	"gpt-5.6-terra": ["gpt-5.6-sol"],
+	"gpt-5": ["gpt-5.6-sol"],
+	"gpt-5-pro": ["gpt-6-astra"],
+	// A retired id still reaches the backend verbatim through the pass-through
+	// rotation proxy, and the backend rejects it as unsupported. One hop to the
+	// replacement OpenAI names for it turns that into a working request, and
+	// from there the same staircase above continues toward Luna.
+	...Object.fromEntries(
+		Object.entries(RETIRED_MODEL_REPLACEMENTS).map(([retired, replacement]) => [
+			retired,
+			[replacement],
+		]),
+	),
 };
 
 export interface UnsupportedCodexModelInfo {

@@ -39,6 +39,7 @@ import type { RuntimeObservabilitySnapshot } from "../../runtime/runtime-observa
 import type { QuotaCacheData } from "../../quota-cache.js";
 import type { TokenFailure, TokenResult } from "../../types.js";
 import { sleep } from "../../utils.js";
+import { shouldUpdateAccountIdFromToken } from "../../auth/token-utils.js";
 import { tempPathFor } from "../../temp-path.js";
 
 interface ReportCliOptions {
@@ -397,7 +398,12 @@ export async function runReportCommand(
 				if (refreshedEmail) {
 					refreshPatch.email = refreshedEmail;
 				}
-				if (tokenDerivedAccountId) {
+				// Only a token-derived id follows the new token (as on every other
+				// refresh path); an explicit (manual) or org binding stays.
+				if (
+					tokenDerivedAccountId &&
+					shouldUpdateAccountIdFromToken(account.accountIdSource, account.accountId)
+				) {
 					refreshPatch.accountId = tokenDerivedAccountId;
 					refreshPatch.accountIdSource = "token";
 				}

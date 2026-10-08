@@ -20,13 +20,16 @@ import {
 } from "node:fs";
 import { rm as rmAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from "node:path";
+import { constants as osConstants, homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import process from "node:process";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+	isFullyQualifiedBinOverride,
+	isWindowsShimPath,
 	resolveRealCodexBin as resolveRealCodexBinFromEnvironment,
+	resolveWindowsShimPackageEntry,
 	splitPathEntries,
 } from "./codex-bin-resolver.js";
 import { normalizeAuthAlias, shouldHandleMultiAuthAuth } from "./codex-routing.js";
@@ -63,6 +66,11 @@ const SHADOW_HOME_STATE_FILE_SET = new Set(SHADOW_HOME_STATE_FILES);
 const SHADOW_HOME_CONFIG_FILE = "config.toml";
 const SHADOW_HOME_SYNC_LOCK_DIR = ".codex-multi-auth-shadow-sync.lock";
 const SHADOW_HOME_SYNC_STATE_FILE = ".codex-multi-auth-shadow-sync-state.json";
+// Housekeeping marker written into every shadow home ({pid, createdAt, and the
+// forwarded child's pid once spawned}) so the next launch can tell a dead
+// owner's leftover from a home still in use. It is never mirrored in from the
+// real home nor synced back into it.
+const SHADOW_HOME_OWNER_FILE = ".codex-multi-auth-owner.json";
 const APP_SERVER_ACCOUNT_DISPLAY_NAME = "codex-multi-auth";
 const RUNTIME_CONSTANTS = await loadRuntimeConstants();
 const RUNTIME_ROTATION_PROXY_PROVIDER_ID =
@@ -686,15 +694,15 @@ function resolveModelFamilyForStatus(model) {
 		return "gpt-5.2";
 	}
 	if (normalized.includes("daybreak")) return "gpt-5.2";
-	// GPT-5.6 general tiers share the gpt-5.2 prompt family (see
-	// lib/request/helpers/model-map.ts MODEL_PROFILES). Check before the generic
-	// gpt-5 catch-all, which would otherwise mis-bucket them as codex.
-	if (normalized.startsWith("gpt-5.6")) return "gpt-5.2";
-	if (normalized.startsWith("gpt-5.2")) return "gpt-5.2";
-	if (normalized.startsWith("gpt-5.1")) return "gpt-5.1";
-	if (normalized.includes("codex-max")) return "codex-max";
-	if (normalized.includes("codex")) return "codex";
-	if (normalized.startsWith("gpt-5")) return "gpt-5-codex";
+	// The proxy keys a /codex/responses request by `getModelFamily(model)`
+	// (lib/runtime-rotation-proxy.ts), i.e. the replacement's prompt family.
+	// Every codex model is retired and runs on `gpt-5.6-sol`/`terra`, and every
+	// live or retired general GPT-5 id runs on a model in the gpt-5.2 family, so
+	// status reads that family. The old `codex`/`codex-max`/`gpt-5.1`/
+	// `gpt-5-codex` answers named keys the proxy does not write for these ids.
+	if (normalized.includes("codex") || normalized.startsWith("gpt-5")) {
+		return "gpt-5.2";
+	}
 	return null;
 }
 
@@ -1327,7 +1335,10 @@ async function autoSyncManagerActiveSelectionIfEnabled() {
 	if (!enabled) return;
 
 	try {
-		const mod = await import("../dist/lib/codex-manager.js");
+		// Slim entry point: importing dist/lib/codex-manager.js here would pull
+		// the whole command/dispatch/settings graph (~126 modules incl. zod)
+		// onto every forwarded invocation's cold-start path.
+		const mod = await import("../dist/lib/codex-manager/active-account-sync.js");
 		if (typeof mod.autoSyncActiveAccountToCodex !== "function") {
 			return;
 		}
@@ -1344,9 +1355,29 @@ async function autoSyncManagerActiveSelectionIfEnabled() {
 function resolveRealCodexBin() {
 	const override = (process.env.CODEX_MULTI_AUTH_REAL_CODEX_BIN ?? "").trim();
 	if (override.length > 0) {
+		// Fully-qualified = absolute AND drive-qualified on Windows: a
+		// root-relative override like "\bin\codex.exe" resolves against the cwd's
+		// drive and could exec a planted file (CWE-426).
+		if (!isFullyQualifiedBinOverride(override, process.platform)) {
+			console.error(
+				`CODEX_MULTI_AUTH_REAL_CODEX_BIN must be a fully-qualified absolute path (a drive-qualified or UNC path on Windows), got: ${override}`,
+			);
+			return null;
+		}
 		if (!existsSync(override)) {
 			console.error(
 				`CODEX_MULTI_AUTH_REAL_CODEX_BIN is set but missing: ${override}`,
+			);
+			return null;
+		}
+		if (
+			process.platform === "win32" &&
+			isWindowsShimPath(override) &&
+			!resolveWindowsShimPackageEntry(override)
+		) {
+			console.error(
+				`CODEX_MULTI_AUTH_REAL_CODEX_BIN points at a script shim that cannot be launched directly on Windows: ${override}\n` +
+					"Point it at codex.exe or @openai/codex/bin/codex.js instead.",
 			);
 			return null;
 		}
@@ -1368,38 +1399,75 @@ const MODEL_ACCESS_DENIED_PATTERN =
 	/the model [`'"]([^`'"]+)[`'"] does not exist or you do not have access to it/i;
 const DIRECT_UNSUPPORTED_MODEL_PATTERN =
 	/['"]([^'"]+)['"]\s+model is not supported when using codex with a chatgpt account/i;
-const CURRENT_CODEX_MODEL = "gpt-5.3-codex";
-const LEGACY_CODEX_MODEL = "gpt-5-codex";
-// Mirrors the GPT-6 rows of lib/request/error-classification.ts
+// Every codex model is retired; codex ids run on the replacement OpenAI names
+// for them. Mirrors lib/request/helpers/model-map.ts CURRENT_CODEX_MODEL and
+// RETIRED_MODEL_REPLACEMENTS, pinned in parity by test/retired-models.test.ts.
+const CURRENT_CODEX_MODEL = "gpt-5.6-sol";
+const CODEX_MINI_REPLACEMENT_MODEL = "gpt-5.6-terra";
+const RETIRED_MODEL_REPLACEMENTS = {
+	// `gpt-6-astra-aeon` never appeared in the bundled Codex catalog or the
+	// public model docs — a Statsig-flag leak, now dead — so it aliases the
+	// flagship it was a variant of.
+	"gpt-6-astra-aeon": "gpt-6-astra",
+	// `gpt-5.5` leaves ChatGPT/Codex OAuth on 2026-10-14 (the catalog names
+	// GPT-6 Sol as the migration target); `gpt-5.5-pro` left the bundled
+	// catalog earlier and is API-only, so it goes to the frontier flagship.
+	"gpt-5.5": "gpt-6-sol",
+	"gpt-5.5-2026-04-23": "gpt-6-sol",
+	"gpt-5.5-20260423": "gpt-6-sol",
+	"gpt-5.5-pro": "gpt-6-astra",
+	"gpt-5.5-pro-2026-04-23": "gpt-6-astra",
+	"gpt-5.5-pro-20260423": "gpt-6-astra",
+	"gpt-5.4": "gpt-6-sol",
+	"gpt-5.4-mini": "gpt-6-luna",
+	"gpt-5.4-nano": "gpt-6-luna",
+	"gpt-5.4-pro": "gpt-6-astra",
+	"gpt-5.2": "gpt-5.6-sol",
+	"gpt-5.2-pro": "gpt-6-astra",
+	"gpt-5.1": "gpt-5.6-sol",
+	"gpt-5-mini": "gpt-5.6-terra",
+	"gpt-5-nano": "gpt-5.6-luna",
+	"gpt-5-chat-latest": "gpt-5.6-sol",
+	"gpt-5.1-chat-latest": "gpt-5.6-sol",
+	"gpt-5.2-chat-latest": "gpt-5.6-sol",
+	"gpt-5.3-chat-latest": "gpt-5.6-sol",
+	"gpt-5.3-codex": CURRENT_CODEX_MODEL,
+	"gpt-5.3-codex-spark": CURRENT_CODEX_MODEL,
+	"gpt-5.2-codex": CURRENT_CODEX_MODEL,
+	"gpt-5.1-codex": CURRENT_CODEX_MODEL,
+	"gpt-5.1-codex-max": CURRENT_CODEX_MODEL,
+	"gpt-5-codex": CURRENT_CODEX_MODEL,
+	"codex-max": CURRENT_CODEX_MODEL,
+	"gpt-5.1-codex-mini": CODEX_MINI_REPLACEMENT_MODEL,
+	"gpt-5-codex-mini": CODEX_MINI_REPLACEMENT_MODEL,
+	"codex-mini-latest": CODEX_MINI_REPLACEMENT_MODEL,
+};
+// Mirrors lib/request/error-classification.ts
 // `DEFAULT_UNSUPPORTED_CODEX_FALLBACK_CHAIN`. This table is walked differently
 // from lib's: `resolveUnsupportedModelRetryTarget` keys on the model named in
 // the error output and falls back to the original requested model, with
 // `attemptedModels` accumulating, so a row's later entries ARE reachable here.
-// The two tables are not identical today (`gpt-5.3-codex` has a row in lib and
-// not here), which predates GPT-6 and is left alone; the GPT-6 rows are pinned
-// in parity by test/codex-model-resolution.test.ts.
+// The explicit rows and the retired-id spread are pinned in parity by
+// test/codex-model-resolution.test.ts; `gpt-6-luna` closes the general walks
+// because it ships on the most plans of any catalog model.
 const WRAPPER_UNSUPPORTED_MODEL_FALLBACK_CHAIN = {
-	"gpt-6-astra": ["gpt-5.6-sol", "gpt-5.5"],
-	"gpt-6-astra-aeon": ["gpt-6-astra", "gpt-5.6-sol"],
-	"gpt-5.6-sol": ["gpt-5.5"],
-	"gpt-5": ["gpt-5.5"],
-	"gpt-5-pro": ["gpt-5.5-pro"],
-	"gpt-5-chat-latest": ["gpt-5.5"],
-	"gpt-5.5": ["gpt-5.4"],
-	"gpt-5.5-pro": ["gpt-5.4"],
-	"gpt-5.5-2026-04-23": ["gpt-5.4"],
-	"gpt-5.5-pro-2026-04-23": ["gpt-5.4"],
-	"gpt-5.5-20260423": ["gpt-5.4"],
-	"gpt-5.5-pro-20260423": ["gpt-5.4"],
-	"gpt-5.3-codex-spark": [CURRENT_CODEX_MODEL],
-	"codex-max": [CURRENT_CODEX_MODEL],
-	"gpt-5.1-codex-max": [CURRENT_CODEX_MODEL],
-	"codex-mini-latest": [CURRENT_CODEX_MODEL],
-	"gpt-5-codex-mini": [CURRENT_CODEX_MODEL],
-	"gpt-5.1-codex-mini": [CURRENT_CODEX_MODEL],
-	[LEGACY_CODEX_MODEL]: [CURRENT_CODEX_MODEL],
-	"gpt-5.2-codex": [CURRENT_CODEX_MODEL],
-	"gpt-5.1-codex": [CURRENT_CODEX_MODEL],
+	"gpt-6.1-sol": ["gpt-6-sol"],
+	"gpt-6-astra": ["gpt-6-sol"],
+	"gpt-6-sol": ["gpt-5.6-sol"],
+	"gpt-6-luna": ["gpt-5.6-luna"],
+	"gpt-5.6-sol": ["gpt-6-luna"],
+	"gpt-5.6-luna": ["gpt-5.6-sol"],
+	"gpt-5.6-terra": ["gpt-5.6-sol"],
+	"gpt-5": ["gpt-5.6-sol"],
+	"gpt-5-pro": ["gpt-6-astra"],
+	// A retired id still reaches the backend verbatim and is rejected; one hop
+	// to its named replacement turns that into a working request.
+	...Object.fromEntries(
+		Object.entries(RETIRED_MODEL_REPLACEMENTS).map(([retired, replacement]) => [
+			retired,
+			[replacement],
+		]),
+	),
 };
 
 function canonicalizeRequestedModelName(model) {
@@ -1776,11 +1844,23 @@ function forwardToRealCodexOnce(
 			? createAppServerAccountReadProtocolProxy()
 			: null;
 		let cleanupProtocolProxy = () => {};
+		let detachSignalRelay = () => {};
+		let signalForceTimer = null;
+		// Set the moment finalization begins so a repeated signal during cleanup
+		// can exit with the result already decided instead of the default
+		// disposition, which would look like a signal death and truncate
+		// shadow-home sync-back mid-write.
+		let finalizedExitCode = null;
 		const finalize = async (exitCode) => {
 			if (settled) {
 				return;
 			}
 			settled = true;
+			finalizedExitCode = exitCode;
+			if (signalForceTimer !== null) {
+				clearTimeout(signalForceTimer);
+				signalForceTimer = null;
+			}
 			cleanupProtocolProxy();
 			protocolProxy?.flushOutput();
 			try {
@@ -1788,6 +1868,11 @@ function forwardToRealCodexOnce(
 			} catch {
 				// Best-effort cleanup only.
 			}
+			// The relay stays installed until cleanup has run: a repeated signal
+			// landing mid-finalize exits with the decided code (see
+			// onRelayedSignal) rather than a default kill that truncates
+			// shadow-home sync-back.
+			detachSignalRelay();
 			if (captureOutput && stdout.length > 0) {
 				const filteredStdout = filterKnownForwardedCodexStderr(stdout);
 				if (filteredStdout.length > 0) {
@@ -1836,6 +1921,68 @@ function forwardToRealCodexOnce(
 			failLaunch(error);
 			return;
 		}
+
+		// The forwarded child can outlive this wrapper — SIGKILL can neither be
+		// caught nor relayed — so the shadow-home owner marker names the child
+		// too; otherwise the next launch's sweep would see only the dead wrapper
+		// PID and reap a home a live child is still writing to.
+		recordShadowHomeChildPid(env.CODEX_HOME, child?.pid);
+
+		// Relay terminal signals to the forwarded child. Without this the child
+		// outlives the wrapper whenever a signal targets the wrapper PID
+		// directly (kill, launcher, monitor) rather than the process group, and
+		// the shadow-home cleanup inside finalize never runs.
+		const signalRelayHandlers = new Map();
+		// The first relayed signal decides the exit result: once the force-kill
+		// fallback SIGKILLs the child, its `close` event reports SIGKILL, which
+		// would mask the SIGTERM the caller actually sent (137 instead of 143).
+		let relayedSignal = null;
+		const onRelayedSignal = (signal) => {
+			if (settled) {
+				// Finalization is already running. A repeated signal here is the
+				// caller escalating (Ctrl-C again, a monitor's follow-up TERM):
+				// exit with the result finalization produced rather than hang on
+				// a slow cleanup — but never with signal-death semantics, which
+				// is what the pre-handler default would have reported.
+				process.exit(finalizedExitCode ?? 1);
+			}
+			relayedSignal ??= signal;
+			try {
+				child?.kill(signal);
+			} catch {
+				// Best-effort forward only.
+			}
+			if (signalForceTimer !== null) {
+				return;
+			}
+			// If the child ignores the signal, force-kill it — but leave
+			// finalization to the child's "close" event, so shadow-home sync and
+			// removal run only after the child is reaped and its stdio drained.
+			signalForceTimer = setTimeout(() => {
+				signalForceTimer = null;
+				try {
+					child?.kill("SIGKILL");
+				} catch {
+					// Best-effort only.
+				}
+			}, 1_000);
+			signalForceTimer.unref?.();
+		};
+		// `on`, not `once`: the handlers stay installed until finalization, so a
+		// repeated signal while a child still ignores the first keeps relaying
+		// instead of falling back to the default disposition — which would kill
+		// the wrapper before it can reap the child or clean the shadow home.
+		for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+			const handler = () => onRelayedSignal(signal);
+			signalRelayHandlers.set(signal, handler);
+			process.on(signal, handler);
+		}
+		detachSignalRelay = () => {
+			for (const [signal, handler] of signalRelayHandlers) {
+				process.removeListener(signal, handler);
+			}
+			signalRelayHandlers.clear();
+		};
 
 		if (proxyAppServerAccountRead && protocolProxy) {
 			let stdinClosed = false;
@@ -1907,9 +2054,16 @@ function forwardToRealCodexOnce(
 		});
 
 		child.once("close", (code, signal) => {
-			if (signal) {
-				const signalNumber = signal === "SIGINT" ? 130 : 1;
-				finalize(signalNumber);
+			const reportedSignal = relayedSignal ?? signal;
+			if (reportedSignal) {
+				const signalNumber = osConstants.signals?.[reportedSignal];
+				finalize(
+					typeof signalNumber === "number"
+						? 128 + signalNumber
+						: reportedSignal === "SIGINT"
+							? 130
+							: 1,
+				);
 				return;
 			}
 			finalize(typeof code === "number" ? code : 1);
@@ -1918,11 +2072,16 @@ function forwardToRealCodexOnce(
 }
 
 async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
+	sweepStaleShadowHomes(baseEnv);
 	let currentArgs = [...rawArgs];
 	let lastExitCode = 1;
 	const attemptedModels = new Set();
 
-	for (let attempt = 0; attempt < 4; attempt += 1) {
+	// Five forwards: the deepest supported-model staircase (gpt-6.1-sol ->
+	// gpt-6-sol -> gpt-5.6-sol -> gpt-6-luna -> gpt-5.6-luna) spends exactly
+	// the shared per-request attempt budget of 5 the plugin host uses. With 4
+	// the terminal model was unreachable from the new default.
+	for (let attempt = 0; attempt < 5; attempt += 1) {
 		const requestedModel = extractRequestedModel(currentArgs);
 		if (requestedModel) {
 			attemptedModels.add(requestedModel);
@@ -2022,25 +2181,15 @@ function hasCliAuthCredentialsStoreOverride(args) {
 // and its GPT-5 normalization helpers.
 // This wrapper runs before the TypeScript build, so it cannot import that source.
 const SUPPORTED_REASONING_EFFORTS_BY_MODEL = {
-	[CURRENT_CODEX_MODEL]: ["low", "medium", "high", "xhigh"],
 	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
-	"gpt-6-astra-aeon": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+	"gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-daybreak-blue-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-daybreak-red-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
 	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.5-pro": ["medium", "high", "xhigh"],
-	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.4-pro": ["medium", "high", "xhigh"],
-	"gpt-5.4-mini": ["medium"],
-	"gpt-5.4-nano": ["medium"],
-	"gpt-5.2-pro": ["medium", "high", "xhigh"],
-	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.1": ["none", "low", "medium", "high"],
-	"gpt-5-mini": ["medium"],
-	"gpt-5-nano": ["medium"],
 };
 
 const REASONING_FALLBACKS = {
@@ -2071,13 +2220,9 @@ const REASONING_ALIAS_VARIANTS = [
 	"xhigh",
 ];
 const REQUESTED_MODEL_ALIASES = new Map();
-const DEFAULT_GENERAL_GPT5_MODEL = "gpt-5.5";
-const GPT_5_5_CANONICAL_MODEL = "gpt-5.5";
-const GPT_5_5_PRO_CANONICAL_MODEL = "gpt-5.5-pro";
-const GPT_5_5_RELEASE_MODEL = "gpt-5.5-2026-04-23";
-const GPT_5_5_PRO_RELEASE_MODEL = "gpt-5.5-pro-2026-04-23";
-const GPT_5_5_RELEASE_COMPAT_MODEL = "gpt-5.5-20260423";
-const GPT_5_5_PRO_RELEASE_COMPAT_MODEL = "gpt-5.5-pro-20260423";
+// The general GPT-5 landing spot: with 5.5 retired, the newest living 5.x
+// flagship is 5.6 Sol. Mirrors lib/request/helpers/model-map.ts.
+const DEFAULT_GENERAL_GPT5_MODEL = "gpt-5.6-sol";
 // GPT-5.6 tiers. Sol and Terra expose `ultra`; Luna stops at `max`. No tier
 // accepts `none`/`minimal`. Bare `gpt-5.6` aliases to the flagship (Sol).
 const GPT_5_6_SOL_MODEL = "gpt-5.6-sol";
@@ -2086,45 +2231,67 @@ const GPT_5_6_LUNA_MODEL = "gpt-5.6-luna";
 const GPT_5_6_FLAGSHIP_ALIAS = "gpt-5.6";
 const GPT_5_6_SOL_TERRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const GPT_5_6_LUNA_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-// GPT-6 Astra (2026-09-03). No Sol/Terra/Luna split this generation: the
-// flagship plus `aeon`, a long-horizon variant. Same frontier effort ladder as
-// 5.6 (no `none`/`minimal`, `ultra` at the top). Bare `gpt-6` -> flagship.
+// GPT-6 Astra (2026-09-03): the frontier flagship. Same frontier effort
+// ladder as 5.6 (no `none`/`minimal`, `ultra` at the top). Bare `gpt-6` ->
+// flagship. The leaked `aeon` long-horizon variant was never catalog-listed
+// and is retired; its ids alias the flagship.
 const GPT_6_ASTRA_MODEL = "gpt-6-astra";
-const GPT_6_ASTRA_AEON_MODEL = "gpt-6-astra-aeon";
 const GPT_6_FLAGSHIP_ALIAS = "gpt-6";
 const GPT_6_ASTRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+// GPT-6 Sol and Luna (upstream catalog, 2026-09-22). Sol reaches `ultra`, Luna
+// stops at `max`. No GPT-6 Terra. Mirrors lib/request/helpers/model-map.ts.
+const GPT_6_SOL_MODEL = "gpt-6-sol";
+const GPT_6_LUNA_MODEL = "gpt-6-luna";
+const GPT_6_SOL_EFFORTS = GPT_6_ASTRA_EFFORTS;
+const GPT_6_LUNA_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+// GPT-6.1 Sol (upstream catalog, 2026-09-29): the first 6.1 release, added as
+// the catalog's default model. Sol is the only 6.1 tier yet, so bare `gpt-6.1`
+// aliases to it, matching the bare-alias convention.
+const GPT_6_1_SOL_MODEL = "gpt-6.1-sol";
+const GPT_6_1_FLAGSHIP_ALIAS = "gpt-6.1";
+const GPT_6_1_SOL_EFFORTS = GPT_6_ASTRA_EFFORTS;
 // Daybreak cyber models from the upstream Codex catalog. `red` is the
 // cyber-permissive variant, `blue` the defensive one.
 const DAYBREAK_BLUE_MODEL = "gpt-daybreak-blue-latest";
 const DAYBREAK_RED_MODEL = "gpt-daybreak-red-latest";
 const DAYBREAK_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+// Retired minors map to the replacement OpenAI names for them. Mirrors lib.
 const GENERAL_GPT5_VERSION_CATALOG = {
 	1: {
-		base: "gpt-5.1",
+		base: GPT_5_6_SOL_MODEL,
+		pro: GPT_6_ASTRA_MODEL,
 	},
 	2: {
-		base: "gpt-5.2",
-		pro: "gpt-5.2-pro",
+		base: GPT_5_6_SOL_MODEL,
+		pro: GPT_6_ASTRA_MODEL,
 	},
 	4: {
-		base: DEFAULT_GENERAL_GPT5_MODEL,
-		pro: "gpt-5.4-pro",
-		mini: "gpt-5.4-mini",
-		nano: "gpt-5.4-nano",
+		base: GPT_6_SOL_MODEL,
+		pro: GPT_6_ASTRA_MODEL,
+		mini: GPT_6_LUNA_MODEL,
+		nano: GPT_6_LUNA_MODEL,
 	},
 	5: {
-		base: GPT_5_5_CANONICAL_MODEL,
-		pro: GPT_5_5_PRO_CANONICAL_MODEL,
-		mini: "gpt-5-mini",
-		nano: "gpt-5-nano",
+		base: GPT_6_SOL_MODEL,
+		pro: GPT_6_ASTRA_MODEL,
+		mini: GPT_5_6_TERRA_MODEL,
+		nano: GPT_5_6_LUNA_MODEL,
 	},
 };
-const GENERAL_GPT5_STABLE_VARIANTS = GENERAL_GPT5_VERSION_CATALOG[5];
+// Unknown future 5.x minors land on the newest generation the line still
+// serves — deliberately NOT `gpt-6-sol`, since an id naming a 5.x minor keeps
+// its generation. Mirrors lib GENERAL_GPT5_STABLE_VARIANTS.
+const GENERAL_GPT5_STABLE_VARIANTS = {
+	base: GPT_5_6_SOL_MODEL,
+	pro: GPT_6_ASTRA_MODEL,
+	mini: GPT_5_6_TERRA_MODEL,
+	nano: GPT_5_6_LUNA_MODEL,
+};
 const GENERAL_GPT5_GENERIC_VARIANTS = {
 	base: DEFAULT_GENERAL_GPT5_MODEL,
-	pro: GPT_5_5_PRO_CANONICAL_MODEL,
-	mini: "gpt-5-mini",
-	nano: "gpt-5-nano",
+	pro: GPT_6_ASTRA_MODEL,
+	mini: GPT_5_6_TERRA_MODEL,
+	nano: GPT_5_6_LUNA_MODEL,
 };
 
 function addRequestedModelAlias(alias, normalizedModel) {
@@ -2244,43 +2411,11 @@ function renameFileWithRetry(sourcePath, destinationPath, expectedDestinationSta
 }
 
 function seedRequestedModelAliases() {
-	addRequestedModelReasoningAliases(
-		GPT_5_5_CANONICAL_MODEL,
-		GPT_5_5_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases(
-		GPT_5_5_RELEASE_MODEL,
-		GPT_5_5_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases(
-		GPT_5_5_RELEASE_COMPAT_MODEL,
-		GPT_5_5_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases(
-		GPT_5_5_PRO_CANONICAL_MODEL,
-		GPT_5_5_PRO_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases(
-		GPT_5_5_PRO_RELEASE_MODEL,
-		GPT_5_5_PRO_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases(
-		GPT_5_5_PRO_RELEASE_COMPAT_MODEL,
-		GPT_5_5_PRO_CANONICAL_MODEL,
-	);
-	addRequestedModelReasoningAliases("gpt-5.4", "gpt-5.4");
-	addRequestedModelReasoningAliases("gpt-5.4-pro", "gpt-5.4-pro");
-	addRequestedModelReasoningAliases("gpt-5.4-mini", "gpt-5.4-mini");
-	addRequestedModelReasoningAliases("gpt-5.4-nano", "gpt-5.4-nano");
-	addRequestedModelReasoningAliases("gpt-5.2-pro", "gpt-5.2-pro");
-	addRequestedModelReasoningAliases("gpt-5-pro", GPT_5_5_PRO_CANONICAL_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.2", "gpt-5.2");
-	addRequestedModelReasoningAliases("gpt-5.1", "gpt-5.1");
+	// `gpt-5` and `gpt-5-pro` are the last un-versioned ids upstream published;
+	// with 5.5 retired the 5.x flagship is Sol 5.6 and the pro tier is Astra.
+	// 5.5's own dated and suffixed forms come from the retired table below.
+	addRequestedModelReasoningAliases("gpt-5-pro", GPT_6_ASTRA_MODEL);
 	addRequestedModelReasoningAliases("gpt-5", DEFAULT_GENERAL_GPT5_MODEL);
-	addRequestedModelReasoningAliases("gpt-5-mini", "gpt-5-mini");
-	addRequestedModelReasoningAliases("gpt-5-nano", "gpt-5-nano");
-	addRequestedModelReasoningAliases("gpt-5.1-chat-latest", "gpt-5.1");
-	addRequestedModelReasoningAliases("gpt-5-chat-latest", DEFAULT_GENERAL_GPT5_MODEL);
 	addRequestedModelEffortAliases(
 		GPT_5_6_SOL_MODEL,
 		GPT_5_6_SOL_MODEL,
@@ -2307,20 +2442,35 @@ function seedRequestedModelAliases() {
 		GPT_6_ASTRA_EFFORTS,
 	);
 	addRequestedModelEffortAliases(
-		GPT_6_ASTRA_AEON_MODEL,
-		GPT_6_ASTRA_AEON_MODEL,
-		GPT_6_ASTRA_EFFORTS,
-	);
-	addRequestedModelEffortAliases(
 		GPT_6_FLAGSHIP_ALIAS,
 		GPT_6_ASTRA_MODEL,
 		GPT_6_ASTRA_EFFORTS,
 	);
 	addRequestedModelEffortAliases("astra", GPT_6_ASTRA_MODEL, GPT_6_ASTRA_EFFORTS);
+	// `astra-aeon` was only ever a leaked slug and is retired now, so the name
+	// resolves to the flagship. Its `gpt-6-astra-aeon` form comes from the
+	// retired table, not from a dedicated registration.
 	addRequestedModelEffortAliases(
 		"astra-aeon",
-		GPT_6_ASTRA_AEON_MODEL,
+		GPT_6_ASTRA_MODEL,
 		GPT_6_ASTRA_EFFORTS,
+	);
+	// No bare `sol`/`luna` aliases: those already mean the 5.6 tiers.
+	addRequestedModelEffortAliases(GPT_6_SOL_MODEL, GPT_6_SOL_MODEL, GPT_6_SOL_EFFORTS);
+	addRequestedModelEffortAliases(
+		GPT_6_LUNA_MODEL,
+		GPT_6_LUNA_MODEL,
+		GPT_6_LUNA_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		GPT_6_1_SOL_MODEL,
+		GPT_6_1_SOL_MODEL,
+		GPT_6_1_SOL_EFFORTS,
+	);
+	addRequestedModelEffortAliases(
+		GPT_6_1_FLAGSHIP_ALIAS,
+		GPT_6_1_SOL_MODEL,
+		GPT_6_1_SOL_EFFORTS,
 	);
 	addRequestedModelEffortAliases(
 		DAYBREAK_BLUE_MODEL,
@@ -2342,17 +2492,10 @@ function seedRequestedModelAliases() {
 		DAYBREAK_RED_MODEL,
 		DAYBREAK_EFFORTS,
 	);
-	addRequestedModelReasoningAliases(CURRENT_CODEX_MODEL, CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.3-codex-spark", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases(LEGACY_CODEX_MODEL, CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.2-codex", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.1-codex", CURRENT_CODEX_MODEL);
+	for (const [retired, replacement] of Object.entries(RETIRED_MODEL_REPLACEMENTS)) {
+		addRequestedModelReasoningAliases(retired, replacement);
+	}
 	addRequestedModelAlias("gpt_5_codex", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("codex-max", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.1-codex-max", CURRENT_CODEX_MODEL);
-	addRequestedModelAlias("codex-mini-latest", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5-codex-mini", CURRENT_CODEX_MODEL);
-	addRequestedModelReasoningAliases("gpt-5.1-codex-mini", CURRENT_CODEX_MODEL);
 }
 
 seedRequestedModelAliases();
@@ -2405,39 +2548,13 @@ function resolveStableGeneralGpt5Variant(variant) {
 // between the two, which is exactly what test/codex-model-resolution.test.ts
 // exists to prevent.
 function resolveCodexRequestedModel(normalized) {
-	if (
-		normalized.includes("gpt-5.1-codex-max") ||
-		normalized.includes("gpt 5.1 codex max") ||
-		normalized.includes("codex-max")
-	) {
-		return CURRENT_CODEX_MODEL;
+	// Every codex model is retired: a mini codex id goes to Terra, any other id
+	// carrying `codex` to Sol. Mirrors lib resolveCodexCatalogModel.
+	if (!normalized.includes("codex")) return "";
+	if (/codex[- ]mini(?!mal)/.test(normalized)) {
+		return CODEX_MINI_REPLACEMENT_MODEL;
 	}
-	if (
-		normalized.includes("gpt-5.1-codex-mini") ||
-		normalized.includes("gpt 5.1 codex mini") ||
-		normalized.includes("gpt-5-codex-mini") ||
-		normalized.includes("gpt 5 codex mini") ||
-		normalized.includes("codex-mini-latest")
-	) {
-		return CURRENT_CODEX_MODEL;
-	}
-	if (
-		normalized.includes("gpt-5.3-codex-spark") ||
-		normalized.includes("gpt 5.3 codex spark") ||
-		normalized.includes("gpt-5.3-codex") ||
-		normalized.includes("gpt 5.3 codex") ||
-		normalized.includes("gpt-5.2-codex") ||
-		normalized.includes("gpt 5.2 codex") ||
-		normalized.includes("gpt-5.1-codex") ||
-		normalized.includes("gpt 5.1 codex") ||
-		normalized.includes("gpt-5-codex") ||
-		normalized.includes("gpt 5 codex") ||
-		normalized.includes("codex")
-	) {
-		return CURRENT_CODEX_MODEL;
-	}
-
-	return "";
+	return CURRENT_CODEX_MODEL;
 }
 
 // Resolve GPT-5.6 identifiers, including ones that are not exact aliases (e.g. a
@@ -2447,23 +2564,28 @@ function resolveCodexRequestedModel(normalized) {
 // Resolve GPT-6 identifiers that are not exact aliases (a dated snapshot, the
 // `gpt-6-astra-pro` plan tier, or a tier OpenAI adds later). Without this the
 // general GPT-5 resolver never matches (it needs a `gpt 5` token pair) and the
-// id falls through to 5.5 — running GPT-5.5 for a caller who asked for the
-// frontier model. `aeon` keeps its own id because it is a behaviourally
-// different model, not a rename. Mirrors lib/request/helpers/model-map.ts.
+// id falls through to the default — running 6.1 Sol for a caller who asked for
+// a different model. `aeon` resolves to the flagship it was a leaked variant
+// of. Mirrors lib/request/helpers/model-map.ts.
 function resolveGpt6RequestedModel(stripped) {
 	const tokens = tokenizeRequestedModel(stripped);
 	const gptIndex = tokens.indexOf("gpt");
-	// `gpt6` with no separator tokenizes as one token, so the `gpt` + `6` pair
-	// never forms; mirror lib and claim it here.
 	const versionToken = gptIndex === -1 ? undefined : tokens[gptIndex + 1];
 	// `gpt6` with no separator tokenizes as one token, so the `gpt` + `6` pair
 	// never forms; mirror lib and claim it here.
-	const isGpt6 = versionToken === "6" || tokens.includes("gpt6");
+	const gpt6Index = tokens.indexOf("gpt6");
+	const isGpt6 = versionToken === "6" || gpt6Index !== -1;
+	// A 6.1 minor shows up as the token after `6` (`gpt-6.1-sol`) or after
+	// `gpt6` (`gpt6.1-sol`); both forms land on the 6.1 generation, not on the
+	// 6.0 tier the trailing `sol`/`luna` tokens name.
+	const isGpt61 =
+		(isGpt6 && gptIndex !== -1 && tokens[gptIndex + 2] === "1") ||
+		(gpt6Index !== -1 && tokens[gpt6Index + 1] === "1");
 	// A bare `astra` token counts too: picker labels and OpenAI's own material
 	// say "Astra" with no `gpt-6` prefix, so `Astra Pro` arrives with no version
-	// tokens and would otherwise miss every branch and land on 5.5. Anchored so
-	// an id naming a different GPT major version, `gpt-4-astra-x`, is not
-	// claimed for the frontier model.
+	// tokens and would otherwise miss every branch and land on the default.
+	// Anchored so an id naming a different GPT major version, `gpt-4-astra-x`,
+	// is not claimed for the frontier model.
 	const namesOtherGptVersion =
 		versionToken !== undefined &&
 		/^\d+$/.test(versionToken) &&
@@ -2472,7 +2594,14 @@ function resolveGpt6RequestedModel(stripped) {
 	if ((!isGpt6 && !isAstra) || tokens.includes("codex")) {
 		return "";
 	}
-	if (tokens.includes("aeon")) return GPT_6_ASTRA_AEON_MODEL;
+	if (tokens.includes("aeon")) return GPT_6_ASTRA_MODEL;
+	if (isAstra) return GPT_6_ASTRA_MODEL;
+	// Every unrecognised 6.1 id resolves to the generation's only tier, Sol.
+	if (isGpt61) return GPT_6_1_SOL_MODEL;
+	// `terra` goes to Sol: there is no GPT-6 Terra, and upstream migrates
+	// `gpt-5.6-terra` users to Sol.
+	if (tokens.includes("luna")) return GPT_6_LUNA_MODEL;
+	if (tokens.includes("sol") || tokens.includes("terra")) return GPT_6_SOL_MODEL;
 	return GPT_6_ASTRA_MODEL;
 }
 
@@ -2545,6 +2674,14 @@ function normalizeRequestedModel(model) {
 	const exactMatch = REQUESTED_MODEL_ALIASES.get(normalized);
 	if (exactMatch) {
 		return exactMatch;
+	}
+	// Mirrors lib: retry the alias lookup without a `-max`/`-ultra` suffix.
+	const withoutTopEffort = normalized.replace(/-(max|ultra)$/, "");
+	if (withoutTopEffort !== normalized) {
+		const effortlessMatch = REQUESTED_MODEL_ALIASES.get(withoutTopEffort);
+		if (effortlessMatch) {
+			return effortlessMatch;
+		}
 	}
 
 	const daybreakModel = resolveDaybreakRequestedModel(stripped);
@@ -3024,6 +3161,24 @@ function isFileLike(path) {
 	}
 }
 
+function isSameFile(leftPath, rightPath) {
+	try {
+		const left = statSync(leftPath, { bigint: true });
+		const right = statSync(rightPath, { bigint: true });
+		return left.dev === right.dev && left.ino === right.ino;
+	} catch {
+		return false;
+	}
+}
+
+// A SQLite file materialized by link is the original file itself, so its shadow
+// and original snapshots can never differ and sync-back is always a no-op.
+// Snapshotting it would only read the whole database (often several GB) into
+// memory on every launch and again on cleanup.
+function isLinkedSqliteShadowHomeFile(name, shadowPath, originalPath) {
+	return shouldMaterializeFileIntoShadowHome(name) && isSameFile(shadowPath, originalPath);
+}
+
 function mirrorDirectoryIntoShadowHome(sourcePath, destinationPath) {
 	try {
 		if ((process.env.CODEX_MULTI_AUTH_TEST_FORCE_SHADOW_DIR_COPY ?? "").trim() === "1") {
@@ -3254,6 +3409,7 @@ function collectShadowHomeSyncFileNames(shadowCodexHome, syncFileNames) {
 			if (
 				name === SHADOW_HOME_CONFIG_FILE ||
 				name === SHADOW_HOME_SYNC_STATE_FILE ||
+				name === SHADOW_HOME_OWNER_FILE ||
 				syncFileNames.has(name)
 			) {
 				continue;
@@ -3367,12 +3523,15 @@ function syncAdditionalShadowHomeFiles(
 			continue;
 		}
 		const shadowPath = join(shadowCodexHome, name);
+		const originalPath = join(originalCodexHome, name);
+		if (isLinkedSqliteShadowHomeFile(name, shadowPath, originalPath)) {
+			continue;
+		}
 		const shadowState = captureShadowHomeState(shadowPath);
 		if (!shadowState.exists || shadowState.unreadable) {
 			continue;
 		}
 
-		const originalPath = join(originalCodexHome, name);
 		const originalSnapshot =
 			originalFileStates.get(name) ?? { exists: false, content: null };
 		const currentOriginalState = captureShadowHomeState(originalPath);
@@ -3405,6 +3564,8 @@ function createShadowHomeMirror(
 		options.linkOnlyDirectoryPredicate ?? (() => false);
 	const originalFileStates = new Map();
 	const copiedDirectoryNames = new Set();
+	const materializedFileNames = [];
+	const linkedSqliteFileNames = new Set();
 	const rememberSyncFile = (name) => {
 		if (!originalFileStates.has(name)) {
 			originalFileStates.set(
@@ -3425,6 +3586,7 @@ function createShadowHomeMirror(
 				name === SHADOW_HOME_CONFIG_FILE ||
 				name === SHADOW_HOME_SYNC_STATE_FILE ||
 				name === SHADOW_HOME_SYNC_LOCK_DIR ||
+				name === SHADOW_HOME_OWNER_FILE ||
 				skipMirrorPredicate(name)
 			) {
 				continue;
@@ -3464,7 +3626,12 @@ function createShadowHomeMirror(
 					continue;
 				}
 				if (fileLike) {
-					rememberSyncFile(name);
+					if (shouldMaterializeFile && !isKnownStateFile) {
+						// Snapshot after the loop, once links exist, so linked SQLite is never read.
+						materializedFileNames.push(name);
+					} else {
+						rememberSyncFile(name);
+					}
 					if (isKnownStateFile) {
 						copyFileSync(sourcePath, destinationPath);
 						tightenFile(destinationPath);
@@ -3489,12 +3656,45 @@ function createShadowHomeMirror(
 				// launch; auth/config files still get handled explicitly.
 			}
 		}
+		for (const name of materializedFileNames) {
+			if (
+				isLinkedSqliteShadowHomeFile(
+					name,
+					join(shadowCodexHome, name),
+					join(originalCodexHome, name),
+				)
+			) {
+				// Remember the link identity now: if the original is replaced later,
+				// the shadow hard link no longer matches it, but there is still nothing
+				// to sync back and re-checking at cleanup would read both files in full.
+				linkedSqliteFileNames.add(name);
+				if (isSqliteMainFile(name)) {
+					// Sidecars linked alongside the main file skip their own readdir entry.
+					for (const sidecarName of [`${name}-wal`, `${name}-shm`]) {
+						if (
+							isLinkedSqliteShadowHomeFile(
+								sidecarName,
+								join(shadowCodexHome, sidecarName),
+								join(originalCodexHome, sidecarName),
+							)
+						) {
+							linkedSqliteFileNames.add(sidecarName);
+						}
+					}
+				}
+			} else {
+				rememberSyncFile(name);
+			}
+		}
 	}
 
 	return () => {
 		let releaseLock = () => {};
 		try {
 			const names = collectShadowHomeSyncFileNames(shadowCodexHome, syncFileNames);
+			for (const name of linkedSqliteFileNames) {
+				names.delete(name);
+			}
 			releaseLock = acquireShadowHomeSyncLock(originalCodexHome);
 			syncShadowHomeAuthBundle(
 				originalCodexHome,
@@ -3595,7 +3795,16 @@ function parseRuntimeRotationProxyEnv(value) {
 	return undefined;
 }
 
+function hasNativeAppBinding(env = process.env) {
+	try {
+		const config = readFileSync(join(resolveCodexHomeDir(env), "config.toml"), "utf8");
+		return config.includes("# codex-multi-auth native provider begin") &&
+			extractConfigAssignmentValue(config, "model_provider") === "openai";
+	} catch { return false; }
+}
+
 async function isRuntimeRotationProxyEnabled(rawArgs, baseEnv = process.env) {
+	if (hasNativeAppBinding(baseEnv)) return false;
 	if ((baseEnv.CODEX_MULTI_AUTH_BYPASS ?? "").trim() === "1") {
 		return false;
 	}
@@ -3645,6 +3854,175 @@ function resolveRuntimeRotationProxyOriginalCodexHome(baseEnv) {
 	return override || resolveCodexHomeDir(baseEnv);
 }
 
+// Markerless dirs are pre-sweeper leftovers (or crashed-before-mark runs);
+// 24h is generous next to any real session so a live shadow is never reaped.
+const STALE_SHADOW_HOME_AGE_MS = 24 * 60 * 60 * 1000;
+// A recorded PID is an identity, not just a liveness token: the owning process
+// necessarily started before its marker was written, so a process now holding
+// the PID that started meaningfully later is a different process — the PID was
+// recycled. Same rule sweepStaleRuntimeRotationAppHelperMetadata uses.
+const SHADOW_HOME_OWNER_SKEW_MS = 60_000;
+let staleShadowHomeSweepDone = false;
+
+function writeShadowHomeOwnerMarker(shadowDir) {
+	try {
+		writeFileSync(
+			join(shadowDir, SHADOW_HOME_OWNER_FILE),
+			JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+			{ mode: 0o600 },
+		);
+	} catch {
+		// Best-effort only; a missing marker just defers reaping to the age rule.
+	}
+}
+
+// Once the forwarded child exists it is recorded alongside the wrapper PID: a
+// wrapper that dies ungracefully (SIGKILL cannot be relayed) leaves a marker
+// whose wrapper PID is dead while the child may still be running against the
+// shadow home. Only markers this process wrote are updated — a foreign or
+// leaked marker is left for the sweep's own rules.
+function recordShadowHomeChildPid(shadowDir, childPid) {
+	if (typeof shadowDir !== "string" || shadowDir.trim().length === 0) {
+		return;
+	}
+	if (typeof childPid !== "number" || !Number.isFinite(childPid)) {
+		return;
+	}
+	try {
+		const ownerPath = join(shadowDir, SHADOW_HOME_OWNER_FILE);
+		if (!existsSync(ownerPath)) {
+			return;
+		}
+		const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+		if (owner?.pid !== process.pid) {
+			return;
+		}
+		writeFileSync(
+			ownerPath,
+			JSON.stringify({
+				...owner,
+				childPid,
+				childRecordedAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+	} catch {
+		// Best-effort only; a missing child record just shortens retention.
+	}
+}
+
+function isShadowHomeStale(shadowDir, probeStartTime) {
+	const ownerPath = join(shadowDir, SHADOW_HOME_OWNER_FILE);
+	if (existsSync(ownerPath)) {
+		try {
+			const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+			if (typeof owner?.pid === "number" && Number.isFinite(owner.pid)) {
+				const recordedProcessAlive = (pid, recordedAt) => {
+					if (typeof pid !== "number" || !Number.isFinite(pid)) {
+						return false;
+					}
+					if (!isProcessAlive(pid)) {
+						return false;
+					}
+					if (
+						typeof recordedAt !== "number" ||
+						!Number.isFinite(recordedAt)
+					) {
+						// No marker timestamp to check identity against — bare liveness.
+						return true;
+					}
+					const actualStartTimeMs = probeStartTime(pid);
+					if (actualStartTimeMs === null || actualStartTimeMs === undefined) {
+						// Identity unknowable (Windows, no ps, probe budget spent) —
+						// retaining a maybe-live home beats reaping a live one.
+						return true;
+					}
+					return actualStartTimeMs <= recordedAt + SHADOW_HOME_OWNER_SKEW_MS;
+				};
+				if (recordedProcessAlive(owner.pid, owner.createdAt)) {
+					return false;
+				}
+				// The wrapper that owned this home is gone, but a killed wrapper
+				// can leave its forwarded child running against the shadow home;
+				// the home is only orphaned once the child is gone too.
+				if (
+					recordedProcessAlive(
+						owner.childPid,
+						owner.childRecordedAt ?? owner.createdAt,
+					)
+				) {
+					return false;
+				}
+				return true;
+			}
+		} catch {
+			// Corrupt marker — fall through to the age rule.
+		}
+	}
+	try {
+		return Date.now() - statSync(shadowDir).mtimeMs > STALE_SHADOW_HOME_AGE_MS;
+	} catch {
+		return false;
+	}
+}
+
+function sweepStaleShadowHomes(baseEnv) {
+	if (staleShadowHomeSweepDone) {
+		return;
+	}
+	staleShadowHomeSweepDone = true;
+	const candidates = [
+		{
+			root: join(
+				resolveCodexHomeDir(baseEnv),
+				"multi-auth",
+				"runtime-shadow-homes",
+			),
+			prefix: "codex-multi-auth-runtime-home-",
+		},
+		{ root: tmpdir(), prefix: "codex-multi-auth-home-" },
+	];
+	// Identity probes are memoized per PID and bounded: at most a handful of
+	// `ps` spawns run per launch, and only for markers whose PID is still live —
+	// dead-PID markers, the common case after a crash, never probe at all.
+	const probedStartTimes = new Map();
+	let probeBudget = 20;
+	const probeStartTime = (pid) => {
+		if (probedStartTimes.has(pid)) {
+			return probedStartTimes.get(pid);
+		}
+		if (probeBudget <= 0) {
+			return undefined;
+		}
+		probeBudget -= 1;
+		const startTime = readProcessStartTimeMs(pid);
+		probedStartTimes.set(pid, startTime);
+		return startTime;
+	};
+	for (const { root, prefix } of candidates) {
+		let entries;
+		try {
+			entries = readdirSync(root, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !entry.name.startsWith(prefix)) {
+				continue;
+			}
+			const shadowDir = join(root, entry.name);
+			if (!isShadowHomeStale(shadowDir, probeStartTime)) {
+				continue;
+			}
+			try {
+				removeDirectoryWithRetry(shadowDir);
+			} catch {
+				// Best-effort sweep; a busy shadow is retried on the next launch.
+			}
+		}
+	}
+}
+
 function createRuntimeRotationShadowHome(originalCodexHome) {
 	const shadowRoot = join(
 		originalCodexHome,
@@ -3652,7 +4030,11 @@ function createRuntimeRotationShadowHome(originalCodexHome) {
 		"runtime-shadow-homes",
 	);
 	mkdirSync(shadowRoot, { recursive: true });
-	return mkdtempSync(join(shadowRoot, "codex-multi-auth-runtime-home-"));
+	const shadowDir = mkdtempSync(
+		join(shadowRoot, "codex-multi-auth-runtime-home-"),
+	);
+	writeShadowHomeOwnerMarker(shadowDir);
+	return shadowDir;
 }
 
 function parseHookStateTableKey(line) {
@@ -4018,29 +4400,20 @@ function installRuntimeRotationAppServerCliShim(forwardedEnv, configArgs = []) {
 			// Best-effort stale shim cleanup only; the copy below will report a
 			// persistent failure without leaving a partially-created helper.
 		}
-		if (
-			process.platform === "win32" ||
-			(process.env.CODEX_MULTI_AUTH_TEST_FORCE_APP_SERVER_SHIM_COPY ?? "") === "1"
-		) {
-			// A Windows hard link to the running node.exe remains locked by the
-			// helper process itself, which prevents the shim directory from being
-			// removed during graceful helper shutdown. Use an independent image so
-			// the helper can clean up its app-server shim before exiting.
+		if (process.platform === "win32") {
+			// A running hard-linked node.exe prevents helper cleanup on Windows.
 			withSynchronousFileOperationRetry(() => {
 				maybeThrowSimulatedAppServerShimFileError("copy");
 				copyFileSync(process.execPath, executablePath);
 			});
 		} else {
-			try {
-				linkSync(process.execPath, executablePath);
-			} catch {
-				withSynchronousFileOperationRetry(() => {
-					maybeThrowSimulatedAppServerShimFileError("copy");
-					copyFileSync(process.execPath, executablePath);
-				});
-			}
-		}
-		if (process.platform !== "win32") {
+			// Relocating Node breaks installations with executable-relative shared
+			// libraries (including Homebrew). Invoke the original image in place.
+			const quotedNode = "'" + process.execPath.replace(/'/g, "'\\''") + "'";
+			withSynchronousFileOperationRetry(() => {
+				maybeThrowSimulatedAppServerShimFileError("copy");
+				writeFileSync(executablePath, `#!/bin/sh\nexec ${quotedNode} "$@"\n`, { mode: 0o755 });
+			});
 			chmodSync(executablePath, 0o755);
 		}
 		writeFileSync(
@@ -5911,6 +6284,7 @@ function createCompatibilityCodexHome(
 	}
 
 	const shadowCodexHome = mkdtempSync(join(tmpdir(), "codex-multi-auth-home-"));
+	writeShadowHomeOwnerMarker(shadowCodexHome);
 	let syncShadowHomeStateBack = () => {};
 	const cleanup = () => {
 		try {
@@ -5961,8 +6335,13 @@ function createCompatibilityCodexHome(
 	};
 }
 
-function buildForwardArgs(rawArgs) {
-	const { args: compatibilityArgs, requestedModel } = rewriteReasoningConfigArgs(rawArgs);
+function buildForwardArgs(rawArgs, { preserveNativeSettings = false } = {}) {
+	// Native app binding keeps the caller's model and reasoning settings verbatim;
+	// it still needs the file auth store, because the router authenticates the
+	// desktop token it reads from auth.json.
+	const { args: compatibilityArgs, requestedModel } = preserveNativeSettings
+		? { args: [...rawArgs], requestedModel: extractRequestedModel(rawArgs) }
+		: rewriteReasoningConfigArgs(rawArgs);
 	const forceFileAuthStore = (process.env.CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE ?? "1").trim() !== "0";
 	if (!forceFileAuthStore) {
 		return { args: compatibilityArgs, requestedModel };
@@ -6048,7 +6427,13 @@ function parseRolloutIndexEntry(rolloutPath) {
 		if (typeof record?.timestamp === "string") {
 			updatedAt = record.timestamp;
 		}
-		if (record?.type === "session_meta" && typeof record.payload?.id === "string") {
+		// Forked rollouts append the parent's session_meta after their own, so
+		// only the first one names this rollout.
+		if (
+			!hasSessionMeta &&
+			record?.type === "session_meta" &&
+			typeof record.payload?.id === "string"
+		) {
 			id = record.payload.id;
 			hasSessionMeta = true;
 		}
@@ -6470,6 +6855,33 @@ function ensureWindowsShellShimGuards() {
 	}
 }
 
+export function getResumePickerRequest(args, cwd = process.cwd()) {
+	const baseCwd = cwd;
+	const command = findForwardedCommand(args);
+	if (command?.command !== "resume" || findForwardedSubcommand(args, command.index)) return null;
+	const configArgs = [];
+	let showAll = false;
+	let includeNonInteractive = false;
+	for (let i = 0; i < args.length; i += 1) {
+		const arg = args[i];
+		if (arg === "--") break;
+		if (consumesNextArg(arg) && args[i + 1] === undefined) return null;
+		if (["--last", "--help", "-h", "--remote"].includes(arg) || arg.startsWith("--remote=")) return null;
+		if (arg === "--all") showAll = true;
+		if (arg === "--include-non-interactive") includeNonInteractive = true;
+		if (arg === "-C" || arg === "--cd") cwd = resolvePath(baseCwd, args[i + 1]);
+		else if (arg.startsWith("--cd=")) cwd = resolvePath(baseCwd, arg.slice(5));
+		else if (arg.startsWith("-C") && arg.length > 2) cwd = resolvePath(baseCwd, arg.slice(2));
+		if (["-c", "--config", "-p", "--profile", "--enable", "--disable"].includes(arg)) {
+			configArgs.push(arg, args[i + 1]);
+		} else if (/^--(config|profile|enable|disable)=/.test(arg) || /^-[cp].+/.test(arg)) {
+			configArgs.push(arg);
+		}
+		i = skipOptionValueSpan(args, i);
+	}
+	return { commandIndex: command.index, cwd, configArgs, showAll, includeNonInteractive };
+}
+
 async function main() {
 	hydrateCliVersionEnv();
 
@@ -6510,7 +6922,9 @@ async function main() {
 			[
 				"Could not locate the official Codex CLI.",
 				"Install it with npm, Homebrew, or an official native release so `codex` is on PATH.",
-				"Or set CODEX_MULTI_AUTH_REAL_CODEX_BIN to the full path of either codex or @openai/codex/bin/codex.js.",
+				process.platform === "win32"
+					? "Or set CODEX_MULTI_AUTH_REAL_CODEX_BIN to the full path of codex.exe or @openai/codex/bin/codex.js."
+					: "Or set CODEX_MULTI_AUTH_REAL_CODEX_BIN to the full path of either codex or @openai/codex/bin/codex.js.",
 			].join("\n"),
 		);
 		return 1;
@@ -6519,12 +6933,42 @@ async function main() {
 	// Resolve `--account` / CODEX_MULTI_AUTH_FORCE_ACCOUNT before forwarding: strip
 	// the launcher-only flag from the Codex args and publish the resolved pin, or
 	// fail hard so a forced account can never silently fall back to another one.
+	if (hasNativeAppBinding(process.env)) {
+        const forced = resolveForcedAccountSelector(rawArgs, process.env);
+        if (forced.error || forced.selector !== null) {
+            console.error(forced.error ?? "Native app binding uses the persistent inference selection. Use codex-multi-auth switch instead of --account.");
+            return 1;
+        }
+        delete process.env.CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX;
+        // Best effort: a locked or read-only config.toml (Windows EPERM/EBUSY)
+        // must not block the launch; the per-invocation override below still applies.
+        await ensurePersistedCodexFileAuthStore();
+        const { args: nativeArgs } = buildForwardArgs(forced.strippedArgs, { preserveNativeSettings: true });
+        const result = await forwardToRealCodexOnce(realCodexBin, nativeArgs, process.env);
+        return result.exitCode;
+    }
 	const forcedAccount = await applyForcedAccountSelection(rawArgs, process.env);
 	if (forcedAccount.error) {
 		console.error(forcedAccount.error);
 		return 1;
 	}
-	const forwardArgs = forcedAccount.forwardArgs;
+	const forwardArgs = [...forcedAccount.forwardArgs];
+
+
+	if (process.stdin.isTTY && process.stdout.isTTY && !bypass) {
+		const pickerRequest = getResumePickerRequest(forwardArgs);
+		if (pickerRequest && await isRuntimeRotationProxyEnabled(forwardArgs)) {
+			try {
+				const { pickResumeThread } = await import("../dist/lib/runtime/resume-picker.js");
+				const id = await pickResumeThread({ ...pickerRequest, codexBin: realCodexBin });
+				if (!id) return 0;
+				forwardArgs.splice(pickerRequest.commandIndex + 1, 0, id);
+			} catch (error) {
+				// Discovery is optional: fall back to native `codex resume` with the original args.
+				console.error(`Could not list saved Codex sessions: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+	}
 
 	await ensurePersistedCodexFileAuthStore();
 	await autoSyncManagerActiveSelectionIfEnabled();
@@ -6543,11 +6987,13 @@ async function main() {
 // lib/request/helpers/model-map.ts (see test/codex-model-resolution.test.ts,
 // which asserts wrapper<->lib parity).
 export {
+	isRuntimeRotationProxyEnabled,
 	normalizeRequestedModel,
 	coerceReasoningEffortForModel,
 	resolveModelFamilyForStatus,
 	canonicalizeRequestedModelName,
 	WRAPPER_UNSUPPORTED_MODEL_FALLBACK_CHAIN,
+	RETIRED_MODEL_REPLACEMENTS,
 };
 
 // Run the wrapper only when actually launched (as the `codex-multi-auth-codex`

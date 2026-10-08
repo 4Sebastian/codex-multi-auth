@@ -206,13 +206,17 @@ describe("context budget guard", () => {
 	});
 
 	it("does not pause a request for a model it refuses to estimate", () => {
-		const guard = new ContextBudgetGuard({ enabled: true, hardPercent: 70 });
+		const guard = new ContextBudgetGuard({
+			enabled: true,
+			hardPercent: 70,
+			modelWindowOverrides: { "gpt-5.5": 260_000 },
+		});
 		guard.update("session-1", {
-			model: "gpt-5-codex",
+			model: "gpt-5.5",
 			contextTokens: 250_000,
 			updatedAt: 0,
 		});
-		expect(guard.getAdvisory("session-1", 0, "gpt-5-codex").level).toBe("hard");
+		expect(guard.getAdvisory("session-1", 0, "gpt-5.5").level).toBe("hard");
 		// gpt-5.6-sol is in UNESTIMATED_ROUTABLE_MODELS: cannot evaluate, so it
 		// must not be paused against the previous model's window.
 		expect(guard.getAdvisory("session-1", 0, "gpt-5.6-sol")).toEqual({ level: "ok" });
@@ -293,26 +297,35 @@ describe("context budget guard", () => {
 	});
 
 	it("resolves the window for the raw model string a client actually sends", () => {
-		// The rotation proxy passes body.model verbatim; gpt-5-codex is Codex
-		// CLI's own default and is an alias, not a table key.
-		const guard = new ContextBudgetGuard({ enabled: true, hardPercent: 80 });
+		// The rotation proxy passes body.model verbatim; `gpt-5` is an alias of
+		// gpt-5.6-sol, not a table key. No model ships an estimate, so the
+		// canonical-candidate lookup is exercised through a user override.
+		const guard = new ContextBudgetGuard({
+			enabled: true,
+			hardPercent: 80,
+			modelWindowOverrides: { "gpt-5.6-sol": 260_000 },
+		});
 		guard.update("session-1", {
-			model: "gpt-5-codex",
+			model: "gpt-5",
 			contextTokens: 250_000,
 			updatedAt: 0,
 		});
 		const advisory = guard.getAdvisory("session-1");
 		expect(advisory.level).toBe("hard");
 		if (advisory.level !== "ok") {
-			expect(advisory.windowSource).toBe("estimate");
+			expect(advisory.windowSource).toBe("override");
 			expect(advisory.windowTokens).toBe(260_000);
 		}
 	});
 
 	it("resolves the window through a reasoning-suffixed alias", () => {
-		const guard = new ContextBudgetGuard({ enabled: true, hardPercent: 80 });
+		const guard = new ContextBudgetGuard({
+			enabled: true,
+			hardPercent: 80,
+			modelWindowOverrides: { "gpt-5.6-sol": 260_000 },
+		});
 		guard.update("session-1", {
-			model: "gpt-5.3-codex-high",
+			model: "gpt-5-high",
 			contextTokens: 250_000,
 			updatedAt: 0,
 		});

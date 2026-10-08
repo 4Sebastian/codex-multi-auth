@@ -23,9 +23,9 @@ import { computeOutboundRequestAttemptBudget } from "../lib/request/request-atte
  */
 describe("GPT-6 Astra", () => {
 	describe("model resolution", () => {
-		it("maps the flagship and the long-horizon variant to their own ids", () => {
+		it("maps the flagship to its own id and the retired aeon slug to it", () => {
 			expect(getNormalizedModel("gpt-6-astra")).toBe("gpt-6-astra");
-			expect(getNormalizedModel("gpt-6-astra-aeon")).toBe("gpt-6-astra-aeon");
+			expect(getNormalizedModel("gpt-6-astra-aeon")).toBe("gpt-6-astra");
 			expect(isKnownModel("gpt-6-astra")).toBe(true);
 			expect(isKnownModel("gpt-6-astra-aeon")).toBe(true);
 		});
@@ -34,15 +34,18 @@ describe("GPT-6 Astra", () => {
 			expect(getNormalizedModel("gpt-6")).toBe("gpt-6-astra");
 			expect(getNormalizedModel("gpt-6-high")).toBe("gpt-6-astra");
 			expect(getNormalizedModel("astra")).toBe("gpt-6-astra");
-			expect(getNormalizedModel("astra-aeon")).toBe("gpt-6-astra-aeon");
+			expect(getNormalizedModel("astra-aeon")).toBe("gpt-6-astra");
 		});
 
 		it("keeps effort aliases on their own model", () => {
 			expect(getNormalizedModel("gpt-6-astra-xhigh")).toBe("gpt-6-astra");
 			expect(getNormalizedModel("gpt-6-astra-max")).toBe("gpt-6-astra");
 			expect(getNormalizedModel("gpt-6-astra-ultra")).toBe("gpt-6-astra");
-			expect(getNormalizedModel("gpt-6-astra-aeon-ultra")).toBe(
-				"gpt-6-astra-aeon",
+			// Retired seeding registers aeon's `none`-`xhigh` variants only, so an
+			// `-ultra` suffix is not an exact alias — the resolver still routes it.
+			expect(getNormalizedModel("gpt-6-astra-aeon-ultra")).toBeUndefined();
+			expect(resolveNormalizedModel("gpt-6-astra-aeon-ultra")).toBe(
+				"gpt-6-astra",
 			);
 		});
 
@@ -51,7 +54,7 @@ describe("GPT-6 Astra", () => {
 			expect(getNormalizedModel("gpt-6-astra-minimal")).toBeUndefined();
 		});
 
-		it("resolves unrecognised GPT-6 ids to Astra, never silently to 5.5", () => {
+		it("resolves unrecognised GPT-6 ids to Astra, never silently to the default", () => {
 			// The whole point of the dedicated resolver: none of these are aliases.
 			expect(resolveNormalizedModel("gpt-6-astra-pro")).toBe("gpt-6-astra");
 			expect(resolveNormalizedModel("gpt-6-astra-2026-09-03")).toBe("gpt-6-astra");
@@ -61,20 +64,22 @@ describe("GPT-6 Astra", () => {
 			expect(resolveNormalizedModel("GPT 6 Astra")).toBe("gpt-6-astra");
 		});
 
-		it("keeps an unrecognised aeon id on aeon rather than the flagship", () => {
-			// aeon is a long-horizon model, not a rename of the flagship. Collapsing
-			// it into `gpt-6-astra` would run a materially different model.
+		it("routes the retired aeon slug — dated or verbose — to the flagship", () => {
+			// `aeon` was a Statsig-flag leak that never entered the bundled catalog
+			// or the API docs, so the id is dead; every form of it now resolves to
+			// the flagship it was a long-horizon variant of.
 			expect(resolveNormalizedModel("gpt-6-astra-aeon-2026-09-03")).toBe(
-				"gpt-6-astra-aeon",
+				"gpt-6-astra",
 			);
-			expect(resolveNormalizedModel("GPT 6 Astra Aeon")).toBe("gpt-6-astra-aeon");
+			expect(resolveNormalizedModel("GPT 6 Astra Aeon")).toBe("gpt-6-astra");
 		});
 
 		it("leaves the GPT-5 catalog untouched", () => {
-			expect(getNormalizedModel("gpt-5")).toBe("gpt-5.5");
+			expect(getNormalizedModel("gpt-5")).toBe("gpt-5.6-sol");
 			expect(getNormalizedModel("gpt-5.6")).toBe("gpt-5.6-sol");
 			expect(resolveNormalizedModel("gpt-5.6-terra-fast")).toBe("gpt-5.6-terra");
-			expect(getNormalizedModel("codex-max")).toBe("gpt-5.3-codex");
+			// Retired codex-max runs on 5.6 Sol, not on an Astra model.
+			expect(getNormalizedModel("codex-max")).toBe("gpt-5.6-sol");
 		});
 
 		it("does not claim an `astra` token that names a different GPT version", () => {
@@ -94,15 +99,17 @@ describe("GPT-6 Astra", () => {
 
 		it("defers ids carrying a `codex` token to the codex resolver", () => {
 			// Same rule the 5.6 resolver follows. Astra has no codex variant, and
-			// claiming one here would route a codex request onto a general model.
-			expect(resolveNormalizedModel("gpt-6-codex")).toBe("gpt-5.3-codex");
+			// claiming one here would route a codex request onto the frontier model
+			// instead of the named replacement for retired codex ids.
+			expect(resolveNormalizedModel("gpt-6-codex")).toBe("gpt-5.6-sol");
+			expect(resolveNormalizedModel("gpt-6-astra-codex")).toBe("gpt-5.6-sol");
 		});
 	});
 
 	describe("reasoning effort", () => {
-		it("uses the flagship/long-horizon defaults", () => {
+		it("uses the flagship defaults, aeon included via its replacement", () => {
 			expect(getReasoningConfig("gpt-6-astra", {}).effort).toBe("low");
-			expect(getReasoningConfig("gpt-6-astra-aeon", {}).effort).toBe("medium");
+			expect(getReasoningConfig("gpt-6-astra-aeon", {}).effort).toBe("low");
 		});
 
 		it("passes `max` through untouched", () => {
@@ -139,6 +146,8 @@ describe("GPT-6 Astra", () => {
 
 	describe("profiles", () => {
 		it("exposes the full frontier effort ladder and no `none`", () => {
+			// `aeon` reads the flagship's profile through the retired table, so it
+			// exercises the same ladder a second way.
 			for (const model of ["gpt-6-astra", "gpt-6-astra-aeon"]) {
 				const efforts = getModelProfile(model).supportedReasoningEfforts;
 				expect(efforts, model).toContain("ultra");
@@ -171,6 +180,12 @@ describe("GPT-6 Astra", () => {
 				outputUsdPerMillion: 50,
 				cachedInputUsdPerMillion: 1,
 				reasoningUsdPerMillion: 50,
+				longContext: {
+					inputUsdPerMillion: 20,
+					outputUsdPerMillion: 75,
+					cachedInputUsdPerMillion: 2,
+					reasoningUsdPerMillion: 75,
+				},
 				// Fast tier, also published at launch. See
 				// test/usage-service-tier.test.ts for how it is applied.
 				serviceTiers: {
@@ -179,17 +194,24 @@ describe("GPT-6 Astra", () => {
 						outputUsdPerMillion: 100,
 						cachedInputUsdPerMillion: 2,
 						reasoningUsdPerMillion: 100,
+						longContext: {
+							inputUsdPerMillion: 40,
+							outputUsdPerMillion: 150,
+							cachedInputUsdPerMillion: 4,
+							reasoningUsdPerMillion: 150,
+						},
 					},
 				},
 			});
+			// Input under 272K: short-context rate (long context has its own test).
 			expect(
 				estimateUsageCostUsd("gpt-6-astra", {
-					inputTokens: 1_000_000,
+					inputTokens: 100_000,
 					cachedInputTokens: 0,
 					outputTokens: 1_000_000,
 					reasoningTokens: 0,
 				}),
-			).toBe(60);
+			).toBe(51);
 		});
 
 		it("bills cached input at the platform 90% discount, never free", () => {
@@ -201,26 +223,32 @@ describe("GPT-6 Astra", () => {
 			// already encodes at input/10.
 			expect(
 				estimateUsageCostUsd("gpt-6-astra", {
-					inputTokens: 1_000_000,
-					cachedInputTokens: 1_000_000,
+					inputTokens: 100_000,
+					cachedInputTokens: 100_000,
 					outputTokens: 0,
 					reasoningTokens: 0,
 				}),
-			).toBe(1);
+			).toBe(0.1);
 			// Still never zero: counting cached tokens as free is what made cost
 			// caps unenforceable once already.
 			expect(
 				estimateUsageCostUsd("gpt-6-astra", {
-					inputTokens: 1_000_000,
-					cachedInputTokens: 1_000_000,
+					inputTokens: 100_000,
+					cachedInputTokens: 100_000,
 					outputTokens: 0,
 					reasoningTokens: 0,
 				}),
 			).toBeGreaterThan(0);
 		});
 
-		it("reports aeon's cost as unknown rather than guessing it", () => {
-			expect(getUsageModelPricing("gpt-6-astra-aeon")).toBeNull();
+		it("prices the retired aeon slug at the flagship's rate", () => {
+			// The proxy records the raw client model string, so a new aeon row is
+			// really an Astra request now that the slug is retired into it.
+			expect(getUsageModelPricing("gpt-6-astra-aeon")).toEqual(
+				getUsageModelPricing("gpt-6-astra"),
+			);
+			// 1M input crosses the 272K threshold, so this is Astra's long-context
+			// rate: 1 x $20 input + 1 x $75 output.
 			expect(
 				estimateUsageCostUsd("gpt-6-astra-aeon", {
 					inputTokens: 1_000_000,
@@ -228,7 +256,7 @@ describe("GPT-6 Astra", () => {
 					outputTokens: 1_000_000,
 					reasoningTokens: 0,
 				}),
-			).toBeNull();
+			).toBe(95);
 		});
 	});
 
@@ -300,7 +328,7 @@ describe("bare `astra` ids with no version tokens", () => {
 		expect(resolveNormalizedModel("Astra Pro")).toBe("gpt-6-astra");
 		expect(resolveNormalizedModel("astra-fast")).toBe("gpt-6-astra");
 		expect(resolveNormalizedModel("openai/astra")).toBe("gpt-6-astra");
-		expect(resolveNormalizedModel("Astra Aeon")).toBe("gpt-6-astra-aeon");
+		expect(resolveNormalizedModel("Astra Aeon")).toBe("gpt-6-astra");
 	});
 });
 
@@ -349,17 +377,24 @@ describe("unsupported-model fallback chain", () => {
 		return hops;
 	}
 
-	it("walks the flagship down to a model every account has", () => {
-		expect(walk("gpt-6-astra")).toEqual(["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"]);
+	it("walks the flagship down the generation staircase", () => {
+		// Same-generation workhorse first, then the previous generation's
+		// general/light pair. Nothing on the path is retired.
+		expect(walk("gpt-6-astra")).toEqual([
+			"gpt-6-sol",
+			"gpt-5.6-sol",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
+		]);
 	});
 
-	it("walks aeon through the flagship first", () => {
-		// Still GPT-6, still Astra, just without the long-horizon behaviour.
+	it("walks the retired aeon id through the flagship first", () => {
 		expect(walk("gpt-6-astra-aeon")).toEqual([
 			"gpt-6-astra",
+			"gpt-6-sol",
 			"gpt-5.6-sol",
-			"gpt-5.5",
-			"gpt-5.4",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
 		]);
 	});
 
@@ -386,41 +421,89 @@ describe("unsupported-model fallback chain", () => {
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			});
 
-		expect(secondCandidate("gpt-6-astra", ["gpt-5.6-sol"])).toBe("gpt-5.5");
-		expect(secondCandidate("gpt-6-astra-aeon", ["gpt-6-astra"])).toBe(
-			"gpt-5.6-sol",
-		);
+		// Every default row is single-target now, so the skip-attempted path is
+		// exercised through `customChain`, which merges over the defaults the
+		// same way a caller-supplied policy would.
+		const customChain = { "gpt-6-astra": ["gpt-6-sol", "gpt-5.6-sol"] };
+		const withCustom = (requestedModel: string, attempted: string[]) =>
+			resolveUnsupportedCodexFallbackModel({
+				requestedModel,
+				errorBody: unsupportedBody,
+				attemptedModels: attempted,
+				fallbackOnUnsupportedCodexModel: true,
+				fallbackToGpt52OnUnsupportedGpt53: true,
+				customChain,
+			});
+
+		expect(withCustom("gpt-6-astra", ["gpt-6-sol"])).toBe("gpt-5.6-sol");
 		// Exhausting every candidate on a row ends the resolve rather than looping.
 		expect(
-			secondCandidate("gpt-6-astra", ["gpt-5.6-sol", "gpt-5.5"]),
+			withCustom("gpt-6-astra", ["gpt-6-sol", "gpt-5.6-sol"]),
 		).toBeUndefined();
+		// The retired aeon row is its sole replacement, so an attempted flagship
+		// ends the walk.
+		expect(secondCandidate("gpt-6-astra-aeon", [])).toBe("gpt-6-astra");
+		expect(secondCandidate("gpt-6-astra-aeon", ["gpt-6-astra"])).toBeUndefined();
 	});
 
-	it("ends the walk at a model with no row, which is what stranded it", () => {
-		// This is the mechanism behind the bug the `gpt-5.6-sol` row fixes: a
-		// model with no row returns undefined and the walk stops there, however
-		// many entries the row that pointed at it listed. Terra and Luna still
-		// have no row, deliberately, because nothing steps into them.
-		expect(walk("gpt-5.6-terra")).toEqual([]);
-		expect(walk("gpt-5.6-luna")).toEqual([]);
+	it("keeps every live entry's staircase inside the wrapper's five-forward bound", () => {
+		// scripts/codex.js `forwardToRealCodex` spawns at most 5 times: the
+		// initial request plus four unsupported-model retries — the same bound
+		// the plugin host's outbound attempt budget uses. Every live model's
+		// walk is four hops, so the staircase's terminal model is reachable on
+		// the last allowed spawn; a deeper row would strand the tail on the
+		// wrapper path even though the chain table admits it.
+		for (const entry of [
+			"gpt-6.1-sol",
+			"gpt-6-astra",
+			"gpt-6-sol",
+			"gpt-6-luna",
+			"gpt-5.6-sol",
+			"gpt-5.6-luna",
+			"gpt-5.6-terra",
+		]) {
+			expect(walk(entry).length).toBeLessThanOrEqual(4);
+		}
+		// The deepest legacy alias still reaches the broadest-availability rung
+		// inside the same bound: its fourth hop lands on `gpt-6-luna`.
+		expect(walk("gpt-5-pro").slice(0, 4).at(-1)).toBe("gpt-6-luna");
 	});
 
-	it("fits the single-account attempt budget, with no headroom to spare", () => {
+	it("walks every general model down the same staircase", () => {
+		expect(walk("gpt-5.6-terra")).toEqual([
+			"gpt-5.6-sol",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
+		]);
+		expect(walk("gpt-5.6-luna")).toEqual(["gpt-5.6-sol", "gpt-6-luna"]);
+		expect(walk("gpt-5.5")).toEqual([
+			"gpt-6-sol",
+			"gpt-5.6-sol",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
+		]);
+		expect(walk("gpt-5.5-pro")).toEqual([
+			"gpt-6-astra",
+			"gpt-6-sol",
+			"gpt-5.6-sol",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
+		]);
+	});
+
+	it("keeps every hop reachable inside the single-account attempt budget", () => {
 		// Every fallback hop is a separate outbound attempt against the shared
 		// per-request budget (index.ts tryConsumeOutboundRequestAttempt), so chain
 		// depth is not free. For the common single-account balanced session the
-		// budget is 5, and the aeon walk needs exactly 5: the initial attempt plus
-		// four hops. It fits, and nothing is left over.
+		// budget is 5. The deepest walks (the retired pro/aeon ids stepping
+		// through Astra) are 5 hops, i.e. 6 attempts: the final `gpt-5.6-luna`
+		// hop is beyond that budget, so a single-account walk ends having tried
+		// `gpt-6-luna` — the broadest-entitlement model — last. Hops are ordered
+		// most-valuable-first, so the hop a small pool cannot reach is the least
+		// valuable; larger pools have a larger budget and reach it.
 		//
-		// The consequence is real and worth stating rather than hiding: if that
-		// session also spends an attempt on an ordinary retry or a stream failover,
-		// the tail hops become unreachable and the request ends as an
-		// attempt-budget-exhausted 503 instead of reaching `gpt-5.4`. That needs an
-		// account entitled to none of aeon, Astra, Sol or 5.5. The hops are ordered
-		// so the ones lost first are the least valuable.
-		//
-		// This assertion exists to fail loudly if anyone deepens a GPT-6 row: the
-		// added hop would be dead for every single-account user.
+		// This assertion exists to fail loudly if anyone deepens a row: one more
+		// hop would strand two candidates instead of one.
 		const budget = computeOutboundRequestAttemptBudget({
 			accountCount: 1,
 			maxSameAccountRetries: 1, // balanced failover mode
@@ -429,9 +512,9 @@ describe("unsupported-model fallback chain", () => {
 		});
 		expect(budget).toBe(5);
 
-		const attemptsForDeepestWalk = walk("gpt-6-astra-aeon").length + 1;
-		expect(attemptsForDeepestWalk).toBe(5);
-		expect(attemptsForDeepestWalk).toBeLessThanOrEqual(budget);
+		const deepestHops = walk("gpt-6-astra-aeon").length;
+		expect(deepestHops).toBe(5);
+		expect(deepestHops).toBeLessThanOrEqual(budget);
 	});
 
 	it("stays inert unless the user opted in", () => {

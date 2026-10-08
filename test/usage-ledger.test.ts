@@ -219,29 +219,56 @@ describe("usage ledger core", () => {
 	});
 
 	it("exports pricing helpers with deterministic estimates", async () => {
-		const { estimateUsageCostUsd, listUsageModelPricing } = await import(
-			"../lib/usage/index.js"
-		);
+		const { estimateUsageCostUsd, getUsageModelPricing, listUsageModelPricing } =
+			await import("../lib/usage/index.js");
 
-		expect(Object.keys(listUsageModelPricing())).toContain("gpt-5.3-codex");
+		expect(Object.keys(listUsageModelPricing())).toContain("gpt-6.1-sol");
+		// Bare aliases reach the ledger raw (the proxy records the client's model
+		// string verbatim) but price through their canonical card — an unresolved
+		// alias would read as unpriced and fail a cost budget closed.
+		expect(getUsageModelPricing("gpt-6.1")).toEqual(
+			getUsageModelPricing("gpt-6.1-sol"),
+		);
+		expect(getUsageModelPricing("gpt-6")).toEqual(
+			getUsageModelPricing("gpt-6-astra"),
+		);
+		expect(getUsageModelPricing("gpt-5.6")).toEqual(
+			getUsageModelPricing("gpt-5.6-sol"),
+		);
+		expect(getUsageModelPricing("gpt-6.1-sol-max")).toEqual(
+			getUsageModelPricing("gpt-6.1-sol"),
+		);
 		expect(
-			estimateUsageCostUsd("gpt-5.3-codex", {
+			estimateUsageCostUsd("gpt-6.1", {
+				inputTokens: 100_000,
+				outputTokens: 1_000_000,
+				cachedInputTokens: 0,
+				reasoningTokens: 0,
+				totalTokens: 1_100_000,
+			}),
+		).toBeCloseTo(10.2, 10);
+		// Unknown ids still price as unknown rather than at the default's rate.
+		expect(getUsageModelPricing("gpt-6.2-sol")).toBeNull();
+		// Retired gpt-5.5 prices through its replacement card (gpt-6-sol);
+		// 1M input crosses the 272K long-context threshold ($4/$15/$0.40).
+		expect(
+			estimateUsageCostUsd("gpt-5.5", {
 				inputTokens: 1_000_000,
 				outputTokens: 1_000_000,
 				cachedInputTokens: 1_000_000,
 				reasoningTokens: 1_000_000,
 				totalTokens: 4_000_000,
 			}),
-		).toBe(20.125);
+		).toBe(30.4);
 		expect(
-			estimateUsageCostUsd("gpt-5.3-codex", {
+			estimateUsageCostUsd("gpt-5.5", {
 				inputTokens: 1_000,
 				outputTokens: 200,
 				cachedInputTokens: 50,
 				reasoningTokens: 25,
 				totalTokens: 1_225,
 			}),
-		).toBe(0.00344375);
+		).toBe(0.00416);
 		expect(
 			estimateUsageCostUsd(null, {
 				inputTokens: 1,

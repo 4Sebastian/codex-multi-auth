@@ -75,3 +75,9 @@ export function listRuntimeHelperOwnerPaths(
 	}
 	return owners;
 }
+
+/** Marker shared by config binding and desktop-auth sync protection. */
+export const NATIVE_PROVIDER_BEGIN = "# codex-multi-auth native provider begin";
+export function hasNativeProviderConfig(content: string): boolean {
+	return content.split(/\r?\n/).some(line => line.trim() === NATIVE_PROVIDER_BEGIN);
+}

@@ -23,6 +23,7 @@ import { runDeviceAuthFlow } from "../auth/device-auth.js";
 import { resolveOrgOverride } from "../auth/org-override.js";
 import { startLocalOAuthServer } from "../auth/server.js";
 import { describeCallbackFailure } from "../auth/callback-guidance.js";
+import { codexCliAccountIdFor } from "../auth/token-utils.js";
 import { setCodexCliActiveSelection } from "../codex-cli/writer.js";
 import { createLogger } from "../logger.js";
 import { MODEL_FAMILIES, type ModelFamily } from "../prompts/codex.js";
@@ -33,6 +34,7 @@ import {
 } from "../storage.js";
 import { cloneAccountStorageForPersistence } from "../storage/account-persistence.js";
 import { CodexValidationError } from "../errors.js";
+import type { CodexCliMirror } from "../storage/public-types.js";
 import type { AccountIdSource, TokenResult } from "../types.js";
 import { UI_COPY } from "../ui/ui-copy.js";
 import {
@@ -61,6 +63,8 @@ export type TokenSuccessWithAccount = TokenSuccess & {
 	accountIdSource?: AccountIdSource;
 	accountLabel?: string;
 	workspaces?: Workspace[];
+	/** Set, keep (undefined) or clear (null) the saved CodexCliMirror. */
+	codexCliMirror?: CodexCliMirror | null;
 };
 
 const log = createLogger("codex-manager");
@@ -643,6 +647,7 @@ export async function persistAccountPool(
 				accessToken: result.access,
 				expiresAt: result.expires,
 				workspaces: result.workspaces,
+				codexCliMirror: result.codexCliMirror,
 				// A targeted re-auth only tops up credentials for the row the user
 				// named; it must not silently re-enable an account they disabled.
 				preserveEnabledState: Boolean(options.expectedAccount),
@@ -771,10 +776,17 @@ export async function syncSelectionToCodex(
 	tokens: TokenSuccessWithAccount,
 ): Promise<void> {
 	const tokenAccountId = extractAccountId(tokens.access);
-	const accountId = resolveRequestAccountId(
-		tokens.accountIdOverride,
-		tokens.accountIdSource,
-		tokenAccountId,
+	const accountId = codexCliAccountIdFor(
+		{
+			accountId: resolveRequestAccountId(
+				tokens.accountIdOverride,
+				tokens.accountIdSource,
+				tokenAccountId,
+			),
+			codexCliMirror: tokens.codexCliMirror ?? undefined,
+		},
+		tokens.access,
+		tokens.idToken,
 	);
 	const email = sanitizeEmail(
 		extractAccountEmail(tokens.access, tokens.idToken),

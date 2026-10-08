@@ -136,12 +136,29 @@ describe("runReportCommand", () => {
 			),
 		).toBe(true);
 
-		// A codex-family model is not gated by that record.
+		// A record under another family does not gate it. Every live model is
+		// on gpt-5.2 now, so the other family is the legacy `codex` key an
+		// existing storage file can still carry.
+		const otherFamilyStorage = createStorage([
+			{
+				email: "one@example.com",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+				rateLimitResetTimes: { codex: 31_000 },
+			},
+		]);
+		(deps.loadAccounts as ReturnType<typeof vi.fn>).mockImplementation(
+			async () => otherFamilyStorage,
+		);
 		await expect(
-			runReportCommand(["--json", "--model", "gpt-5.3-codex"], deps),
+			runReportCommand(["--json", "--model", "gpt-5.6-sol"], deps),
 		).resolves.toBe(0);
-		const codex = readForecast();
-		expect(codex.accounts[0]?.availability).toBe("ready");
+		const otherFamily = readForecast();
+		expect(otherFamily.accounts[0]?.availability).toBe("ready");
 	});
 
 	it("keeps a bare report on the codex family", async () => {
@@ -973,5 +990,55 @@ describe("runReportCommand", () => {
 				e.includes("is not supported when using Codex"),
 			),
 		).toBe(false);
+	});
+});
+
+describe("runReportCommand refresh keeps explicit bindings", () => {
+	const jwt = (claims: Record<string, unknown>) =>
+		`h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
+
+	it("keeps a manual id and source when the refreshed token names another workspace", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				accountId: "ws-team",
+				accountIdSource: "manual",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+			},
+		]);
+		const refreshedAccess = jwt({
+			"https://api.openai.com/auth": { chatgpt_account_id: "ws-token-claim" },
+		});
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => structuredClone(storage)),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: refreshedAccess,
+				refresh: "refresh-token-updated",
+				expires: 500,
+			})),
+		});
+
+		expect(await runReportCommand(["--live", "--json"], deps)).toBe(0);
+
+		expect(deps.saveAccounts).toHaveBeenCalledWith(
+			expect.objectContaining({
+				accounts: [
+					expect.objectContaining({
+						accessToken: refreshedAccess,
+						accountId: "ws-team",
+						accountIdSource: "manual",
+					}),
+				],
+			}),
+		);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({ accountId: "ws-team" }),
+		);
 	});
 });

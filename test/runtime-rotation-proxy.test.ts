@@ -1,8 +1,15 @@
+import { once } from "node:events";
+import { createServer } from "node:http";
+import WebSocket, { WebSocketServer } from "ws";
+import * as nativeStorageReader from "../lib/runtime/native-account-storage.js";
+import * as tokenRefreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer as createHttpServer, request } from "node:http";
 import { createConnection } from "node:net";
-import WebSocket, { WebSocketServer } from "ws";
+import { gzipSync, brotliCompressSync, deflateSync } from "node:zlib";
+import * as zlib from "node:zlib";
 import { AccountManager, getRuntimeTrackerKey } from "../lib/accounts.js";
+import { getModelFamily } from "../lib/prompts/codex.js";
 import { CodexValidationError } from "../lib/errors.js";
 import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
 import {
@@ -16,12 +23,14 @@ import {
 import { PreemptiveQuotaScheduler } from "../lib/preemptive-quota-scheduler.js";
 import { SessionAffinityStore } from "../lib/session-affinity.js";
 import { ContextBudgetGuard } from "../lib/context-budget-guard.js";
+import * as config from "../lib/config.js";
 import { clearCircuitBreakers } from "../lib/circuit-breaker.js";
 import {
 	__resetRoutingMutexForTests,
 	isRoutingMutexHeld,
 	withRoutingMutex,
 } from "../lib/routing-mutex.js";
+import * as storageMetaModule from "../lib/runtime/rotation-storage-meta.js";
 import * as runtimePolicy from "../lib/policy/runtime-policy.js";
 import { resetRefreshQueue } from "../lib/refresh-queue.js";
 import {
@@ -390,7 +399,9 @@ function emitServerErrorForProxy(
 	throw new Error(`runtime proxy server on port ${proxy.port} was not found`);
 }
 
+const COMPLETED_FRAME = 'data: {"type":"response.completed","response":{"id":"fixture-completed"}}\n\n';
 function textEventStream(body = "data: {}\n\n", headers?: HeadersInit): Response {
+	if (!/"type"\s*:\s*"(?:response\.(?:completed|failed|incomplete|cancelled)|error)"/.test(body)) body += COMPLETED_FRAME;
 	return new Response(body, {
 		status: HTTP_STATUS.OK,
 		headers: {
@@ -647,6 +658,8 @@ describe("runtime rotation proxy", () => {
 	});
 
 	it("blocks the next WebSocket turn after crossing the context budget", async () => {
+		const modelWindows = vi.spyOn(config, "getContextBudgetGuardModelWindowOverrides")
+			.mockReturnValue({ "gpt-5.5": 260_000 });
 		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
 		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
 		const upstreamFrames: string[] = [];
@@ -692,10 +705,13 @@ describe("runtime rotation proxy", () => {
 		} finally {
 			socket.terminate();
 			await upstream.close();
+			modelWindows.mockRestore();
 		}
 	});
 
 	it("normalizes WebSocket reasoning usage before accounting and context tracking", async () => {
+		const modelWindows = vi.spyOn(config, "getContextBudgetGuardModelWindowOverrides")
+			.mockReturnValue({ "gpt-5.5": 260_000 });
 		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
 		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
 		const usageRecords: Array<Record<string, unknown>> = [];
@@ -764,6 +780,7 @@ describe("runtime rotation proxy", () => {
 			socket.terminate();
 			await upstream.close();
 			usageRecorder.mockRestore();
+			modelWindows.mockRestore();
 		}
 	});
 
@@ -827,7 +844,7 @@ describe("runtime rotation proxy", () => {
 			});
 			expect(
 				estimateUsageCostUsd("gpt-6-astra", usageRecords[0] as unknown as UsageTokenCounts),
-			).toBe(120);
+			).toBe(190);
 		} finally {
 			socket.terminate();
 			await upstream.close();
@@ -2663,6 +2680,53 @@ describe("runtime rotation proxy", () => {
 		expect(response.status).toBe(502);
 		expect(calls).toHaveLength(1);
 	});
+	it("fails fast without cooling or rotating when the upstream answers a redirect", async () => {
+		// redirect:"error" turns an upstream 3xx into a fetch rejection (undici:
+		// TypeError "fetch failed" caused by "unexpected redirect"). That is
+		// upstream configuration, not a transport fault — every managed account
+		// would hit the same redirect — so it must not cool the account, rotate
+		// the pool, or let the redirect target see a request or credential.
+		const targetHits: string[] = [];
+		const redirectorHits: string[] = [];
+		const target = createServer((req, res) => {
+			targetHits.push(req.url ?? "");
+			res.writeHead(200);
+			res.end();
+		});
+		await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+		const targetPort = (target.address() as { port: number }).port;
+		const redirector = createServer((req, res) => {
+			redirectorHits.push(req.url ?? "");
+			res.writeHead(302, { location: `http://127.0.0.1:${targetPort}/stolen` });
+			res.end();
+		});
+		await new Promise<void>((resolve) => redirector.listen(0, "127.0.0.1", resolve));
+		const redirectorPort = (redirector.address() as { port: number }).port;
+
+		try {
+			const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+			const coolingSpy = vi.spyOn(accountManager, "markAccountCoolingDown");
+			const proxy = await startProxy({
+				accountManager,
+				fetchImpl: fetch,
+				options: { upstreamBaseUrl: `http://127.0.0.1:${redirectorPort}` },
+			});
+
+			const response = await postResponses(proxy, { model: "gpt-5.6-sol" });
+			const body = (await response.json()) as { error?: { code?: string } };
+			expect(response.status).toBe(502);
+			expect(body.error?.code).toBe("upstream_redirect_rejected");
+
+			expect(targetHits).toHaveLength(0);
+			expect(redirectorHits).toHaveLength(1);
+			expect(coolingSpy).not.toHaveBeenCalled();
+		} finally {
+			await Promise.all([
+				new Promise<void>((resolve) => target.close(() => resolve())),
+				new Promise<void>((resolve) => redirector.close(() => resolve())),
+			]);
+		}
+	});
 	it("rotates images on an explicit quota rejection", async () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => attempt === 1 ? new Response('{"error":{"code":"rate_limit_exceeded"}}', { status: 429 }) : new Response('{"data":[{"b64_json":"aW1hZ2U="}]}', { headers: { "content-type": "application/json" } }));
@@ -2724,7 +2788,13 @@ describe("runtime rotation proxy", () => {
 			fetchImpl,
 			upstreamBaseUrl: "https://example.test/backend-api",
 		} as Parameters<typeof startRuntimeRotationProxy>[0]).then(
-			() => null,
+			// If validation regresses this resolves with a live server that is not
+			// tracked for cleanup — close it so a failed assertion cannot leave a
+			// listener open.
+			async (proxy) => {
+				await proxy.close();
+				return null;
+			},
 			(error: unknown) => error,
 		);
 		expect(missingKey).toBeInstanceOf(CodexValidationError);
@@ -2740,7 +2810,10 @@ describe("runtime rotation proxy", () => {
 			host: "0.0.0.0",
 			upstreamBaseUrl: "https://example.test/backend-api",
 		}).then(
-			() => null,
+			async (proxy) => {
+				await proxy.close();
+				return null;
+			},
 			(error: unknown) => error,
 		);
 		expect(badHost).toBeInstanceOf(CodexValidationError);
@@ -2749,6 +2822,63 @@ describe("runtime rotation proxy", () => {
 		expect((badHost as CodexValidationError).context).toEqual({
 			host: "0.0.0.0",
 		});
+	});
+
+	// Library-boundary trust enforcement: options.upstreamBaseUrl names the host
+	// every managed OAuth Bearer token is forwarded to. The wrapper validates the
+	// env override, but lib callers are not all the wrapper, so the proxy itself
+	// enforces https-only plus the documented numeric-loopback http dev path.
+	it.each([
+		"http://evil.example.com",
+		"http://example.com:8080/backend-api",
+		"http://localhost:8080",
+		"http://127.0.0.1",
+		"http://127.0.0.1/backend-api",
+		"ftp://127.0.0.1:9000",
+		"https://user:pw@example.com",
+		"https://example.com/backend-api?key=1",
+		"https://example.com/backend-api#frag",
+		"not a url",
+		"file:///etc/passwd",
+	])("rejects upstreamBaseUrl %s at startup", async (upstreamBaseUrl) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+
+		const error = await startRuntimeRotationProxy({
+			accountManager,
+			fetchImpl,
+			clientApiKey: DEFAULT_CLIENT_API_KEY,
+			upstreamBaseUrl,
+		}).then(
+			async (proxy) => {
+				await proxy.close();
+				return null;
+			},
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(CodexValidationError);
+		expect((error as CodexValidationError).field).toBe("upstreamBaseUrl");
+	});
+
+	it.each([
+		"https://example.test/backend-api",
+		"https://chatgpt.com/backend-api",
+		"http://127.0.0.1:8080",
+		"http://127.0.0.1:8080/backend-api",
+		"http://127.0.0.2:9999/base",
+		"http://[::1]:4444",
+		"http://127.0.0.1:80/dev",
+	])("accepts upstreamBaseUrl %s", async (upstreamBaseUrl) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl },
+		});
+		expect(proxy.port).toBeGreaterThan(0);
+		await proxy.close();
 	});
 
 	// Regression (runtime-proxy-01): the proxy forwards managed OAuth tokens and must
@@ -2988,7 +3118,7 @@ describe("runtime rotation proxy", () => {
 		);
 
 		expect(accepted.status).toBe(HTTP_STATUS.OK);
-		expect(await accepted.text()).toBe("data: forwarded\n\n");
+		expect(await accepted.text()).toBe("data: forwarded\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(1);
 
 		const acceptedWithApiKey = await postResponses(
@@ -3002,7 +3132,7 @@ describe("runtime rotation proxy", () => {
 		);
 
 		expect(acceptedWithApiKey.status).toBe(HTTP_STATUS.OK);
-		expect(await acceptedWithApiKey.text()).toBe("data: forwarded\n\n");
+		expect(await acceptedWithApiKey.text()).toBe("data: forwarded\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(2);
 	});
 
@@ -3073,7 +3203,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, requestBody, "/v1/responses?trace=1");
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: forwarded\n\n");
+		expect(await response.text()).toBe("data: forwarded\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.url).toBe(
 			"https://example.test/backend-api/codex/responses?trace=1",
@@ -3163,7 +3293,7 @@ describe("runtime rotation proxy", () => {
 		});
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(
 			calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)),
 		).toEqual(["acc_1", "acc_1"]);
@@ -3326,7 +3456,7 @@ describe("runtime rotation proxy", () => {
 		});
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(3);
 		expect(
 			new Set(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))),
@@ -3478,7 +3608,7 @@ describe("runtime rotation proxy", () => {
 		});
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(17);
 		expect(
 			new Set(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).size,
@@ -3614,7 +3744,7 @@ describe("runtime rotation proxy", () => {
 			});
 
 			expect(response.status).toBe(HTTP_STATUS.OK);
-			expect(await response.text()).toBe("data: pinned\n\n");
+			expect(await response.text()).toBe("data: pinned\n\n" + COMPLETED_FRAME);
 			expect(calls).toHaveLength(1);
 			expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_1");
 			// A pinned request neither consumes nor refills the pool-scoring bucket.
@@ -3888,9 +4018,10 @@ describe("runtime rotation proxy", () => {
 		// precedence, but recovery is bounded by whichever record ends last —
 		// here a server-error cooldown that outlives the limit by 50s. The
 		// sentence must not attribute that later timestamp to the rate limit.
-		// The record is keyed by the requested model's family ("gpt-5-codex"
-		// maps to its own family, not "codex"), or it would not gate at all.
-		pinned.rateLimitResetTimes = { "gpt-5-codex": now + 10_000 };
+		// The record is keyed by the requested model's family (retired
+		// "gpt-5-codex" runs on gpt-5.6-sol, family "gpt-5.2", not "codex"), or
+		// it would not gate at all.
+		pinned.rateLimitResetTimes = { "gpt-5.2": now + 10_000 };
 		pinned.coolingDownUntil = now + 60_000;
 		pinned.cooldownReason = "server-error";
 		const { calls, fetchImpl } = createRecordingFetch(() =>
@@ -4502,7 +4633,7 @@ describe("runtime rotation proxy", () => {
 			const storage = createStorage(now, 2);
 			const firstAccount = storage.accounts[0];
 			if (firstAccount) {
-				firstAccount.rateLimitResetTimes = { "gpt-5-codex": now + 60_000 };
+				firstAccount.rateLimitResetTimes = { "gpt-5.2": now + 60_000 };
 			}
 			const accountManager = new AccountManager(undefined, storage);
 			const { calls, fetchImpl } = createRecordingFetch(() =>
@@ -4516,12 +4647,12 @@ describe("runtime rotation proxy", () => {
 			});
 
 			expect(response.status).toBe(HTTP_STATUS.OK);
-			expect(await response.text()).toBe("data: served\n\n");
+			expect(await response.text()).toBe("data: served\n\n" + COMPLETED_FRAME);
 			await accountManager.flushPendingSave();
 			expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_2");
 			expect(persisted.at(-1)).toMatchObject({
 				activeIndex: 0,
-				activeIndexByFamily: { codex: 0, "gpt-5-codex": 1 },
+				activeIndexByFamily: { codex: 0, "gpt-5.2": 1 },
 			});
 			expect(persisted.at(-1)?.accounts[1]?.lastSwitchReason).toBe("rotation");
 		} finally {
@@ -4610,7 +4741,7 @@ describe("runtime rotation proxy", () => {
 		});
 		expect(proxy.getStatus()).not.toHaveProperty("lastAccountEmail");
 		expect(
-			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"],
+			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5.2"],
 		).toBeTypeOf("number");
 	});
 
@@ -4632,7 +4763,7 @@ describe("runtime rotation proxy", () => {
 			"acc_2",
 		]);
 		expect(
-			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"] ?? 0) -
+			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5.2"] ?? 0) -
 				Date.now(),
 		).toBeGreaterThan(60 * 60 * 1_000);
 	});
@@ -4843,7 +4974,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
 			"acc_1",
 			"acc_2",
@@ -4881,7 +5012,7 @@ describe("runtime rotation proxy", () => {
 
 		const first = await postResponses(proxy, body);
 		expect(first.status).toBe(HTTP_STATUS.OK);
-		expect(await first.text()).toBe("data: recovered\n\n");
+		expect(await first.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		const second = await postResponses(proxy, body);
 		expect(second.status).toBe(HTTP_STATUS.OK);
 		await second.text();
@@ -4938,7 +5069,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, { model: "gpt-5-codex" });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
 			"acc_1",
 			"acc_2",
@@ -5137,7 +5268,7 @@ describe("runtime rotation proxy", () => {
 		const reloadedStorage = persisted.at(-1);
 		expect(reloadedStorage).toBeDefined();
 		if (!reloadedStorage) throw new Error("expected persisted storage");
-		expect(reloadedStorage?.accounts[0]?.rateLimitResetTimes["gpt-5-codex"]).toBeTypeOf(
+		expect(reloadedStorage?.accounts[0]?.rateLimitResetTimes["gpt-5.2"]).toBeTypeOf(
 			"number",
 		);
 		const secondManager = new AccountManager(undefined, reloadedStorage);
@@ -5173,7 +5304,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: third\n\n");
+		expect(await response.text()).toBe("data: third\n\n" + COMPLETED_FRAME);
 		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
 			"acc_1",
 			"acc_2",
@@ -5856,7 +5987,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
 			"acc_1",
 			"acc_2",
@@ -5882,7 +6013,7 @@ describe("runtime rotation proxy", () => {
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n");
+		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(calls).toHaveLength(2);
 		expect(proxy.getStatus().rotations).toBe(1);
 	});
@@ -6446,4 +6577,1298 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 			totalTokens: 1500,
 		});
 	});
+});
+
+describe("native OpenAI catalog routing", () => {
+	it("rechecks workspace disablement after catalog I/O before dispatch",async()=>{
+		const disk=createStorage(Date.now());disk.accounts=disk.accounts.slice(0,1);
+		disk.accounts[0]!.workspaces=[{id:"acc_1",enabled:true}];
+		const manager=new AccountManager(undefined,structuredClone(disk));
+		const {calls,fetchImpl}=createRecordingFetch(call=>{
+			if(call.url.includes("/models")){disk.accounts[0]!.workspaces![0]!.enabled=false;return Response.json({models:[{slug:"shared"}]});}
+			return textEventStream();
+		});
+		const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+		const response=await postResponses(proxy,{model:"shared",input:"hello"});
+		expect(response.status).toBe(503);await response.text();
+		expect(calls.some(call=>call.url.endsWith("/responses"))).toBe(false);
+	});
+	it.each(["response.created", "response.failed"])("does not reward an unsuccessful %s stream",async type=>{
+		const manager=new AccountManager(undefined,createStorage(Date.now()));const success=vi.spyOn(manager,"recordSuccess");
+		const {fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):new Response(`data: ${JSON.stringify({type,response:{id:"fixture-response"}})}\n\n`,{headers:{"content-type":"text/event-stream"}}));
+		const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,forcedAccountIndex:0}});
+		const response=await postResponses(proxy,{model:"shared",input:"hello",stream:true});const text=await response.text();
+		expect(success).not.toHaveBeenCalled();
+		if(type==="response.created")expect(text).toContain("upstream_missing_terminal");
+	});
+	it("treats an incomplete stream as delivered for account health",async()=>{
+		const manager=new AccountManager(undefined,createStorage(Date.now()));const success=vi.spyOn(manager,"recordSuccess");const failure=vi.spyOn(manager,"recordFailure");
+		const {fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):new Response(`data: ${JSON.stringify({type:"response.incomplete",response:{id:"fixture-response",incomplete_details:{reason:"max_output_tokens"}}})}\n\n`,{headers:{"content-type":"text/event-stream"}}));
+		const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,forcedAccountIndex:0}});
+		const response=await postResponses(proxy,{model:"shared",input:"hello",stream:true});const text=await response.text();
+		expect(text).toContain("response.incomplete");expect(text).not.toContain("upstream_response_incomplete");
+		expect(success).toHaveBeenCalledTimes(1);expect(failure).not.toHaveBeenCalled();
+		expect(proxy.getStatus().lastError).toBeNull();
+	});
+	it("authenticates managed OAuth and unions account catalogs without returning credentials", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { fetchImpl } = createRecordingFetch(call => Response.json({ models: [{ slug: call.headers.get("chatgpt-account-id") === "acc_1" ? "model-a" : "model-b", visibility: "list" }] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true } });
+		const response = await fetch(`${proxy.baseUrl}/models?client_version=0.156.0`, { headers: { authorization: "Bearer access-1" } });
+		expect(response.status).toBe(200);
+		const text = await response.text(); expect(text).not.toContain("access-");
+		expect(JSON.parse(text).models.map((m: { slug: string }) => m.slug)).toEqual(["model-a", "model-b"]);
+	});
+	it("does not authenticate unknown or disabled OAuth tokens", async () => {
+		const storage = createStorage(Date.now()); storage.accounts[0]!.enabled = false;
+		const accountManager = new AccountManager(undefined, storage);
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ models: [] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true } });
+		for (const token of ["unknown", "access-1"]) { const r = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: `Bearer ${token}` } }); expect(r.status).toBe(401); await r.text(); }
+		expect(calls).toHaveLength(0);
+	});
+	it("honors a pin for catalog discovery and refuses unsupported pinned models", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ models: [{ slug: "supported" }] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, forcedAccountIndex: 0 } });
+		const response = await postResponses(proxy, { model: "not-supported", input: "hello" });
+		expect(response.status).toBe(403); expect((await response.json()).error.code).toBe("model_not_available_in_account_catalog");
+		expect(calls.every(c => c.url.includes("/models"))).toBe(true);
+	});
+});
+
+describe("reference account catalog", () => {
+	it("prioritizes reference metadata but unions all catalogs independently of the inference pin", async () => {
+		let now = Date.now(); let models = [{ slug: "model-a", supported_reasoning_levels: [{ effort: "high" }] }];
+		const storage = createStorage(now); const reference = storage.accounts[0]!;
+		const accountManager = new AccountManager(undefined, storage);
+		const { calls, fetchImpl } = createRecordingFetch(call => Response.json({ models: call.headers.get("chatgpt-account-id") === "acc_1" ? models : [{ slug: "model-b" }] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, forcedAccountIndex: 1, now: () => now, catalogAccount: { email: reference.email!, accountId: reference.accountId! } } });
+		const read = async (force = false) => { const r = await fetch(`${proxy.baseUrl}/models${force ? "?refresh_capabilities=1" : ""}`, { headers: { authorization: "Bearer access-1" } }); expect(r.status).toBe(200); return r.json(); };
+		expect((await read()).models).toEqual([...models, { slug: "model-b" }]);
+		models = [...models, { slug: "new-model", supported_reasoning_levels: [] }]; now += 61000;
+		expect((await read(true)).models).toEqual([...models, { slug: "model-b" }]);
+		const rejected = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(rejected.status).toBe(403); await rejected.text();
+		expect(calls.every(c => c.url.includes("/models"))).toBe(true);
+	});
+});
+
+describe("native login isolation", () => {
+	it.each([undefined, 1])("routes inference with pin %s without replacing the desktop login", async (forcedAccountIndex) => {
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const sync = vi.spyOn(manager, "syncCodexCliActiveSelectionForIndex").mockResolvedValue();
+		const { calls, fetchImpl } = createRecordingFetch(call => call.url.includes("/models") ? Response.json({ models: [{ slug: "model-a" }] }) : textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: { nativeOpenai: true, forcedAccountIndex } });
+		const result = await postResponses(proxy, { model: "model-a", input: "hello", stream: true }, "/responses", { authorization: "Bearer access-1" });
+		expect(result.status).toBe(200); await result.text();
+		expect(calls.some(c => c.url.includes("/responses") && c.headers.get("authorization")?.startsWith("Bearer access-"))).toBe(true);
+		if (forcedAccountIndex === 1) {
+			const inference = calls.find(c => c.url.includes("/responses"));
+			expect(inference?.headers.get("authorization")).toBe("Bearer access-2");
+			expect(inference?.headers.get("chatgpt-account-id")).toBe("acc_2");
+		}
+		expect(sync).not.toHaveBeenCalled();
+	});
+});
+
+describe("native re-login while router is running", () => {
+	it("accepts the newly saved credential and drops the obsolete auth cooldown", async () => {
+		const storage = createStorage(Date.now()); const accountManager = new AccountManager(undefined, storage);
+		const account = accountManager.getAccountByIndex(0)!; account.cooldownReason = "auth-failure"; account.coolingDownUntil = Date.now() + 300000;
+		let disk = structuredClone(storage);
+		const { fetchImpl } = createRecordingFetch(() => Response.json({ models: [{ slug: "model-a" }] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage: async () => disk } });
+		Object.assign(disk.accounts[0]!, { accessToken: "new-login-token", refreshToken: "new-refresh", expiresAt: Date.now() + 7200000 });
+		const response = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: "Bearer new-login-token" } });
+		expect(response.status).toBe(200); await response.text();
+		expect(account.access).toBe("new-login-token"); expect(account.cooldownReason).toBeUndefined();
+
+		disk.accounts[0]!.authInvalidatedAt = Date.now();
+		const revoked = await fetch(`${proxy.baseUrl}/models`, {headers: {authorization: "Bearer new-login-token"}});
+		expect(revoked.status).toBe(401); await revoked.text();
+		disk.accounts[0]!.enabled = false;
+		const rejected = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: "Bearer new-login-token" } });
+		expect(rejected.status).toBe(401); await rejected.text();
+	});
+});
+
+describe("native catalog client version", () => {
+	it("recovers discovery when a native client supplies its version after an unversioned request", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const { fetchImpl } = createRecordingFetch(call => new URL(call.url).searchParams.get("client_version") === "9.1.0" ? Response.json({ models: [{ slug: "future-model" }] }) : new Response("version required", { status: 400 }));
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: { nativeOpenai: true } });
+		const headers = { authorization: "Bearer access-1" };
+		const first = await fetch(`${proxy.baseUrl}/models`, { headers }); expect(first.status).toBe(503); await first.text();
+		const next = await fetch(`${proxy.baseUrl}/models?client_version=9.1.0`, { headers }); expect(next.status).toBe(200); expect((await next.json()).models[0].slug).toBe("future-model");
+	});
+});
+
+describe("Responses WebSocket upgrade", () => {
+	it("accepts the custom-provider WebSocket only after authenticating", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({}));
+		const proxy = await startProxy({ accountManager: manager, fetchImpl });
+		const upgrade = async (token: string) => new Promise<number>((resolve, reject) => {
+			const req = request(`${proxy.baseUrl}/responses`, { headers: { authorization: `Bearer ${token}`, connection: "Upgrade", upgrade: "websocket", "sec-websocket-version": "13", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" } }, res => { res.resume(); res.on("end", () => resolve(res.statusCode ?? 0)); });
+			req.on("upgrade", (res, socket) => { socket.destroy(); resolve(res.statusCode ?? 0); });
+			req.on("error", reject); req.end();
+		});
+		expect(await upgrade("unknown")).toBe(401);
+		expect(await upgrade(DEFAULT_CLIENT_API_KEY)).toBe(101);
+		expect(calls).toHaveLength(0);
+		const ordinary = await fetch(`${proxy.baseUrl}/responses`, { headers: { authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}` } });
+		expect(ordinary.status).toBe(404); await ordinary.text();
+	});
+});
+
+describe("native account storage availability", () => {
+ it("rejects stale managed credentials when the live account store disappears", async () => {
+  const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:"model-a"}]}));
+  const proxy=await startProxy({accountManager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>null}});
+  const response=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:"Bearer access-1"}});
+  expect(response.status).toBe(401);await response.text();
+  expect(calls).toHaveLength(0);
+ });
+});
+
+describe("native mode authenticates before touching account storage", () => {
+	it("never reads storage for a request without credentials", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const readNativeAccountStorage = vi.fn(async () => createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ models: [] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage } });
+		const response = await fetch(`${proxy.baseUrl}/models`);
+		expect(response.status).toBe(401); await response.text();
+		expect(readNativeAccountStorage).not.toHaveBeenCalled();
+		expect(calls).toHaveLength(0);
+	});
+	it("does not adopt stored credentials on behalf of an unauthenticated caller", async () => {
+		const storage = createStorage(Date.now()); const accountManager = new AccountManager(undefined, storage);
+		const account = accountManager.getAccountByIndex(0)!;
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, { accessToken: "relogin-token", refreshToken: "relogin-refresh", expiresAt: Date.now() + 7200000 });
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ models: [] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage: async () => disk } });
+		const response = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: "Bearer not-a-known-token" } });
+		expect(response.status).toBe(401); await response.text();
+		expect(account.access).toBe("access-1");
+		expect(account.refreshToken).toBe("refresh-1");
+		expect(calls).toHaveLength(0);
+	});
+	it("answers an authenticated client with 503, not 401, when the account store is missing", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ models: [{ slug: "model-a" }] }));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage: async () => null } });
+		const response = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}` } });
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.code).toBe("native_account_storage_unavailable");
+		expect(calls).toHaveLength(0);
+	});
+	it("keeps the live pool and its learned limits while the store is missing", async () => {
+		const storage = createStorage(Date.now(), 1);
+		const accountManager = new AccountManager(undefined, storage);
+		let missing = false;
+		const { calls, fetchImpl } = createRecordingFetch(call => call.url.includes("/models") ? Response.json({ models: [{ slug: "model-a" }] }) : textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage: async () => missing ? null : structuredClone(storage) } });
+		const until = Date.now() + 10 * 60_000;
+		accountManager.getAccountByIndex(0)!.rateLimitResetTimes["codex:model-b"] = until;
+		missing = true;
+		const gone = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(gone.status).toBe(503);
+		expect((await gone.json()).error.code).toBe("native_account_storage_unavailable");
+		expect(calls.filter(c => c.url.endsWith("/responses"))).toHaveLength(0);
+		missing = false;
+		const back = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(back.status).toBe(200); await back.text();
+		expect(accountManager.getAccountByIndex(0)!.rateLimitResetTimes["codex:model-b"]).toBe(until);
+	});
+});
+
+describe("native catalog outages", () => {
+	it("routes to an account whose catalog is unknown instead of refusing the model", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(call => {
+			if (call.url.includes("/models")) {
+				return call.headers.get("chatgpt-account-id") === "acc_1"
+					? new Response("slow down", { status: 429 })
+					: Response.json({ models: [{ slug: "other-model" }] });
+			}
+			return textEventStream('data: {"type":"response.completed","response":{}}\n\n');
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true } });
+		const response = await postResponses(proxy, { model: "model-a", input: "hello", stream: true });
+		expect(response.status).toBe(200); await response.text();
+		const inference = calls.filter(c => c.url.includes("/responses"));
+		expect(inference.length).toBeGreaterThan(0);
+		expect(inference.every(c => c.headers.get("chatgpt-account-id") === "acc_1")).toBe(true);
+	});
+	it("keeps excluding by the last successful catalog after a later refresh fails", async () => {
+		let now = Date.now(); let throttled = false;
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const { calls, fetchImpl } = createRecordingFetch(call => {
+			if (call.url.includes("/models")) return throttled ? new Response("busy", { status: 429 }) : Response.json({ models: [{ slug: "model-a" }] });
+			return textEventStream();
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, now: () => now } });
+		const first = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(first.status).toBe(200); await first.text();
+		throttled = true; now += 20 * 60_000;
+		const known = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(known.status).toBe(200); await known.text();
+		const absent = await postResponses(proxy, { model: "model-b", input: "hello" });
+		expect(absent.status).toBe(403); await absent.text();
+		expect(calls.filter(c => c.url.endsWith("/responses"))).toHaveLength(2);
+	});
+	it("checks every eligible account catalog concurrently", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 3));
+		let inFlight = 0; let maxInFlight = 0;
+		const { fetchImpl } = createRecordingFetch(async call => {
+			if (!call.url.includes("/models")) return textEventStream('data: {"type":"response.completed","response":{}}\n\n');
+			inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise(resolve => setTimeout(resolve, 50));
+			inFlight--;
+			return Response.json({ models: [{ slug: "model-a" }] });
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true } });
+		const response = await postResponses(proxy, { model: "model-a", input: "hello", stream: true });
+		expect(response.status).toBe(200); await response.text();
+		expect(maxInFlight).toBe(3);
+	});
+});
+
+describe("PR review regressions", () => {
+ it.each(["removed", "shorter", "expired"])("revokes a persisted managed bearer when %s", async (change) => {
+  const now=Date.now(), storage=createStorage(now), manager=new AccountManager(undefined,storage), disk=structuredClone(storage);
+  if(change==="removed") delete disk.accounts[0]!.accessToken;
+  if(change==="shorter") Object.assign(disk.accounts[0]!,{accessToken:"replacement",expiresAt:now+600_000});
+  if(change==="expired") disk.accounts[0]!.expiresAt=now-1;
+  const {fetchImpl,calls}=createRecordingFetch(()=>Response.json({models:[]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>disk}});
+  const response=await getModels(proxy,undefined,{authorization:"Bearer access-1"});
+  expect(response.status).toBe(401);await response.text();expect(calls).toHaveLength(0);
+ });
+ it("retains routing mutex mode after inventory replacement",async()=>{
+  const previous=process.env.CODEX_AUTH_ROUTING_MUTEX;process.env.CODEX_AUTH_ROUTING_MUTEX="enabled";
+  try {
+  const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
+  const mode=vi.spyOn(AccountManager.prototype,"setRoutingMutexMode");
+  const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:"model-test"}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>createStorage(Date.now(),2)}});
+  mode.mockClear();const response=await getModels(proxy);await response.text();
+  expect(mode).toHaveBeenCalledWith("enabled");mode.mockRestore();
+  } finally {if(previous===undefined) delete process.env.CODEX_AUTH_ROUTING_MUTEX;else process.env.CODEX_AUTH_ROUTING_MUTEX=previous;}
+ });
+ it.each(["add","remove","reorder"])("preserves a concurrent inventory %s when an old request completes",async(change)=>{
+  const storage=createStorage(Date.now(),2);let disk=structuredClone(storage);
+  withAccountStorageTransactionMock.mockImplementation(async(handler)=>handler(structuredClone(disk),async(next:AccountStorageV3)=>{disk=structuredClone(next);}));
+  const manager=new AccountManager(undefined,storage);
+  let release!:()=>void,started!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;});const entered=new Promise<void>(resolve=>{started=resolve;});
+  const {fetchImpl}=createRecordingFetch(async(call)=>{
+   if(call.url.includes('/models'))return Response.json({models:[{slug:'model-test'}]});
+   started();await gate;return textEventStream();
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+  const pending=postResponses(proxy,{model:'model-test',input:'test'});await entered;
+  if(change==='add')disk.accounts.push({...createStorage(Date.now(),3).accounts[2]!});
+  if(change==='remove')disk.accounts.splice(0,1);
+  if(change==='reorder')disk.accounts.reverse();
+  disk.activeIndex=0;disk.activeIndexByFamily={codex:0};
+  const expected=disk.accounts.map(a=>a.accountId);
+  const discovery=await getModels(proxy);await discovery.text();
+  release();const response=await pending;await response.text();await manager.flushPendingSave();
+  expect(disk.accounts.map(a=>a.accountId)).toEqual(expected);
+ });
+ it("keeps concurrent client catalogs isolated across a delayed credential refresh",async()=>{
+  const now=Date.now(),storage=createStorage(now,1);storage.accounts[0]!.expiresAt=now-1;
+  let refreshStarted!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>{refreshStarted=resolve;});
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  refreshAccessTokenMock.mockImplementation(async()=>{refreshStarted();await gate;return {type:'success',access:'renewed',refresh:'renewed-refresh',expires:now+3600_000};});
+  const manager=new AccountManager(undefined,storage);
+  const {fetchImpl,calls}=createRecordingFetch(call=>Response.json({models:[{slug:`model-${new URL(call.url).searchParams.get('client_version')}`}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const refreshCalls=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken");
+  const first=getModels(proxy,'/models?client_version=1.0');await started;
+  const second=getModels(proxy,'/models?client_version=2.0');
+  // Wait until the second request reaches token refresh, without timing a network delay.
+  await vi.waitFor(()=>expect(refreshCalls).toHaveBeenCalledTimes(2));release();refreshCalls.mockRestore();
+  const [a,b]=await Promise.all([first,second]);
+  expect((await a.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-1.0']);
+  expect((await b.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-2.0']);
+  expect(calls.map(c=>new URL(c.url).searchParams.get('client_version')).sort()).toEqual(['1.0','2.0']);
+ });
+ it("routes reasoning and speed only to an account advertising both",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),2));
+  const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'model-test',supported_reasoning_levels:[{effort:call.headers.get('authorization')==='Bearer access-1'?'low':'high'}],service_tiers:call.headers.get('authorization')==='Bearer access-1'?[]:[{id:'priority',name:'Fast',description:''}]}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:'model-test',reasoning:{effort:'high'},service_tier:'priority',input:'test'});await response.text();
+  expect(response.status).toBe(200);
+  expect(calls.filter(c=>c.url.endsWith('/responses')).map(c=>c.headers.get('authorization'))).toEqual(['Bearer access-2']);
+ });
+});
+
+describe("catalog review concurrency and backoff",()=>{
+ it("bounds inference discovery to three in-flight calls for six accounts",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),6));let active=0,peak=0;
+  const {fetchImpl}=createRecordingFetch(async call=>{
+   if(!call.url.includes('/models'))return textEventStream();
+   peak=Math.max(peak,++active);await new Promise<void>(r=>setImmediate(r));active--;
+   return Response.json({models:[{slug:'model-test'}]});
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();
+  expect(response.status).toBe(200);expect(peak).toBeLessThanOrEqual(3);
+ });
+ it("honors catalog Retry-After instead of polling every five seconds",async()=>{
+  let now=Date.now(),reads=0;
+  const manager=new AccountManager(undefined,createStorage(now,1));
+  const {fetchImpl}=createRecordingFetch(call=>{
+   if(call.url.includes('/models')){reads++;return new Response('busy',{status:429,headers:{'retry-after':'120'}});}
+   return textEventStream();
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+  for(const advance of [0,6000,6000]){now+=advance;const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();expect(response.status).toBe(200);}
+  expect(reads).toBe(1);
+  now+=120000;const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();expect(reads).toBe(2);
+ });
+ it.each([["86400"],[new Date(Date.now()+30*24*3600_000).toUTCString()]])("caps a catalog Retry-After of %s at fifteen minutes",async retryAfter=>{
+  let now=Date.now(),reads=0;
+  const manager=new AccountManager(undefined,createStorage(now,1));
+  const {fetchImpl}=createRecordingFetch(call=>{
+   if(call.url.includes('/models')){reads++;return new Response('busy',{status:429,headers:{'retry-after':retryAfter}});}
+   return textEventStream();
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+  const first=await postResponses(proxy,{model:'model-test',input:'test'});await first.text();expect(first.status).toBe(200);
+  expect(reads).toBe(1);
+  now+=15*60_000+1;
+  const later=await postResponses(proxy,{model:'model-test',input:'test'});await later.text();expect(later.status).toBe(200);
+  expect(reads).toBe(2);
+ });
+ it("lets an explicit capability refresh bypass an earlier catalog backoff",async()=>{
+  let now=Date.now(),reads=0;
+  const manager=new AccountManager(undefined,createStorage(now,1));
+  const {fetchImpl}=createRecordingFetch(call=>{
+   if(call.url.includes('/models')){reads++;return reads===1?new Response('busy',{status:429,headers:{'retry-after':'600'}}):Response.json({models:[{slug:'model-test'}]});}
+   return textEventStream();
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+  const first=await postResponses(proxy,{model:'model-test',input:'test'});await first.text();expect(reads).toBe(1);
+  const refreshed=await getModels(proxy,"/models?refresh_capabilities=1");
+  expect(refreshed.status).toBe(200);expect((await refreshed.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-test']);
+  expect(reads).toBe(2);
+ });
+ it("still recovers stale state when another account lacks the model",async()=>{
+  const storage=createStorage(Date.now(),2),manager=new AccountManager(undefined,storage);
+  manager.markAccountCoolingDown(manager.getAccountByIndex(1)!,60000,'network-error');
+  const reload=vi.spyOn(AccountManager,'loadFromDisk').mockResolvedValue(new AccountManager(undefined,storage));
+  const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('authorization')==='Bearer access-1'?'other':'model-test'}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();
+  expect(response.status).toBe(200);expect(reload).toHaveBeenCalled();
+  expect(calls.filter(c=>c.url.endsWith('/responses')).map(c=>c.headers.get('authorization'))).toEqual(['Bearer access-2']);
+ });
+});
+
+describe("native inventory read resilience",()=>{
+ it.each(["EBUSY","EPERM","EACCES"])("preserves live routing after a delayed %s without trusting managed bearers",async code=>{
+  let clock=Date.now();vi.spyOn(Date,"now").mockImplementation(()=>clock);
+  const storage=createStorage(clock,1),manager=new AccountManager(undefined,storage);
+  const read=vi.fn().mockResolvedValue(storage);
+  const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'model-test'}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});
+  expect((await getModels(proxy)).status).toBe(200);
+  clock+=3000;read.mockRejectedValue(Object.assign(Error("locked"),{code}));
+  const response=await postResponses(proxy,{model:"model-test",input:"test"});await response.text();expect(response.status).toBe(200);
+  expect((await getModels(proxy,undefined,{authorization:"Bearer access-1"})).status).toBe(401);
+  expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(1);
+  clock+=30000;
+  const expired=await postResponses(proxy,{model:"model-test",input:"test"});
+  expect(expired.status).toBe(503);await expired.text();
+  expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(1);
+  read.mockResolvedValue(storage);
+  const recovered=await postResponses(proxy,{model:"model-test",input:"test"});
+  expect(recovered.status).toBe(200);await recovered.text();
+
+ });
+
+ it.each(['EBUSY','EPERM'])("keeps independently authenticated inference available through one %s read",async code=>{
+  const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
+  const read=vi.fn().mockResolvedValueOnce(storage).mockResolvedValueOnce(storage).mockRejectedValueOnce(Object.assign(Error('busy'),{code})).mockResolvedValue(storage);
+  const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'model-test'}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});
+  for(let i=0;i<3;i++){const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();expect(response.status).toBe(200);}
+  expect(read).toHaveBeenCalledTimes(6);expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(3);
+ });
+ it("never authenticates a managed bearer with a stale snapshot",async()=>{
+  const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
+  const read=vi.fn().mockResolvedValueOnce(storage).mockRejectedValueOnce(Object.assign(Error('busy'),{code:'EBUSY'})).mockResolvedValue({...storage,accounts:[{...storage.accounts[0]!,accessToken:undefined}]});
+  const {fetchImpl,calls}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});
+  expect((await getModels(proxy)).status).toBe(200);
+  for(let i=0;i<2;i++){const response=await getModels(proxy,undefined,{authorization:'Bearer access-1'});await response.text();expect(response.status).toBe(401);}
+  expect(calls).toHaveLength(1);
+ });
+ it("coalesces concurrent inventory reads and replaces the manager only once",async()=>{
+  const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
+  let release!:()=>void,started!:()=>void;
+  const gate=new Promise<void>(r=>release=r),entered=new Promise<void>(r=>started=r);
+  const read=vi.fn(async()=>{started();await gate;return createStorage(Date.now(),2);});
+  const original=nativeStorageReader.createNativeAccountStorageReader;
+  const readerCalls=vi.fn();
+  vi.spyOn(nativeStorageReader,'createNativeAccountStorageReader').mockImplementation((...args)=>{
+   const reader=original(...args);return ()=>{readerCalls();return reader();};
+  });
+  const mode=vi.spyOn(AccountManager.prototype,'setRoutingMutexMode');
+  const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});mode.mockClear();
+  const first=getModels(proxy);await entered;const second=getModels(proxy);
+  await vi.waitFor(()=>expect(readerCalls).toHaveBeenCalledTimes(2));
+  release();await Promise.all([first.then(r=>r.text()),second.then(r=>r.text())]);
+  expect(read).toHaveBeenCalledTimes(1);expect(mode).toHaveBeenCalledTimes(1);
+ });
+ it("preserves unexpired 429 state across inventory changes",async()=>{
+  const now=Date.now(),manager=new AccountManager(undefined,createStorage(now,1));
+  manager.getAccountByIndex(0)!.rateLimitResetTimes={codex:now+60000};
+  const mode=vi.spyOn(AccountManager.prototype,'setRoutingMutexMode');
+  const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>createStorage(now,2)}});mode.mockClear();
+  const response=await getModels(proxy);await response.text();
+  const replacement=mode.mock.contexts[0] as AccountManager;
+  expect(replacement.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(now+60000);
+ });
+});
+
+it("clamps a reference catalog's context to the serving pool",async()=>{
+ const storage=createStorage(Date.now(),2),manager=new AccountManager(undefined,storage);
+ const {fetchImpl}=createRecordingFetch(call=>Response.json({models:[{slug:'model-test',context_window:call.headers.get('authorization')==='Bearer access-1'?200000:100000}]}));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,catalogAccount:{email:storage.accounts[0]!.email!,accountId:'acc_1'}}});
+ const response=await getModels(proxy);expect((await response.json()).models[0].context_window).toBe(100000);
+});
+
+describe("explicit API model routes",()=>{
+ it.each([
+  ["gzip",gzipSync(Buffer.from('{"model":"zdr/exclusive","input":"test","stream":true}'))],
+  ["deflate",deflateSync(Buffer.from('{"model":"zdr/exclusive","input":"test","stream":true}'))],
+  ["br",brotliCompressSync(Buffer.from('{"model":"zdr/exclusive","input":"test","stream":true}'))],
+  ["zstd",Buffer.from("KLUv/SA2sQEAeyJtb2RlbCI6Inpkci9leGNsdXNpdmUiLCJpbnB1dCI6InRlc3QiLCJzdHJlYW0iOnRydWV9","base64")],
+ ])("decodes compressed aliases before choosing credentials and removes wire encoding: %s",async(encoding,body)=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.endsWith("/models")?Response.json({data:[{id:"exclusive"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[{id:"fixture",label:"Fixture",kind:"zdr",apiKey:"fixture-api-key",enabled:true,priority:0,visibleModels:["exclusive"]}]}});
+  const response=await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json","content-encoding":encoding},body});
+  if(encoding==="zstd"&&!("zstdDecompress" in zlib)){expect(response.status).toBe(415);await response.text();expect(calls).toHaveLength(0);return;}
+  expect(response.status).toBe(200);await response.text();
+  const inference=calls.filter(c=>c.url.endsWith("/responses"));
+  expect(inference).toHaveLength(1);
+  expect(inference[0]?.url).toBe("https://api.openai.com/v1/responses");
+  expect(inference[0]?.headers.get("authorization")).toBe("Bearer fixture-api-key");
+  expect(inference[0]?.headers.has("content-encoding")).toBe(false);
+  expect(JSON.parse(inference[0]!.bodyText).model).toBe("exclusive");
+ });
+ it.each([
+  ["gzip",Buffer.from("broken"),400],
+  ["unknown",Buffer.from("{}"),415],
+  ["identity",Buffer.from("broken"),400],
+  ["identity",Buffer.from('{"model":42}'),400],
+  ["gzip",gzipSync(JSON.stringify({model:"zdr/exclusive",input:"x".repeat(4096)})),413],
+ ])("rejects unreadable or expanded requests before any upstream: %s",async(encoding,body,status)=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(()=>Response.json({}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{maxRequestBodyBytes:512}});
+  const response=await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json","content-encoding":encoding},body});
+  expect(response.status).toBe(status);await response.text();expect(calls).toHaveLength(0);
+ });
+
+ it("advertises selected API-only models and never sends a ZDR alias to OAuth",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const routes=[{id:"fixture-api",label:"Fixture API",kind:"zdr" as const,apiKey:"fixture-api-key",enabled:true,priority:0,visibleModels:["api-exclusive"]}];
+  const {calls,fetchImpl}=createRecordingFetch(call=>{
+   if(call.url==="https://api.openai.com/v1/models")return Response.json({data:[{id:"api-exclusive"},{id:"hidden"}]});
+   if(call.url==="https://api.openai.com/v1/responses")return textEventStream('data: {"type":"response.completed","response":{}}\n\n');
+   return Response.json({models:[{slug:"oauth-only"}]});
+  });
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>routes}});
+  const list=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});
+  expect((await list.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["oauth-only","zdr/api-exclusive"]);
+  const response=await postResponses(proxy,{model:"zdr/api-exclusive",input:"test",stream:true});
+  expect(response.status).toBe(200);await response.text();
+  const inference=calls.filter(c=>c.url.endsWith("/responses"));
+  expect(inference).toHaveLength(1);
+  expect(inference[0]?.url).toBe("https://api.openai.com/v1/responses");
+  expect(inference[0]?.headers.get("authorization")).toBe("Bearer fixture-api-key");
+  expect(inference[0]?.headers.has("chatgpt-account-id")).toBe(false);
+  expect(proxy.getStatus()).toMatchObject({lastAccountIndex:null,lastAccountLabel:"ZDR credential 1",upstreamRequests:1});
+ });
+ it("fails closed on an unconfigured ZDR alias instead of forwarding it normally",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:"shared"}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[]}});
+  const response=await postResponses(proxy,{model:"zdr/shared",input:"test"});
+  expect(response.status).toBe(503);await response.text();
+  expect(calls).toHaveLength(0);
+ });
+});
+
+describe("model pool capability boundaries",()=>{
+ it.each(["speed/accelerated/common","common"])("routes a speed selection only to a matching credential: %s",async(model)=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common",service_tiers:call.headers.get("chatgpt-account-id")==="acc_2"?[{id:"accelerated",name:"Accelerated",description:"Fixture speed"}]:[]}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model,service_tier:"accelerated",input:"test",stream:true});
+  expect(response.status).toBe(200);await response.text();
+  const sent=calls.filter(c=>c.url.includes("/responses"));
+  expect(sent.map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_2"]);
+  expect(JSON.parse(sent[0]!.bodyText)).toMatchObject({model:"common",service_tier:"accelerated"});
+ });
+
+ it("keeps a stored switch pin strict and never serves an exclusive model from another account",async()=>{
+  vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:call.headers.get("chatgpt-account-id")==="acc_2"?"exclusive":"common"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:"exclusive",input:"test",stream:true});
+  expect(response.status).toBe(403);expect((await response.json()).error.code).toBe("model_not_available_in_account_catalog");
+  expect(calls.filter(c=>c.url.includes("/responses"))).toHaveLength(0);
+ });
+ it("fails a stored native pin with codex_pinned_account_unavailable instead of rotating",async()=>{
+  vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  manager.markAccountCoolingDown(manager.getAccountByIndex(0)!,10*60_000,"network-error");
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:"common",input:"test",stream:true});
+  expect(response.status).toBe(503);expect((await response.json()).error.code).toBe("codex_pinned_account_unavailable");
+  expect(calls.filter(c=>c.url.includes("/responses"))).toHaveLength(0);
+ });
+
+ it("advertises an exclusive OAuth model and sends it only to its eligible account",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?
+   Response.json({models:[{slug:call.headers.get("chatgpt-account-id")==="acc_2"?"exclusive":"common"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const result=await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json","content-encoding":"gzip"},body:gzipSync(JSON.stringify({model:"exclusive",input:"test",stream:true}))});
+  expect(result.status).toBe(200);await result.text();
+  const inference=calls.filter(c=>c.url.includes("/responses"));
+  expect(inference).toHaveLength(1);expect(inference[0]?.headers.get("chatgpt-account-id")).toBe("acc_2");
+  expect(inference[0]?.headers.has("content-encoding")).toBe(false);
+  expect(JSON.parse(inference[0]!.bodyText).model).toBe("exclusive");
+ });
+ it("does not route a requested reasoning setting to an account that lacks it",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?
+   Response.json({models:[{slug:"common",supported_reasoning_levels:[{effort:call.headers.get("chatgpt-account-id")==="acc_2"?"high":"low"}]}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,forcedAccountIndex:0}});
+  const result=await postResponses(proxy,{model:"common",reasoning:{effort:"high"},input:"test",stream:true});
+  expect(result.status).toBe(403);await result.text();
+  expect(calls.some(c=>c.url.includes("/responses"))).toBe(false);
+ });
+});
+
+describe("native picker refresh",()=>{
+ it("caches picker reads and refreshes all credentials only on explicit check",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));let revision=1;
+  const routes=[{id:"api-fixture",label:"API fixture",kind:"api" as const,apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["api-new"]}];
+  const {fetchImpl}=createRecordingFetch(call=>call.url==="https://api.openai.com/v1/models"?
+   Response.json({data:revision===1?[]:[{id:"api-new"}]}):Response.json({models:[{slug:`account-${call.headers.get("chatgpt-account-id")}-${revision}`}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>routes}});
+  const read=async(force=false)=>{const response=await fetch(`${proxy.baseUrl}/models${force?"?refresh_capabilities=1":""}`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});return (await response.json()).models.map((m:{slug:string})=>m.slug);};
+  expect(await read()).toHaveLength(2);revision=2;
+  expect(await read()).toEqual(["account-acc_1-1","account-acc_2-1"]);
+  expect(await read(true)).toEqual(["account-acc_1-2","account-acc_2-2","api/api-new"]);
+ });
+});
+
+describe("API-only credential inventory",()=>{
+ it("serves explicit API models with local authentication when no OAuth pool is stored",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now()));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.endsWith("/models")?Response.json({data:[{id:"exclusive"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>null,readApiRoutes:async()=>[{id:"fixture",label:"API fixture",kind:"api",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["exclusive"]}]}});
+  const result=await postResponses(proxy,{model:"api/exclusive",input:"test"});
+  expect(result.status).toBe(200);await result.text();
+  expect(calls.every(c=>c.url.startsWith("https://api.openai.com/"))).toBe(true);
+  const stale=await postResponses(proxy,{model:"api/exclusive",input:"test"},"/responses",{authorization:"Bearer access-1"});
+  expect(stale.status).toBe(401);await stale.text();
+ });
+});
+
+it("changes the union catalog ETag on refresh and signals it on OAuth and API responses",async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ let models=[{slug:"model-a"}];
+ const {fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json(call.url.includes("api.openai.com")?{data:[{id:"exclusive"}]}:{models}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[{id:"fixture",label:"Fixture",kind:"zdr",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["exclusive"]}]}});
+ const read=async(force=false)=>{const r=await fetch(`${proxy.baseUrl}/models${force?"?refresh_capabilities=1":""}`,{headers:{authorization:"Bearer access-1"}});await r.text();return r.headers.get("etag");};
+ const first=await read();expect(first).toBeTruthy();expect(await read()).toBe(first);
+ models.push({slug:"model-new"});const second=await read(true);expect(second).not.toBe(first);
+ for(const model of ["model-new","zdr/exclusive"]){const r=await postResponses(proxy,{model,input:"hello",stream:true});expect(r.status).toBe(200);expect(r.headers.get("x-models-etag")).toBe(second);await r.text();}
+});
+
+it("routes native WebSocket model requests through capability-aware account priority", async () => {
+ const {createServer}=await import("node:http");const {once}=await import("node:events");const {default:WebSocket,WebSocketServer}=await import("ws");
+ const upstream=createServer();const wss=new WebSocketServer({server:upstream});const accounts:string[]=[];
+ wss.on("connection",(ws,req)=>{accounts.push(String(req.headers["chatgpt-account-id"]));ws.on("message",raw=>{const body=JSON.parse(raw.toString());expect(body.model).toBe("exclusive");ws.send(JSON.stringify({type:"response.created",response:{id:"fixture-response"}}));ws.send(JSON.stringify({type:"response.completed",response:{id:"fixture-response",output:[],usage:{input_tokens:1,output_tokens:1}}}));});});
+ upstream.listen(0,"127.0.0.1");await once(upstream,"listening");const address=upstream.address();if(!address||typeof address==="string")throw Error("fixture listen");
+ let client:InstanceType<typeof WebSocket>|undefined;
+ try{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ const proxy=await startProxy({accountManager:manager,fetchImpl:async(_url,init)=>Response.json({models:[{slug:new Headers(init?.headers).get("chatgpt-account-id")==="acc_2"?"exclusive":"shared"}]}),options:{nativeOpenai:true,upstreamBaseUrl:`http://127.0.0.1:${address.port}`}});
+ client=new WebSocket(proxy.baseUrl.replace("http:","ws:")+"/responses",{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});await once(client,"open");
+ const done=new Promise<void>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error("WebSocket turn timeout")),3000);client?.on("message",raw=>{if(JSON.parse(raw.toString()).type==="response.completed"){clearTimeout(timer);resolve();}});});
+ client.send(JSON.stringify({type:"response.create",model:"exclusive",input:[{role:"user",content:"test"}]}));await done;expect(accounts).toEqual(["acc_2"]);
+ }finally{client?.terminate();for(const ws of wss.clients)ws.terminate();wss.close();await new Promise<void>(r=>upstream.close(()=>r()));}
+});
+
+it("learns a stale subscription model entitlement and retries another eligible account",async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):call.headers.get("chatgpt-account-id")==="acc_1"?Response.json({error:{code:"model_not_found",param:"model"}},{status:404}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+ for(let i=0;i<2;i++){const r=await postResponses(proxy,{model:"shared",input:"hello",stream:true});expect(r.status).toBe(200);await r.text();}
+ expect(calls.filter(c=>c.url.endsWith("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_1","acc_2","acc_2"]);
+});
+
+
+it('does not record a pinned model rejection as successful inference',async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));const success=vi.spyOn(manager,'recordSuccess');
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'shared'}]}):Response.json({error:{code:'model_not_found',param:'model'}},{status:404}));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,forcedAccountIndex:0}});
+ const response=await postResponses(proxy,{model:'shared',input:'hello',stream:true});expect(response.status).toBe(404);await response.text();expect(success).not.toHaveBeenCalled();expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(1);
+});
+
+it.each(["1.0.0", "2.0.0"])("preserves completed discovery snapshots during overlapping discovery (%s)", async secondVersion => {
+ const now = Date.now();
+ const manager = new AccountManager(undefined, createStorage(now, 8));
+ let releaseFirst!: () => void, firstReady!: () => void;
+ let releaseSecond!: () => void, secondReady!: () => void;
+ const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+ const firstStarted = new Promise<void>(resolve => { firstReady = resolve; });
+ const secondGate = new Promise<void>(resolve => { releaseSecond = resolve; });
+ const secondStarted = new Promise<void>(resolve => { secondReady = resolve; });
+ let routeReads = 0, catalogReads = 0;
+ const proxy = await startProxy({accountManager: manager,
+  fetchImpl: async (input) => {
+   const version = new URL(String(input)).searchParams.get("client_version");
+   if (++catalogReads > 8) { secondReady(); await secondGate; }
+   return Response.json({models: [{slug: `fixture-${version}`} ]});
+  }, options: {nativeOpenai: true, readApiRoutes: async () => {
+   if (++routeReads === 1) { firstReady(); await firstGate; }
+   return [];
+  }}});
+ const first = getModels(proxy, "/models?refresh_capabilities=1&client_version=1.0.0");
+ await firstStarted;
+ const second = getModels(proxy, `/models?refresh_capabilities=1&client_version=${secondVersion}`);
+ await secondStarted;
+ try {
+  releaseFirst();
+  const response = await first;
+  expect(response.status).toBe(200);
+  await response.text();
+  const {loadModelInventory} = await import("../lib/runtime/model-discovery-status.js");
+  const inventory = await loadModelInventory();
+  expect(inventory?.clientVersion).toBe("1.0.0");
+  expect(inventory?.entries).toHaveLength(8);
+  expect(inventory?.entries.every(e => e.checkedAt > 0 && !e.error && e.models.includes("fixture-1.0.0"))).toBe(true);
+ } finally {
+  releaseFirst(); releaseSecond();
+  await (await second).text();
+ }
+});
+
+it("checks and advertises enabled workspaces through the proxy", async () => {
+ const now=Date.now(), storage=createStorage(now,1);
+ storage.accounts[0]!.workspaces=[{id:"acc_1",enabled:true},{id:"alternate",enabled:true},{id:"disabled",enabled:false}];
+ storage.accounts[0]!.currentWorkspaceIndex=1;
+ const accountManager=new AccountManager(undefined,storage);
+ const seen:string[]=[];
+ const fetchImpl=vi.fn(async (_url: string | URL | Request, init?:RequestInit)=>{
+  const id=new Headers(init?.headers).get(OPENAI_HEADERS.ACCOUNT_ID)!; seen.push(id);
+  return Response.json({models:[{slug:id==="alternate"?"alternate-model":"bound-model"}]});
+ });
+ const proxy=await startProxy({accountManager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+ const response=await fetch(`${proxy.baseUrl}/models?refresh_capabilities=1`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});
+ expect(response.status).toBe(200);
+ expect((await response.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["bound-model", "alternate-model"]);
+ expect(seen.sort()).toEqual(["acc_1","alternate"]);
+ const {loadModelInventory}=await import("../lib/runtime/model-discovery-status.js");
+ const inventory=await loadModelInventory();
+ expect(inventory?.entries.find(e=>e.models.includes("alternate-model"))).toMatchObject({routable:true,selected:true});
+ expect(accountManager.getAccountByIndex(0)?.accountId).toBe("acc_1");
+});
+
+it("routes by workspace capabilities and learns a rejection without excluding sibling workspaces", async () => {
+ const now=Date.now(), storage=createStorage(now,1);
+ storage.accounts[0]!.workspaces=[{id:"acc_1",enabled:true},{id:"alternate",enabled:true}];
+ const accountManager=new AccountManager(undefined,storage);
+ const requests:string[]=[];
+ const {fetchImpl}=createRecordingFetch(call=>{
+  const id=call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)!;
+  if(call.url.includes("/models")) return Response.json({models:[{slug:"workspace-model", supported_reasoning_levels:[{effort:"high"}]}]});
+  requests.push(id);
+  if(id==="acc_1") return Response.json({error:{code:"model_not_supported"}},{status:403});
+  return new Response('data: {"type":"response.completed"}\n\n',{headers:{"content-type":"text/event-stream"}});
+ });
+ const proxy=await startProxy({accountManager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+ for(let i=0;i<2;i++){
+  const result=await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({model:"workspace-model",reasoning:{effort:"high"},input:"fixture"})});
+  expect(result.status).toBe(200); await result.text();
+ }
+ expect(requests).toEqual(["acc_1","alternate","alternate"]);
+ expect(proxy.getStatus()).toMatchObject({lastAccountId:"acc_1",lastRequestedWorkspaceId:"alternate"});
+ expect(accountManager.getAccountByIndex(0)?.accountId).toBe("acc_1");
+ expect(accountManager.getAccountByIndex(0)?.currentWorkspaceIndex??0).toBe(0);
+});
+
+it("uses different workspace headers for concurrent model requests without changing selection", async () => {
+ const storage=createStorage(Date.now(),1);
+ storage.accounts[0]!.workspaces=[{id:"acc_1",enabled:true},{id:"alternate",enabled:true},{id:"disabled",enabled:false}];
+ const accountManager=new AccountManager(undefined,storage);
+ const requests:string[]=[];
+ const {fetchImpl}=createRecordingFetch(call=>{
+  const id=call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)!;
+  if(call.url.includes("/models")) return Response.json({models:[{slug:`model-${id}`,supported_reasoning_levels:[{effort:"ultra"}],service_tiers:[{id:"priority",name:"Fast",description:"Fixture tier"}]}]});
+  expect(JSON.parse(call.bodyText).model).toBe(`model-${id}`);
+  requests.push(id);
+  return new Response('data: {"type":"response.completed"}\n\n',{headers:{"content-type":"text/event-stream"}});
+ });
+ const proxy=await startProxy({accountManager,fetchImpl,options:{nativeOpenai:true}});
+ const results=await Promise.all(["acc_1","alternate"].map(id=>fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({model:`model-${id}`,reasoning:{effort:"ultra"},service_tier:"priority",input:"fixture"})})));
+ for(const result of results){expect(result.status).toBe(200);await result.text();}
+ expect(requests.sort()).toEqual(["acc_1","alternate"]);
+ expect(accountManager.getAccountByIndex(0)?.accountId).toBe("acc_1");
+});
+
+it("disables only the rejected workspace and preserves the credential and sibling access", async () => {
+ const storage=createStorage(Date.now(),1);
+ storage.accounts[0]!.workspaces=[{id:"acc_1",enabled:true},{id:"alternate",enabled:true}];
+ const accountManager=new AccountManager(undefined,storage);
+ const requests:string[]=[];
+ const {fetchImpl}=createRecordingFetch(call=>{
+  if(call.url.includes("/models")) return Response.json({models:[{slug:"workspace-model"}]});
+  const id=call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)!;requests.push(id);
+  return id==="acc_1" ? Response.json({error:{code:"workspace_disabled"}},{status:403}) : new Response('data: {"type":"response.completed"}\n\n',{headers:{"content-type":"text/event-stream"}});
+ });
+ const proxy=await startProxy({accountManager,fetchImpl,options:{nativeOpenai:true}});
+ const response=await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({model:"workspace-model",input:"fixture"})});
+ expect(response.status).toBe(200);await response.text();
+ expect(requests).toEqual(["acc_1","alternate"]);
+ expect(accountManager.getAccountByIndex(0)?.enabled).not.toBe(false);
+ expect(accountManager.getAccountByIndex(0)?.workspaces?.map(w=>w.enabled)).toEqual([false,true]);
+});
+
+it("records actual inference dispatch separately from selection and catalog checks",async()=>{
+ const {getRuntimeObservabilitySnapshot,mutateRuntimeObservabilitySnapshot}=await import("../lib/runtime/runtime-observability.js");
+ const {inferenceAccountKey}=await import("../lib/runtime/inference-activity.js");
+ mutateRuntimeObservabilitySnapshot(s=>{s.lastInferenceRequestAtByAccount={};});
+ let now=Date.now();const storage=createStorage(now,1);const manager=new AccountManager(undefined,storage);
+ const {fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"fixture"}]}):new Response('data: {"type":"response.completed"}\n\n',{headers:{"content-type":"text/event-stream"}}));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+ const headers={authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json"};
+ await (await fetch(`${proxy.baseUrl}/models`,{headers})).text();
+ expect(getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount).toEqual({});
+ await (await fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers,body:JSON.stringify({model:"fixture",input:"fixture"})})).text();
+ const key=inferenceAccountKey(storage.accounts[0]!);
+ expect(getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount?.[key]).toBe(now);
+ const used=now;now+=1000;
+ await (await fetch(`${proxy.baseUrl}/models`,{headers})).text();
+ expect(getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount?.[key]).toBe(used);
+});
+
+it("keeps the native desktop pin strict across tiers and after a capability rejection", async () => {
+ vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+ vi.spyOn(runtimePolicy,"evaluateRuntimePolicy").mockResolvedValue({allowed:true,statusCode:200,errorCode:null,reasons:[],projectKey:null,blockedAccountIndexes:new Set(),scoreBoostByAccount:{},priorityByAccount:{0:8,1:1},budgetEvaluations:[]});
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):call.headers.get("chatgpt-account-id")==="acc_1"?Response.json({error:{code:"model_not_found",message:"Model not supported"}},{status:404}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+ const response=await postResponses(proxy,{model:"common",input:"test",stream:true});
+ expect(response.status).not.toBe(200);await response.text();
+ expect(calls.filter(c=>c.url.includes("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_1"]);
+});
+
+it("uses reset urgency, preserves the subscription reserve, and spends that reserve only after other subscriptions drain",async()=>{
+ const now=Date.now();const manager=new AccountManager(undefined,createStorage(now));
+ const entry=(used:number,hours:number)=>({status:200,updatedAt:now,planType:"pro",model:"common",primary:{},secondary:{usedPercent:used,resetAtMs:now+hours*3600000}});
+ const cache={byAccountId:{acc_1:entry(80,24),acc_2:entry(60,2)},byEmail:{}};
+ let secondAccountCalls=0;
+ const {calls,fetchImpl}=createRecordingFetch(call=>{
+  if(call.url.includes("/models"))return Response.json({models:[{slug:"common"}]});
+  const id=call.headers.get("chatgpt-account-id");
+  if(id==="acc_2")secondAccountCalls++;
+  return new Response('data: {"type":"response.completed","response":{}}\n\n',{headers:{"content-type":"text/event-stream","x-codex-secondary-used-percent":id==="acc_2"?"95":"100","x-codex-secondary-reset-after-seconds":id==="acc_2"?"7200":"86400","x-codex-plan-type":"pro"}});
+ });
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now,quotaRemainingPercentThreshold:undefined,readSubscriptionQuota:async()=>cache,readApiRoutes:async()=>[{id:"fixture-paid",label:"API",kind:"api",apiKey:"fixture-paid-key",enabled:true,priority:0,visibleModels:["common"]}]}});
+ for(let i=0;i<3;i++){const response=await postResponses(proxy,{model:"common",input:"fixture",stream:true});expect(response.status).toBe(200);await response.text();}
+ const dispatched=calls.filter(c=>c.url.includes("/responses"));
+ expect(dispatched.map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_2","acc_1","acc_2"]);
+ expect(dispatched.some(c=>c.headers.get("authorization")==="Bearer fixture-paid-key")).toBe(false);
+ expect(secondAccountCalls).toBe(2);
+});
+
+it("keeps unused subscriptions behind a native pin and established reset ordering",async()=>{
+ const now=Date.now();const manager=new AccountManager(undefined,createStorage(now,3));
+ const entry=(left:number,hours:number)=>({status:200,updatedAt:now,planType:"pro",model:"common",primary:{},secondary:{usedPercent:100-left,resetAtMs:now+hours*3600000}});
+ const cache={byAccountId:{acc_1:entry(90,3),acc_2:entry(7,2),acc_3:{...entry(100,24),secondary:{usedPercent:0}}},byEmail:{}};
+ let pin:number|null=0;
+ vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockImplementation(()=>({pinnedAccountIndex:pin,affinityGeneration:1}));
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):new Response('data: {"type":"response.completed","response":{}}\n\n',{headers:{"content-type":"text/event-stream",...(call.headers.get("chatgpt-account-id")==="acc_3"?{"x-codex-secondary-used-percent":"0","x-codex-secondary-reset-after-seconds":"86400"}:{})}}));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now,readSubscriptionQuota:async()=>cache,quotaRemainingPercentThreshold:undefined}});
+ const first=await postResponses(proxy,{model:"common",input:"fixture",stream:true});expect(first.status).toBe(200);await first.text();
+ pin=null;
+ const second=await postResponses(proxy,{model:"common",input:"fixture",stream:true});expect(second.status).toBe(200);await second.text();
+ expect(calls.filter(c=>c.url.includes("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_1","acc_2"]);
+});
+
+it("switches subscriptions at five percent from quota events on a reused WebSocket", async () => {
+ const {createServer}=await import("node:http");
+ const {once}=await import("node:events");
+ const {default:WebSocket,WebSocketServer}=await import("ws");
+ const now=Date.now();
+ const upstream=createServer();
+ const wss=new WebSocketServer({server:upstream});
+ const dispatched:string[]=[];
+ let connections=0;
+ wss.on("connection",(socket,request)=>{
+  connections++;
+  const account=String(request.headers["chatgpt-account-id"]);
+  socket.on("message",()=>{
+   dispatched.push(account);
+   const id=`response_${dispatched.length}`;
+   socket.send(JSON.stringify({type:"response.created",response:{id}}));
+   socket.send(JSON.stringify({type:"codex.rate_limits",plan_type:"pro",rate_limits:{secondary:{used_percent:dispatched.length===1?80:95,reset_at:Math.floor(now/1000)+7200}}}));
+   socket.send(JSON.stringify({type:"response.completed",response:{id,output:[]}}));
+  });
+ });
+ upstream.listen(0,"127.0.0.1");await once(upstream,"listening");
+ const address=upstream.address();if(!address||typeof address==="string")throw Error("No address");
+ const entry=(used:number,hours:number)=>({status:200,updatedAt:now,planType:"pro",model:"common",primary:{},secondary:{usedPercent:used,resetAtMs:now+hours*3600000}});
+ const manager=new AccountManager(undefined,createStorage(now));
+ const proxy=await startProxy({accountManager:manager,fetchImpl:async()=>Response.json({models:[{slug:"common"}]}),options:{nativeOpenai:true,now:()=>now,quotaRemainingPercentThreshold:undefined,upstreamBaseUrl:`http://127.0.0.1:${address.port}`,readSubscriptionQuota:async()=>({byAccountId:{acc_1:entry(50,24),acc_2:entry(60,2)},byEmail:{}}),readApiRoutes:async()=>[{id:"paid",label:"API",kind:"api",apiKey:"fixture-paid",enabled:true,priority:0,visibleModels:["common"]}]}});
+ const client=new WebSocket(proxy.baseUrl.replace("http:","ws:")+"/responses",{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});
+ try {
+  await once(client,"open");
+  for(let i=0;i<3;i++){
+   await new Promise<void>((resolve,reject)=>{
+    const timer=setTimeout(()=>{client.off("message",onMessage);reject(Error("Response timeout"));},5000);
+    const onMessage=(raw:import("ws").RawData)=>{const event=JSON.parse(raw.toString());if(event.type==="response.completed"||event.type==="error"){clearTimeout(timer);client.off("message",onMessage);event.type==="error"?reject(Error("Unexpected error")):resolve();}};
+    client.on("message",onMessage);
+    client.send(JSON.stringify({type:"response.create",model:"common",input:[]}));
+   });
+  }
+  expect(dispatched).toEqual(["acc_2","acc_2","acc_1"]);
+  expect(connections).toBe(2);
+  expect(proxy.getStatus()).toMatchObject({streamQuotaUpdates:3,lastStreamQuotaUpdateAt:now});
+ } finally {
+  client.terminate();await proxy.close();
+  for(const socket of wss.clients)socket.terminate();
+  wss.close();await new Promise<void>(resolve=>upstream.close(()=>resolve()));
+ }
+});
+
+it("serves native picker models within its deadline while a slow workspace finishes in the background", async () => {
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+ const reads:string[]=[];
+ const proxy=await startProxy({accountManager:manager,fetchImpl:async(input,init)=>{
+  if(String(input).includes("api.openai.com"))return Response.json({data:[{id:"api-fixture"}]});
+  const id=new Headers(init?.headers).get("chatgpt-account-id")!;reads.push(id);
+  if(id==="acc_2")await gate;
+  return Response.json({models:[{slug:id==="acc_1"?"specialized-fixture":"late-model"}]});
+ },options:{nativeOpenai:true,readApiRoutes:async()=>[{id:"fixture",label:"ZDR",kind:"zdr",apiKey:"fixture-key",enabled:true,priority:9,visibleModels:["api-fixture"]}]}});
+ try{
+  const response=await fetch(`${proxy.baseUrl}/models?client_version=1.0.0`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`},signal:AbortSignal.timeout(4000)});
+  expect(response.status).toBe(200);
+  expect((await response.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["specialized-fixture","zdr/api-fixture"]);
+  release();
+  const full=await getModels(proxy,"/models?client_version=1.0.0");
+  expect((await full.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["specialized-fixture","late-model","zdr/api-fixture"]);
+  expect(reads).toEqual(["acc_1","acc_2"]);
+ }finally{release();}
+});
+
+it("keeps independent warm catalogs for desktop and CLI versions",async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));const versions:string[]=[];
+ const proxy=await startProxy({accountManager:manager,fetchImpl:async input=>{const version=new URL(String(input)).searchParams.get("client_version")!;versions.push(version);return Response.json({models:[{slug:`model-${version}`}]});},options:{nativeOpenai:true}});
+ for(const version of ["1.0","2.0","1.0"]){const r=await getModels(proxy,`/models?client_version=${version}`);expect((await r.json()).models.map((m:{slug:string})=>m.slug)).toEqual([`model-${version}`]);}
+ expect(versions).toEqual(["1.0","1.0","2.0","2.0"]);
+});
+
+it("returns a warm picker cache immediately while expired workspace data refreshes",async()=>{
+ let now=Date.now(),slow=false,release!:()=>void;
+ const gate=new Promise<void>(resolve=>{release=resolve;});let reads=0;
+ const proxy=await startProxy({accountManager:new AccountManager(undefined,createStorage(now)),fetchImpl:async()=>{reads++;if(slow)await gate;return Response.json({models:[{slug:slow?"new-model":"old-model"}]});},options:{nativeOpenai:true,now:()=>now}});
+ await (await getModels(proxy, "/models")).text();slow=true;now+=6*60_000;
+ try{
+  const r=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`},signal:AbortSignal.timeout(10000)});
+  expect((await r.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["old-model"]);
+  expect(reads).toBe(4);
+ }finally{release();}
+});
+
+it("keeps the live manager and its catalogs when stored emails differ only in case",async()=>{
+ const disk=createStorage(Date.now(),1);disk.accounts[0]!.email="Account-1@Example.com";
+ const manager=new AccountManager(undefined,disk);let catalogReads=0;
+ const {fetchImpl}=createRecordingFetch(call=>{if(call.url.includes("/models")){catalogReads++;return Response.json({models:[{slug:"common"}]});}return textEventStream();});
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+ for(let i=0;i<2;i++){const response=await postResponses(proxy,{model:"common",input:"fixture"});expect(response.status).toBe(200);await response.text();}
+ expect(catalogReads).toBe(1);
+});
+
+it("reads the subscription quota cache at most once per second across native requests",async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ const readSubscriptionQuota=vi.fn(async()=>null);
+ const {fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream());
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readSubscriptionQuota}});
+ for(let i=0;i<3;i++){const response=await postResponses(proxy,{model:"common",input:"fixture"});expect(response.status).toBe(200);await response.text();}
+ expect(readSubscriptionQuota).toHaveBeenCalledTimes(1);
+});
+
+it("keeps session affinity when the client disconnects mid-stream",async()=>{
+ const forget=vi.spyOn(SessionAffinityStore.prototype,"forgetSession");
+ const manager=new AccountManager(undefined,createStorage(Date.now(),2));
+ const failure=vi.spyOn(manager,"recordFailure");
+ let cancelled=false;
+ const {fetchImpl}=createRecordingFetch(()=>new Response(new ReadableStream<Uint8Array>({
+  start(controller){controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"r"}}\n\n'));},
+  cancel(){cancelled=true;},
+ }),{headers:{"content-type":"text/event-stream"}}));
+ const proxy=await startProxy({accountManager:manager,fetchImpl});
+ const response=await postResponses(proxy,{model:"gpt-5-codex",input:"fixture",stream:true},"/responses",{session_id:"affinity-session"});
+ const reader=response.body!.getReader();await reader.read();await reader.cancel();
+ await vi.waitFor(()=>expect(cancelled).toBe(true));
+ await new Promise(resolve=>setTimeout(resolve,50));
+ expect(forget).not.toHaveBeenCalled();
+ expect(failure).not.toHaveBeenCalled();
+ forget.mockRestore();
+});
+
+describe("learned limits across a native inventory rebuild",()=>{
+ const tokenFor=(workspace:string)=>{
+  const part=(value:unknown)=>Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${part({alg:"none"})}.${part({"https://api.openai.com/auth":{chatgpt_account_id:workspace}})}.sig`;
+ };
+ it("keeps a 429 window on the account that earned it when identity-less rows are reordered",async()=>{
+  const storage=createStorage(Date.now(),2);
+  storage.accounts.forEach((account,index)=>{delete account.accountId;delete account.email;account.accessToken=tokenFor(`ws_${index+1}`);});
+  const manager=new AccountManager(undefined,structuredClone(storage));
+  manager.markRateLimited(manager.getAccountByIndex(0)!,10*60_000,getModelFamily("common"),"common");
+  const disk=structuredClone(storage);disk.accounts.reverse();
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+  const response=await postResponses(proxy,{model:"common",input:"fixture"});
+  expect(response.status).toBe(200);await response.text();
+  expect(calls.filter(c=>c.url.endsWith("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["ws_2"]);
+ });
+ it("carries a 429 window by stored record id when the email changes",async()=>{
+  const storage=createStorage(Date.now(),2);storage.accounts.forEach((account,index)=>{account.recordId=`record-${index+1}`;});
+  const manager=new AccountManager(undefined,structuredClone(storage));
+  manager.markRateLimited(manager.getAccountByIndex(0)!,10*60_000,getModelFamily("common"),"common");
+  // Renamed in place plus a new login appended: the inventory changes, the record does not.
+  const disk=structuredClone(storage);disk.accounts[0]!.email="renamed@example.com";
+  disk.accounts.push({...structuredClone(storage.accounts[1]!),recordId:"record-3",accountId:"acc_3",email:"account-3@example.com",refreshToken:"refresh-3",accessToken:"access-3"});
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+  for(let i=0;i<4;i++){const response=await postResponses(proxy,{model:"common",input:"fixture"});expect(response.status).toBe(200);await response.text();}
+  expect(calls.filter(c=>c.url.endsWith("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).not.toContain("acc_1");
+ });
+ it("carries a 429 window across a re-login that changes the refresh token",async()=>{
+  const storage=createStorage(Date.now(),2);
+  const manager=new AccountManager(undefined,structuredClone(storage));
+  manager.markRateLimited(manager.getAccountByIndex(0)!,10*60_000,getModelFamily("common"),"common");
+  const disk=structuredClone(storage);
+  disk.accounts[0]!.refreshToken="refresh-after-relogin";disk.accounts[0]!.accessToken="access-after-relogin";
+  disk.accounts.reverse();
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(disk)}});
+  const response=await postResponses(proxy,{model:"common",input:"fixture"});
+  expect(response.status).toBe(200);await response.text();
+  expect(calls.filter(c=>c.url.endsWith("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_2"]);
+ });
+});
+
+describe("pre-dispatch eligibility re-read",()=>{
+ const tokenFor=(workspace:string)=>{
+  const part=(value:unknown)=>Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${part({alg:"none"})}.${part({"https://api.openai.com/auth":{chatgpt_account_id:workspace}})}.sig`;
+ };
+ it.each([["no stored account id",undefined],["a padded account id"," acc_token "]])("routes an account with %s through Responses and images",async(_label,stored)=>{
+  const storage=createStorage(Date.now(),1);const account=storage.accounts[0]!;
+  account.accessToken=tokenFor("acc_token");
+  if(stored===undefined)delete account.accountId;else account.accountId=stored;
+  const manager=new AccountManager(undefined,structuredClone(storage));
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):call.url.includes("/images/")?Response.json({data:[]}):textEventStream());
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(storage)}});
+  const responses=await postResponses(proxy,{model:"common",input:"fixture"});
+  expect(responses.status).toBe(200);await responses.text();
+  const image=await postResponses(proxy,{model:"gpt-image-2",prompt:"fixture"},"/images/generations");
+  expect(image.status).toBe(200);await image.text();
+  const dispatched=calls.filter(c=>!c.url.includes("/models"));
+  expect(dispatched).toHaveLength(2);
+  expect(dispatched.every(c=>c.headers.get("chatgpt-account-id")==="acc_token")).toBe(true);
+ });
+});
+
+describe("request-level capability rejections",()=>{
+ const reject=()=>Response.json({error:{code:"invalid_value",param:"reasoning.effort",message:"Unsupported effort fixture"}},{status:400});
+ const catalog=()=>Response.json({models:[{slug:"common",supported_reasoning_levels:[{effort:"ultra"}]}]});
+ const rejectNumbered=(n:number)=>Response.json({error:{code:"invalid_value",param:"reasoning.effort",message:`Unsupported effort fixture ${n}`}},{status:400});
+ const run=async(storage:AccountStorageV3,respond:(n:number)=>Response)=>{
+  const manager=new AccountManager(undefined,storage);let n=0;
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?catalog():respond(++n));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await postResponses(proxy,{model:"common",reasoning:{effort:"ultra"},input:"fixture"});
+  return {response,inference:calls.filter(c=>c.url.endsWith("/responses"))};
+ };
+ it("keeps trying distinct workspaces and succeeds on the third",async()=>{
+  const {response,inference}=await run(createStorage(Date.now(),3),n=>n<3?rejectNumbered(n):textEventStream());
+  expect(response.status).toBe(200);await response.text();
+  expect(inference).toHaveLength(3);
+  expect(new Set(inference.map(c=>c.headers.get("chatgpt-account-id"))).size).toBe(3);
+ });
+ it("tries a workspace shared by two accounts only once",async()=>{
+  const storage=createStorage(Date.now(),2);for(const account of storage.accounts)account.accountId="shared_workspace";
+  const {response,inference}=await run(storage,n=>rejectNumbered(n));
+  expect(response.status).toBe(400);await response.text();
+  expect(inference).toHaveLength(1);
+ });
+ it("reports a 429 that follows a capability rejection instead of the stale 400",async()=>{
+  const {response,inference}=await run(createStorage(Date.now(),2),n=>n===1?rejectNumbered(n):new Response(JSON.stringify({error:{code:"rate_limit_exceeded"}}),{status:429,headers:{"content-type":"application/json","retry-after":"30"}}));
+  expect(response.status).not.toBe(400);
+  const body=await response.json();
+  expect(body.error.code).toBe("codex_runtime_rotation_pool_exhausted");
+  expect(body.error.reason).toBe("rate-limit");
+  expect(inference).toHaveLength(2);
+ });
+ it("forwards the last upstream 400 when every workspace rejects the setting",async()=>{
+  const {response,inference}=await run(createStorage(Date.now(),3),n=>rejectNumbered(n));
+  expect(response.status).toBe(400);
+  expect((await response.json()).error).toMatchObject({code:"invalid_value",param:"reasoning.effort",message:"Unsupported effort fixture 3"});
+  expect(inference).toHaveLength(3);
+ });
+ it("forwards a capability 400 unchanged on a non-native proxy without rotating",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),3));
+  const {calls,fetchImpl}=createRecordingFetch(()=>reject());
+  const proxy=await startProxy({accountManager:manager,fetchImpl});
+  const response=await postResponses(proxy,{model:"gpt-5-codex",reasoning:{effort:"ultra"},input:"fixture"});
+  expect(response.status).toBe(400);
+  expect((await response.json()).error.code).toBe("invalid_value");
+  expect(calls.filter(c=>c.url.endsWith("/responses"))).toHaveLength(1);
+ });
+});
+
+describe('earned reset last-resort integration',()=>{
+ it('never redeems or moves traffic off a stored native pin',async()=>{
+  vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+  const {createResetCreditService}=await import('../lib/runtime/account-reset-credits.js');
+  const native=await import('../lib/runtime/native-rate-limits.js');
+  let consumptions=0;
+  const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation(async(auth,method)=>{
+   if(method==='account/rateLimitResetCredit/consume'){consumptions++;return {outcome:'reset'};}
+   const allowed=auth.accountId==='acc_2';
+   return {accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};
+  });
+  const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-pin-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
+  const service=createResetCreditService();await service.setPolicy('last-resort');
+  try{
+   const manager=new AccountManager(undefined,createStorage(Date.now()));
+   const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'chat-fixture'}]}):textEventStream());
+   const quota={updatedAt:Date.now(),status:200,model:'chat-fixture',planType:'pro',primary:{usedPercent:100},secondary:{usedPercent:0}};
+   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readSubscriptionQuota:async()=>({byAccountId:{acc_1:quota,acc_2:quota},byEmail:{}})}});
+   const response=await postResponses(proxy,{model:'chat-fixture',input:'hello'});await response.text();
+   expect(consumptions).toBe(0);
+   expect(calls.filter(c=>c.url.endsWith('/responses')).every(c=>c.headers.get('chatgpt-account-id')==='acc_1')).toBe(true);
+  }finally{await service.setPolicy('manual');rpc.mockRestore();if(originalDir===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=originalDir;await fs.rm(testDir,{recursive:true,force:true,maxRetries:5});}
+ });
+ it.each([true,false])('refreshes all subscription capacity before spending (other usable=%s)',async otherUsable=>{
+  const {createResetCreditService}=await import('../lib/runtime/account-reset-credits.js');
+  const native=await import('../lib/runtime/native-rate-limits.js');
+  let redeemed=false;let consumptions=0;
+  const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation(async(auth,method)=>{
+   if(method==='account/rateLimitResetCredit/consume'){redeemed=true;consumptions++;return {outcome:'reset'};}
+   const allowed=(otherUsable&&auth.accountId==='acc_2')||(redeemed&&auth.accountId==='acc_1');
+   return {accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:redeemed?0:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};
+  });
+  const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-integration-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
+  const service=createResetCreditService();await service.setPolicy('last-resort');
+  try{
+   const disk=createStorage(Date.now());const stored=await import("../lib/storage.js");const diskSpy=vi.spyOn(stored,"loadAccounts").mockResolvedValue(disk);
+   const manager=new AccountManager(undefined,disk);
+   const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'chat-fixture'}]}):textEventStream());
+   const quota={updatedAt:Date.now(),status:200,model:'chat-fixture',planType:'pro',primary:{usedPercent:100},secondary:{usedPercent:0}};
+   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readSubscriptionQuota:async()=>({byAccountId:{acc_1:quota,acc_2:quota},byEmail:{}})}});
+   const response=await postResponses(proxy,{model:'chat-fixture',input:'hello'});expect(response.status).toBe(200);await response.text();
+   diskSpy.mockRestore();
+   expect(consumptions).toBe(otherUsable?0:1);
+   expect(calls.find(c=>c.url.endsWith('/responses'))?.headers.get('chatgpt-account-id')).toBe(otherUsable?'acc_2':'acc_1');
+  }finally{await service.setPolicy('manual');rpc.mockRestore();if(originalDir===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=originalDir;await fs.rm(testDir,{recursive:true,force:true,maxRetries:5});}
+ });
+});
+
+describe("independent transport review",()=>{
+ it.each(["cancel-before", "close-before", "cancel-after"])("does not replay or penalize accounts after %s",async mode=>{
+  const upstream=createServer(),wss=new WebSocketServer({server:upstream});let count=0,received!:()=>void,closed!:()=>void;
+  const requestReceived=new Promise<void>(r=>received=r),upstreamClosed=new Promise<void>(r=>closed=r);
+  wss.on('connection',socket=>{socket.once('close',()=>closed());socket.on('message',()=>{count++;if(mode==='cancel-after')socket.send(JSON.stringify({type:'response.created',response:{id:'fixture-response'}}));received();});});
+  upstream.listen(0,'127.0.0.1');await once(upstream,'listening');const address=upstream.address();if(!address||typeof address==='string')throw Error('listen');
+  const manager=new AccountManager(undefined,createStorage(Date.now(),2));
+  const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,upstreamBaseUrl:`http://127.0.0.1:${address.port}`,readApiRoutes:async()=>[]}});
+  const models=await getModels(proxy);await models.text();
+  const client=new WebSocket(proxy.baseUrl.replace('http:','ws:')+'/responses',{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`}});
+  try {
+   await once(client,'open');const event=mode==='cancel-after'?once(client,'message'):Promise.resolve();
+   client.send(JSON.stringify({type:'response.create',model:'model-test',input:[]}));await requestReceived;await event;
+   if(mode==='close-before')client.terminate();else client.send(JSON.stringify({type:'response.cancel'}));
+   await upstreamClosed;await new Promise(r=>setTimeout(r,80));
+   expect(count).toBe(1);expect(proxy.getStatus().retries).toBe(0);
+   expect(manager.getAccountsSnapshot().map(a=>a.cooldownReason)).toEqual([undefined,undefined]);
+  } finally {client.terminate();for(const socket of wss.clients)socket.terminate();wss.close();await new Promise<void>(r=>upstream.close(()=>r()));}
+ });
+ it("keeps OAuth model discovery available when API configuration is invalid",async()=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),1));const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>{throw Error('fixture invalid config');}}});
+  const response=await getModels(proxy);expect(response.status).toBe(200);expect((await response.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-test']);
+ });
+});
+it("does not admit an unsupported workspace through a shared missing-binding key",async()=>{
+ const stored=createStorage(Date.now(),2);
+ stored.accounts.forEach((a,i)=>{delete a.accountId;a.workspaces=[{id:`workspace-${i}`,enabled:true}];a.currentWorkspaceIndex=0;});
+ const manager=new AccountManager(undefined,stored);
+ const {fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('chatgpt-account-id')==='workspace-1'?'model-test':'other'}]}):textEventStream());
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[]}});
+ const models=await getModels(proxy);await models.text();
+ const refresh=vi.spyOn(tokenRefreshRuntime,'ensureFreshAccessToken');
+ try {const response=await postResponses(proxy,{model:'model-test',input:[]});await response.text();expect(response.status).toBe(200);
+ expect(refresh.mock.calls.filter(([args])=>args.model==='model-test').map(([args])=>args.account.index)).toEqual([1]);}
+ finally{refresh.mockRestore();}
+});
+
+describe("independent review catalog regressions",()=>{
+ it.each([false,true])("retains catalog cache and backoff across client versions (limited=%s)",async limited=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),1));
+  const {fetchImpl,calls}=createRecordingFetch(call=>limited?new Response("busy",{status:429,headers:{"retry-after":"120"}}):Response.json({models:[{slug:`model-${new URL(call.url).searchParams.get("client_version")}`}]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  for(const version of ["1.0","2.0","1.0","2.0"]){const response=await getModels(proxy,`/models?client_version=${version}`);await response.text();}
+  expect(calls).toHaveLength(limited?1:2);
+ });
+ it("does not refresh an invalidated account for catalog discovery",async()=>{
+  const stored=createStorage(Date.now(),1);stored.accounts[0]!.authInvalidatedAt=Date.now();stored.accounts[0]!.expiresAt=0;
+  const manager=new AccountManager(undefined,stored);
+  const {fetchImpl}=createRecordingFetch(()=>Response.json({models:[]}));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+  const response=await getModels(proxy);await response.text();
+  expect(refreshAccessTokenMock).not.toHaveBeenCalled();
+ });
+});
+it("requires fresh eligibility when stale recovery reorders the account inventory",async()=>{
+ const disk=createStorage(Date.now(),2),manager=new AccountManager(undefined,disk);
+ manager.markAccountCoolingDown(manager.getAccountByIndex(1)!,60000,'network-error');
+ const reordered=structuredClone(disk);reordered.accounts.reverse();
+ const reload=vi.spyOn(AccountManager,'loadFromDisk').mockResolvedValue(new AccountManager(undefined,reordered));
+ const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('authorization')==='Bearer access-2'?'model-test':'other'}]}):textEventStream());
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[]}});
+ try{const response=await postResponses(proxy,{model:'model-test',input:[]});await response.text();expect(response.status).toBe(503);expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(0);}finally{reload.mockRestore();}
+});
+
+
+describe("native catalog outage with reasoning settings", () => {
+	it("routes an effort-bearing request while the catalog is rate limited", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl, calls } = createRecordingFetch(call => call.url.includes("/models")
+			? new Response("busy", { status: 429, headers: { "retry-after": "120" } })
+			: textEventStream());
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: { nativeOpenai: true } });
+		const response = await postResponses(proxy, { model: "model-test", reasoning: { effort: "high" }, service_tier: "priority", input: "test" });
+		await response.text();
+		expect(response.status).toBe(200);
+		expect(calls.some(c => c.url.endsWith("/responses"))).toBe(true);
+	});
+});
+
+describe("effort-bearing requests during catalog outages", () => {
+ it("forwards unchanged reasoning settings while discovery is throttled", async () => {
+  let now = Date.now();
+  const manager = new AccountManager(undefined, createStorage(now,1));
+  const {fetchImpl,calls} = createRecordingFetch(call => call.url.includes("/models")
+   ? new Response("busy",{status:429,headers:{"retry-after":"120"}})
+   : textEventStream());
+  const proxy = await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,now:()=>now}});
+  for (const advance of [0,6000,6000]) {
+   now += advance;
+   const response = await postResponses(proxy,{model:"model-test",reasoning:{effort:"high"},service_tier:"priority",input:"test"});
+   await response.text();expect(response.status).toBe(200);
+  }
+  expect(calls.filter(call=>call.url.includes("/models"))).toHaveLength(1);
+  expect(calls.filter(call=>call.url.endsWith("/responses"))).toHaveLength(3);
+  for (const call of calls.filter(call=>call.url.endsWith("/responses"))) expect(JSON.parse(call.bodyText)).toMatchObject({reasoning:{effort:"high"},service_tier:"priority"});
+ });
+});
+
+describe("unversioned catalog requests", () => {
+	it("does not borrow another client's catalog version", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { fetchImpl } = createRecordingFetch(call => {
+			if (!call.url.includes("/models")) return textEventStream();
+			const version = new URL(call.url).searchParams.get("client_version");
+			return Response.json({ models: [{ slug: version === "2.0" ? "model-new" : "model-old" }] });
+		});
+		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: { nativeOpenai: true } });
+		const versioned = await getModels(proxy, "/models?client_version=2.0");
+		expect((await versioned.json()).models.map((m: { slug: string }) => m.slug)).toEqual(["model-new"]);
+		const unversioned = await postResponses(proxy, { model: "model-old", input: "test" });
+		await unversioned.text();
+		expect(unversioned.status).toBe(200);
+	});
+});
+
+
+it("retains known exclusions when a forced catalog refresh fails",async()=>{
+ const manager=new AccountManager(undefined,createStorage(Date.now()));
+ let fail=false;
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")
+  ?fail?new Response("busy",{status:503}):Response.json({models:[{slug:"known"}]})
+  :textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
+ await (await getModels(proxy,"/models?refresh_capabilities=1")).text();
+ fail=true;
+ await (await getModels(proxy,"/models?refresh_capabilities=1")).text();
+ const response=await postResponses(proxy,{model:"unknown",input:"hello"});
+ expect(response.status).toBe(403);await response.text();
+ expect(calls.filter(c=>c.url.endsWith("/responses"))).toHaveLength(0);
+});
+it("stops a stored pin after refresh disables its only workspace",async()=>{
+ vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+ const stored=createStorage(Date.now(),1);stored.pinnedAccountIndex=0;
+ stored.accounts[0]!.workspaces=[{id:"acc_1",enabled:true}];
+ const manager=new AccountManager(undefined,stored);
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):textEventStream());
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(stored)}});
+ await (await getModels(proxy,"/models?refresh_capabilities=1")).text();
+ const refresh=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken").mockImplementation(async({account})=>{
+  account.workspaces![0]!.enabled=false;
+  return {ok:true,accessToken:account.access!,account};
+ });
+ const response=await postResponses(proxy,{model:"shared",input:"hello"});
+ const body=await response.json();
+ expect(response.status).toBe(503);expect(body.error.reason).toBe("workspace-disabled");
+ expect(refresh).toHaveBeenCalledTimes(1);
+ expect(calls.filter(c=>c.url.endsWith("/responses"))).toHaveLength(0);
+});
+
+it("routes with scoped Personal quota while keeping exhausted shared organization bindings separate", async () => {
+ const { updateQuotaCacheForWorkspace, updateQuotaCacheForAccount } = await import("../lib/codex-manager/quota-cache-helpers.js");
+ const now = Date.now();
+ const storage = createStorage(now);
+ storage.accounts.forEach((account, i) => { account.recordId=`fixture-${i}`; account.accountId="shared-org"; account.currentWorkspaceIndex=1; account.workspaces=[{id:"shared-org",enabled:true},{id:`personal-${i}`,enabled:true}]; });
+ const cache = {byAccountId:{},byEmail:{}};
+ for (const [i,account] of storage.accounts.entries()) {
+  updateQuotaCacheForAccount(cache,account,{status:200,model:"common",primary:{usedPercent:100,resetAtMs:now+3600000},secondary:{}},storage.accounts);
+  updateQuotaCacheForWorkspace(cache,account,`personal-${i}`,{status:200,model:"common",planType:"pro",primary:{usedPercent:i===0?100:30,resetAtMs:now+3600000},secondary:{}},storage.accounts);
+ }
+ const manager=new AccountManager(undefined,storage);
+ const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
+ const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readSubscriptionQuota:async()=>cache,quotaRemainingPercentThreshold:undefined}});
+ const response=await postResponses(proxy,{model:"common",input:"fixture",stream:true});
+ expect(response.status).toBe(200);await response.text();
+ expect(calls.filter(c=>c.url.includes("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["personal-1"]);
 });
