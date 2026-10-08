@@ -250,6 +250,24 @@ describe("runHealthCheck live probe", () => {
 		expect(logged()).toContain("0 signed in only");
 	});
 
+	it("clears a stale invalidation after a successful live probe", async () => {
+		const storage = storageWith([
+			account("a", {
+				authInvalidatedAt: REAL_NOW - 60_000,
+				authInvalidationErrorCode: "token_revoked",
+			}),
+		]);
+		loadAccountsMock.mockResolvedValue(storage);
+		fetchCodexQuotaSnapshotMock.mockResolvedValue(snapshot());
+
+		await runHealthCheck({ liveProbe: true });
+
+		expect(storage.accounts[0]?.authInvalidatedAt).toBeUndefined();
+		expect(storage.accounts[0]?.authInvalidationErrorCode).toBeUndefined();
+		expect(saveAccountsMock).toHaveBeenCalledExactlyOnceWith(storage);
+		expect(logged()).not.toContain("token-invalid");
+	});
+
 	it("probes with the refreshed token after a stale session is renewed", async () => {
 		// The refresh-then-probe branch must use the rotated access token, not
 		// the stale pre-refresh one.

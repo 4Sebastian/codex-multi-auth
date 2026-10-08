@@ -154,14 +154,16 @@ The generated provider configuration declares `supports_websockets = true`, so W
 The first `response.create` evaluates runtime policy before selecting and authenticating one managed account for that connection.
 Every `response.create`, including the first, passes the runtime policy, quota/cooldown, and circuit-breaker availability gates and records exactly one redacted usage row for its final outcome.
 Upstream handshake failures can try another eligible account up to `maxRuntimeAccountAttempts`, but explicit token invalidation stops failover to prevent an invalid-token cascade.
+Persistent WebSockets use drain-first account selection regardless of the HTTP/SSE scheduling strategy: all new sockets share the active account until it becomes unavailable. This prevents long-lived sockets from interleaving different OAuth tokens from one IP after the ordinary rotation-throttle window expires.
 Each healthy upstream WebSocket remains bound to one account, but the persistent local connection can replace that upstream and replay a full `response.create` when the account becomes unavailable or the transport fails before any response event is forwarded.
 Connection-scoped continuations are not replayed on a replacement upstream; the proxy emits `previous_response_not_found` so the client can rebuild a full request.
 Rate-limit terminal events honor retry headers and reset metadata when calculating that cooldown.
 
-**Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes two mitigations:
+**Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes three mitigations:
 
 - **Token-invalidation detection**: when the upstream or the token-refresh endpoint returns an explicit OAuth revocation message, the proxy returns the error directly to the client instead of rotating to the next account. The affected account receives a 5-minute cooldown (`tokenInvalidationCooldownMs`, default `300000`) instead of the generic 30-second auth-failure cooldown. Configure via `CODEX_AUTH_TOKEN_INVALIDATION_COOLDOWN_MS`.
-- **Rotation-rate throttle**: the proxy biases account selection toward the last-served account for a configurable window (default 60 seconds, `minRotationIntervalMs`). Accounts that are rate-limited or cooling down are still rotated around. Configure via `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS` or set to `0` to disable.
+- **Replacement-token recovery**: an invalidation belongs to the access-token generation that received it. Loading or reconciling a newer token clears the older marker, and a successful live Responses probe also clears and persists stale invalidation state.
+- **Rotation-rate throttle and WebSocket drain-first routing**: HTTP/SSE selection biases toward the last-served account for a configurable window (default 60 seconds, `minRotationIntervalMs`). Persistent WebSockets always share one drain-first active account because a finite sticky window cannot constrain already-open sockets. Accounts that are rate-limited or cooling down are still rotated around. Configure the HTTP/SSE throttle via `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS` or set it to `0` to disable.
 
 ### Sequential / drain-first scheduling
 

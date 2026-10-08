@@ -1,5 +1,6 @@
 import type { Auth } from "@codex-ai/sdk";
 import { createHash } from "node:crypto";
+import { decodeJWT } from "./auth/auth.js";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
 import { createLogger } from "./logger.js";
 import {
@@ -101,6 +102,30 @@ import {
 
 const log = createLogger("accounts");
 let nextRuntimeCircuitKeyId = 0;
+
+function tokenIssuedAtMs(accessToken: string | undefined): number | null {
+	if (!accessToken) return null;
+	const issuedAt = decodeJWT(accessToken)?.iat;
+	if (typeof issuedAt !== "number" || !Number.isFinite(issuedAt) || issuedAt <= 0) {
+		return null;
+	}
+	return issuedAt * 1_000;
+}
+
+function isAuthInvalidationSuperseded(
+	accessToken: string | undefined,
+	invalidatedAt: number | undefined,
+): boolean {
+	if (
+		typeof invalidatedAt !== "number" ||
+		!Number.isFinite(invalidatedAt) ||
+		invalidatedAt <= 0
+	) {
+		return false;
+	}
+	const issuedAt = tokenIssuedAtMs(accessToken);
+	return issuedAt !== null && issuedAt > invalidatedAt;
+}
 
 function getAccountCircuitKey(account: ManagedAccount): string {
 	if (!account.circuitKeyId) {
@@ -564,7 +589,7 @@ export class AccountManager {
 							? authFallback.refresh
 							: account.refreshToken;
 
-					return {
+					const managedAccount: ManagedAccount = {
 						index,
 						recordId: resolveAccountRecordId(
 							{ ...account, refreshToken },
@@ -598,6 +623,8 @@ export class AccountManager {
 						workspaces: account.workspaces,
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
 					};
+					this.clearSupersededAuthInvalidation(managedAccount);
+					return managedAccount;
 				})
 				.filter((account): account is ManagedAccount => account !== null);
 
@@ -1465,7 +1492,20 @@ export class AccountManager {
 		delete account.authInvalidationErrorCode;
 	}
 
+	private clearSupersededAuthInvalidation(account: ManagedAccount): boolean {
+		if (!isAuthInvalidationSuperseded(account.access, account.authInvalidatedAt)) {
+			return false;
+		}
+		this.clearAuthInvalidation(account);
+		return true;
+	}
+
 	isAccountAuthInvalidated(account: ManagedAccount): boolean {
+		// A replacement access token proves that an invalidation attached to the
+		// previous token generation is stale. Normalize defensively here as well as
+		// during hydration/reconciliation so legacy snapshots self-heal even when
+		// their first operation is account selection.
+		this.clearSupersededAuthInvalidation(account);
 		return (
 			typeof account.authInvalidatedAt === "number" &&
 			Number.isFinite(account.authInvalidatedAt) &&
@@ -1558,7 +1598,8 @@ export class AccountManager {
 			// Disk holds a strictly-newer token than our in-memory copy: adopt it
 			// so we don't clobber another process's rotation. Equal expiries keep
 			// our copy (no-op); newer in-memory copy wins (our own refresh).
-			if (diskExpires > memExpires && disk.refreshToken) {
+			const adoptedNewerCredentials = diskExpires > memExpires && !!disk.refreshToken;
+			if (adoptedNewerCredentials) {
 				account.refreshToken = disk.refreshToken;
 				account.accessToken = disk.accessToken;
 				account.expiresAt = disk.expiresAt;
@@ -1567,15 +1608,29 @@ export class AccountManager {
 			const diskHasValidInvalidation =
 				typeof diskInvalidatedAt === "number" &&
 				Number.isFinite(diskInvalidatedAt) &&
-				diskInvalidatedAt > 0;
+				diskInvalidatedAt > 0 &&
+				!isAuthInvalidationSuperseded(disk.accessToken, diskInvalidatedAt);
+			if (
+				isAuthInvalidationSuperseded(
+					account.accessToken,
+					account.authInvalidatedAt,
+				) ||
+				(adoptedNewerCredentials && !diskHasValidInvalidation)
+			) {
+				// A refresh/re-login in another process supersedes an invalidation of
+				// the prior access token. Do not combine the newer disk credentials
+				// with this manager's stale marker and write the account back unusable.
+				delete account.authInvalidatedAt;
+				delete account.authInvalidationErrorCode;
+			}
 			const accountHasValidInvalidation =
 				typeof account.authInvalidatedAt === "number" &&
 				Number.isFinite(account.authInvalidatedAt) &&
 				account.authInvalidatedAt > 0;
 			if (diskHasValidInvalidation && !accountHasValidInvalidation) {
-				// Ordinary saves must not erase an invalidation written by another
-				// AccountManager. Successful refresh persistence explicitly deletes
-				// this marker in commitRefreshedAuth; this reconciliation path does not.
+				// Ordinary saves must not erase a CURRENT invalidation written by
+				// another AccountManager. A marker older than the token generation is
+				// stale and is intentionally not resurrected.
 				account.authInvalidatedAt = diskInvalidatedAt;
 				if (disk.authInvalidationErrorCode) {
 					account.authInvalidationErrorCode = disk.authInvalidationErrorCode;

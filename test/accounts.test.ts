@@ -2503,6 +2503,97 @@ describe("AccountManager", () => {
 			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
 		});
 
+		it("clears a legacy invalidation superseded by the current access token", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const now = Date.now();
+			const payload = Buffer.from(
+				JSON.stringify({ iat: Math.floor((now + 60_000) / 1_000) }),
+			).toString("base64url");
+			const manager = new AccountManager(undefined, {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "refreshed-token",
+						accessToken: `header.${payload}.signature`,
+						expiresAt: now + 3_600_000,
+						addedAt: now - 60_000,
+						lastUsed: now,
+						authInvalidatedAt: now,
+						authInvalidationErrorCode: "token_revoked",
+					},
+				],
+			});
+			const account = manager.getAccountByIndex(0);
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
+			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+		});
+
+		it("does not resurrect invalidation after another process refreshes credentials", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const now = Date.now();
+			const initialStorage: AccountStorageV3 = {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						email: "shared@example.com",
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now + 60_000,
+						addedAt: now - 60_000,
+						lastUsed: now,
+						authInvalidatedAt: now,
+						authInvalidationErrorCode: "token_revoked",
+					},
+				],
+			};
+			const refreshedOnDisk: AccountStorageV3 = {
+				...structuredClone(initialStorage),
+				accounts: [
+					{
+						...initialStorage.accounts[0]!,
+						refreshToken: "new-refresh",
+						accessToken: "new-access",
+						expiresAt: now + 3_600_000,
+						authInvalidatedAt: undefined,
+						authInvalidationErrorCode: undefined,
+					},
+				],
+			};
+			mockWithAccountStorageTransaction.mockImplementationOnce(async (handler) => {
+				const persist = async (storage: AccountStorageV3) => {
+					await mockSaveAccounts(storage);
+				};
+				return handler(structuredClone(refreshedOnDisk), persist);
+			});
+			const manager = new AccountManager(undefined, initialStorage);
+
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount).toMatchObject({
+				refreshToken: "new-refresh",
+				accessToken: "new-access",
+				expiresAt: now + 3_600_000,
+			});
+			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
+			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+		});
+
 		it("preserves an invalidation written by another manager before a stale routine save", async () => {
 			const { saveAccounts, withAccountStorageTransaction } = await import(
 				"../lib/storage.js"

@@ -424,7 +424,7 @@ export async function fetchCodexQuotaSnapshot(
 			}
 
 			const snapshotBase = parseQuotaSnapshotBase(response.headers, response.status);
-			if (snapshotBase) {
+			if (snapshotBase && (response.ok || response.status === 429)) {
 				try {
 					await response.body?.cancel();
 				} catch {
@@ -433,6 +433,9 @@ export async function fetchCodexQuotaSnapshot(
 				return { ...snapshotBase, model };
 			}
 
+			// Quota headers can accompany authentication failures. They are useful
+			// on a 429, but must never turn a revoked-token 401 into a successful
+			// health probe that clears or hides the account's invalidation marker.
 			if (!response.ok) {
 				const bodyText = await response.text().catch(() => "");
 				let errorBody: unknown = undefined;

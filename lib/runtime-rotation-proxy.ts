@@ -143,6 +143,14 @@ export type { StorageMeta } from "./runtime/rotation-storage-meta.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 
+// Persistent WebSocket connections outlive individual requests. Hybrid
+// selection can therefore leave different sockets bound to different OAuth
+// accounts and interleave those tokens from one IP indefinitely, bypassing the
+// normal minimum-rotation window and triggering upstream anti-abuse revocation.
+// Drain-first selection gives every new WebSocket the same active account and
+// only advances after that account becomes unavailable.
+const WEBSOCKET_SCHEDULING_STRATEGY = "sequential" as const;
+
 function isLoopbackHost(host: string): boolean {
 	const normalized = host.trim().toLowerCase();
 	return (
@@ -1614,25 +1622,11 @@ async function prepareWebSocketAccount(
 				skipReasons,
 				stickyBoostByAccount: rotationStickyBoost,
 				pidOffsetEnabled: state.pidOffsetEnabled,
-				schedulingStrategy: state.schedulingStrategy,
+				schedulingStrategy: WEBSOCKET_SCHEDULING_STRATEGY,
 			});
 		const selected =
 			state.routingMutexMode === "enabled"
-				? await withRoutingMutex(state.routingMutexMode, async () => {
-						const candidate = selectAccount();
-						if (
-							candidate &&
-							pinnedIndex === null &&
-							state.schedulingStrategy !== "sequential"
-						) {
-							await accountManager.markSwitchedLocked(
-								candidate,
-								"rotation",
-								context.family,
-							);
-						}
-						return candidate;
-					})
+				? await withRoutingMutex(state.routingMutexMode, () => selectAccount())
 				: selectAccount();
 		if (!selected) {
 			if (
@@ -1833,7 +1827,7 @@ async function connectManagedWebSocket(
 				account,
 				context.family,
 				isPinned,
-				state.schedulingStrategy,
+				WEBSOCKET_SCHEDULING_STRATEGY,
 			);
 			return { upstream, prepared };
 		} catch (error) {

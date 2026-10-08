@@ -1267,7 +1267,7 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("selects sticky WebSocket accounts while holding the routing mutex", async () => {
+	it("selects drain-first WebSocket accounts while holding the routing mutex", async () => {
 		const previousMutex = process.env.CODEX_AUTH_ROUTING_MUTEX;
 		const previousInterval = process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS;
 		process.env.CODEX_AUTH_ROUTING_MUTEX = "enabled";
@@ -1282,13 +1282,14 @@ describe("runtime rotation proxy", () => {
 			},
 		});
 		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
-		const originalMarkSwitchedLocked = accountManager.markSwitchedLocked.bind(accountManager);
+		const originalSequentialSelection =
+			accountManager.getCurrentOrNextForFamilySequential.bind(accountManager);
 		const lockStates: boolean[] = [];
-		const markSwitchedLocked = vi
-			.spyOn(accountManager, "markSwitchedLocked")
-			.mockImplementation((account, reason, family) => {
+		const sequentialSelection = vi
+			.spyOn(accountManager, "getCurrentOrNextForFamilySequential")
+			.mockImplementation((family, model, blockedIndexes) => {
 				lockStates.push(isRoutingMutexHeld());
-				return originalMarkSwitchedLocked(account, reason, family);
+				return originalSequentialSelection(family, model, blockedIndexes);
 			});
 		const { fetchImpl } = createRecordingFetch(() => textEventStream());
 		const proxy = await startProxy({
@@ -1332,11 +1333,68 @@ describe("runtime rotation proxy", () => {
 			firstClient?.terminate();
 			secondClient?.terminate();
 			await upstream.close();
-			markSwitchedLocked.mockRestore();
+			sequentialSelection.mockRestore();
 			if (previousMutex === undefined) delete process.env.CODEX_AUTH_ROUTING_MUTEX;
 			else process.env.CODEX_AUTH_ROUTING_MUTEX = previousMutex;
 			if (previousInterval === undefined) delete process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS;
 			else process.env.CODEX_AUTH_MIN_ROTATION_INTERVAL_MS = previousInterval;
+		}
+	});
+
+	it("keeps concurrent persistent WebSockets on one drain-first account", async () => {
+		const authorizationAttempts: Array<string | undefined> = [];
+		const waitingSockets: WebSocket[] = [];
+		const upstream = await startTestWebSocketUpstream({
+			onConnection: (socket, request) => {
+				authorizationAttempts.push(request.headers.authorization);
+				socket.once("message", () => {
+					waitingSockets.push(socket);
+					if (waitingSockets.length !== 2) return;
+					for (const waiting of waitingSockets) {
+						waiting.send(JSON.stringify({ type: "response.completed", response: {} }));
+					}
+				});
+			},
+		});
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const hybridSelection = vi.spyOn(accountManager, "getCurrentOrNextForFamilyHybrid");
+		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { upstreamBaseUrl: upstream.baseUrl },
+		});
+		const url = proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses";
+		const firstClient = await connectWebSocket(url);
+		const secondClient = await connectWebSocket(url);
+		try {
+			const firstResponse = nextWebSocketMessage(firstClient);
+			const secondResponse = nextWebSocketMessage(secondClient);
+			firstClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "parallel-first",
+				input: [],
+			}));
+			secondClient.send(JSON.stringify({
+				type: "response.create",
+				model: "gpt-5.6-sol",
+				prompt_cache_key: "parallel-second",
+				input: [],
+			}));
+
+			await Promise.all([firstResponse, secondResponse]);
+
+			expect(authorizationAttempts).toEqual([
+				"Bearer access-1",
+				"Bearer access-1",
+			]);
+			expect(hybridSelection).not.toHaveBeenCalled();
+		} finally {
+			firstClient.terminate();
+			secondClient.terminate();
+			hybridSelection.mockRestore();
+			await upstream.close();
 		}
 	});
 

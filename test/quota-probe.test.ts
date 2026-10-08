@@ -206,6 +206,28 @@ describe("quota-probe", () => {
 		expect(formatQuotaSnapshotLine(snapshot)).toContain("rate-limited");
 	});
 
+	it("rejects authentication failures even when quota headers are present", async () => {
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({ error: { message: "Your authentication token has been invalidated." } }),
+				{
+					status: 401,
+					headers: makeQuotaHeaders({ "content-type": "application/json" }),
+				},
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(
+			fetchCodexQuotaSnapshot({
+				accountId: "acc-revoked",
+				accessToken: "token-revoked",
+				model: "gpt-5-codex",
+				fallbackModels: [],
+			}),
+		).rejects.toThrow("authentication token has been invalidated");
+	});
+
 	it("times out a stalled probe and surfaces abort failure", async () => {
 		vi.useFakeTimers();
 		const fetchMock = vi.fn((_url: string, init?: RequestInit) => {

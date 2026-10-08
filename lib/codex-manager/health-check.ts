@@ -52,6 +52,21 @@ function appendAuthInvalidationMarker(
 		: detail;
 }
 
+function clearAuthInvalidationMarker(account: {
+	authInvalidatedAt?: number;
+	authInvalidationErrorCode?: string;
+}): boolean {
+	if (
+		typeof account.authInvalidatedAt !== "number" &&
+		account.authInvalidationErrorCode === undefined
+	) {
+		return false;
+	}
+	delete account.authInvalidatedAt;
+	delete account.authInvalidationErrorCode;
+	return true;
+}
+
 /**
  * Body of the `check` command, also reused by the login dashboard's quick
  * check / deep check actions. Moved verbatim out of lib/codex-manager.ts
@@ -155,6 +170,16 @@ export async function runHealthCheck(
 									quotaEmailFallbackState ?? undefined,
 								) || quotaCacheChanged;
 						}
+						if (
+							snapshot.status >= 200 &&
+							snapshot.status < 300 &&
+							clearAuthInvalidationMarker(account)
+						) {
+							// A successful Responses probe proves the current access token is
+							// usable. Persist that recovery instead of continuing to exclude
+							// the account because an older token was revoked.
+							changed = true;
+						}
 						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display);
 						codexAvailable += 1;
 					} catch (error) {
@@ -220,12 +245,7 @@ export async function runHealthCheck(
 				account.enabled = true;
 				changed = true;
 			}
-			if (
-				typeof account.authInvalidatedAt === "number" ||
-				account.authInvalidationErrorCode !== undefined
-			) {
-				delete account.authInvalidatedAt;
-				delete account.authInvalidationErrorCode;
+			if (clearAuthInvalidationMarker(account)) {
 				changed = true;
 			}
 			if (accountIdentityChanged && liveProbe && workingQuotaCache) {
