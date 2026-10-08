@@ -1103,6 +1103,7 @@ interface PendingWebSocketFrame {
 	data: RawData;
 	isBinary: boolean;
 	recoveryAttempts?: number;
+	upstreamConnection?: WebSocket;
 	request?: PreparedWebSocketRequest;
 }
 
@@ -1483,6 +1484,7 @@ function websocketTerminalUsage(
 		readStringRecordValue(error ?? {}, "type");
 	const rawBody = body.toString("utf8");
 	const statusCode =
+		(isTokenInvalidationError(rawBody) ? HTTP_STATUS.UNAUTHORIZED : null) ??
 		readWebSocketStatusCode(parsed, response, error) ??
 		(outcome === "success"
 			? HTTP_STATUS.OK
@@ -1566,8 +1568,8 @@ function applyWebSocketTerminalAccountFailure(
 	if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 		accountManager.refundToken(account, context.family, context.model);
 		accountManager.recordFailure(account, context.family, context.model);
-		if (terminal.record.errorCode === "token_invalidated") {
-			accountManager.markAuthInvalidated(account, terminal.record.errorCode);
+		if (isTokenInvalidationError(terminal.rawBody)) {
+			accountManager.markAuthInvalidated(account, "token_invalidated");
 			applyMonotonicAuthCooldown(
 				accountManager,
 				account,
@@ -1618,6 +1620,7 @@ function applyWebSocketTerminalAccountSuccess(
 	terminal: WebSocketTerminalEvent,
 ): void {
 	if (terminal.record.outcome !== "success") return;
+	active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model);
 	state.lastGlobalAccountIndex = active.account.index;
 	state.lastGlobalSwitchAt = state.now();
 }
@@ -1817,12 +1820,6 @@ async function prepareWebSocketAccount(
 		attemptedIndexes.size < accountManager.getAccountCount() &&
 		attemptBudget.attempts < attemptBudget.limit
 	) {
-		const rotationStickyBoost: Record<number, number> =
-			state.minRotationIntervalMs > 0 &&
-			state.lastGlobalAccountIndex !== null &&
-			state.now() - state.lastGlobalSwitchAt < state.minRotationIntervalMs
-				? { [state.lastGlobalAccountIndex]: 1000 }
-				: {};
 		const selectAccount = (): ManagedAccount | null =>
 			chooseAccount({
 				accountManager,
@@ -1835,7 +1832,6 @@ async function prepareWebSocketAccount(
 				policy: policyDecision,
 				pinnedIndex,
 				skipReasons,
-				stickyBoostByAccount: rotationStickyBoost,
 				pidOffsetEnabled: state.pidOffsetEnabled,
 				schedulingStrategy: WEBSOCKET_SCHEDULING_STRATEGY,
 			});
@@ -2059,10 +2055,7 @@ async function connectManagedWebSocket(
 			state.sessionAffinityStore?.forgetSession(context.sessionKey);
 			if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 				accountManager.recordFailure(account, context.family, context.model);
-				if (
-					errorCode === "token_invalidated" ||
-					isTokenInvalidationError(bodyText)
-				) {
+				if (isTokenInvalidationError(bodyText)) {
 					accountManager.markAuthInvalidated(
 						account,
 						errorCode ?? "token_invalidated",
@@ -2245,9 +2238,18 @@ function bridgeWebSocketConnection(
 		frame: PendingWebSocketFrame,
 		preparedHandshake?: PreparedWebSocketAccount,
 	): Promise<void> => {
-		if (closed || upstream?.readyState !== WebSocket.OPEN) {
-			if (preparedHandshake) {
-				settlePendingHandshake("cancelled", "client_websocket_closed");
+		if (closed) {
+			if (preparedHandshake) settlePendingHandshake("cancelled", "client_websocket_closed");
+			return;
+		}
+		if (upstream?.readyState !== WebSocket.OPEN || (hasConnectionScopedContinuation(frame) && frame.upstreamConnection !== upstream)) {
+			if (hasConnectionScopedContinuation(frame)) {
+				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame.data);
+				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
+				reportConnectionScopedContinuationLoss();
+			} else {
+				pending.push(frame);
+				void initialize();
 			}
 			return;
 		}
@@ -2379,17 +2381,18 @@ function bridgeWebSocketConnection(
 		if (connecting || reconnectTimer || upstream || pending.length === 0) return;
 		connecting = true;
 		try {
-			const firstFrame = pending[0];
-			if (!firstFrame) return;
 			// previous_response_id is scoped to the upstream WebSocket connection.
 			// If the proxy needs a new upstream connection, replaying that delta frame
 			// would make Codex reject it. Emit the backend's standard retryable error so
 			// the client clears its cached continuation and rebuilds a full request.
-			if (hasConnectionScopedContinuation(firstFrame)) {
-				pending.shift();
+			while (pending[0] && hasConnectionScopedContinuation(pending[0])) {
+				const lost = pending.shift()!;
+				const request = lost.request ?? await prepareWebSocketRequest(state, req, lost.data);
+				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
 				reportConnectionScopedContinuationLoss();
-				return;
 			}
+			const firstFrame = pending[0];
+			if (!firstFrame) return;
 			const firstRequest =
 				firstFrame.request ?? await prepareWebSocketRequest(state, req, firstFrame.data);
 			firstFrame.request = firstRequest;
@@ -2475,6 +2478,13 @@ function bridgeWebSocketConnection(
 						});
 					}
 				}
+				if (terminal?.record.outcome === "failure" && isTokenInvalidationError(terminal.rawBody)) {
+					if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({type: "error", status: 401, error: {code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}}));
+					settleAll("failure", "token_invalidated");
+					settlePending("failure", "token_invalidated");
+					closeBoth(WEBSOCKET_CLOSE_POLICY_VIOLATION, "OAuth token invalidated");
+					return;
+				}
 				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
 			});
 			connectedUpstream.on("close", (code, reason) => {
@@ -2532,7 +2542,7 @@ function bridgeWebSocketConnection(
 	}
 	client.on("message", (data, isBinary) => {
 		if (upstream?.readyState === WebSocket.OPEN) {
-			enqueueClientFrame({ data, isBinary });
+			enqueueClientFrame({ data, isBinary, upstreamConnection: upstream });
 			return;
 		}
 		pending.push({ data, isBinary });
@@ -2734,6 +2744,7 @@ export async function startRuntimeRotationProxy(
 
 	const websocketGateway = new ResponsesWebSocketGateway(fetchImpl, {maxPayloadBytes: state.maxRequestBodyBytes});
 	state.fetchImpl = websocketGateway.fetch;
+	state.webSocketRequestSent = () => websocketGateway.requestSent();
 	const server = createServer((req, res) => {
 		websocketGateway.handle(req, () => handleRequest(state, req, res));
 	});
@@ -2894,9 +2905,11 @@ async function handleRequestInner(
             }
             nativeStorageMissing = snapshot.storage === null && !snapshot.transientFailure;
             if (snapshot.verified && snapshot.storage !== null) {
-			const accounts = accountManager.getAccountsSnapshot();
+			let accounts = accountManager.getAccountsSnapshot();
 			const sameInventory = accounts.length === disk.accounts.length && accounts.every((a, i) => isSameNativeAccount(a, disk.accounts[i]));
 			if (!sameInventory) {
+				syncNativeAccountCredentials(accountManager, disk);
+				accounts = accountManager.getAccountsSnapshot();
 				accountManager = new AccountManager(undefined, disk);
 				accountManager.setRoutingMutexMode(state.routingMutexMode);
                 // Preserve independently learned limits by identity, never by the old index.
@@ -2921,6 +2934,11 @@ async function handleRequestInner(
                     const current = carryTarget(previous);
                     const live = current && accountManager.getAccountByIndex(current.index);
                     if (!live) continue;
+                    live.enabled = previous.enabled;
+                    if (previous.access === live.access && previous.authInvalidatedAt) {
+                        live.authInvalidatedAt = previous.authInvalidatedAt;
+                        live.authInvalidationErrorCode = previous.authInvalidationErrorCode;
+                    }
                     for (const [key, until] of Object.entries(previous.rateLimitResetTimes)) {
                         if (typeof until === "number" && until > state.now()) live.rateLimitResetTimes[key] = Math.max(live.rateLimitResetTimes[key] ?? 0, until);
                     }
@@ -3360,7 +3378,7 @@ async function handleRequestInner(
                 backoff.delete(key);
 				const scope = state.activeAccountManager.getAccountsSnapshot().flatMap(workspaceModelScopes).find(s=>s.id===key && s.enabled);
     const account = scope ? state.activeAccountManager.getAccountByIndex(scope.accountIndex) : null;
-				if (!account || account.enabled === false || account.authInvalidatedAt ||
+				if (!account || account.enabled === false || state.activeAccountManager.isAccountAuthInvalidated(account) ||
                     (account.cooldownReason === "auth-failure" && (account.coolingDownUntil ?? 0) > state.now())) throw new Error("Account unavailable");
 				const fresh = await ensureFreshAccessToken({					accountManager: state.activeAccountManager, account,
 					family: "codex", model: null, now: state.now(), tokenRefreshSkewMs: state.tokenRefreshSkewMs,
@@ -3962,7 +3980,7 @@ async function handleRequestInner(
 				// A stored record carries accessToken; the transient-grace fallback is a live account (access).
 				const diskToken = (disk as { accessToken?: string } | undefined)?.accessToken ?? (disk as { access?: string } | undefined)?.access;
 				const diskBoundId = disk ? disk.accountId?.trim() || extractAccountId(diskToken)?.trim() : undefined;
-				const stillEligible = disk && disk.enabled !== false && !disk.authInvalidatedAt &&
+				const stillEligible = disk && disk.enabled !== false && !disk.authInvalidatedAt && !accountManager.isAccountAuthInvalidated(refreshed.account) &&
 					(workspace ? workspace.enabled !== false : accountId === diskBoundId);
 				if (!stillEligible) {
 					writeJson(res, 503, {error:{code:"routing_configuration_changed",message:"Routing eligibility changed while preparing the request. Retry with the current configuration."}});
@@ -4066,6 +4084,11 @@ async function handleRequestInner(
 						errorCode: "upstream_redirect_rejected",
 						account: refreshed.account,
 					});
+					return;
+				}
+				if (state.webSocketRequestSent?.()) {
+					writeJson(res, 502, {error: {code: "upstream_websocket_disconnected", message: "Upstream WebSocket request failed; not replayed."}});
+					await usageRecorder.record({outcome: "failure", statusCode: 502, errorCode: "upstream_websocket_disconnected", account: refreshed.account});
 					return;
 				}
 				// A timeout may occur after generation; do not retry within this request.
@@ -4495,6 +4518,13 @@ async function handleRequestInner(
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
+					if (isRecord(event) && (event.type === "error" || event.type === "response.failed") && isTokenInvalidationError(JSON.stringify(event))) {
+						accountManager.markAuthInvalidated(refreshed.account, "token_invalidated");
+						accountManager.recordFailure(refreshed.account, context.family, context.model);
+						applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs);
+						state.sessionAffinityStore?.forgetSession(context.sessionKey);
+						accountManager.saveToDiskDebounced();
+					}
 					const snapshot = readSubscriptionQuotaEvent(event, state.now());
 					if (!snapshot) return;
 					observeQuota(snapshot, snapshot.planType);

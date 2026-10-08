@@ -18,7 +18,16 @@ const TOKEN_INVALIDATION_PHRASES = [
 
 export function isTokenInvalidationError(bodyText: string): boolean {
 	const lower = bodyText.toLowerCase();
-	return TOKEN_INVALIDATION_PHRASES.some((phrase) => lower.includes(phrase));
+	if (TOKEN_INVALIDATION_PHRASES.some((phrase) => lower.includes(phrase))) return true;
+	try {
+		const parsed: unknown = JSON.parse(bodyText);
+		if (!isRecord(parsed)) return false;
+		const response = isRecord(parsed.response) ? parsed.response : undefined;
+		const error = isRecord(response?.error) ? response.error : isRecord(parsed.error) ? parsed.error : parsed;
+		return typeof error.code === "string" && error.code.trim().toLowerCase() === "token_invalidated";
+	} catch {
+		return false;
+	}
 }
 
 export function isTokenRefreshRetryable(result: Extract<TokenResult, { type: "failed" }>): boolean {

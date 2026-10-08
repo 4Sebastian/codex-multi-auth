@@ -140,6 +140,57 @@ it("matches preferences by account identity and workspace ID despite reordered l
  expect(manager.getAccountByIndex(1)?.currentWorkspaceIndex).toBe(0);
 });
 
+describe("native invalidation reconciliation", () => {
+	it("does not restore a marker from an older JWT generation", () => {
+		const storage = fixture();
+		Object.assign(storage.accounts[0]!, {accessToken: `h.${Buffer.from(JSON.stringify({iat: 10})).toString("base64url")}.s`, authInvalidatedAt: 5000});
+		const manager = new AccountManager(undefined, storage);
+		syncNativeAccountCredentials(manager, structuredClone(storage));
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.rateLimitResetTimes.codex).toBe(99999);
+	});
+	it("adopts a successful probe clear without changing credentials", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		delete disk.accounts[0]!.authInvalidatedAt;
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBeUndefined();
+	});
+	it("preserves a newer concurrent invalidation and local disablement", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage), account = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(account, "token_invalidated", 2000);
+		manager.setAccountEnabled(0, false);
+		delete disk.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.authInvalidatedAt).toBe(2000);
+		expect(account.enabled).toBe(false);
+		expect(account.cooldownReason).toBe("auth-failure");
+	});
+	it("preserves a same-millisecond local invalidation across repeated stale reads and a probe clear", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(account, "token_invalidated", 1500);
+		for (let read = 0; read < 2; read++) syncNativeAccountCredentials(manager, structuredClone(storage));
+		const cleared = structuredClone(storage); delete cleared.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, cleared);
+		expect(account.authInvalidatedAt).toBe(1500);
+		expect(account.authInvalidationErrorCode).toBe("token_invalidated");
+		expect(account.cooldownReason).toBe("auth-failure");
+	});
+	it("preserves a quota cooldown when a re-login supersedes invalidation", () => {
+		const storage = fixture(); Object.assign(storage.accounts[0]!, {authInvalidatedAt: 1500, cooldownReason: "network-error"});
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accessToken: "new-access", refreshToken: "new-refresh"});
+		delete disk.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, disk);
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("network-error");
+	});
+});
+
 describe("native account identity", () => {
 	it("matches a stored email that differs only in case and leaves the account alone", () => {
 		const storage = fixture();

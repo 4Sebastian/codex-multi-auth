@@ -1,129 +1,53 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
-import { describe, expect, it } from "vitest";
-
-// Every ~/.codex/auth.json write has to hand the writer the id from
-// codexCliAccountIdFor(): it applies the account's CodexCliMirror (an explicit
-// id the backend refused) and the org-id substitution (#700/#703). A writer
-// that passes account.accountId straight through puts a refused id back into
-// auth.json, and Codex CLI 0.156+ then fails every request.
-
-const ROOT = join(__dirname, "..");
-const WRITER = "lib/codex-cli/writer.ts";
-
-function listSources(dir: string): string[] {
-	return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-		const path = join(dir, entry.name);
-		if (entry.isDirectory()) return listSources(path);
-		return entry.name.endsWith(".ts") ? [path] : [];
-	});
-}
-
-/** The text between the "(" at `open` and its matching ")". */
-function argumentAt(source: string, open: number): string {
-	let depth = 0;
-	for (let i = open; i < source.length; i += 1) {
-		if (source[i] === "(") depth += 1;
-		else if (source[i] === ")") {
-			depth -= 1;
-			if (depth === 0) return source.slice(open + 1, i);
-		}
-	}
-	throw new Error("unbalanced call");
-}
-
-/** The object literal assigned to `name` (`name = {...}`) in `source`. */
-function assignedLiterals(source: string, name: string): string[] {
-	const literals: string[] = [];
-	const pattern = new RegExp(`\\b${name}\\s*=\\s*\\{`, "g");
-	for (const match of source.matchAll(pattern)) {
-		const start = (match.index ?? 0) + match[0].length - 1;
-		let depth = 0;
-		for (let i = start; i < source.length; i += 1) {
-			if (source[i] === "{") depth += 1;
-			else if (source[i] === "}") {
-				depth -= 1;
-				if (depth === 0) {
-					literals.push(source.slice(start, i + 1));
-					break;
-				}
-			}
-		}
-	}
-	return literals;
-}
-
-function accountIdViolation(literal: string, source: string): string | null {
-	const property = /\baccountId\s*:\s*([^\n]+)/.exec(literal);
-	if (property) {
-		return property[1]?.trim().startsWith("codexCliAccountIdFor(")
-			? null
-			: `accountId: ${property[1]?.trim()}`;
-	}
-	if (/(^|[\s{,])accountId\s*,/.test(literal)) {
-		return /\bconst accountId\s*=\s*codexCliAccountIdFor\(/.test(source)
-			? null
-			: "accountId shorthand not from codexCliAccountIdFor()";
-	}
-	return "no accountId";
-}
-
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AccountManager } from "../lib/accounts.js";
+import { clearCodexCliStateCache } from "../lib/codex-cli/state.js";
+import { syncCodexCliActiveSelectionIfDrifted } from "../lib/codex-manager/login-menu-data.js";
+import { persistAndSyncSelectedAccount } from "../lib/codex-manager/persist-selected-account.js";
+import { nativeRateLimitsRpc } from "../lib/runtime/native-rate-limits.js";
+import type { AccountStorageV3 } from "../lib/storage.js";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
+vi.mock("../lib/storage.js", async importOriginal => ({...await importOriginal<typeof import("../lib/storage.js")>(), saveAccounts: vi.fn(async () => {})}));
+const jwt = `h.${Buffer.from(JSON.stringify({sub: "fixture-user", exp: 4102444800, "https://api.openai.com/auth": {chatgpt_account_id: "native-default"}, "https://api.openai.com/profile": {email: "fixture@example.test"}})).toString("base64url")}.s`;
+const fixture = (): AccountStorageV3 => ({version: 3, activeIndex: 0, activeIndexByFamily: {}, accounts: [{accountId: "refused-binding", accountIdSource: "manual", email: "fixture@example.test", accessToken: jwt, refreshToken: "fixture-refresh", expiresAt: 4102444800000, addedAt: 1, lastUsed: 1, codexCliMirror: {forAccountId: "refused-binding", accountId: "native-default"}}]});
+let dir: string;
+beforeEach(async () => {
+	dir = await mkdtemp(join(tmpdir(), "writer-callers-"));
+	vi.stubEnv("CODEX_CLI_AUTH_PATH", join(dir, "auth.json"));
+	vi.stubEnv("CODEX_CLI_ACCOUNTS_PATH", join(dir, "accounts.json"));
+	vi.stubEnv("CODEX_CLI_CONFIG_PATH", join(dir, "config.toml"));
+	vi.stubEnv("CODEX_MULTI_AUTH_SYNC_CODEX_CLI", "1");
+	vi.stubEnv("CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE", "0");
+	clearCodexCliStateCache();
+});
+afterEach(async () => {
+	clearCodexCliStateCache();
+	vi.unstubAllEnvs();
+	await removeWithRetry(dir, {recursive: true, force: true});
+});
+async function writtenAccount() { return JSON.parse(await readFile(join(dir, "auth.json"), "utf8")).tokens.account_id; }
 describe("Codex auth.json writer callers", () => {
-	const sources = [...listSources(join(ROOT, "lib")), join(ROOT, "index.ts")].filter(
-		(path) => relative(ROOT, path).replace(/\\/g, "/") !== WRITER,
-	);
-	const calls = sources.flatMap((path) => {
-		const source = readFileSync(path, "utf-8");
-		return [...source.matchAll(/\bsetCodexCliActiveSelection\(/g)].map((match) => {
-			const argument = argumentAt(
-				source,
-				(match.index ?? 0) + match[0].length - 1,
-			).trim();
-			const literals = argument.startsWith("{")
-				? [argument]
-				: assignedLiterals(source, argument);
-			return { file: relative(ROOT, path), argument, literals, source };
-		});
+	it("writes the mirror identity from runtime account selection", async () => {
+		await new AccountManager(undefined, fixture()).syncCodexCliActiveSelectionForIndex(0);
+		expect(await writtenAccount()).toBe("native-default");
 	});
-
-	it("finds the known writer call sites", () => {
-		expect(calls.length).toBeGreaterThanOrEqual(9);
+	it("writes the mirror identity when the login menu repairs drift", async () => {
+		await writeFile(join(dir, "auth.json"), JSON.stringify({auth_mode: "chatgpt", tokens: {access_token: jwt, refresh_token: "fixture-refresh", account_id: "org-refused-binding"}}));
+		expect(await syncCodexCliActiveSelectionIfDrifted(fixture())).toBe(true);
+		expect(await writtenAccount()).toBe("native-default");
+		expect(await syncCodexCliActiveSelectionIfDrifted(fixture())).toBe(false);
 	});
-
-	it("routes every written account id through codexCliAccountIdFor()", () => {
-		const violations = calls.flatMap(({ file, argument, literals, source }) =>
-			literals.length === 0
-				? [`${file}: cannot resolve argument ${argument}`]
-				: literals.flatMap((literal) => {
-						const violation = accountIdViolation(literal, source);
-						return violation ? [`${file}: ${violation}`] : [];
-					}),
-		);
-		expect(violations).toEqual([]);
+	it("writes the mirror identity after a managed account switch", async () => {
+		await persistAndSyncSelectedAccount({storage: fixture(), targetIndex: 0, parsed: 1, switchReason: "manual"});
+		expect(await writtenAccount()).toBe("native-default");
 	});
-
-	// A module that writes its own auth.json (e.g. an isolated CODEX_HOME for a
-	// native RPC) bypasses the writer, so its literal token object must apply
-	// the same mapping.
-	const literalWrites = sources.flatMap((path) => {
-		const source = readFileSync(path, "utf-8");
-		if (!/["']auth\.json["']/.test(source)) return [];
-		return [...source.matchAll(/\baccount_id\s*[:=]\s*([^,}\n;]+)/g)].map((match) => ({
-			file: relative(ROOT, path),
-			value: match[1]?.trim() ?? "",
-		}));
-	});
-
-	it("finds the literal auth.json token writers", () => {
-		expect(literalWrites.map(({ file }) => file.replace(/\\/g, "/"))).toContain(
-			"lib/runtime/native-rate-limits.ts",
-		);
-	});
-
-	it("routes every literal auth.json account_id through codexCliAccountIdFor()", () => {
-		const violations = literalWrites
-			.filter(({ value }) => !value.startsWith("codexCliAccountIdFor("))
-			.map(({ file, value }) => `${file}: account_id ${value}`);
-		expect(violations).toEqual([]);
+	it("writes the mirror identity into an isolated native RPC home", async () => {
+		const script = join(dir, "rpc.mjs"), seen = join(dir, "seen.json");
+		await writeFile(script, `import {readFileSync,writeFileSync} from 'node:fs';import {createInterface} from 'node:readline';writeFileSync(${JSON.stringify(seen)},readFileSync(process.env.CODEX_HOME+'/auth.json'));createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id!==undefined)console.log(JSON.stringify({id:m.id,result:{}}));});`);
+		const account = fixture().accounts[0]!;
+		await nativeRateLimitsRpc({accessToken: jwt, expiresAt: account.expiresAt!, accountId: account.accountId!, codexCliMirror: account.codexCliMirror}, "account/rateLimits/read", {}, {command: [process.execPath, script], tempRoot: dir});
+		expect(JSON.parse(await readFile(seen, "utf8")).tokens.account_id).toBe("native-default");
 	});
 });

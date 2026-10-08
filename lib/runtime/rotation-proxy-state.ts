@@ -34,6 +34,7 @@ export interface RotationProxyStateInit {
 	routingMutexMode: "enabled" | "legacy";
 	schedulingStrategy: "hybrid" | "sequential";
 	fetchImpl: typeof fetch;
+	webSocketRequestSent?: () => boolean;
 	upstreamBaseUrl: string;
 	clientApiKey: string;
 	now: () => number;

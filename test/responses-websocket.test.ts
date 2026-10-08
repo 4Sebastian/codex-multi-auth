@@ -470,6 +470,25 @@ it("keeps Retry-After and quota headers from a rejected upstream handshake", asy
 	expect(g.responses[0]?.headers.get("x-codex-primary-used-percent")).toBe("100");
 });
 
+it.each(["oversized", "stalled"])("bounds %s native handshake bodies and retains safe revocation metadata", async mode => {
+	const upstream = createServer();
+	let closed = false;
+	upstream.on("upgrade", (_req, socket) => {
+		socket.on("end", () => {closed = true; socket.destroy();});
+		socket.resume();
+		socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 1000000\r\nRetry-After: 120\r\nx-codex-primary-used-percent: 100\r\n\r\nYour authentication token has been invalidated. credential-secret");
+		if (mode === "oversized") socket.write("x".repeat(100000));
+	});
+	const g = await customGateway({upstream, outboundHeaders: {"chatgpt-account-id": "acc_fixture"}});
+	const ws = await g.connect();
+	const events = await turn(ws, {model: "shared", input: []});
+	expect(events.at(-1)).toMatchObject({type: "error", status: 401, error: {code: "token_invalidated"}});
+	expect(JSON.stringify(events)).not.toContain("credential-secret");
+	expect(g.responses[0]?.headers.get("retry-after")).toBe("120");
+	expect(g.responses[0]?.headers.get("x-codex-primary-used-percent")).toBe("100");
+	await vi.waitFor(() => expect(closed).toBe(true));
+});
+
 it("keeps headers carried by a pre-generation error event", async () => {
 	const upstream = createServer();
 	const wss = new WebSocketServer({ server: upstream });

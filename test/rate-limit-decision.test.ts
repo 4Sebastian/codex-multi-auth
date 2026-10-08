@@ -12,6 +12,14 @@ import {
 } from "../lib/request/rate-limit-decision.js";
 
 describe("isTokenInvalidationError", () => {
+	it.each([
+		{error: {code: "token_invalidated", message: "rejected"}},
+		{response: {error: {code: " TOKEN_INVALIDATED "}}},
+		{code: "token_invalidated"},
+		{error: {code: "authentication_error", message: "Your authentication token has been invalidated."}},
+	])("recognizes revocation across terminal and handshake envelopes %j", envelope => {
+		expect(isTokenInvalidationError(JSON.stringify(envelope))).toBe(true);
+	});
 	it("matches known invalidation phrases case-insensitively", () => {
 		expect(
 			isTokenInvalidationError('{"message":"Invalidated OAuth Token"}'),

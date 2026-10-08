@@ -1,6 +1,5 @@
 import { mergeAccountCooldown, mergeAccountSnapshot, mergeAccountRuntimeObservations } from "./storage/snapshot-merge.js";
 import type { Auth } from "@codex-ai/sdk";
-import { decodeJWT } from "./auth/auth.js";
 import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-identity.js";
 export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
@@ -91,6 +90,7 @@ export {
 
 import {
 	codexCliAccountIdFor,
+	isAuthInvalidationSuperseded,
 	extractAccountId,
 	extractAccountEmail,
 	shouldUpdateAccountIdFromToken,
@@ -108,30 +108,6 @@ import {
 
 const log = createLogger("accounts");
 let nextRuntimeCircuitKeyId = 0;
-
-function tokenIssuedAtMs(accessToken: string | undefined): number | null {
-	if (!accessToken) return null;
-	const issuedAt = decodeJWT(accessToken)?.iat;
-	if (typeof issuedAt !== "number" || !Number.isFinite(issuedAt) || issuedAt <= 0) {
-		return null;
-	}
-	return issuedAt * 1_000;
-}
-
-function isAuthInvalidationSuperseded(
-	accessToken: string | undefined,
-	invalidatedAt: number | undefined,
-): boolean {
-	if (
-		typeof invalidatedAt !== "number" ||
-		!Number.isFinite(invalidatedAt) ||
-		invalidatedAt <= 0
-	) {
-		return false;
-	}
-	const issuedAt = tokenIssuedAtMs(accessToken);
-	return issuedAt !== null && issuedAt > invalidatedAt;
-}
 
 function getAccountCircuitKey(account: ManagedAccount): string {
 	if (!account.circuitKeyId) {
@@ -606,6 +582,7 @@ export class AccountManager {
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
 						codexCliMirror: account.codexCliMirror,
 					};
+					this.nativeAuthSnapshots.set(managedAccount, {authInvalidatedAt: account.authInvalidatedAt, enabled: account.enabled !== false});
 					this.clearSupersededAuthInvalidation(managedAccount);
 					return managedAccount;
 				})
@@ -741,6 +718,10 @@ export class AccountManager {
 			const saved = (matches.length === 1 ? matches[0] : undefined) ?? account;
 			this.persistedWorkspaceSelections.set(account, saved.workspaces?.[saved.currentWorkspaceIndex ?? 0]?.id);
 			this.persistedWorkspaces.set(account, structuredClone(saved.workspaces));
+			if (snapshot) this.nativeAuthSnapshots.set(account, {
+				authInvalidatedAt: saved.authInvalidatedAt,
+				enabled: saved.enabled !== false,
+			});
 		});
 		this.hadPersistedStorage ||= existsSync(this.resolveSelectionStoragePath());
 	}
@@ -1522,6 +1503,8 @@ export class AccountManager {
 		errorCode = "token_invalidated",
 		invalidatedAt = nowMs(),
 	): void {
+		const prior = this.nativeAuthSnapshots.get(account);
+		if (prior) this.nativeAuthSnapshots.set(account, {...prior, authInvalidatedAt: undefined});
 		account.authInvalidatedAt = invalidatedAt;
 		account.authInvalidationErrorCode = errorCode;
 	}
@@ -1531,11 +1514,39 @@ export class AccountManager {
 		delete account.authInvalidationErrorCode;
 	}
 
+	private readonly nativeAuthSnapshots = new WeakMap<ManagedAccount, {authInvalidatedAt?: number; enabled: boolean}>();
+
+	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}): boolean {
+		const prior = this.nativeAuthSnapshots.get(account);
+		const before = account.authInvalidatedAt;
+		const wasEnabled = account.enabled !== false;
+		const enabled = disk.enabled !== false;
+		if (!prior || enabled !== prior.enabled) account.enabled = enabled;
+		const diskInvalidatedAt = isAuthInvalidationSuperseded(disk.accessToken, disk.authInvalidatedAt) ? undefined : disk.authInvalidatedAt;
+		if (diskInvalidatedAt) {
+			if (!before || diskInvalidatedAt > before || disk.accessToken !== account.access) {
+				account.authInvalidatedAt = diskInvalidatedAt;
+				account.authInvalidationErrorCode = disk.authInvalidationErrorCode;
+			}
+		} else if (isAuthInvalidationSuperseded(disk.accessToken, before) ||
+			(disk.accessToken !== account.access && !!disk.accessToken) ||
+			(prior?.authInvalidatedAt === before && prior?.authInvalidatedAt !== undefined)) {
+			this.clearAuthInvalidation(account);
+			if (account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
+		}
+		const observedInvalidation = before && before !== prior?.authInvalidatedAt && account.authInvalidatedAt === before
+			? prior?.authInvalidatedAt
+			: diskInvalidatedAt;
+		this.nativeAuthSnapshots.set(account, {authInvalidatedAt: observedInvalidation, enabled});
+		return before !== account.authInvalidatedAt || wasEnabled !== (account.enabled !== false);
+	}
+
 	private clearSupersededAuthInvalidation(account: ManagedAccount): boolean {
 		if (!isAuthInvalidationSuperseded(account.access, account.authInvalidatedAt)) {
 			return false;
 		}
 		this.clearAuthInvalidation(account);
+		if (account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
 		return true;
 	}
 

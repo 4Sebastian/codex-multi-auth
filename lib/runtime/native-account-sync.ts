@@ -38,18 +38,7 @@ export function syncNativeAccountCredentials(
 			changed = true;
 			continue;
 		}
-		if ((account.enabled !== false) !== (disk.enabled !== false)) {
-			account.enabled = disk.enabled;
-			changed = true;
-		}
-		if (
-			disk.authInvalidatedAt &&
-			disk.authInvalidatedAt !== account.authInvalidatedAt
-		) {
-			account.authInvalidatedAt = disk.authInvalidatedAt;
-			account.authInvalidationErrorCode = disk.authInvalidationErrorCode;
-			changed = true;
-		}
+		changed = manager.syncAuthInvalidationFromSnapshot(account, disk) || changed;
 		if (
 			disk.accessToken === account.access &&
 			disk.refreshToken === account.refreshToken &&
@@ -59,9 +48,7 @@ export function syncNativeAccountCredentials(
 		account.access = disk.accessToken;
 		account.refreshToken = disk.refreshToken;
 		account.expires = disk.expiresAt;
-		if (disk.accessToken && disk.refreshToken && !disk.authInvalidatedAt) {
-			delete account.authInvalidatedAt;
-			delete account.authInvalidationErrorCode;
+		if (disk.accessToken && disk.refreshToken && !manager.isAccountAuthInvalidated(account)) {
 			if (account.cooldownReason === "auth-failure")
 				manager.clearAccountCooldown(account);
 		}

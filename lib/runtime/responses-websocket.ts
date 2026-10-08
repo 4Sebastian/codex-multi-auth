@@ -1,3 +1,4 @@
+import { isTokenInvalidationError } from "../request/rate-limit-decision.js";
 import { ClientCancellationError } from "../request/client-cancellation.js";
 import type { Duplex } from "node:stream";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -19,7 +20,7 @@ const terminal = new Set([
 ]);
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
-type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
+type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string; requestSent?: boolean };
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -113,6 +114,7 @@ class SocketSession {
 		init: RequestInit,
 		context: Context,
 	): Promise<Response> {
+        context.requestSent = false;
         if (context.signal.aborted || this.closed) throw new ClientCancellationError();
 		const url = new URL(String(input));
 		url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -207,22 +209,40 @@ class SocketSession {
 						reject(context.signal.aborted ? new ClientCancellationError() : Error("Upstream WebSocket connection failed"));
 					});
 					opening.once("unexpected-response", (_request, response) => {
-						cleanup();
-						response.resume();
-						const status = response.statusCode ?? 502;
-						resolve(
-							Response.json(
-								{
-									error: {
-										code: "websocket_handshake_rejected",
-										message: "Upstream rejected the WebSocket handshake.",
-									},
-								},
-								// Retry-After and x-codex-* quota headers drive cooldowns.
-								{ status: status >= 400 && status <= 599 ? status : 502, headers: upstreamHeaders(response.headers) },
-							),
-						);
-						opening.terminate();
+						const chunks: Buffer[] = [];
+						let size = 0;
+						let done = false;
+						const finish = () => {
+							if (done) return;
+							done = true;
+							clearTimeout(timer);
+							cleanup();
+							response.off("data", onData);
+							init.signal?.removeEventListener("abort", cancel);
+							context.signal.removeEventListener("abort", cancel);
+							const revoked = isTokenInvalidationError(Buffer.concat(chunks).toString("utf8"));
+							const status = response.statusCode ?? 502;
+							resolve(Response.json({error: {
+								code: revoked ? "token_invalidated" : "websocket_handshake_rejected",
+								message: revoked ? "OAuth token has been invalidated. Please re-login." : "Upstream rejected the WebSocket handshake.",
+							}}, {status: revoked ? 401 : status >= 400 && status <= 599 ? status : 502, headers: upstreamHeaders(response.headers)}));
+							response.destroy();
+							opening.terminate();
+						};
+						const onData = (chunk: Buffer) => {
+							const remaining = 64 * 1024 - size;
+							chunks.push(chunk.subarray(0, remaining));
+							size += chunk.length;
+							if (size >= 64 * 1024) finish();
+						};
+						const cancel = () => { finish(); response.destroy(); };
+						const timer = setTimeout(finish, 1000);
+						init.signal?.addEventListener("abort", cancel, {once: true});
+						context.signal.addEventListener("abort", cancel, {once: true});
+						response.on("data", onData);
+						response.once("end", finish);
+						response.once("error", finish);
+						response.once("close", finish);
 					});
 				},
 			);
@@ -268,7 +288,7 @@ class SocketSession {
                     ? new ClientCancellationError()
                     : Error("Upstream WebSocket disconnected");
                 if (accepted) streamController.error(error);
-                else if (cancelled) reject(error);
+                else if (cancelled || !context.requestSent) reject(error);
                 else {
                     // A sent create has an ambiguous outcome. Return a terminal
                     // stream error so the HTTP router cannot retry generation.
@@ -277,14 +297,19 @@ class SocketSession {
                     }));
                 }
 			};
-			const abort = () => active.terminate();
+			const abort = () => { active.terminate(); onClose(); };
 			const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
 				try {
 					if (isBinary) throw Error("Unexpected binary response");
-					const text = raw.toString();
-					const event: unknown = JSON.parse(text);
+					let text = raw.toString();
+					let event: unknown = JSON.parse(text);
 					if (!isRecord(event) || typeof event.type !== "string")
 						throw Error("Invalid response event");
+					if ((event.type === "error" || event.type === "response.failed") && isTokenInvalidationError(text)) {
+						event = wireError("token_invalidated", 401);
+						text = JSON.stringify(event);
+					}
+					if (!isRecord(event) || typeof event.type !== "string") throw Error("Invalid response event");
 					if (event.type === "error" && !accepted) {
 						finished = true;
 						cleanup();
@@ -340,6 +365,7 @@ class SocketSession {
 				return;
 			}
 			this.stats.upstreamRequests++;
+			context.requestSent = true;
 			active.send(JSON.stringify(body), (error) => {
 				if (error) onClose();
 			});
@@ -392,6 +418,9 @@ export class ResponsesWebSocketGateway {
 			return context.session.fetch(input, init, context);
 		return this.upstreamFetch(input, init);
 	};
+	requestSent(): boolean {
+		return this.scope.getStore()?.requestSent === true;
+	}
 	handle(req: IncomingMessage, handler: () => Promise<void>): void {
 		const id = req.headers[CONTEXT_HEADER];
 		delete req.headers[CONTEXT_HEADER];
