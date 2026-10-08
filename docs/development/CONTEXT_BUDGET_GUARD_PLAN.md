@@ -248,7 +248,7 @@ instance — no shared mutable state between the two pipelines):
    the pre-flight advisory was `"soft"`.
 
 The same runtime-proxy guard also covers each persistent WebSocket `response.create`.
-It evaluates the stable session key before account selection, emits a local pause event for a hard advisory, and updates the guard from normalized terminal Responses usage.
+Custom-provider/Pi sockets evaluate the stable session key before account selection. A hard advisory records a blocked request and closes the client connection; it does not emit a local pause event. Native OpenAI turns use the HTTP guard lifecycle through `ResponsesWebSocketGateway`. Both transports update the guard from normalized terminal Responses usage.
 Replay carries the prepared logical request, so account failover or a pre-event reconnect does not update the guard or usage ledger twice.
 Terminal usage is normalized through the shared Responses extraction path, so reasoning tokens are not counted twice as retained output and service-tier pricing metadata remains available to the usage ledger.
 

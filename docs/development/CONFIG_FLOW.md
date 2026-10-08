@@ -92,7 +92,7 @@ For dashboard display values:
    - **Any other request-bearing command** — create a temporary shadow `CODEX_HOME` and rewrite its `config.toml` to use `codex-multi-auth-runtime-proxy`.
 5. Forward official Codex with the selected home.
 6. HTTP/SSE handling selects or refreshes managed accounts and rotates on rate limit, auth, network, or server failure before streaming starts.
-7. WebSocket handling binds one account per connection, applies policy and usage governance to every `response.create`, and makes handshake or reconnect failover decisions from the same bounded account-routing controls.
+7. Custom-provider/Pi WebSockets bind one account per upstream connection and use drain-first selection. Each `response.create` passes policy and usage governance, with bounded handshake or reconnect failover. Native OpenAI WebSockets use `ResponsesWebSocketGateway` and route each turn through native HTTP authentication, policy, catalogs, and account or API pools. Native ambiguously sent creates are not replayed.
 8. On process exit, shadow-home transports sync refreshed official Codex state files back and remove the shadow home. The canonical-home transport wrote state in place, so there is nothing to sync.
 
 Independently of the transport, the wrapper reconciles the top-level `cli_auth_credentials_store = "file"` assignment in the real `~/.codex/config.toml` at startup (idempotent; see `lib/codex-cli/writer.ts`). That is the only key this project persists into the official config.

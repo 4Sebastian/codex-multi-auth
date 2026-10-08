@@ -1,7 +1,10 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as pendingAuth from "../lib/storage/pending-auth.js";
+import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
+import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
 import { AccountManager } from "../lib/accounts.js";
 import { saveAccounts, loadAccounts, getStoragePath, clearAccounts, setStoragePathDirect, cloneTrackedAccountStorage, withAccountAndFlaggedStorageTransaction } from "../lib/storage.js";
 import { withRetry } from "../lib/fs-retry.js";
@@ -15,6 +18,46 @@ async function setup() {
     await saveAccounts({ version: 3, activeIndex: 0, accounts: [{ recordId: "first", accountId: "first", refreshToken: "fixture-first", addedAt: 1, lastUsed: 1, workspaces: [{ id: "personal", enabled: true }, { id: "business", enabled: true }], currentWorkspaceIndex: 0 }] });
     return new AccountManager(undefined, await loadAccounts());
 }
+it("orders delayed native snapshots before durable invalidation and later probe recovery", async () => {
+    await setup();
+    const initial = (await loadAccounts())!;
+    initial.accounts[0]!.accessToken = "fixture-access";
+    initial.accounts[0]!.expiresAt = Date.now() + 3600000;
+    await saveAccounts(initial);
+    const manager = new AccountManager(undefined, await loadAccounts()), account = manager.getAccountByIndex(0)!;
+    const read = createNativeAccountStorageReader(undefined, getStoragePath());
+    let release!: () => void, captured!: () => void;
+    const barrier = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {captured = resolve;});
+    const apply = pendingAuth.applyPendingAuth;
+    const overlay = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementationOnce(async (path, storage) => {captured(); await barrier; return apply(path, storage);});
+    try {
+        const oldRead = read();
+        await ready;
+        manager.markAuthInvalidated(account, "token_invalidated", 1500);
+        manager.markAccountCoolingDown(account, 60000, "auth-failure");
+        manager.setAccountEnabled(0, false);
+        account.rateLimitResetTimes["codex:unrelated"] = Date.now() + 60000;
+        await manager.saveToDisk();
+        expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(1500);
+        release();
+        const old = await oldRead;
+        syncNativeAccountCredentials(manager, old.storage!, old.capturedAt);
+        expect(account.authInvalidatedAt).toBe(1500);
+        expect(account.enabled).toBe(false);
+        expect(account.cooldownReason).toBe("auth-failure");
+        const persisted = (await loadAccounts())!;
+        delete persisted.accounts[0]!.authInvalidatedAt;
+        delete persisted.accounts[0]!.authInvalidationErrorCode;
+        await saveAccounts(persisted);
+        const fresh = await read();
+        syncNativeAccountCredentials(manager, fresh.storage!, fresh.capturedAt);
+        expect(account.authInvalidatedAt).toBeUndefined();
+        expect(account.cooldownReason).toBeUndefined();
+        expect(account.enabled).toBe(false);
+        expect(account.rateLimitResetTimes["codex:unrelated"]).toBeGreaterThan(Date.now());
+    } finally {release(); overlay.mockRestore();}
+});
+
 it("does not overwrite a CLI workspace exclusion or account addition across repeated daemon saves", async () => {
     const manager = await setup(), cli = (await loadAccounts())!;
     cli.accounts[0]!.workspaces![1]!.enabled = false;

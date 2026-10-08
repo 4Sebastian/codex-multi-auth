@@ -1439,11 +1439,12 @@ function websocketTerminalUsage(
 	const body = rawDataToBuffer(data);
 	const parsed = parseRequestBody(body);
 	if (!parsed) return null;
-	const type = readStringRecordValue(parsed, "type");
+	const response = isRecord(parsed.response) ? parsed.response : null;
+	let type = readStringRecordValue(parsed, "type");
+	if (type === "response.done") type = `response.${readStringRecordValue(response ?? {}, "status") ?? "completed"}`;
 	let outcome: "success" | "failure" | "cancelled";
 	if (
 		type === "response.completed" ||
-		type === "response.done" ||
 		type === "response.incomplete"
 	) {
 		outcome = "success";
@@ -1454,7 +1455,6 @@ function websocketTerminalUsage(
 	} else {
 		return null;
 	}
-	const response = isRecord(parsed.response) ? parsed.response : null;
 	const usage = extractResponsesUsage(parsed);
 	const error = response && isRecord(response.error)
 		? response.error
@@ -2058,7 +2058,7 @@ async function connectManagedWebSocket(
 				if (isTokenInvalidationError(bodyText)) {
 					accountManager.markAuthInvalidated(
 						account,
-						errorCode ?? "token_invalidated",
+						"token_invalidated",
 					);
 					applyMonotonicAuthCooldown(
 						accountManager,
@@ -2240,6 +2240,10 @@ function bridgeWebSocketConnection(
 	): Promise<void> => {
 		if (closed) {
 			if (preparedHandshake) settlePendingHandshake("cancelled", "client_websocket_closed");
+			else if (readStringRecordValue(parseRequestBody(rawDataToBuffer(frame.data)) ?? {}, "type") === "response.create") {
+				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame.data);
+				await request.usageRecorder.record({outcome: "failure", errorCode: "client_websocket_closed"});
+			}
 			return;
 		}
 		if (upstream?.readyState !== WebSocket.OPEN || (hasConnectionScopedContinuation(frame) && frame.upstreamConnection !== upstream)) {
@@ -2253,6 +2257,7 @@ function bridgeWebSocketConnection(
 			}
 			return;
 		}
+		const forwardingUpstream = upstream;
 		let request = preparedHandshake?.request ?? frame.request;
 		let consumedForFrame = false;
 		if (!request) {
@@ -2262,6 +2267,20 @@ function bridgeWebSocketConnection(
 				return;
 			}
 			request = await prepareWebSocketRequest(state, req, frame.data);
+			if (closed) {
+				await request.usageRecorder.record({outcome: "failure", errorCode: "client_websocket_closed"});
+				return;
+			}
+			if (upstream !== forwardingUpstream || upstream.readyState !== WebSocket.OPEN) {
+				if (hasConnectionScopedContinuation(frame)) {
+					await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
+					reportConnectionScopedContinuationLoss();
+				} else {
+					pending.push({...frame, request});
+					void initialize();
+				}
+				return;
+			}
 			if (!boundAccountManager || !boundAccount) {
 				throw createRuntimeProxyHttpError(
 					"The account bound to this WebSocket connection is unavailable.",
@@ -2277,6 +2296,13 @@ function bridgeWebSocketConnection(
 				);
 			} catch (error) {
 				if (!isRecoverableWebSocketAccountError(error)) throw error;
+				if (activeRequests.length > 0) {
+					void request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_active_turn_interrupted", account: boundAccount});
+					settleAll("failure", "websocket_active_turn_interrupted");
+					settlePending("failure", "websocket_active_turn_interrupted");
+					closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Active WebSocket turn interrupted");
+					return;
+				}
 				const staleUpstream = upstream;
 				const staleAccount = boundAccount;
 				upstream = null;
@@ -2447,6 +2473,7 @@ function bridgeWebSocketConnection(
 			}
 			state.status.streamsStarted += 1;
 			connectedUpstream.on("message", (data, isBinary) => {
+				if (closed || upstream !== connectedUpstream) return;
 				const active = activeRequests[0];
 				if (active) active.sawUpstreamEvent = true;
 				const terminal = websocketTerminalUsage(data);
@@ -2488,7 +2515,7 @@ function bridgeWebSocketConnection(
 				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
 			});
 			connectedUpstream.on("close", (code, reason) => {
-				if (upstream !== connectedUpstream) return;
+				if (closed || upstream !== connectedUpstream) return;
 				upstream = null;
 				boundAccountManager = null;
 				boundAccount = null;
@@ -2525,6 +2552,7 @@ function bridgeWebSocketConnection(
 				mirrorWebSocketClose(client, code, reason);
 			});
 			connectedUpstream.on("error", (error) => {
+				if (closed || upstream !== connectedUpstream) return;
 				state.status.lastError = error.message;
 				connectedUpstream.terminate();
 			});
@@ -2657,8 +2685,7 @@ export async function startRuntimeRotationProxy(
 	);
 	const tokenRefreshSkewMs = getTokenRefreshSkewMs(pluginConfig);
 	const networkErrorCooldownMs = getNetworkErrorCooldownMs(pluginConfig);
-	const serverErrorCooldownMs =
-		options.serverErrorCooldownMs ?? getServerErrorCooldownMs(pluginConfig);
+	const serverErrorCooldownMs = getServerErrorCooldownMs(pluginConfig);
 	// Normalize the explicit option as well as the env var: a caller passing a
 	// negative or multi-hour value would otherwise bypass the documented cap.
 	// `0` stays 0, since it is the documented kill switch.
@@ -2904,11 +2931,12 @@ async function handleRequestInner(
                 return;
             }
             nativeStorageMissing = snapshot.storage === null && !snapshot.transientFailure;
-            if (snapshot.verified && snapshot.storage !== null) {
+            if (snapshot.verified && snapshot.storage !== null && accountManager.getAccountsSnapshot().every(account => accountManager.isNativeSnapshotCurrent(account, snapshot.capturedAt))) {
 			let accounts = accountManager.getAccountsSnapshot();
 			const sameInventory = accounts.length === disk.accounts.length && accounts.every((a, i) => isSameNativeAccount(a, disk.accounts[i]));
 			if (!sameInventory) {
-				syncNativeAccountCredentials(accountManager, disk);
+				syncNativeAccountCredentials(accountManager, disk, snapshot.capturedAt);
+				const previousManager = accountManager;
 				accounts = accountManager.getAccountsSnapshot();
 				accountManager = new AccountManager(undefined, disk);
 				accountManager.setRoutingMutexMode(state.routingMutexMode);
@@ -2934,6 +2962,8 @@ async function handleRequestInner(
                     const current = carryTarget(previous);
                     const live = current && accountManager.getAccountByIndex(current.index);
                     if (!live) continue;
+                    const previousLive = previousManager.getAccountByIndex(previous.index);
+                    if (previousLive) accountManager.inheritNativeAuthObservation(live, previousManager, previousLive);
                     live.enabled = previous.enabled;
                     if (previous.access === live.access && previous.authInvalidatedAt) {
                         live.authInvalidatedAt = previous.authInvalidatedAt;
@@ -2953,7 +2983,7 @@ async function handleRequestInner(
 				state.knownAccountManagers.add(accountManager);
 				state.modelCatalog = undefined;
                 state.modelCatalogs?.clear();
-			} else if (syncNativeAccountCredentials(accountManager, disk)) {
+			} else if (syncNativeAccountCredentials(accountManager, disk, snapshot.capturedAt)) {
 				state.modelCatalog = undefined;
                 state.modelCatalogs?.clear();
 			}
@@ -3783,6 +3813,7 @@ async function handleRequestInner(
 			if (!selected) {
 				if (
 					!reloadedAfterNoAccount &&
+					!(state.nativeOpenai && state.readNativeAccountStorage) &&
 					!isPinned &&
 					accountCount > 0 &&
 					exhaustionReason === "no-account" &&
@@ -4518,7 +4549,7 @@ async function handleRequestInner(
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (isRecord(event) && (event.type === "error" || event.type === "response.failed") && isTokenInvalidationError(JSON.stringify(event))) {
+					if (isRecord(event) && (event.type === "error" || event.type === "response.failed" || event.type === "response.done") && isTokenInvalidationError(JSON.stringify(event))) {
 						accountManager.markAuthInvalidated(refreshed.account, "token_invalidated");
 						accountManager.recordFailure(refreshed.account, context.family, context.model);
 						applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs);

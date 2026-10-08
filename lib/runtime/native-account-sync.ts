@@ -27,18 +27,19 @@ export function isSameNativeAccount(account: Identity, disk: Identity | undefine
 export function syncNativeAccountCredentials(
 	manager: AccountManager,
 	storage: AccountStorageV3,
+	capturedAt = performance.now(),
 ): boolean {
-	let changed = manager.syncWorkspaceSelections(storage);
+	let changed = manager.syncWorkspaceSelections(storage, capturedAt);
 	for (const snapshot of manager.getAccountsSnapshot()) {
 		const account = manager.getAccountByIndex(snapshot.index);
-		if (!account) continue;
+		if (!account || !manager.isNativeSnapshotCurrent(account, capturedAt)) continue;
 		const disk = storage.accounts.find((a) => isSameNativeAccount(account, a));
 		if (!disk) {
-			account.enabled = false;
+			manager.setAccountEnabled(account.index, false);
 			changed = true;
 			continue;
 		}
-		changed = manager.syncAuthInvalidationFromSnapshot(account, disk) || changed;
+		changed = manager.syncAuthInvalidationFromSnapshot(account, disk, capturedAt) || changed;
 		if (
 			disk.accessToken === account.access &&
 			disk.refreshToken === account.refreshToken &&

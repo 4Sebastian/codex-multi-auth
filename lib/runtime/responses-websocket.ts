@@ -1,3 +1,4 @@
+import { extractResponsesUsage } from "../usage/usage-extraction.js";
 import { isTokenInvalidationError } from "../request/rate-limit-decision.js";
 import { ClientCancellationError } from "../request/client-cancellation.js";
 import type { Duplex } from "node:stream";
@@ -13,6 +14,7 @@ import { ResponseOutputHistory, hasOrphanToolResult } from "./response-output-hi
 const CONTEXT_HEADER = "x-local-responses-transport";
 const terminal = new Set([
 	"response.completed",
+	"response.done",
 	"response.failed",
 	"response.incomplete",
 	"response.cancelled",
@@ -305,12 +307,21 @@ class SocketSession {
 					let event: unknown = JSON.parse(text);
 					if (!isRecord(event) || typeof event.type !== "string")
 						throw Error("Invalid response event");
-					if ((event.type === "error" || event.type === "response.failed") && isTokenInvalidationError(text)) {
-						event = wireError("token_invalidated", 401);
+					if ((event.type === "error" || event.type === "response.failed" || event.type === "response.done") && isTokenInvalidationError(text)) {
+						const source = isRecord(event.response) ? event.response : event;
+						const response: Json = {status: "failed", error: {type: "authentication_error", code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}};
+						if (typeof source.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(source.id)) response.id = source.id;
+						const counts = extractResponsesUsage(event);
+						if (counts) {
+							response.usage = {input_tokens: counts.inputTokens, output_tokens: counts.outputTokens + counts.reasoningTokens, total_tokens: counts.totalTokens,
+								input_tokens_details: {cached_tokens: counts.cachedInputTokens}, output_tokens_details: {reasoning_tokens: counts.reasoningTokens}};
+							if (counts.serviceTier) response.service_tier = counts.serviceTier;
+						}
+						event = {type: event.type, status: 401, error: response.error, response};
 						text = JSON.stringify(event);
 					}
 					if (!isRecord(event) || typeof event.type !== "string") throw Error("Invalid response event");
-					if (event.type === "error" && !accepted) {
+					if (event.type === "error" && !accepted && !extractResponsesUsage(event)) {
 						finished = true;
 						cleanup();
 						const status =

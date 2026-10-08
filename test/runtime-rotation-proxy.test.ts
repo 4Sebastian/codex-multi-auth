@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { createServer } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
+import * as pendingAuth from "../lib/storage/pending-auth.js";
 import * as nativeStorageReader from "../lib/runtime/native-account-storage.js";
 import * as tokenRefreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1817,13 +1818,12 @@ describe("runtime rotation proxy", () => {
 		});
 		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
 		const { fetchImpl } = createRecordingFetch(() => textEventStream());
+		const previousCooldown = process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
+		process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS = "1000";
 		const proxy = await startProxy({
 			accountManager,
 			fetchImpl,
-			options: {
-				upstreamBaseUrl: upstream.baseUrl,
-				serverErrorCooldownMs: 1_000,
-			},
+			options: {upstreamBaseUrl: upstream.baseUrl},
 		});
 		const socket = await connectWebSocket(
 			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
@@ -1846,6 +1846,8 @@ describe("runtime rotation proxy", () => {
 			await upstream.close();
 			evaluatePolicy.mockRestore();
 			usageRecorder.mockRestore();
+			if (previousCooldown === undefined) delete process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
+			else process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS = previousCooldown;
 		}
 	});
 
@@ -6646,47 +6648,120 @@ describe("review transport boundary regressions", () => {
 		} finally { client.terminate(); await upstream.close(); }
 	});
 
-	it.each(["token_invalidated", "authentication_error"])("classifies native handshake revocation %s without leaking raw errors", async code => {
+	it.each([false, true])("normalizes custom/native handshake revocation, native=%s", async native => {
 		const upstream = createHttpServer();
 		let attempts = 0;
 		upstream.on("upgrade", (_req, socket) => {
 			attempts++;
-			const body = JSON.stringify({error: {code, message: "Your authentication token has been invalidated. credential-secret"}});
+			const body = JSON.stringify({error: {code: "authentication_error", message: "Your authentication token has been invalidated. credential-secret"}});
 			socket.end(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
 		});
 		upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
 		const address = upstream.address(); if (!address || typeof address === "string") throw Error("Missing address");
 		const manager = new AccountManager(undefined, createStorage(Date.now()));
-		const proxy = await startProxy({accountManager: manager, fetchImpl: async () => Response.json({models: [{slug: "shared"}]}), options: {nativeOpenai: true, upstreamBaseUrl: `http://127.0.0.1:${address.port}`}});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: async () => Response.json({models: [{slug: "shared"}]}), options: {nativeOpenai: native, upstreamBaseUrl: `http://127.0.0.1:${address.port}`}});
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
-			const result = nextWebSocketMessage(client);
+			const result = native ? nextWebSocketMessage(client) : nextWebSocketClose(client);
 			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
-			const text = await result;
-			expect(JSON.parse(text).error.code).toBe("token_invalidated");
-			expect(text).not.toContain("credential-secret");
+			const outcome = await result;
+			if (typeof outcome === "string") {
+				expect(JSON.parse(outcome).error.code).toBe("token_invalidated");
+				expect(outcome).not.toContain("credential-secret");
+			} else expect(outcome.code).toBe(1008);
 			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeDefined();
+			expect(manager.getAccountByIndex(0)?.authInvalidationErrorCode).toBe("token_invalidated");
 			expect(attempts).toBe(1);
 		} finally { client.terminate(); await new Promise<void>(resolve => upstream.close(() => resolve())); }
 	});
 
-	it("persists native revocation after visible output without replaying", async () => {
+	it.each(["response.failed", "response.done", "error"].flatMap(type => [{type, visible: true}, {type, visible: false}]))("preserves billed priority usage while sanitizing native %j", async ({type, visible}) => {
 		let creates = 0;
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
 		const manager = new AccountManager(undefined, createStorage(Date.now()));
 		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.once("message", () => {
 			creates++;
-			ws.send(JSON.stringify({type: "response.created", response: {id: "visible"}}));
-			ws.send(JSON.stringify({type: "response.failed", response: {error: {code: "authentication_error", message: "Your authentication token has been invalidated."}}}));
+			if (visible) ws.send(JSON.stringify({type: "response.output_text.delta", response_id: "visible", delta: "Visible output"}));
+			ws.send(JSON.stringify({type, response: {id: "visible", status: "failed", service_tier: "priority", usage: {input_tokens: 1000, output_tokens: 500, total_tokens: 1500, input_tokens_details: {cached_tokens: 200}, output_tokens_details: {reasoning_tokens: 300}}, error: {code: "authentication_error", message: "Your authentication token has been invalidated. credential-secret", access_token: "credential-secret"}}}));
 		})});
-		const proxy = await startProxy({accountManager: manager, fetchImpl: async () => Response.json({models: [{slug: "shared"}]}), options: {nativeOpenai: true, upstreamBaseUrl: upstream.baseUrl}});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: async () => Response.json({models: [{slug: "gpt-6-astra"}]}), options: {nativeOpenai: true, upstreamBaseUrl: upstream.baseUrl}});
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
-			const types: string[] = []; client.on("message", raw => types.push(JSON.parse(raw.toString()).type));
-			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
-			await vi.waitFor(() => expect(types).toEqual(["response.created", "error"]));
+			const events: Array<Record<string, unknown>> = []; client.on("message", raw => events.push(JSON.parse(raw.toString())));
+			client.send(JSON.stringify({type: "response.create", model: "gpt-6-astra", input: []}));
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			if (visible) expect(events[0]?.type).toBe("response.output_text.delta");
+			expect(events[visible ? 1 : 0]).toMatchObject({type, response: {id: "visible", status: "failed", service_tier: "priority", error: {code: "token_invalidated"}, usage: {input_tokens: 1000, output_tokens: 500, total_tokens: 1500, input_tokens_details: {cached_tokens: 200}, output_tokens_details: {reasoning_tokens: 300}}}});
+			expect(JSON.stringify(events)).not.toContain("credential-secret");
+			const billed = await append.mock.results[0]!.value as Awaited<ReturnType<typeof usageLedger.appendUsageLedgerRow>>;
+			expect(billed).toMatchObject({outcome: "failure", tokens: {inputTokens: 1000, outputTokens: 200, cachedInputTokens: 200, reasoningTokens: 300, totalTokens: 1500, serviceTier: "priority"}});
+			expect(billed.costUsd).toBe(estimateUsageCostUsd("gpt-6-astra", billed.tokens));
+			expect(billed.costUsd).toBeGreaterThan(estimateUsageCostUsd("gpt-6-astra", {...billed.tokens, serviceTier: "standard"})!);
 			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeDefined();
 			expect(creates).toBe(1);
-		} finally {client.terminate(); await upstream.close();}
+		} finally {client.terminate(); await upstream.close(); append.mockRestore();}
+	});
+
+	it.each(["failed", "cancelled", "completed", "incomplete"])("classifies custom response.done status=%s", async status => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const success = vi.spyOn(manager, "recordSuccess");
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.once("message", () => {
+			ws.send(JSON.stringify({type: "response.done", response: {id: "done-outcome", status, usage: {input_tokens: 10, output_tokens: 2}, ...(status === "failed" ? {error: {code: "token_invalidated"}} : {})}}));
+		})});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const result = nextWebSocketMessage(client);
+			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+			const event = JSON.parse(await result);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			const billed = await append.mock.results[0]!.value as Awaited<ReturnType<typeof usageLedger.appendUsageLedgerRow>>;
+			expect(billed.outcome).toBe(status === "failed" ? "failure" : status === "cancelled" ? "cancelled" : "success");
+			expect(billed.tokens).toMatchObject({inputTokens: 10, outputTokens: 2});
+			expect(success).toHaveBeenCalledTimes(status === "failed" || status === "cancelled" ? 1 : 2);
+			if (status === "failed") {
+				expect(event.error.code).toBe("token_invalidated");
+				expect(manager.getAccountByIndex(0)?.authInvalidationErrorCode).toBe("token_invalidated");
+				await vi.waitFor(() => expect(client.readyState).toBe(WebSocket.CLOSED));
+			} else expect(event.response.status).toBe(status);
+		} finally {client.terminate(); await upstream.close(); append.mockRestore(); success.mockRestore();}
+	});
+
+	it("closes overlapping visible custom turns before account replacement", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now()));
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let oldProxySocket: WebSocket | undefined;
+		let connections = 0, creates = 0;
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {
+			connections++;
+			ws.on("message", () => {creates++; ws.send(JSON.stringify({type: "response.output_text.delta", response_id: "turn-A", delta: "visible A"}));});
+		}});
+		const send = WebSocket.prototype.send;
+		const sending = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
+			if (this.url?.startsWith(upstream.baseUrl.replace("http:", "ws:"))) oldProxySocket = this;
+			return send.apply(this, args);
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const visible = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: ["A"]})); await visible;
+			const retired = oldProxySocket; if (!retired) throw Error("Missing upstream");
+			manager.markAccountCoolingDown(manager.getAccountByIndex(0)!, 60000, "network-error");
+			const closed = nextWebSocketClose(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: ["B"]}));
+			expect((await closed).code).toBe(1013);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			const before = append.mock.calls.map(([row]) => ({...row}));
+			retired.emit("message", Buffer.from(JSON.stringify({type: "response.completed", response: {id: "obsolete-A", usage: {input_tokens: 999, output_tokens: 888}}})), false);
+			retired.emit("message", Buffer.from(JSON.stringify({type: "response.output_text.delta", response_id: "obsolete-B", delta: "late obsolete output"})), false);
+			retired.emit("close", 1006, Buffer.from("obsolete close"));
+			retired.emit("error", Error("obsolete error"));
+			await new Promise(resolve => setImmediate(resolve));
+			expect(append.mock.calls.map(([row]) => row)).toEqual(before);
+			expect(before.every(row => row.outcome === "failure")).toBe(true);
+			expect(before.every(row => row.accountIndex === 0)).toBe(true);
+			expect(creates).toBe(1); expect(connections).toBe(1);
+		} finally {client.terminate(); await upstream.close(); append.mockRestore(); sending.mockRestore();}
 	});
 
 	it.each([false, true])("routes recovered native snapshots with managed bearer=%s", async managedBearer => {
@@ -6700,6 +6775,52 @@ describe("review transport boundary regressions", () => {
 		expect(response.status).toBe(200); await response.text();
 		expect(calls.some(call => call.url.endsWith("/responses"))).toBe(true);
 		expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+	});
+
+	it.each([{bearer: true, rebuild: false}, {bearer: false, rebuild: false}, {bearer: true, rebuild: true}, {bearer: false, rebuild: true}])("rejects snapshots captured before a saved invalidation %j", async ({bearer, rebuild}) => {
+		let disk = createStorage(Date.now(), rebuild ? 2 : 1);
+		const initial = structuredClone(disk); if (rebuild) initial.accounts.pop();
+		const manager = new AccountManager(undefined, initial);
+		let release!: () => void, captured!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const reading = new Promise<void>(resolve => {captured = resolve;});
+		const overlay = pendingAuth.applyPendingAuth;
+		let reads = 0;
+		const pending = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementation(async (path, storage) => {
+			if (++reads === 1) {captured(); await barrier;}
+			return overlay(path, storage);
+		});
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async next => {disk = structuredClone(next);}));
+		const {calls, fetchImpl} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "shared"}, {slug: call.headers.get("chatgpt-account-id") === "acc_1" ? "first-only" : "second-only"}]}) : textEventStream());
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
+		let request: Promise<Response> | undefined;
+		try {
+			request = fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: `Bearer ${bearer ? "access-1" : DEFAULT_CLIENT_API_KEY}`, "content-type": "application/json"}, body: JSON.stringify({model: "shared", input: []})});
+			void request.catch(() => undefined);
+			await reading;
+			const account = manager.getAccountByIndex(0)!;
+			manager.markAuthInvalidated(account, "token_invalidated", 1500);
+			manager.markAccountCoolingDown(account, 60000, "auth-failure");
+			account.rateLimitResetTimes["codex:unrelated"] = Date.now() + 60000;
+			await manager.saveToDisk();
+			expect(disk.accounts[0]?.authInvalidatedAt).toBe(1500);
+			release();
+			const response = await request;
+			if (bearer) expect(response.status).toBe(401);
+			await response.text();
+			expect(calls.some(call => call.url.endsWith("/responses") && call.headers.get("chatgpt-account-id") === "acc_1")).toBe(false);
+			expect(account.authInvalidatedAt).toBe(1500);
+			expect(account.cooldownReason).toBe("auth-failure");
+			expect(account.rateLimitResetTimes["codex:unrelated"]).toBeGreaterThan(Date.now());
+			delete disk.accounts[0]!.authInvalidatedAt;
+			delete disk.accounts[0]!.authInvalidationErrorCode;
+			const recovered = await fetch(`${proxy.baseUrl}/models?client_version=1.0.0`, {headers: {authorization: `Bearer ${bearer ? "access-1" : DEFAULT_CLIENT_API_KEY}`}});
+			expect(recovered.status).toBe(200);
+			expect((await recovered.json()).models).toEqual(expect.arrayContaining([expect.objectContaining({slug: "first-only"})]));
+			const restored = await postResponses(proxy, {model: "first-only", input: [], stream: true});
+			expect(restored.status).toBe(200); await restored.text();
+			expect(calls.some(call => call.url.endsWith("/responses") && call.headers.get("chatgpt-account-id") === "acc_1")).toBe(true);
+		} finally {release(); await request?.then(response => response.body?.cancel().catch(() => undefined)).catch(() => undefined); pending.mockRestore();}
 	});
 
 	it.each([false, true])("honors a successful probe clear with unchanged credentials, managed bearer=%s", async managedBearer => {
@@ -6756,15 +6877,28 @@ describe("review transport boundary regressions", () => {
 	it("closes a successful custom half-open circuit without clearing a concurrent cooldown", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 1)), account = manager.getAccountByIndex(0)!;
 		const breaker = getCircuitBreaker(getAccountIdentityKey(account)!, {failureThreshold: 1, resetTimeoutMs: 1});
-		breaker.recordFailure(); await new Promise(resolve => setTimeout(resolve, 5));
-		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.once("message", () => {
-			manager.markAccountCoolingDown(account, 60000, "network-error");
-			ws.send(JSON.stringify({type: "response.completed", response: {id: "success"}}));
-		})});
+		let turns = 0, connections = 0;
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {
+			connections++;
+			ws.on("message", () => {
+				turns++;
+				if (turns === 2) {
+					expect(breaker.getState()).toBe("half-open");
+					manager.markAccountCoolingDown(account, 60000, "network-error");
+				}
+				ws.send(JSON.stringify({type: "response.completed", response: {id: `success-${turns}`}}));
+			});
+		}});
 		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
+			const first = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); await first;
+			breaker.recordFailure();
+			expect(breaker.getState()).toBe("open");
+			await new Promise(resolve => setTimeout(resolve, 5));
 			const result = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); await result;
+			expect(connections).toBe(1);
+			expect(turns).toBe(2);
 			expect(breaker.getState()).toBe("closed");
 			expect(account.cooldownReason).toBe("network-error");
 		} finally {client.terminate(); await upstream.close();}

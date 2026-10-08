@@ -582,7 +582,7 @@ export class AccountManager {
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
 						codexCliMirror: account.codexCliMirror,
 					};
-					this.nativeAuthSnapshots.set(managedAccount, {authInvalidatedAt: account.authInvalidatedAt, enabled: account.enabled !== false});
+					this.nativeAuthSnapshots.set(managedAccount, {authInvalidatedAt: account.authInvalidatedAt, enabled: account.enabled !== false, observedAt: performance.now()});
 					this.clearSupersededAuthInvalidation(managedAccount);
 					return managedAccount;
 				})
@@ -670,10 +670,11 @@ export class AccountManager {
 	}
 
 	/** Reconcile external workspace policy by ID, preserving health changes not superseded on disk. */
-	syncWorkspaceSelections(current: AccountStorageV3 | null): boolean {
+	syncWorkspaceSelections(current: AccountStorageV3 | null, capturedAt = Number.POSITIVE_INFINITY): boolean {
 		if (!current) return false;
 		let changed = false;
 		for (const account of this.accounts) {
+			if (!this.isNativeSnapshotCurrent(account, capturedAt)) continue;
 			const matches = current.accounts.filter(disk => disk.recordId && disk.recordId === account.recordId);
 			const key = getAccountIdentityKey(account);
 			const candidates = matches.length ? matches : current.accounts.filter(disk => key && getAccountIdentityKey(disk) === key);
@@ -718,9 +719,10 @@ export class AccountManager {
 			const saved = (matches.length === 1 ? matches[0] : undefined) ?? account;
 			this.persistedWorkspaceSelections.set(account, saved.workspaces?.[saved.currentWorkspaceIndex ?? 0]?.id);
 			this.persistedWorkspaces.set(account, structuredClone(saved.workspaces));
-			if (snapshot) this.nativeAuthSnapshots.set(account, {
+			if (snapshot && saved.authInvalidatedAt === account.authInvalidatedAt && (saved.enabled !== false) === (account.enabled !== false)) this.nativeAuthSnapshots.set(account, {
 				authInvalidatedAt: saved.authInvalidatedAt,
 				enabled: saved.enabled !== false,
+				observedAt: performance.now(),
 			});
 		});
 		this.hadPersistedStorage ||= existsSync(this.resolveSelectionStoragePath());
@@ -1504,19 +1506,31 @@ export class AccountManager {
 		invalidatedAt = nowMs(),
 	): void {
 		const prior = this.nativeAuthSnapshots.get(account);
-		if (prior) this.nativeAuthSnapshots.set(account, {...prior, authInvalidatedAt: undefined});
+		if (prior) this.nativeAuthSnapshots.set(account, {...prior, authInvalidatedAt: undefined, observedAt: performance.now()});
 		account.authInvalidatedAt = invalidatedAt;
 		account.authInvalidationErrorCode = errorCode;
 	}
 
 	clearAuthInvalidation(account: ManagedAccount): void {
+		const prior = this.nativeAuthSnapshots.get(account);
+		if (prior) this.nativeAuthSnapshots.set(account, {...prior, observedAt: performance.now()});
 		delete account.authInvalidatedAt;
 		delete account.authInvalidationErrorCode;
 	}
 
-	private readonly nativeAuthSnapshots = new WeakMap<ManagedAccount, {authInvalidatedAt?: number; enabled: boolean}>();
+	private readonly nativeAuthSnapshots = new WeakMap<ManagedAccount, {authInvalidatedAt?: number; enabled: boolean; observedAt: number}>();
 
-	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}): boolean {
+	isNativeSnapshotCurrent(account: ManagedAccount, capturedAt: number): boolean {
+		return capturedAt >= (this.nativeAuthSnapshots.get(account)?.observedAt ?? 0);
+	}
+
+	inheritNativeAuthObservation(account: ManagedAccount, source: AccountManager, previous: ManagedAccount): void {
+		const observation = source.nativeAuthSnapshots.get(previous);
+		if (observation) this.nativeAuthSnapshots.set(account, {...observation});
+	}
+
+	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}, capturedAt = performance.now()): boolean {
+		if (!this.isNativeSnapshotCurrent(account, capturedAt)) return false;
 		const prior = this.nativeAuthSnapshots.get(account);
 		const before = account.authInvalidatedAt;
 		const wasEnabled = account.enabled !== false;
@@ -1537,7 +1551,7 @@ export class AccountManager {
 		const observedInvalidation = before && before !== prior?.authInvalidatedAt && account.authInvalidatedAt === before
 			? prior?.authInvalidatedAt
 			: diskInvalidatedAt;
-		this.nativeAuthSnapshots.set(account, {authInvalidatedAt: observedInvalidation, enabled});
+		this.nativeAuthSnapshots.set(account, {authInvalidatedAt: observedInvalidation, enabled, observedAt: capturedAt});
 		return before !== account.authInvalidatedAt || wasEnabled !== (account.enabled !== false);
 	}
 
@@ -2236,6 +2250,8 @@ export class AccountManager {
 		const account = this.accounts[index];
 		if (!account) return null;
 		const wasEnabled = account.enabled !== false;
+		const prior = this.nativeAuthSnapshots.get(account);
+		if (prior) this.nativeAuthSnapshots.set(account, {...prior, observedAt: performance.now()});
 		account.enabled = enabled;
 		if (enabled && !wasEnabled) {
 			this.resetWorkspaces(account);
