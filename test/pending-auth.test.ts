@@ -107,7 +107,7 @@ it("refuses a late rotated credential after the pool was reset",async()=>{
  await expect(fs.stat(getPendingAuthPath(storagePath))).rejects.toMatchObject({code:"ENOENT"});
 });
 it.each(["auth-failure","network-error","rate-limit"] as const)("only clears obsolete authentication blockers when replaying journaled auth (%s)",async reason=>{
- await recordPendingAuth(storagePath,rotation("spent-a","fresh"));
+ await recordPendingAuth(storagePath,{...rotation("spent-a","fresh"), accessToken: `e30.${Buffer.from(JSON.stringify({iat: 2})).toString("base64url")}.fixture`});
  const pool=storage();Object.assign(pool.accounts[0]!,{coolingDownUntil:Date.now()+60000,cooldownReason:reason,authInvalidatedAt:1});
  const result=await applyPendingAuth(storagePath,pool);
  expect(result?.accounts[0]?.authInvalidatedAt).toBeUndefined();
@@ -222,6 +222,43 @@ it("never rewinds a chained rotation when a delayed rescue journals its older at
 		const pool = {version: 3 as const, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]};
 		expect((await applyPendingAuth(storagePath, pool))?.accounts[0]?.refreshToken).toBe("c");
 	}
+});
+
+it.each(["disabled", "invalidated", "self"])("preserves independent authorization in delayed journal chains (%s)", async state => {
+	await recordPendingAuth(storagePath, rotation("b", state === "self" ? "b" : "c"));
+	if (state === "self") await recordPendingAuth(storagePath, {...rotation("b", "b"), authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"});
+	const restrictions = state === "disabled" ? {enabled: false as const} : state === "invalidated" ? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"} : {};
+	const retained = await recordPendingAuth(storagePath, {...rotation("a", "b"), ...restrictions, at: 2000});
+	if (state === "disabled") expect(retained.enabled).toBe(false);
+	else expect(retained.authInvalidatedAt).toBe(1500);
+	for (const token of ["a", "b"]) {
+		const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]});
+		if (state === "disabled") expect(restored?.accounts[0]?.enabled).toBe(false);
+		else expect(restored?.accounts[0]?.authInvalidatedAt).toBe(1500);
+	}
+});
+
+it("preserves authorization carried by another alias of the retained credential", async () => {
+	const {createHash} = await import("node:crypto");
+	const prior = (token: string) => createHash("sha256").update(token).digest("hex");
+	await fs.writeFile(getPendingAuthPath(storagePath), JSON.stringify({version: 1, entries: [
+		{prior: prior("a"), refreshToken: "c", accessToken: "access-c", expiresAt: 1, at: 1, enabled: false},
+		{prior: prior("b"), refreshToken: "c", accessToken: "access-c", expiresAt: 1, at: 1},
+	]}));
+	const retained = await recordPendingAuth(storagePath, rotation("d", "b"));
+	expect(retained).toMatchObject({refreshToken: "c", enabled: false});
+	for (const token of ["a", "b", "d"]) {
+		const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]});
+		expect(restored?.accounts[0]).toMatchObject({refreshToken: "c", enabled: false});
+	}
+});
+
+it.each([false, true])("only clears disk revocation with replacement issuance evidence, recovered=%s", async recovered => {
+	const token = `e30.${Buffer.from(JSON.stringify({iat: recovered ? 3 : 1})).toString("base64url")}.fixture`;
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), accessToken: token});
+	const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "a", accessToken: "old", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated", enabled: false, addedAt: 1, lastUsed: 1}]});
+	expect(restored?.accounts[0]?.authInvalidatedAt).toBe(recovered ? undefined : 1500);
+	expect(restored?.accounts[0]?.enabled).toBe(false);
 });
 
 it("covers an intermediate spent token when rotations chain", async () => {

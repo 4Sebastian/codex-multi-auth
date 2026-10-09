@@ -1686,7 +1686,12 @@ export class AccountManager {
 				typeof account.authInvalidatedAt === "number" &&
 				Number.isFinite(account.authInvalidatedAt) &&
 				account.authInvalidatedAt > 0;
-			if (diskHasValidInvalidation && !accountHasValidInvalidation) {
+			const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId && row.recordId === account.recordId)
+				?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === key);
+			const explicitlyCleared = baseline?.authInvalidatedAt === diskInvalidatedAt && baseline?.authInvalidationErrorCode === disk.authInvalidationErrorCode &&
+				baseline?.accessToken === account.accessToken && baseline?.refreshToken === account.refreshToken &&
+				disk.accessToken === account.accessToken && disk.refreshToken === account.refreshToken;
+			if (diskHasValidInvalidation && !accountHasValidInvalidation && !explicitlyCleared) {
 				// Ordinary saves must not erase a CURRENT invalidation written by
 				// another AccountManager. A marker older than the token generation is
 				// stale and is intentionally not resurrected.
@@ -1815,8 +1820,6 @@ export class AccountManager {
 		>,
 		auth: OAuthAuthDetails,
 	): Promise<ManagedAccount | null> {
-		const nextAccountId = extractAccountId(auth.access)?.trim() || undefined;
-		const nextEmail = sanitizeEmail(extractAccountEmail(auth.access));
 		const initialLive = this.getAccountByIdentity(source, auth);
 		const initialState = initialLive ? structuredClone(initialLive) : undefined;
 		const initialObservation = initialLive ? this.nativeAuthSnapshots.get(initialLive) : undefined;
@@ -1824,6 +1827,12 @@ export class AccountManager {
 		try {
 			return await withAccountStorageTransaction(async (_current, persist) => {
 				if (!_current && this.hadPersistedStorage) throw Object.assign(new Error("Account storage was removed; reload before saving."), {code:"ESTALE"});
+				const currentLive = this.getAccountByIdentity(source, auth);
+				const currentAuth = currentLive === initialLive && currentLive?.access && currentLive.expires !== undefined && initialState &&
+					(["access", "refreshToken", "expires"] as const).some(field => currentLive[field] !== initialState[field])
+					? {type: "oauth" as const, access: currentLive.access, refresh: currentLive.refreshToken, expires: currentLive.expires} : auth;
+				const nextAccountId = extractAccountId(currentAuth.access)?.trim() || undefined;
+				const nextEmail = sanitizeEmail(extractAccountEmail(currentAuth.access));
 				this.syncWorkspaceSelections(_current);
 				// Snapshot the live in-memory pool under the storage lock so refresh
 				// persistence merges against the latest account state. Reconcile the
@@ -1837,7 +1846,7 @@ export class AccountManager {
 				const storageIndex = findAccountIndexByIdentity(
 					nextStorage.accounts,
 					source,
-					auth,
+					currentAuth,
 				);
 				if (storageIndex === undefined) {
 					log.warn("Unable to resolve refreshed account for persistence", {
@@ -1851,9 +1860,9 @@ export class AccountManager {
 					return null;
 				}
 
-				storedAccount.refreshToken = auth.refresh;
-				storedAccount.accessToken = auth.access;
-				storedAccount.expiresAt = auth.expires;
+				storedAccount.refreshToken = currentAuth.refresh;
+				storedAccount.accessToken = currentAuth.access;
+				storedAccount.expiresAt = currentAuth.expires;
 				if (
 					nextAccountId &&
 					shouldUpdateAccountIdFromToken(
@@ -1873,7 +1882,7 @@ export class AccountManager {
 				delete storedAccount.coolingDownUntil;
 				delete storedAccount.cooldownReason;
 
-				const liveAccount = this.getAccountByIdentity(source, auth);
+				const liveAccount = this.getAccountByIdentity(source, currentAuth);
 				if (liveAccount) {
 					const previousLiveAccountState = {
 						access: liveAccount.access,
@@ -1892,10 +1901,20 @@ export class AccountManager {
 					};
 
 					const previousObservation = this.nativeAuthSnapshots.get(liveAccount);
-					this.updateFromAuth(liveAccount, auth);
-					liveAccount.enabled = true;
-					this.clearAccountCooldown(liveAccount);
-					this.clearAuthFailures(liveAccount);
+					const newerInvalidation = previousLiveAccountState.authInvalidatedAt !== initialState?.authInvalidatedAt &&
+						!isAuthInvalidationSuperseded(currentAuth.access, previousLiveAccountState.authInvalidatedAt);
+					this.updateFromAuth(liveAccount, currentAuth);
+					if (newerInvalidation) {
+						liveAccount.authInvalidatedAt = storedAccount.authInvalidatedAt = previousLiveAccountState.authInvalidatedAt;
+						liveAccount.authInvalidationErrorCode = storedAccount.authInvalidationErrorCode = previousLiveAccountState.authInvalidationErrorCode;
+					}
+					liveAccount.enabled = !(previousLiveAccountState.enabled === false && initialState?.enabled !== false);
+					if (!liveAccount.enabled) storedAccount.enabled = false;
+					const newerCooldown = previousLiveAccountState.coolingDownUntil !== initialState?.coolingDownUntil || previousLiveAccountState.cooldownReason !== initialState?.cooldownReason;
+					if (newerInvalidation || newerCooldown) {
+						storedAccount.coolingDownUntil = previousLiveAccountState.coolingDownUntil;
+						storedAccount.cooldownReason = previousLiveAccountState.cooldownReason;
+					} else {this.clearAccountCooldown(liveAccount); this.clearAuthFailures(liveAccount);}
 					const attemptedState = structuredClone(liveAccount);
 					const attemptedObservation = this.nativeAuthSnapshots.get(liveAccount);
 
@@ -1940,12 +1959,20 @@ export class AccountManager {
 			// spends the old token just the same, so it is rescued like an unreadable file.
 			const live = isRetryableAuthPersistenceError(error) ? this.getAccountByIdentity(source, auth) : null;
 			if (live) {
-				if (live === initialLive && initialState && live.enabled !== false &&
-					this.nativeAuthSnapshots.get(live)?.observedAt === initialObservation?.observedAt &&
-					(["access", "refreshToken", "expires", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => live[field] === initialState[field])) {
+				if (live === initialLive && initialState &&
+					(["access", "refreshToken", "expires"] as const).every(field => live[field] === initialState[field])) {
+					const authorizationChanged = this.nativeAuthSnapshots.get(live)?.observedAt !== initialObservation?.observedAt ||
+						live.authInvalidatedAt !== initialState.authInvalidatedAt || live.enabled !== initialState.enabled;
+					const invalidatedAt = live.authInvalidatedAt, invalidationCode = live.authInvalidationErrorCode;
 					this.updateFromAuth(live, auth);
-					if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
-					this.clearAuthFailures(live);
+					if (authorizationChanged && !isAuthInvalidationSuperseded(auth.access, invalidatedAt)) {
+						live.authInvalidatedAt = invalidatedAt;
+						live.authInvalidationErrorCode = invalidationCode;
+					}
+					if (!authorizationChanged) {
+						if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
+						this.clearAuthFailures(live);
+					}
 				}
 				// The debounced save needs this process to survive and the file to
 				// unlock. Journal the rotated credential beside the pool so the next
@@ -2347,6 +2374,12 @@ export class AccountManager {
     const committed = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
     await persist(committed);
     acceptCommitted(committed);
+    for (const baseline of this.persistenceBaseline.accounts) {
+     const matches = (row: AccountStorageV3["accounts"][number]) => baseline.recordId && row.recordId ? baseline.recordId === row.recordId : getAccountIdentityKey(baseline) === getAccountIdentityKey(row);
+     const saved = committed.accounts.find(matches), requested = proposed.accounts.find(matches);
+     if (!saved || !requested || saved.accessToken !== requested.accessToken || saved.refreshToken !== requested.refreshToken) continue;
+     for (const field of ["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode", "enabled"] as const) Object.assign(baseline, {[field]: saved[field]});
+    }
     log.warn("Saved runtime observations; conflicting account edits remain pending and require reload or reconciliation.");
     return;
    }
@@ -2359,17 +2392,6 @@ export class AccountManager {
    const disk = current.accounts[index];
    if (!prior || !disk || !this.persistenceBaseline || disk.refreshToken !== prior.refreshToken || disk.enabled === false || disk.authInvalidatedAt) throw error;
    merged = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
-   // Persist revocations of unchanged sibling credentials even when user edits conflict.
-   for (const saved of merged.accounts) {
-    const previous = this.persistenceBaseline.accounts.find(candidate => candidate.recordId === saved.recordId);
-    const requested = proposed.accounts.find(candidate => candidate.recordId === saved.recordId);
-    if (previous && requested && saved.accessToken === requested.accessToken &&
-     requested.authInvalidatedAt !== previous.authInvalidatedAt &&
-     (requested.authInvalidatedAt ?? 0) > (saved.authInvalidatedAt ?? 0)) {
-     saved.authInvalidatedAt = requested.authInvalidatedAt;
-     saved.authInvalidationErrorCode = requested.authInvalidationErrorCode;
-    }
-   }
    const row = merged.accounts[index];
    if (!row || !this.persistenceBaseline) throw error;
    rescuedBaseline = structuredClone(this.persistenceBaseline);

@@ -77,7 +77,6 @@ export interface RotationProxyStateInit {
  * @internal
  */
 export interface RotationProxyState extends RotationProxyStateInit {
-	readonly knownAccountManagers: Set<AccountManager>;
 	readonly status: RuntimeRotationProxyStatus;
 	modelCatalog?: AccountModelCatalog;
 	modelCatalogs?: Map<string, AccountModelCatalog>;
@@ -107,7 +106,6 @@ export function createRotationProxyState(
 ): RotationProxyState {
 	return {
 		...init,
-		knownAccountManagers: new Set<AccountManager>([init.activeAccountManager]),
 		status: {
 			startedAt: init.now(),
 			totalRequests: 0,
@@ -169,7 +167,6 @@ export async function recoverStaleRuntimeState(
 		// (full-pool exhaustion), so the extra synchronous write is cheap.
 		await reloaded.flushPendingSave();
 		state.activeAccountManager = reloaded;
-		state.knownAccountManagers.add(reloaded);
 		state.lastStaleRuntimeReloadAt = Date.now();
 		recordRuntimeReload("pool-exhausted-no-account");
 		return reloaded;

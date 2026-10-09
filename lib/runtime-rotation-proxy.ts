@@ -1,6 +1,7 @@
 import { startAutomaticAccountChecks } from "./runtime/automatic-account-checks.js";
 import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscription-checks.js";
 import { ClientCancellationError } from "./request/client-cancellation.js";
+import { getCircuitBreaker } from "./circuit-breaker.js";
 import { createNativeAccountStorageReader } from "./runtime/native-account-storage.js";
 import { resetSnapshotQuota } from "./runtime/reset-credits.js";
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
@@ -1292,6 +1293,7 @@ async function prepareWebSocketRequest(
 	state: RotationProxyState,
 	req: IncomingMessage,
 	frame: PendingWebSocketFrame,
+	accountManager = state.activeAccountManager,
 ): Promise<PreparedWebSocketRequest> {
 	const existing = frame.request;
 	const context = existing?.context ?? buildWebSocketRequestContext(req, frame.data);
@@ -1315,7 +1317,7 @@ async function prepareWebSocketRequest(
 		recorderInput.projectKey = policyState.project.projectKey;
 		policyDecision = await evaluateRuntimePolicy({
 			state: policyState,
-			accounts: state.activeAccountManager.getAccountsSnapshot(),
+			accounts: accountManager.getAccountsSnapshot(),
 			model: context.model,
 			now: startedAt,
 		});
@@ -1377,13 +1379,15 @@ async function prepareWebSocketRequest(
 	return { context, policyDecision, usageRecorder };
 }
 
-async function consumeWebSocketRequestForAccount(
+function validateWebSocketRequestForAccount(
+	state: RotationProxyState,
 	request: PreparedWebSocketRequest,
 	accountManager: AccountManager,
 	account: ManagedAccount,
-): Promise<void> {
+	ownsAdmission = false,
+): void {
 	if (request.policyDecision.blockedAccountIndexes.has(account.index)) {
-		await request.usageRecorder.record({
+		void request.usageRecorder.record({
 			outcome: "blocked",
 			statusCode: HTTP_STATUS.FORBIDDEN,
 			errorCode: "policy_blocked",
@@ -1395,11 +1399,14 @@ async function consumeWebSocketRequestForAccount(
 			"policy_blocked",
 		);
 	}
-	const runtimeSkipReason = accountManager.getManagedAccountRuntimeSkipReason(
+	let runtimeSkipReason = accountManager.getAccountByIndex(account.index) !== account ? "missing" : accountManager.getManagedAccountRuntimeSkipReason(
 		account,
 		request.context.family,
 		request.context.model,
 	);
+	if (runtimeSkipReason === "circuit-open" && ownsAdmission && account.circuitKeyId && getCircuitBreaker(account.circuitKeyId).getState() === "half-open") runtimeSkipReason = null;
+	const deferral = state.preemptiveQuotaScheduler.getDeferral(buildQuotaScheduleKey(account, request.context.family, request.context.model), state.now());
+	if (!runtimeSkipReason && deferral.defer) runtimeSkipReason = "rate-limited";
 	if (runtimeSkipReason) {
 		const recoverable =
 			runtimeSkipReason === "rate-limited" ||
@@ -1407,7 +1414,7 @@ async function consumeWebSocketRequestForAccount(
 			runtimeSkipReason === "cooling-down" ||
 			runtimeSkipReason.startsWith("cooling-down:");
 		if (!recoverable) {
-			await request.usageRecorder.record({
+			void request.usageRecorder.record({
 				outcome: "failure",
 				statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
 				errorCode: "websocket_account_unavailable",
@@ -1422,6 +1429,15 @@ async function consumeWebSocketRequestForAccount(
 				: "websocket_account_unavailable",
 		);
 	}
+}
+
+function consumeWebSocketRequestForAccount(
+	state: RotationProxyState,
+	request: PreparedWebSocketRequest,
+	accountManager: AccountManager,
+	account: ManagedAccount,
+): void {
+	validateWebSocketRequestForAccount(state, request, accountManager, account);
 	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {
 		throw createRuntimeProxyHttpError(
 			"The account bound to this WebSocket connection is temporarily unavailable.",
@@ -2225,13 +2241,25 @@ function bridgeWebSocketConnection(
 		mirrorWebSocketClose(client, code, reason);
 		if (upstream) mirrorWebSocketClose(upstream, code, reason);
 	};
+	const sendBuffered = (socket: WebSocket, data: RawData | string, isBinary = false): boolean => {
+		const bytes = typeof data === "string" ? Buffer.byteLength(data) : rawDataToBuffer(data).byteLength;
+		if (socket.bufferedAmount + bytes > state.maxRequestBodyBytes) {
+			settlePendingHandshake("failure", "websocket_buffer_exceeded");
+			settleAll("failure", "websocket_buffer_exceeded");
+			settlePending("failure", "websocket_buffer_exceeded");
+			closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "WebSocket buffer exceeded");
+			return false;
+		}
+		socket.send(data, {binary: isBinary});
+		return true;
+	};
 	const reportConnectionScopedContinuationLoss = (): void => {
 		if (client.readyState !== WebSocket.OPEN) return;
 		// Match the Responses WebSocket protocol used by the official Codex CLI.
 		// It treats this code as retryable, discards its cached socket state, and
 		// rebuilds the next attempt from the full request instead of replaying a
 		// previous_response_id that belonged to a different upstream connection.
-		client.send(JSON.stringify({
+		sendBuffered(client, JSON.stringify({
 			type: "error",
 			error: {
 				type: "invalid_request_error",
@@ -2272,7 +2300,7 @@ function bridgeWebSocketConnection(
 		}
 		if (type !== "response.create") {
 			releaseFrame(frame);
-			if (upstream?.readyState === WebSocket.OPEN && frame.upstreamConnection === upstream) upstream.send(frame.data, {binary: frame.isBinary});
+			if (upstream?.readyState === WebSocket.OPEN && frame.upstreamConnection === upstream) sendBuffered(upstream, frame.data, frame.isBinary);
 			return;
 		}
 		if (upstream?.readyState !== WebSocket.OPEN || (hasConnectionScopedContinuation(frame) && frame.upstreamConnection !== upstream)) {
@@ -2292,7 +2320,7 @@ function bridgeWebSocketConnection(
 		let request = preparedHandshake?.request;
 		let consumedForFrame = false;
 		if (!request) {
-			request = await prepareWebSocketRequest(state, req, frame);
+			request = await prepareWebSocketRequest(state, req, frame, boundAccountManager ?? state.activeAccountManager);
 			frame.request = request;
 			if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame)) return;
 			if (upstream !== forwardingUpstream || upstream.readyState !== WebSocket.OPEN) {
@@ -2311,6 +2339,10 @@ function bridgeWebSocketConnection(
 		}
 		const forwardingAccountManager = preparedHandshake?.accountManager ?? boundAccountManager;
 		const forwardingAccount = preparedHandshake?.account ?? boundAccount;
+		if (preparedHandshake) {
+			request = await prepareWebSocketRequest(state, req, frame, preparedHandshake.accountManager);
+			frame.request = request;
+		}
 		// Only the initial handshake has already admitted this turn to this account.
 		if (!preparedHandshake) {
 			if (!forwardingAccountManager || !forwardingAccount) {
@@ -2321,7 +2353,8 @@ function bridgeWebSocketConnection(
 				);
 			}
 			try {
-				await consumeWebSocketRequestForAccount(
+				consumeWebSocketRequestForAccount(
+					state,
 					request,
 					forwardingAccountManager,
 					forwardingAccount,
@@ -2368,9 +2401,21 @@ function bridgeWebSocketConnection(
 			if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(frame)) enqueueClientFrame(frame);
 			return;
 		}
+		try {
+			validateWebSocketRequestForAccount(state, request, forwardingAccountManager, forwardingAccount, true);
+			if (preparedHandshake && (preparedHandshake.accessToken !== forwardingAccount.access || (forwardingAccount.expires ?? 0) <= state.now())) throw createRuntimeProxyHttpError("WebSocket credentials changed during preparation.", HTTP_STATUS.SERVICE_UNAVAILABLE, "websocket_account_unavailable");
+		} catch (error) {
+			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
+			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
+			throw error;
+		}
 		activeRequests.push({request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
 		try {
-			forwardingUpstream.send(frame.data, { binary: frame.isBinary });
+			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
+				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
+				else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
+				return;
+			}
 		} catch (error) {
 			const active = activeRequests.pop();
 			if (active) applyWebSocketTransportAccountFailure(state, active);
@@ -2529,13 +2574,13 @@ function bridgeWebSocketConnection(
 					}
 				}
 				if (terminal?.record.outcome === "failure" && terminal.tokenInvalidated) {
-					if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({type: "error", status: 401, error: {code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}}));
+					if (client.readyState === WebSocket.OPEN) sendBuffered(client, JSON.stringify({type: "error", status: 401, error: {code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}}));
 					settleAll("failure", "token_invalidated");
 					settlePending("failure", "token_invalidated");
 					closeBoth(WEBSOCKET_CLOSE_POLICY_VIOLATION, "OAuth token invalidated");
 					return;
 				}
-				if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+				if (client.readyState === WebSocket.OPEN) sendBuffered(client, data, isBinary);
 			});
 			connectedUpstream.on("close", (code, reason) => {
 				if (closed || upstream !== connectedUpstream) return;
@@ -3022,7 +3067,6 @@ async function handleRequestInner(
                 const generation = disk.affinityGeneration ?? 0;
                 if (generation <= state.lastObservedAffinityGeneration) state.sessionAffinityStore?.clearAll();
                 state.activeAccountManager = accountManager;
-				state.knownAccountManagers.add(accountManager);
 				state.modelCatalog = undefined;
                 state.modelCatalogs?.clear();
 			} else if (syncNativeAccountCredentials(accountManager, disk, snapshot.capturedAt)) {
@@ -3292,7 +3336,8 @@ async function handleRequestInner(
 					() => {scanner.result();return responseOutcome.finish();},
 				);
 				const attemptedCredential = attemptedCredentialIndex === undefined ? undefined : apiRoutes[attemptedCredentialIndex];
-				if (!forwarded && attemptedCredential) apiRuntime.recordStreamFailure(attemptedCredential, context.model, body, responseOutcome.rejection);
+				const clientDisconnected = res.destroyed && !res.writableEnded;
+				if (!forwarded && !clientDisconnected && attemptedCredential) apiRuntime.recordStreamFailure(attemptedCredential, context.model, body, responseOutcome.rejection);
 				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
 				const usageTokens = scanner.result();
 				if (usageTokens && context.stableSessionKey && context.model) {
@@ -3303,13 +3348,14 @@ async function handleRequestInner(
 					});
 				}
 				await usageRecorder.record({
-					outcome: forwarded && upstream.ok ? "success" : "failure",
+					outcome: forwarded && upstream.ok ? "success" : clientDisconnected ? "cancelled" : "failure",
 					statusCode: upstream.status,
-					errorCode: responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
+					errorCode: clientDisconnected ? "client_disconnected" : responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
 					...(usageTokens ?? {}),
 				});
             } catch (error) {
                 if (error instanceof ClientCancellationError || res.destroyed) {
+                    await usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled"});
                     if (!res.destroyed) res.destroy();
                     return;
                 }
@@ -3384,9 +3430,7 @@ async function handleRequestInner(
 		/** Reconcile once before selection or recording a new upstream observation. */
 		const reconcileManualSelection = () => {
 			const meta = readStorageMetaFromDisk();
-			for (const manager of state.knownAccountManagers) {
-				manager.applyManualSelection(meta);
-			}
+			for (const manager of new Set([state.activeAccountManager, accountManager])) manager.applyManualSelection(meta);
 			if (meta.affinityGeneration > state.lastObservedAffinityGeneration) {
 				const switchedAccount = meta.pinnedAccountIndex === null
 					? null
@@ -4124,6 +4168,7 @@ async function handleRequestInner(
 				);
 			} catch (error) {
                 if (clientGone() || (error instanceof ClientCancellationError)) {
+                    await usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled", account: refreshed.account});
                     if (!res.destroyed) res.destroy();
                     return;
                 }
@@ -4873,6 +4918,11 @@ async function handleRequestInner(
 			});
 		}
 	} catch (error) {
+		if (error instanceof ClientCancellationError || (res.destroyed && !res.writableEnded)) {
+			await usageRecorder?.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled"});
+			if (!res.destroyed) res.destroy();
+			return;
+		}
 		const rawErrorMessage = error instanceof Error ? error.message : String(error);
 		// errors-logging-08: redact any email/token material that leaked into a
 		// raw upstream or refresh error string before it reaches state.status consumers
@@ -4916,6 +4966,8 @@ async function handleRequestInner(
 		} else if (!res.destroyed) {
 			res.destroy(error instanceof Error ? error : undefined);
 		}
+	} finally {
+		if (res.destroyed && !res.writableEnded) await usageRecorder?.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled"});
 	}
 }
 

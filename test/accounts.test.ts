@@ -5073,6 +5073,53 @@ describe("AccountManager", () => {
 });
 
 describe("commit and retryable rescue ordering", () => {
+	it.each(["ELOCKED", "EBUSY", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "disable", "rotate", "remove"].map(mutation => ({code, mutation}))))("rescues credential lineage before transaction entry %j", async ({code, mutation}) => {
+		const storageModule = await import("../lib/storage.js");
+		const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
+		const manager = new AccountManager(undefined, {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]});
+		const account = manager.getAccountByIndex(0)!;
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {entered = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async () => {entered(); await gate; throw Object.assign(Error("load blocked"), {code});});
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		void refreshing.catch(() => undefined);
+		try {
+			await ready;
+			if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else if (mutation === "disable") manager.setAccountEnabled(0, false);
+			else if (mutation === "rotate") manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000});
+			else manager.removeAccount(account);
+			release();
+			if (mutation === "remove") {await expect(refreshing).rejects.toThrow(); expect(journal).not.toHaveBeenCalled(); return;}
+			await refreshing;
+			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
+			expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({priorRefreshToken: "fixture-old", refreshToken: account.refreshToken}));
+			if (mutation === "invalidate") {expect(account.authInvalidatedAt).toBe(1500); expect(account.cooldownReason).toBe("auth-failure");}
+			if (mutation === "disable") expect(account.enabled).toBe(false);
+		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
+	});
+	it.each(["invalidate", "disable", "rotate"])("keeps newer live authority when transaction acquisition succeeds (%s)", async mutation => {
+		const storageModule = await import("../lib/storage.js");
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		const manager = new AccountManager(undefined, structuredClone(disk)), account = manager.getAccountByIndex(0)!;
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => {entered(); await gate; return handler(structuredClone(disk), async next => {disk = structuredClone(next);});});
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		try {
+			await ready;
+			if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else if (mutation === "disable") manager.setAccountEnabled(0, false);
+			else {manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000}); disk.accounts[0]!.enabled = false;}
+			release(); await refreshing;
+			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
+			expect(restarted.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
+			if (mutation === "invalidate") expect(restarted).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			else expect(restarted.enabled).toBe(false);
+		} finally {release(); await refreshing;}
+	});
+
 	it.each(["EACCES", "EBUSY", "EPERM", "ELOCKED", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "rotate", "disable"].map(mutation => ({code, mutation}))))("retains live authorization during retryable rescue %j", async ({code, mutation}) => {
 		const storageModule = await import("../lib/storage.js");
 		const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);

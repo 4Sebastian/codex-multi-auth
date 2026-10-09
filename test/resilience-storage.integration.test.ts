@@ -6,7 +6,7 @@ import * as pendingAuth from "../lib/storage/pending-auth.js";
 import { promises as filesystem } from "node:fs";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
 import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
-import { AccountManager } from "../lib/accounts.js";
+import { AccountManager, AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
 import { saveAccounts, loadAccounts, getStoragePath, clearAccounts, setStoragePathDirect, cloneTrackedAccountStorage, withAccountAndFlaggedStorageTransaction } from "../lib/storage.js";
 import { withRetry } from "../lib/fs-retry.js";
 const dirs: string[] = [];
@@ -103,6 +103,26 @@ it("orders delayed native snapshots before durable invalidation and later probe 
     } finally {release(); overlay.mockRestore();}
 });
 
+it.each(["invalidated", "disabled"])("persists authorization immediately during an ordinary runtime conflict (%s)", async restriction => {
+    const manager = await setup(), account = manager.getAccountByIndex(0)!;
+    account.accountLabel = "Local";
+    const disk = (await loadAccounts())!;
+    disk.accounts[0]!.accountLabel = "External";
+    await saveAccounts(disk);
+    if (restriction === "invalidated") manager.markAuthInvalidated(account, "token_invalidated", 1500);
+    else manager.setAccountEnabled(0, false);
+    await manager.saveToDisk(true);
+    const restarted = new AccountManager(undefined, await loadAccounts());
+    expect(restarted.getAccountRuntimeSkipReason(0, "codex")).toBe(restriction === "disabled" ? "disabled" : AUTH_INVALIDATION_MARKER);
+    expect((await loadAccounts())?.accounts[0]?.accountLabel).toBe("External");
+    expect(account.accountLabel).toBe("Local");
+    if (restriction === "invalidated") {
+        manager.clearAuthInvalidation(account);
+        await manager.saveToDisk(true);
+        expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+        expect((await loadAccounts())?.accounts[0]?.accountLabel).toBe("External");
+    }
+});
 it("does not overwrite a CLI workspace exclusion or account addition across repeated daemon saves", async () => {
     const manager = await setup(), cli = (await loadAccounts())!;
     cli.accounts[0]!.workspaces![1]!.enabled = false;

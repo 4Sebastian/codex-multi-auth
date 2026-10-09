@@ -1,4 +1,5 @@
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
+import { isAuthInvalidationSuperseded } from "../auth/token-utils.js";
 import { getAccountIdentityKey } from "./identity.js";
 import { isRecord } from "../utils.js";
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -90,7 +91,17 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
         const value = clear ? undefined : Math.max(a ?? 0, b ?? 0);
         if (value !== undefined) limits[key] = value;
     }
+    const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
+    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && !isAuthInvalidationSuperseded(accessToken, row.authInvalidatedAt) ? row.authInvalidatedAt : undefined;
+    const diskInvalidation = currentInvalidation(disk), localInvalidation = currentInvalidation(local);
+    const clearedInvalidation = base.authInvalidatedAt !== undefined && (
+        (disk.accessToken === base.accessToken && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
+        (local.accessToken === base.accessToken && local.authInvalidatedAt === undefined && disk.authInvalidatedAt === base.authInvalidatedAt));
+    const invalidated = (diskInvalidation ?? 0) >= (localInvalidation ?? 0) ? disk : local;
+    const authInvalidatedAt = clearedInvalidation ? undefined : currentInvalidation(invalidated);
     const runtime = {
+        authInvalidatedAt,
+        authInvalidationErrorCode: authInvalidatedAt ? invalidated.authInvalidationErrorCode : undefined,
         rateLimitResetTimes: Object.keys(limits).length ? limits : undefined,
         ...mergeAccountCooldown(base, disk, local),
         lastSwitchReason: local.lastSwitchReason ?? disk.lastSwitchReason,
@@ -186,6 +197,12 @@ export function mergeAccountRuntimeObservations(base: AccountStorageV3, current:
         const next = local.accounts.find(row => matches(prior, row));
         if (!next) continue;
         prior.lastUsed = Math.max(prior.lastUsed, next.lastUsed);
+        if (next.enabled === false) prior.enabled = false;
+        const disk = current.accounts.find(row => matches(prior, row));
+        if (disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken) {
+            prior.authInvalidatedAt = next.authInvalidatedAt;
+            prior.authInvalidationErrorCode = next.authInvalidationErrorCode;
+        }
         for (const field of ["rateLimitResetTimes", "coolingDownUntil", "cooldownReason", "lastSwitchReason"] as const) {
             if (next[field] === undefined) delete prior[field];
             else Object.assign(prior, { [field]: structuredClone(next[field]) });

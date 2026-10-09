@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAuthInvalidationSuperseded } from "../auth/token-utils.js";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -41,6 +42,17 @@ export function getPendingAuthPath(storagePath: string): string {
 }
 
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
+
+type Authorization = Pick<PendingAuth, "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled">;
+function mergeAuthorization(accessToken: string, sources: Authorization[]): Authorization {
+	const invalidated = sources.filter(source => source.authInvalidatedAt && !isAuthInvalidationSuperseded(accessToken, source.authInvalidatedAt))
+		.sort((a, b) => (b.authInvalidatedAt ?? 0) - (a.authInvalidatedAt ?? 0))[0];
+	return {
+		authInvalidatedAt: invalidated?.authInvalidatedAt,
+		authInvalidationErrorCode: invalidated?.authInvalidationErrorCode,
+		enabled: sources.some(source => source.enabled === false) ? false : undefined,
+	};
+}
 
 /**
  * Only a missing file is empty. The entries are the only copy of rotated
@@ -86,16 +98,18 @@ export async function recordPendingAuth(
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const prior = hash(auth.priorRefreshToken);
 		const existing = await read(path);
-		let retained: Omit<PendingAuth, "prior"> = auth;
+		let retained: Omit<PendingAuth, "prior"> = {...auth, ...mergeAuthorization(auth.accessToken, [auth, ...existing.filter(entry => entry.prior === prior)])};
 		const followed = new Set<string>();
-		for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next && next.refreshToken !== retained.refreshToken; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
+		for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
 			if (followed.has(next.prior)) throw Error("Cyclic pending credential rotation");
 			followed.add(next.prior);
-			retained = next;
+			const sameToken = next.refreshToken === retained.refreshToken;
+			retained = {...next, ...mergeAuthorization(next.accessToken, [retained, next])};
+			if (sameToken) break;
 		}
-		const replacement: Omit<PendingAuth, "prior"> = {recordId: auth.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, authInvalidatedAt: retained.authInvalidatedAt, authInvalidationErrorCode: retained.authInvalidationErrorCode, enabled: retained.enabled, at: retained.at};
+		const replacement: Omit<PendingAuth, "prior"> = {recordId: auth.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained.accessToken, [retained]), at: retained.at};
 		const entries = existing.filter(
-			(entry) => entry.prior !== prior && entry.prior !== hash(replacement.refreshToken),
+			(entry) => entry.prior !== prior && (entry.prior !== hash(replacement.refreshToken) || entry.refreshToken === replacement.refreshToken),
 		);
 		// Rotating a token that is itself only journaled: extend that entry to the
 		// newest credential, but ALSO keep an entry keyed by the token this
@@ -104,7 +118,13 @@ export async function recordPendingAuth(
 		// recovery source can surface — a stale-snapshot restore then self-heals
 		// straight to the newest credential instead of reviving a spent token.
 		const chained = entries.find((entry) => entry.refreshToken === auth.priorRefreshToken);
-		if (chained) Object.assign(chained, {...replacement, recordId: chained.recordId ?? auth.recordId});
+		if (chained) {
+			Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, chained]));
+			Object.assign(chained, {...replacement, recordId: chained.recordId ?? auth.recordId});
+		}
+		const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
+		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
+		for (const entry of aliases) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
 		const current: PendingAuth = {prior, ...replacement};
 		entries.push(current);
 		const excess = entries.length - MAX_ENTRIES;
@@ -142,13 +162,14 @@ export async function applyPendingAuth(
 		const entry = account.refreshToken ? entries.find((item) => item.prior === hash(account.refreshToken)) : undefined;
 		if (!entry) continue;
 		account.recordId ??= entry.recordId;
+		const authorization = mergeAuthorization(entry.accessToken, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
 		account.refreshToken = entry.refreshToken;
 		account.accessToken = entry.accessToken;
 		account.expiresAt = entry.expiresAt;
-		account.authInvalidatedAt = entry.authInvalidatedAt;
-		account.authInvalidationErrorCode = entry.authInvalidationErrorCode;
-		if (entry.enabled === false) account.enabled = false;
-		if (!entry.authInvalidatedAt && account.cooldownReason === "auth-failure") {
+		account.authInvalidatedAt = authorization.authInvalidatedAt;
+		account.authInvalidationErrorCode = authorization.authInvalidationErrorCode;
+		if (authorization.enabled === false) account.enabled = false;
+		if (!account.authInvalidatedAt && account.cooldownReason === "auth-failure") {
 			delete account.coolingDownUntil;
 			delete account.cooldownReason;
 		}

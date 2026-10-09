@@ -1,7 +1,24 @@
 import { expect, it } from "vitest";
-import { mergeAccountSnapshot } from "../lib/storage/snapshot-merge.js";
+import { mergeAccountSnapshot, mergeAccountRuntimeObservations } from "../lib/storage/snapshot-merge.js";
 import type { AccountStorageV3 } from "../lib/storage/public-types.js";
 const fixture = (): AccountStorageV3 => ({ version: 3, activeIndex: 0, accounts: [{ recordId: "a", accountId: "a", refreshToken: "fixture-a", addedAt: 1, lastUsed: 1, workspaces: [{ id: "personal", enabled: true }, { id: "business", enabled: true }], currentWorkspaceIndex: 0 }] });
+it.each(["same", "rotated", "disabled", "deleted", "recovered"])("persists conflict authorization without crossing credential generations (%s)", state => {
+    const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
+    for (const pool of [base, disk, local]) pool.accounts[0]!.accessToken = "fixture-access";
+    disk.accounts[0]!.accountLabel = "External";
+    local.accounts[0]!.accountLabel = "Local";
+    local.accounts[0]!.authInvalidatedAt = 1500;
+    local.accounts[0]!.authInvalidationErrorCode = "token_invalidated";
+    if (state === "rotated") {disk.accounts[0]!.accessToken = "fixture-newer"; disk.accounts[0]!.refreshToken = "fixture-newer-refresh";}
+    if (state === "disabled") local.accounts[0]!.enabled = false;
+    if (state === "deleted") disk.accounts = [];
+    if (state === "recovered") {base.accounts[0]!.authInvalidatedAt = 1500; disk.accounts[0]!.authInvalidatedAt = 1500; delete local.accounts[0]!.authInvalidatedAt; delete local.accounts[0]!.authInvalidationErrorCode;}
+    const result = mergeAccountRuntimeObservations(base, disk, local);
+    if (state === "deleted") {expect(result.accounts).toEqual([]); return;}
+    expect(result.accounts[0]!.authInvalidatedAt).toBe(state === "rotated" || state === "recovered" ? undefined : 1500);
+    expect(result.accounts[0]!.accountLabel).toBe("External");
+    if (state === "disabled") expect(result.accounts[0]!.enabled).toBe(false);
+});
 it("preserves independently added accounts and workspace edits during an old runtime save", () => {
     const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
     disk.accounts.push({ recordId: "b", accountId: "b", refreshToken: "fixture-b", addedAt: 2, lastUsed: 2 });

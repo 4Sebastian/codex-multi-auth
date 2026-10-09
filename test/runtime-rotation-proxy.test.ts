@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { createServer } from "node:http";
+import { createServer, ServerResponse } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
 import * as nativeStorageReader from "../lib/runtime/native-account-storage.js";
@@ -8557,6 +8557,94 @@ describe('earned reset last-resort integration',()=>{
    expect(calls.find(c=>c.url.endsWith('/responses'))?.headers.get('chatgpt-account-id')).toBe(otherUsable?'acc_2':'acc_1');
   }finally{await service.setPolicy('manual');rpc.mockRestore();if(originalDir===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=originalDir;await fs.rm(testDir,{recursive:true,force:true,maxRetries:5});}
  });
+});
+
+describe("review boundary regressions", () => {
+	it.each(["disabled", "invalidated", "quota", "circuit", "policy", "account-policy"])("revalidates prepared custom handshake at dispatch (%s)", async mutation => {
+		const disk = createStorage(Date.now(), 1);
+		const manager = new AccountManager(undefined, structuredClone(disk)), account = manager.getAccountByIndex(0)!;
+		const selection = vi.spyOn(manager, "syncCodexCliActiveSelectionForIndex").mockResolvedValue(undefined);
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async () => undefined));
+		let creates = 0, handshaken = false;
+		const evaluate = runtimePolicy.evaluateRuntimePolicy;
+		const policy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async input => {
+			const decision = await evaluate(input);
+			if (handshaken && mutation === "policy") return {...decision, allowed: false, statusCode: 403, errorCode: "policy_blocked"};
+			if (handshaken && mutation === "account-policy") decision.blockedAccountIndexes.add(account.index);
+			return decision;
+		});
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {
+			handshaken = true;
+			if (mutation === "disabled") manager.setAccountEnabled(0, false);
+			else if (mutation === "invalidated") manager.markAuthInvalidated(account, "token_invalidated", 1500);
+			else if (mutation === "quota") manager.markRateLimitedWithReason(account, 60000, getModelFamily("shared"), "quota", "shared");
+			else if (mutation === "circuit") {const breaker = getCircuitBreaker(getAccountIdentityKey(account)!); for (let i = 0; i < 3; i++) breaker.recordFailure();}
+			ws.on("message", () => {creates++;});
+		}});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl, forcedAccountIndex: 0}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+			await vi.waitFor(() => expect(proxy.getStatus().streamsStarted).toBe(1));
+			await new Promise(resolve => setImmediate(resolve));
+			expect(creates).toBe(0);
+		} finally {client.terminate(); await upstream.close(); selection.mockRestore(); policy.mockRestore();}
+	});
+
+	it.each(["client", "upstream"])("bounds custom outgoing bytes toward %s without penalizing accounts", async direction => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1)), account = manager.getAccountByIndex(0)!;
+		const failure = vi.spyOn(manager, "recordFailure"), append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let source!: WebSocket, target: WebSocket | undefined, armed = false;
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {source = ws; ws.once("message", () => ws.send(JSON.stringify({type: "response.output_text.delta", delta: "visible"})));}});
+		const original = WebSocket.prototype.send;
+		const sending = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
+			if ((direction === "upstream" && this.url?.startsWith(upstream.baseUrl.replace("http:", "ws:"))) || (direction === "client" && this !== source && !this.url)) target = this;
+			return original.apply(this, args);
+		});
+		const buffered = vi.spyOn(WebSocket.prototype, "bufferedAmount", "get").mockImplementation(function(this: WebSocket) {return armed && this === target ? 65530 : 0;});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl, maxRequestBodyBytes: 65536}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const visible = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); await visible;
+			expect(target).toBeDefined(); armed = true;
+			const closed = nextWebSocketClose(client);
+			if (direction === "client") source.send(JSON.stringify({type: "response.output_text.delta", delta: "overflow"}));
+			else client.send(JSON.stringify({type: "probe"}));
+			await closed;
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: "failure", errorCode: "websocket_buffer_exceeded"});
+			expect(failure).not.toHaveBeenCalled(); expect(account.cooldownReason).toBeUndefined();
+		} finally {client.terminate(); await upstream.close(); sending.mockRestore(); buffered.mockRestore(); append.mockRestore(); failure.mockRestore();}
+	});
+
+	it.each(["shared", "api/shared", "zdr/shared", "catalog"])("settles native cancellation before response headers (%s)", async model => {
+		const {ClientCancellationError} = await import("../lib/request/client-cancellation.js");
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow"), failure = vi.spyOn(manager, "recordFailure");
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		const {fetchImpl} = createRecordingFetch(async call => {
+			if (model === "catalog" || !call.url.includes("/models")) {entered(); await gate; if (model !== "catalog") throw new ClientCancellationError();}
+			return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "cancel-paid", label: "Fixture", kind: model.startsWith("zdr/") ? "zdr" : "api", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}]}});
+		let serverClosed!: () => void;
+		const gone = new Promise<void>(resolve => {serverClosed = resolve;});
+		const emit = ServerResponse.prototype.emit;
+		const closing = vi.spyOn(ServerResponse.prototype, "emit").mockImplementation(function(this: ServerResponse, ...args: Parameters<ServerResponse["emit"]>) {
+			if (args[0] === "close" && this.req.url === "/responses" && !this.writableEnded) serverClosed();
+			return emit.apply(this, args);
+		});
+		const controller = new AbortController();
+		const response = fetch(proxy.baseUrl + "/responses", {method: "POST", headers: {authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}`, "content-type": "application/json"}, body: JSON.stringify({model: model === "catalog" ? "shared" : model, input: []}), signal: controller.signal});
+		void response.catch(() => undefined);
+		try {
+			await ready; controller.abort(); await response.catch(() => undefined); await gone; release();
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0].outcome).toBe("cancelled");
+			expect(failure).not.toHaveBeenCalled(); expect(manager.getAccountByIndex(0)?.cooldownReason).toBeUndefined();
+		} finally {release(); await response.catch(() => undefined); closing.mockRestore(); append.mockRestore(); failure.mockRestore();}
+	});
 });
 
 describe("independent transport review",()=>{
