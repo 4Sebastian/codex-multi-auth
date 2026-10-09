@@ -2527,7 +2527,7 @@ describe("AccountManager", () => {
 			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
 		});
 
-		it("clears a legacy invalidation superseded by the current access token", async () => {
+		it("preserves persisted current-generation invalidation despite issuer clock skew", async () => {
 			const { saveAccounts } = await import("../lib/storage.js");
 			const mockSaveAccounts = vi.mocked(saveAccounts);
 			const now = Date.now();
@@ -2552,12 +2552,12 @@ describe("AccountManager", () => {
 			const account = manager.getAccountByIndex(0);
 			if (!account) throw new Error("account missing");
 
-			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
 			await manager.saveToDisk();
 
 			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
-			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
-			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+			expect(savedAccount?.authInvalidatedAt).toBe(now);
+			expect(savedAccount?.authInvalidationErrorCode).toBe("token_revoked");
 		});
 
 		it("does not resurrect invalidation after another process refreshes credentials", async () => {
@@ -5095,7 +5095,7 @@ describe("commit and retryable rescue ordering", () => {
 			await refreshing;
 			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
 			expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({priorRefreshToken: "fixture-old", refreshToken: account.refreshToken}));
-			if (mutation === "invalidate") {expect(account.authInvalidatedAt).toBe(1500); expect(account.cooldownReason).toBe("auth-failure");}
+			if (mutation === "invalidate") {expect(account.authInvalidatedAt).toBeUndefined(); expect(account.cooldownReason).toBeUndefined();}
 			if (mutation === "disable") expect(account.enabled).toBe(false);
 		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
 	});
@@ -5115,7 +5115,7 @@ describe("commit and retryable rescue ordering", () => {
 			release(); await refreshing;
 			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
 			expect(restarted.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
-			if (mutation === "invalidate") expect(restarted).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (mutation === "invalidate") {expect(restarted.authInvalidatedAt).toBeUndefined(); expect(restarted.cooldownReason).toBeUndefined();}
 			else expect(restarted.enabled).toBe(false);
 		} finally {release(); await refreshing;}
 	});

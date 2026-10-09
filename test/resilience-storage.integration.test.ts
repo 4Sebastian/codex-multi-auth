@@ -6,6 +6,7 @@ import * as pendingAuth from "../lib/storage/pending-auth.js";
 import { promises as filesystem } from "node:fs";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
 import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
+import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import { AccountManager, AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
 import { saveAccounts, loadAccounts, getStoragePath, clearAccounts, setStoragePathDirect, cloneTrackedAccountStorage, withAccountAndFlaggedStorageTransaction } from "../lib/storage.js";
 import { withRetry } from "../lib/fs-retry.js";
@@ -19,6 +20,50 @@ async function setup() {
     await saveAccounts({ version: 3, activeIndex: 0, accounts: [{ recordId: "first", accountId: "first", refreshToken: "fixture-first", addedAt: 1, lastUsed: 1, workspaces: [{ id: "personal", enabled: true }, { id: "business", enabled: true }], currentWorkspaceIndex: 0 }] });
     return new AccountManager(undefined, await loadAccounts());
 }
+it("preserves confirmed current-generation revocation with issuer clock ahead",async()=>{
+ const manager=await setup(),account=manager.getAccountByIndex(0)!;
+ const access=`e30.${Buffer.from(JSON.stringify({iat:Math.floor(Date.now()/1000)+30})).toString("base64url")}.fixture`;
+ manager.updateFromAuth(account,{type:"oauth",access,refresh:"fixture-first",expires:Date.now()+3600000});await manager.saveToDisk();
+ manager.markAuthInvalidated(account,"token_invalidated",Date.now(),access);manager.markAccountCoolingDown(account,60000,"auth-failure");
+ expect(manager.isAccountAuthInvalidated(account)).toBe(true);await manager.saveToDisk();
+ const disk=(await createNativeAccountStorageReader()()).storage!;
+ expect(disk.accounts[0]?.authInvalidatedAt).toBeDefined();
+ const hydrated=new AccountManager(undefined,disk);expect(hydrated.isAccountAuthInvalidated(hydrated.getAccountByIndex(0)!)).toBe(true);
+ await pendingAuth.recordPendingAuth(getStoragePath(),{priorRefreshToken:account.refreshToken,refreshToken:account.refreshToken,accessToken:access,expiresAt:account.expires!,authInvalidatedAt:account.authInvalidatedAt,authInvalidationErrorCode:"token_invalidated",at:Date.now()});
+ expect((await createNativeAccountStorageReader()()).storage?.accounts[0]?.authInvalidatedAt).toBeDefined();
+});
+it.each(["unchanged","disabled","revoked","deleted","replacement","rebuild","old-expiry","old-revocation"])("preserves memory-only refresh across a later real native read (%s)",async change=>{
+ await setup();const initial=(await loadAccounts())!;Object.assign(initial.accounts[0]!,{accessToken:"fixture-A",expiresAt:Date.now()+1000,...(change === "old-revocation" ? {authInvalidatedAt:1500,authInvalidationErrorCode:"token_invalidated"} : {})});await saveAccounts(initial);
+ const manager=new AccountManager(undefined,await loadAccounts()),account=manager.getAccountByIndex(0)!;
+ const rename=filesystem.rename.bind(filesystem);const blocked=vi.spyOn(filesystem,"rename").mockImplementation(async(source,target)=>{if(target===getStoragePath() || target===pendingAuth.getPendingAuthPath(getStoragePath())) throw Object.assign(Error("fixture locked"),{code:"EACCES"});return rename(source,target);});
+ const timer=vi.spyOn(manager,"saveToDiskDebounced").mockImplementation(()=>undefined);
+ await manager.commitRefreshedAuth(account,{type:"oauth",access:"fixture-B",refresh:"fixture-B-refresh",expires:Date.now()+7200000});blocked.mockRestore();
+ expect(account.access).toBe("fixture-B");
+ const external=structuredClone(initial);
+ if(change==="old-expiry") external.accounts[0]!.expiresAt=Date.now()+3600000;
+ if(change==="disabled") external.accounts[0]!.enabled=false;
+ if(change==="revoked") external.accounts[0]!.authInvalidatedAt=Date.now();
+ if(change==="deleted") external.accounts=[];
+ if(change==="replacement") Object.assign(external.accounts[0]!,{accessToken:"fixture-C",refreshToken:"fixture-C-refresh",expiresAt:Date.now()+3600000});
+ if(change==="rebuild") external.accounts.push({recordId:"second",accountId:"second",accessToken:"fixture-second",refreshToken:"fixture-second-refresh",expiresAt:Date.now()+3600000,addedAt:2,lastUsed:2});
+ await writeFile(getStoragePath(),JSON.stringify(external));const snapshot=await createNativeAccountStorageReader()();
+ syncNativeAccountCredentials(manager,snapshot.storage!,snapshot.capturedAt);
+ if(change==="old-expiry") expect(account.access).toBe("fixture-B");
+ if(change==="old-revocation") {expect(account.access).toBe("fixture-B");expect(account.authInvalidatedAt).toBeUndefined();}
+ if(change==="unchanged") {expect(account.access).toBe("fixture-B");await manager.saveToDisk();expect((await loadAccounts())?.accounts[0]?.accessToken).toBe("fixture-B");}
+ if(change==="replacement") expect(account.access).toBe("fixture-C");
+ if(change==="disabled" || change==="deleted") expect(account.enabled).toBe(false);
+ if(change==="revoked") expect(account.authInvalidatedAt).toBeDefined();
+ if(change==="rebuild") {
+  const headers:string[]=[];
+  const proxy=await startRuntimeRotationProxy({nativeOpenai:true,accountManager:manager,readNativeAccountStorage:async()=>(await createNativeAccountStorageReader()()).storage,clientApiKey:"fixture-independent",upstreamBaseUrl:"http://127.0.0.1:1",fetchImpl:async(_url,init)=>{headers.push(new Headers(init?.headers).get("authorization") ?? "");return Response.json({models:[{slug:"shared"}]});}});
+  try {
+   for(let i=0;i<2;i++) {const response=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:"Bearer fixture-B"}});expect(response.status).toBe(200);await response.text();}
+   expect(headers).toContain("Bearer fixture-B");expect(headers).not.toContain("Bearer fixture-A");
+  } finally {await proxy.close();}
+ }
+ timer.mockRestore();
+});
 it.each(["ordinary", "refresh", "rescue"])("orders a snapshot captured during the atomic %s write before its commit", async mode => {
  await setup();
  const initial = (await loadAccounts())!;

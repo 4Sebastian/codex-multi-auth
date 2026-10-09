@@ -1,5 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { promises as fs } from "node:fs";
+import {recordPendingAuth, getPendingAuthPath} from "../lib/storage/pending-auth.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
@@ -7,6 +9,18 @@ import * as parser from "../lib/storage/storage-parser.js";
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true }); });
+it.each(["EACCES","corrupt"])("never verifies unrestricted primary after journal observation fails (%s)",async failure=>{
+ const root=await mkdtemp(join(tmpdir(),"native-journal-"));roots.push(root);const path=join(root,"accounts.json");
+ const disk={version:3,activeIndex:0,accounts:[{recordId:"first",accessToken:"fixture-A",refreshToken:"fixture-refresh",expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1}]};
+ await writeFile(path,JSON.stringify(disk));const read=createNativeAccountStorageReader(undefined,path);expect((await read()).verified).toBe(true);
+ await recordPendingAuth(path,{priorRefreshToken:"fixture-refresh",recordId:"first",refreshToken:"fixture-refresh",accessToken:"fixture-A",expiresAt:disk.accounts[0]!.expiresAt,authInvalidatedAt:1500,enabled:false,at:1});
+ const original=fs.readFile.bind(fs);
+ const blocked=vi.spyOn(fs,"readFile").mockImplementation(async(...args:Parameters<typeof fs.readFile>)=>{if(String(args[0])===getPendingAuthPath(path)) throw Object.assign(Error("fixture locked"),{code:"EACCES"});return original(...args);});
+ if(failure==="corrupt") {blocked.mockRestore();await writeFile(getPendingAuthPath(path),"corrupt fixture");}
+ const failed=await read();expect(failed.verified).toBe(false);
+ blocked.mockRestore();await rm(getPendingAuthPath(path));
+ expect((await read()).verified).toBe(true);
+});
 it("caches settled primary storage but adopts credential revocation on change", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-cache-"));
     roots.push(root);

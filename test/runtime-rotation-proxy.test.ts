@@ -7298,6 +7298,8 @@ describe("review transport boundary regressions", () => {
 		const token = `h.${Buffer.from(JSON.stringify({iat: Math.floor(Date.now() / 1000), "https://api.openai.com/auth": {chatgpt_account_id: "acc_1"}})).toString("base64url")}.s`;
 		Object.assign(disk.accounts[0]!, {accessToken: token, authInvalidatedAt: Date.now() - 10000, authInvalidationErrorCode: "token_invalidated", coolingDownUntil: Date.now() + 50000, cooldownReason: "auth-failure"});
 		const manager = new AccountManager(undefined, structuredClone(disk));
+		delete disk.accounts[0]!.authInvalidatedAt;
+		delete disk.accounts[0]!.authInvalidationErrorCode;
 		const {calls, fetchImpl} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "shared"}]}) : textEventStream());
 		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
 		const response = await fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: `Bearer ${managedBearer ? token : DEFAULT_CLIENT_API_KEY}`, "content-type": "application/json"}, body: JSON.stringify({model: "shared", input: [], stream: true})});

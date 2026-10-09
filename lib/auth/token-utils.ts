@@ -9,12 +9,6 @@ import { isRecord } from "../utils.js";
 import type { CodexCliMirror } from "../storage/public-types.js";
 import type { AccountIdSource, JWTPayload } from "../types.js";
 
-export function isAuthInvalidationSuperseded(accessToken: string | undefined, invalidatedAt: number | undefined): boolean {
-	if (!accessToken || typeof invalidatedAt !== "number" || !Number.isFinite(invalidatedAt) || invalidatedAt <= 0) return false;
-	const issuedAt = decodeJWT(accessToken)?.iat;
-	return typeof issuedAt === "number" && Number.isFinite(issuedAt) && issuedAt > 0 && issuedAt * 1000 > invalidatedAt;
-}
-
 export interface AccountIdCandidate {
 	accountId: string;
 	label: string;

@@ -90,7 +90,6 @@ export {
 
 import {
 	codexCliAccountIdFor,
-	isAuthInvalidationSuperseded,
 	extractAccountId,
 	extractAccountEmail,
 	shouldUpdateAccountIdFromToken,
@@ -574,16 +573,15 @@ export class AccountManager {
 						lastUsed: clampNonNegativeInt(account.lastUsed, 0),
 						lastSwitchReason: account.lastSwitchReason,
 						rateLimitResetTimes: account.rateLimitResetTimes ?? {},
-						coolingDownUntil: account.coolingDownUntil,
-						cooldownReason: account.cooldownReason,
-						authInvalidatedAt: account.authInvalidatedAt,
-						authInvalidationErrorCode: account.authInvalidationErrorCode,
+						coolingDownUntil: matchesFallback && authFallback?.access !== account.accessToken && account.cooldownReason === "auth-failure" ? undefined : account.coolingDownUntil,
+						cooldownReason: matchesFallback && authFallback?.access !== account.accessToken && account.cooldownReason === "auth-failure" ? undefined : account.cooldownReason,
+						authInvalidatedAt: matchesFallback && authFallback?.access !== account.accessToken ? undefined : account.authInvalidatedAt,
+						authInvalidationErrorCode: matchesFallback && authFallback?.access !== account.accessToken ? undefined : account.authInvalidationErrorCode,
 						workspaces: account.workspaces,
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
 						codexCliMirror: account.codexCliMirror,
 					};
 					this.nativeAuthSnapshots.set(managedAccount, {authInvalidatedAt: account.authInvalidatedAt, enabled: account.enabled !== false, observedAt: performance.now()});
-					this.clearSupersededAuthInvalidation(managedAccount);
 					return managedAccount;
 				})
 				.filter((account): account is ManagedAccount => account !== null);
@@ -1527,22 +1525,24 @@ export class AccountManager {
 		if (observation) this.nativeAuthSnapshots.set(account, {...observation});
 	}
 
-	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}, capturedAt = performance.now()): boolean {
+	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}, capturedAt = performance.now(), retainingLiveCredentials = false): boolean {
 		if (!this.isNativeSnapshotCurrent(account, capturedAt)) return false;
 		const prior = this.nativeAuthSnapshots.get(account);
 		const before = account.authInvalidatedAt;
 		const wasEnabled = account.enabled !== false;
 		const enabled = disk.enabled !== false;
 		if (!prior || enabled !== prior.enabled) account.enabled = enabled;
-		const diskInvalidatedAt = isAuthInvalidationSuperseded(disk.accessToken, disk.authInvalidatedAt) ? undefined : disk.authInvalidatedAt;
+		const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId === account.recordId)
+			?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === getAccountIdentityKey(account));
+		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt;
+		const diskInvalidatedAt = unchangedAuthorization ? before : disk.authInvalidatedAt;
 		if (diskInvalidatedAt) {
-			if (!before || diskInvalidatedAt > before || disk.accessToken !== account.access) {
+			if (!unchangedAuthorization && (!before || diskInvalidatedAt > before || disk.accessToken !== account.access)) {
 				account.authInvalidatedAt = diskInvalidatedAt;
 				account.authInvalidationErrorCode = disk.authInvalidationErrorCode;
 			}
-		} else if (isAuthInvalidationSuperseded(disk.accessToken, before) ||
-			(disk.accessToken !== account.access && !!disk.accessToken) ||
-			(prior?.authInvalidatedAt === before && prior?.authInvalidatedAt !== undefined)) {
+		} else if (!retainingLiveCredentials && ((disk.accessToken !== account.access && !!disk.accessToken) ||
+			(prior?.authInvalidatedAt === before && prior?.authInvalidatedAt !== undefined))) {
 			this.clearAuthInvalidation(account);
 			if (account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
 		}
@@ -1553,21 +1553,17 @@ export class AccountManager {
 		return before !== account.authInvalidatedAt || wasEnabled !== (account.enabled !== false);
 	}
 
-	private clearSupersededAuthInvalidation(account: ManagedAccount): boolean {
-		if (!isAuthInvalidationSuperseded(account.access, account.authInvalidatedAt)) {
-			return false;
-		}
-		this.clearAuthInvalidation(account);
-		if (account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
+	acceptNativeCredentials(account: ManagedAccount, disk: AccountStorageV3["accounts"][number]): boolean {
+		const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId === account.recordId)
+			?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === getAccountIdentityKey(account));
+		if (baseline && disk.accessToken === baseline.accessToken && disk.refreshToken === baseline.refreshToken &&
+			(account.access !== baseline.accessToken || account.refreshToken !== baseline.refreshToken ||
+				(disk.expiresAt === baseline.expiresAt && account.expires !== baseline.expiresAt))) return false;
+		if (baseline) for (const field of ["accessToken", "refreshToken", "expiresAt"] as const) Object.assign(baseline, {[field]: disk[field]});
 		return true;
 	}
 
 	isAccountAuthInvalidated(account: ManagedAccount): boolean {
-		// A replacement access token proves that an invalidation attached to the
-		// previous token generation is stale. Normalize defensively here as well as
-		// during hydration/reconciliation so legacy snapshots self-heal even when
-		// their first operation is account selection.
-		this.clearSupersededAuthInvalidation(account);
 		return (
 			typeof account.authInvalidatedAt === "number" &&
 			Number.isFinite(account.authInvalidatedAt) &&
@@ -1670,15 +1666,8 @@ export class AccountManager {
 			const diskHasValidInvalidation =
 				typeof diskInvalidatedAt === "number" &&
 				Number.isFinite(diskInvalidatedAt) &&
-				diskInvalidatedAt > 0 &&
-				!isAuthInvalidationSuperseded(disk.accessToken, diskInvalidatedAt);
-			if (
-				isAuthInvalidationSuperseded(
-					account.accessToken,
-					account.authInvalidatedAt,
-				) ||
-				(adoptedNewerCredentials && !diskHasValidInvalidation)
-			) {
+				diskInvalidatedAt > 0;
+			if (adoptedNewerCredentials && !diskHasValidInvalidation) {
 				// A refresh/re-login in another process supersedes an invalidation of
 				// the prior access token. Do not combine the newer disk credentials
 				// with this manager's stale marker and write the account back unusable.
@@ -1694,7 +1683,7 @@ export class AccountManager {
 			const explicitlyCleared = baseline?.authInvalidatedAt === diskInvalidatedAt && baseline?.authInvalidationErrorCode === disk.authInvalidationErrorCode &&
 				baseline?.accessToken === account.accessToken && baseline?.refreshToken === account.refreshToken &&
 				disk.accessToken === account.accessToken && disk.refreshToken === account.refreshToken;
-			if (diskHasValidInvalidation && !accountHasValidInvalidation && !explicitlyCleared) {
+			if (diskHasValidInvalidation && disk.accessToken === account.accessToken && !accountHasValidInvalidation && !explicitlyCleared) {
 				// Ordinary saves must not erase a CURRENT invalidation written by
 				// another AccountManager. A marker older than the token generation is
 				// stale and is intentionally not resurrected.
@@ -1905,7 +1894,7 @@ export class AccountManager {
 
 					const previousObservation = this.nativeAuthSnapshots.get(liveAccount);
 					const newerInvalidation = previousLiveAccountState.authInvalidatedAt !== initialState?.authInvalidatedAt &&
-						!isAuthInvalidationSuperseded(currentAuth.access, previousLiveAccountState.authInvalidatedAt);
+						currentAuth.access === previousLiveAccountState.access;
 					this.updateFromAuth(liveAccount, currentAuth);
 					if (newerInvalidation) {
 						liveAccount.authInvalidatedAt = storedAccount.authInvalidatedAt = previousLiveAccountState.authInvalidatedAt;
@@ -1913,7 +1902,8 @@ export class AccountManager {
 					}
 					liveAccount.enabled = !(previousLiveAccountState.enabled === false && initialState?.enabled !== false);
 					if (!liveAccount.enabled) storedAccount.enabled = false;
-					const newerCooldown = previousLiveAccountState.coolingDownUntil !== initialState?.coolingDownUntil || previousLiveAccountState.cooldownReason !== initialState?.cooldownReason;
+					const newerCooldown = (previousLiveAccountState.coolingDownUntil !== initialState?.coolingDownUntil || previousLiveAccountState.cooldownReason !== initialState?.cooldownReason) &&
+						(previousLiveAccountState.cooldownReason !== "auth-failure" || previousLiveAccountState.access === currentAuth.access);
 					if (newerInvalidation || newerCooldown) {
 						storedAccount.coolingDownUntil = previousLiveAccountState.coolingDownUntil;
 						storedAccount.cooldownReason = previousLiveAccountState.cooldownReason;
@@ -1968,10 +1958,11 @@ export class AccountManager {
 						live.authInvalidatedAt !== initialState.authInvalidatedAt || live.enabled !== initialState.enabled;
 					const invalidatedAt = live.authInvalidatedAt, invalidationCode = live.authInvalidationErrorCode;
 					this.updateFromAuth(live, auth);
-					if (authorizationChanged && !isAuthInvalidationSuperseded(auth.access, invalidatedAt)) {
+					if (authorizationChanged && auth.access === initialState.access) {
 						live.authInvalidatedAt = invalidatedAt;
 						live.authInvalidationErrorCode = invalidationCode;
 					}
+					if (live.cooldownReason === "auth-failure" && auth.access !== initialState.access) this.clearAccountCooldown(live);
 					if (!authorizationChanged) {
 						if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
 						this.clearAuthFailures(live);
@@ -2356,7 +2347,7 @@ export class AccountManager {
      account.access = saved.accessToken;
      account.refreshToken = saved.refreshToken;
      account.expires = saved.expiresAt;
-     account.authInvalidatedAt = isAuthInvalidationSuperseded(saved.accessToken, saved.authInvalidatedAt) ? undefined : saved.authInvalidatedAt;
+     account.authInvalidatedAt = saved.authInvalidatedAt;
      account.authInvalidationErrorCode = account.authInvalidatedAt ? saved.authInvalidationErrorCode : undefined;
     }
     if ((account.enabled !== false) === (prior.enabled !== false)) account.enabled = saved.enabled !== false;

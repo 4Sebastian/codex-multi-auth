@@ -244,17 +244,17 @@ it("never rewinds a chained rotation when a delayed rescue journals its older at
 	}
 });
 
-it.each(["disabled", "invalidated", "self"])("preserves independent authorization in delayed journal chains (%s)", async state => {
+it.each(["disabled", "invalidated", "self"])("scopes delayed journal restrictions to their credential generation (%s)", async state => {
 	await recordPendingAuth(storagePath, rotation("b", state === "self" ? "b" : "c"));
 	if (state === "self") await recordPendingAuth(storagePath, {...rotation("b", "b"), authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"});
 	const restrictions = state === "disabled" ? {enabled: false as const} : state === "invalidated" ? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"} : {};
 	const retained = await recordPendingAuth(storagePath, {...rotation("a", "b"), ...restrictions, at: 2000});
 	if (state === "disabled") expect(retained.enabled).toBe(false);
-	else expect(retained.authInvalidatedAt).toBe(1500);
+	else expect(retained.authInvalidatedAt).toBe(state === "self" ? 1500 : undefined);
 	for (const token of ["a", "b"]) {
 		const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]});
 		if (state === "disabled") expect(restored?.accounts[0]?.enabled).toBe(false);
-		else expect(restored?.accounts[0]?.authInvalidatedAt).toBe(1500);
+		else expect(restored?.accounts[0]?.authInvalidatedAt).toBe(state === "self" ? 1500 : undefined);
 	}
 });
 
@@ -273,8 +273,8 @@ it("preserves authorization carried by another alias of the retained credential"
 	}
 });
 
-it.each([false, true])("only clears disk revocation with replacement issuance evidence, recovered=%s", async recovered => {
-	const token = `e30.${Buffer.from(JSON.stringify({iat: recovered ? 3 : 1})).toString("base64url")}.fixture`;
+it.each([false, true])("only clears disk revocation with an authenticated replacement generation, recovered=%s", async recovered => {
+	const token = recovered ? "fixture-new-generation" : "old";
 	await recordPendingAuth(storagePath, {...rotation("a", "b"), accessToken: token});
 	const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "a", accessToken: "old", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated", enabled: false, addedAt: 1, lastUsed: 1}]});
 	expect(restored?.accounts[0]?.authInvalidatedAt).toBe(recovered ? undefined : 1500);

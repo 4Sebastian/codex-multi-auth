@@ -141,13 +141,13 @@ it("matches preferences by account identity and workspace ID despite reordered l
 });
 
 describe("native invalidation reconciliation", () => {
-	it("does not restore a marker from an older JWT generation", () => {
+	it("does not clear a current marker solely from JWT issuance time", () => {
 		const storage = fixture();
 		Object.assign(storage.accounts[0]!, {accessToken: `h.${Buffer.from(JSON.stringify({iat: 10})).toString("base64url")}.s`, authInvalidatedAt: 5000});
 		const manager = new AccountManager(undefined, storage);
 		syncNativeAccountCredentials(manager, structuredClone(storage));
-		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
-		expect(manager.getAccountByIndex(0)!.cooldownReason).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBe(5000);
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("auth-failure");
 		expect(manager.getAccountByIndex(0)!.rateLimitResetTimes.codex).toBe(99999);
 	});
 	it("adopts a successful probe clear without changing credentials", () => {

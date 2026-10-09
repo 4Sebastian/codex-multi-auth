@@ -39,7 +39,9 @@ export function syncNativeAccountCredentials(
 			changed = true;
 			continue;
 		}
-		changed = manager.syncAuthInvalidationFromSnapshot(account, disk, capturedAt) || changed;
+		const adoptCredentials = manager.acceptNativeCredentials(account, disk);
+		changed = manager.syncAuthInvalidationFromSnapshot(account, disk, capturedAt, !adoptCredentials) || changed;
+		if (!adoptCredentials) continue;
 		if (
 			disk.accessToken === account.access &&
 			disk.refreshToken === account.refreshToken &&

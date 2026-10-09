@@ -127,6 +127,11 @@ export async function runHealthCheck(
 	let signedInOnly = 0;
 	const activeIndex = resolveActiveIndex(storage, "codex");
 	let activeAccountRefreshed = false;
+	const classifyProbe = (account: Parameters<typeof recoverAccount>[0], snapshot: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>>): void => {
+		if (snapshot.tokenInvalidated || account.authInvalidatedAt) failed += 1;
+		else if (snapshot.responseCompleted === true && !snapshot.primingFailure) codexAvailable += 1;
+		else signedInOnly += 1;
+	};
 	const now = Date.now();
 	console.log(
 		stylePromptText(
@@ -185,7 +190,8 @@ export async function runHealthCheck(
 					: undefined;
 				if (!probeAccountId || !currentAccessToken) {
 					warnings += 1;
-					signedInOnly += 1;
+					if (account.authInvalidatedAt) failed += 1;
+					else signedInOnly += 1;
 					healthTone = "warning";
 					healthDetail =
 						"signed in (live check skipped: missing account ID or unavailable selected workspace)";
@@ -205,10 +211,11 @@ export async function runHealthCheck(
 						if (recoverAccount(account, snapshot)) changed = true;
 						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
 						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthTone = "warning"; warnings += 1; }
-						codexAvailable += 1;
+						classifyProbe(account, snapshot);
 					} catch (error) {
 						warnings += 1;
-						signedInOnly += 1;
+						if (account.authInvalidatedAt) failed += 1;
+						else signedInOnly += 1;
 						healthTone = "warning";
 						if (isCodexUnavailableError(error)) {
 							healthDetail =
@@ -251,6 +258,8 @@ export async function runHealthCheck(
 			}
 			if (account.accessToken !== result.access) {
 				account.accessToken = result.access;
+				delete account.authInvalidatedAt;
+				delete account.authInvalidationErrorCode;
 				changed = true;
 			}
 			if (account.expiresAt !== result.expires) {
@@ -287,7 +296,8 @@ export async function runHealthCheck(
 				const probeAccountId = automaticCheckWorkspaceId(account);
 				if (!probeAccountId) {
 					warnings += 1;
-					signedInOnly += 1;
+					if (account.authInvalidatedAt) failed += 1;
+					else signedInOnly += 1;
 					healthyTone = "warning";
 					healthyMessage =
 						"signed in (live check skipped: missing account ID or unavailable selected workspace)";
@@ -305,10 +315,11 @@ export async function runHealthCheck(
 						if (recoverAccount(account, snapshot)) changed = true;
 						healthyMessage = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
 						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthyTone = "warning"; warnings += 1; }
-						codexAvailable += 1;
+						classifyProbe(account, snapshot);
 					} catch (error) {
 						warnings += 1;
-						signedInOnly += 1;
+						if (account.authInvalidatedAt) failed += 1;
+						else signedInOnly += 1;
 						healthyTone = "warning";
 						if (isCodexUnavailableError(error)) {
 							healthyMessage =

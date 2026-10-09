@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { isAuthInvalidationSuperseded } from "../auth/token-utils.js";
 import { decodeJWT } from "../auth/auth.js";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
@@ -45,8 +44,8 @@ export function getPendingAuthPath(storagePath: string): string {
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
 
 type Authorization = Pick<PendingAuth, "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled">;
-function mergeAuthorization(accessToken: string, sources: Authorization[]): Authorization {
-	const invalidated = sources.filter(source => source.authInvalidatedAt && !isAuthInvalidationSuperseded(accessToken, source.authInvalidatedAt))
+function mergeAuthorization(accessToken: string, sources: Array<Authorization & {accessToken?: string}>): Authorization {
+	const invalidated = sources.filter(source => source.authInvalidatedAt && source.accessToken === accessToken)
 		.sort((a, b) => (b.authInvalidatedAt ?? 0) - (a.authInvalidatedAt ?? 0))[0];
 	return {
 		authInvalidatedAt: invalidated?.authInvalidatedAt,

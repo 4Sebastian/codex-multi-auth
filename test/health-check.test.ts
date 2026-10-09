@@ -264,6 +264,23 @@ describe("runHealthCheck live probe", () => {
 		expect(storage.accounts[0]).toMatchObject({enabled:false,authInvalidatedAt:REAL_NOW-60000,authInvalidationErrorCode:"token_revoked"});
 		expect(saveAccountsMock).not.toHaveBeenCalled();
 	});
+	it.each([false,true].flatMap(refresh=>["revoked","unconfirmed","completed"].map(outcome=>({refresh,outcome}))))("classifies health summary by actual probe completion %j",async({refresh,outcome})=>{
+ const storage=storageWith([account("a",{...(refresh?{expiresAt:STALE_EXPIRES_AT}:{} )})]);loadAccountsMock.mockResolvedValue(storage);
+ queuedRefreshMock.mockResolvedValue({type:"success",access:"access-new",refresh:"fixture-refresh-new",expires:REAL_NOW+7200000});
+ fetchCodexQuotaSnapshotMock.mockResolvedValue({...snapshot(),responseCompleted:outcome==="completed",tokenInvalidated:outcome==="revoked"});
+ await runHealthCheck({liveProbe:true});
+ expect(logged()).toContain(`${outcome==="completed"?1:0} Codex available`);
+ expect(logged()).toContain(`${outcome==="revoked"?1:0} need re-login`);
+ expect(logged()).toContain(`${outcome==="unconfirmed"?1:0} signed in only`);
+ if(outcome==="revoked") expect(storage.accounts[0]?.authInvalidatedAt).toBeDefined();
+ });
+	it.each([false,true])("counts retained revocation without completion, refreshed generation=%s",async refresh=>{
+ const storage=storageWith([account("a",{authInvalidatedAt:1500,...(refresh?{expiresAt:STALE_EXPIRES_AT}:{})})]);loadAccountsMock.mockResolvedValue(storage);
+ queuedRefreshMock.mockResolvedValue({type:"success",access:"access-new",refresh:"fixture-refresh-new",expires:REAL_NOW+7200000});
+ fetchCodexQuotaSnapshotMock.mockResolvedValue({...snapshot(),responseCompleted:false});await runHealthCheck({liveProbe:true});
+ expect(logged()).toContain("0 Codex available");expect(logged()).toContain(`${refresh?0:1} need re-login`);
+ expect(storage.accounts[0]?.authInvalidatedAt).toBe(refresh?undefined:1500);
+ });
 	it("clears a stale invalidation after a successful live probe", async () => {
 		const storage = storageWith([
 			account("a", {

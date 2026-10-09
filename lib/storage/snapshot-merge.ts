@@ -1,5 +1,4 @@
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
-import { isAuthInvalidationSuperseded } from "../auth/token-utils.js";
 import { getAccountIdentityKey } from "./identity.js";
 import { isRecord } from "../utils.js";
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -93,7 +92,7 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
         if (value !== undefined) limits[key] = value;
     }
     const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
-    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && !isAuthInvalidationSuperseded(accessToken, row.authInvalidatedAt) ? row.authInvalidatedAt : undefined;
+    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken ? row.authInvalidatedAt : undefined;
     const diskInvalidation = currentInvalidation(disk), localInvalidation = currentInvalidation(local);
     const clearedInvalidation = base.authInvalidatedAt !== undefined && (
         (disk.accessToken === base.accessToken && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
