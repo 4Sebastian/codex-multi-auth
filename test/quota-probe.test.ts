@@ -68,6 +68,15 @@ describe("quota-probe", () => {
 		vi.useRealTimers();
 	});
 
+	it.each([false,true].flatMap(prime => ["response.failed", "response.done", "response.cancelled", "response.incomplete", "response.created", "empty", "response.completed"].map(type => ({prime,type}))))("requires successful probe completion independently of quota headers %j", async ({prime,type}) => {
+		const headers=makeQuotaHeaders({"content-type":"text/event-stream",...(prime ? {"x-codex-primary-used-percent":"0","x-codex-secondary-used-percent":"0","x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800"} : {})});
+		const body=type === "empty" ? "" : `data: ${JSON.stringify({type,response:{status:type === "response.completed" ? "completed" : "failed",error:{code:"token_invalidated"}}})}\r\n\r\n`;
+		const fetchMock=vi.fn(async()=>new Response(body,{status:200,headers})); vi.stubGlobal("fetch",fetchMock);
+		const result=await fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture",model:DEFAULT_PROBE_MODEL,primeUnusedSubscription:prime,fallbackModels:[]});
+		expect(result).toMatchObject({status:200,responseCompleted:type === "response.completed"});
+		if(prime) expect(result.primingCompleted === true).toBe(type === "response.completed");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
 	it("does not start or retry a quota probe after cancellation",async()=>{
       const controller=new AbortController();controller.abort();const fetchMock=vi.fn();vi.stubGlobal("fetch",fetchMock);
       await expect(fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture",signal:controller.signal})).rejects.toMatchObject({name:"AbortError"});

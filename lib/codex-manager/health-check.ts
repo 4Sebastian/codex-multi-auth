@@ -60,19 +60,22 @@ function appendAuthInvalidationMarker(
 		: detail;
 }
 
-function clearAuthInvalidationMarker(account: {
+function recoverAccount(account: {
+	enabled?: boolean;
 	authInvalidatedAt?: number;
 	authInvalidationErrorCode?: string;
-}): boolean {
-	if (
-		typeof account.authInvalidatedAt !== "number" &&
-		account.authInvalidationErrorCode === undefined
-	) {
-		return false;
+}, probe?: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>>): boolean {
+	if (probe?.tokenInvalidated) {
+		account.authInvalidatedAt = Date.now();
+		account.authInvalidationErrorCode = "token_invalidated";
+		return true;
 	}
+	if (probe && (probe.responseCompleted !== true || probe.primingFailure)) return false;
+	const changed = account.enabled === false || account.authInvalidatedAt !== undefined || account.authInvalidationErrorCode !== undefined;
+	if (account.enabled === false) account.enabled = true;
 	delete account.authInvalidatedAt;
 	delete account.authInvalidationErrorCode;
-	return true;
+	return changed;
 }
 
 /**
@@ -169,12 +172,9 @@ export async function runHealthCheck(
 		const labelText = stylePromptText(label, "accent");
 		const sessionLikelyValid = hasUsableAccessToken(account, now);
 		if (!forceRefresh && sessionLikelyValid) {
-			if (account.enabled === false) {
+			if (!liveProbe && !account.authInvalidatedAt && account.enabled === false) {
 				account.enabled = true;
 				changed = true;
-			}
-			if (i === activeIndex) {
-				activeAccountRefreshed = true;
 			}
 			let healthDetail = "signed in and working";
 			let healthTone: "success" | "warning" = "success";
@@ -202,18 +202,9 @@ export async function runHealthCheck(
 							updateQuotaCacheForWorkspace(workingQuotaCache, account, probeAccountId, snapshot, storage.accounts);
 							quotaCacheChanged = true;
 						}
-						if (
-							snapshot.status >= 200 &&
-							snapshot.status < 300 &&
-							clearAuthInvalidationMarker(account)
-						) {
-							// A successful Responses probe proves the current access token is
-							// usable. Persist that recovery instead of continuing to exclude
-							// the account because an older token was revoked.
-							changed = true;
-						}
+						if (recoverAccount(account, snapshot)) changed = true;
 						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
-						if (snapshot.primingFailure) { healthTone = "warning"; warnings += 1; }
+						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthTone = "warning"; warnings += 1; }
 						codexAvailable += 1;
 					} catch (error) {
 						warnings += 1;
@@ -236,6 +227,7 @@ export async function runHealthCheck(
 				healthDetail += " (re-login suggested soon)";
 			}
 			healthDetail = appendAuthInvalidationMarker(account, healthDetail);
+			if (i === activeIndex && !account.authInvalidatedAt && account.enabled !== false) activeAccountRefreshed = true;
 			ok += 1;
 			if (display.showPerAccountRows) {
 				const healthMarker = healthTone === "success" ? "✓" : "!";
@@ -274,13 +266,7 @@ export async function runHealthCheck(
 				changed = true;
 				accountIdentityChanged = true;
 			}
-			if (account.enabled === false) {
-				account.enabled = true;
-				changed = true;
-			}
-			if (clearAuthInvalidationMarker(account)) {
-				changed = true;
-			}
+			if (!liveProbe && recoverAccount(account)) changed = true;
 			if (accountIdentityChanged && liveProbe && workingQuotaCache) {
 				quotaEmailFallbackState = buildQuotaEmailFallbackState(
 					storage.accounts,
@@ -294,9 +280,6 @@ export async function runHealthCheck(
 					) || quotaCacheChanged;
 			}
 			account.lastUsed = Date.now();
-			if (i === activeIndex) {
-				activeAccountRefreshed = true;
-			}
 			ok += 1;
 			let healthyMessage = "working now";
 			let healthyTone: "success" | "warning" = "success";
@@ -319,8 +302,9 @@ export async function runHealthCheck(
 							updateQuotaCacheForWorkspace(workingQuotaCache, account, probeAccountId, snapshot, storage.accounts);
 							quotaCacheChanged = true;
 						}
+						if (recoverAccount(account, snapshot)) changed = true;
 						healthyMessage = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
-						if (snapshot.primingFailure) { healthyTone = "warning"; warnings += 1; }
+						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthyTone = "warning"; warnings += 1; }
 						codexAvailable += 1;
 					} catch (error) {
 						warnings += 1;
@@ -339,6 +323,7 @@ export async function runHealthCheck(
 					}
 				}
 			}
+			if (i === activeIndex && !account.authInvalidatedAt && account.enabled !== false) activeAccountRefreshed = true;
 			if (display.showPerAccountRows) {
 				healthyMessage = appendAuthInvalidationMarker(account, healthyMessage);
 				const healthyMarker = healthyTone === "success" ? "✓" : "!";

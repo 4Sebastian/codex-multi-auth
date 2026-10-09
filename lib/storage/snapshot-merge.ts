@@ -61,7 +61,7 @@ function mergeWorkspaces(base: AccountMetadataV3, disk: AccountMetadataV3, local
     const untracked = [base, disk, local].every(row => row.currentWorkspaceIndex === undefined);
     return { workspaces, currentWorkspaceIndex: untracked && index === 0 ? undefined : index };
 }
-type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason" | "refreshToken">;
+type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason" | "refreshToken" | "accessToken">;
 /**
  * Preserve concurrent cooldown observations while allowing an unchanged blocker to clear.
  * An auth-failure cooldown belongs to the credential it was recorded against: once
@@ -71,7 +71,8 @@ type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason"
  */
 export function mergeAccountCooldown(base: CooldownRow, disk: CooldownRow, local: CooldownRow): Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason"> {
     const keptToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
-    const current = (row: CooldownRow): CooldownRow => row.cooldownReason === "auth-failure" && row.refreshToken !== keptToken
+    const keptAccessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
+    const current = (row: CooldownRow): CooldownRow => row.cooldownReason === "auth-failure" && (row.refreshToken !== keptToken || row.accessToken !== keptAccessToken)
         ? { ...row, coolingDownUntil: undefined, cooldownReason: undefined } : row;
     disk = current(disk);
     local = current(local);

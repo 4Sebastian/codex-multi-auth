@@ -23,12 +23,15 @@ afterEach(async () => {
 });
 const rotation = (prior: string, next: string) => ({ priorRefreshToken: prior, refreshToken: next, accessToken: `access-${next}`, expiresAt: 1, at: 1 });
 const storage = () => ({ version: 3 as const, activeIndex: 0, accounts: [{ refreshToken: "spent-a", addedAt: 1, lastUsed: 1 }, { refreshToken: "spent-b", addedAt: 1, lastUsed: 1 }] });
-function failReads(code: string, times: number) {
+function failReads(code: string, times: number, skip = 0) {
 	const path = getPendingAuthPath(storagePath);
 	const original = fs.readFile.bind(fs);
 	let left = times;
 	return vi.spyOn(fs, "readFile").mockImplementation((async (file: unknown, ...rest: unknown[]) => {
-		if (String(file) === path && left-- > 0) throw Object.assign(new Error("busy"), { code });
+		if (String(file) === path) {
+			if (skip > 0) skip--;
+			else if (left-- > 0) throw Object.assign(new Error("busy"), {code});
+		}
 		return (original as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
 	}) as typeof fs.readFile);
 }
@@ -59,12 +62,29 @@ it("never overwrites a corrupt pending file", async () => {
 	expect(await fs.readFile(path, "utf8")).toBe("{torn");
 });
 
+it.each(["probe", "renewal"].flatMap(mode => [0, 1].map(skip => ({mode, skip}))))("refuses false recovery after required journal capture fails (%j)", async ({mode, skip}) => {
+ const {saveAccounts,loadAccounts,setStoragePathDirect}=await import("../lib/storage.js");
+ setStoragePathDirect(storagePath);
+ await saveAccounts({version:3,activeIndex:0,accounts:[{recordId:"first",refreshToken:"b",accessToken:"access-b",expiresAt:10000,addedAt:1,lastUsed:1}]});
+ await recordPendingAuth(storagePath,{...rotation("b","b"),recordId:"first",expiresAt:10000,authInvalidatedAt:1500});
+ const pool=(await loadAccounts())!;
+ delete pool.accounts[0]!.authInvalidatedAt;
+ if(mode==="renewal") Object.assign(pool.accounts[0]!,{accessToken:"access-new",expiresAt:20000});
+ failReads("EBUSY",6,skip);
+ await expect(saveAccounts(pool)).rejects.toThrow();
+ expect((await loadAccounts())?.accounts[0]?.accessToken).toBe("access-b");
+ expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(1500);
+ await saveAccounts(pool);
+ const restarted=(await loadAccounts())!;
+ expect(restarted.accounts[0]?.accessToken).toBe(pool.accounts[0]?.accessToken);
+ expect(restarted.accounts[0]?.authInvalidatedAt).toBeUndefined();
+});
 it("never logs journal contents on read or post-save prune failures",async()=>{
  const {saveAccounts,setStoragePathDirect}=await import("../lib/storage.js");
  setStoragePathDirect(storagePath);
  await fs.writeFile(getPendingAuthPath(storagePath),'fixture-secret');
  await applyPendingAuth(storagePath,storage());
- await saveAccounts(storage());
+ await expect(saveAccounts(storage())).rejects.toThrow("Failed to observe pending account recovery");
  expect(logs.error).toHaveBeenCalled();expect(logs.warn).toHaveBeenCalled();
  expect(JSON.stringify([logs.error.mock.calls,logs.warn.mock.calls])).not.toContain("fixture-secret");
 });

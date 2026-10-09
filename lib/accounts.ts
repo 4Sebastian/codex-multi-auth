@@ -1499,11 +1499,14 @@ export class AccountManager {
 		account: ManagedAccount,
 		errorCode = "token_invalidated",
 		invalidatedAt = nowMs(),
-	): void {
+		submittedAccessToken = account.access,
+	): boolean {
+		if (this.getAccountByIndex(account.index) !== account || account.access !== submittedAccessToken) return false;
 		const prior = this.nativeAuthSnapshots.get(account);
 		if (prior) this.nativeAuthSnapshots.set(account, {...prior, authInvalidatedAt: undefined, observedAt: performance.now()});
 		account.authInvalidatedAt = invalidatedAt;
 		account.authInvalidationErrorCode = errorCode;
+		return true;
 	}
 
 	clearAuthInvalidation(account: ManagedAccount): void {
@@ -2348,7 +2351,7 @@ export class AccountManager {
     const authUnchanged = this.isNativeSnapshotCurrent(account, observedAt) &&
      (["access", "refreshToken", "expires", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => account[field] === prior[field]) &&
      requested !== undefined && (["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => requested[field] === saved[field] || requested[field] === baseline?.[field]);
-    const cooldown = mergeAccountCooldown(prior, saved, account);
+    const cooldown = mergeAccountCooldown({...prior, accessToken: prior.access}, saved, {...account, accessToken: account.access});
     if (authUnchanged) {
      account.access = saved.accessToken;
      account.refreshToken = saved.refreshToken;

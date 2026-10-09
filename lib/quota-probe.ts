@@ -52,6 +52,8 @@ export interface CodexQuotaWindow {
 export interface CodexQuotaSnapshot {
 	/** Time quota headers were observed, before consuming the response stream. */
 	observedAt?: number;
+	responseCompleted?: boolean;
+	tokenInvalidated?: boolean;
 	primingCompleted?: boolean;
 	primingObservedAt?: number;
 	primingFailure?: FirstUseProbeError["reason"];
@@ -446,22 +448,18 @@ export async function fetchCodexQuotaSnapshot(
 			const snapshotBase = parseQuotaSnapshotBase(response.headers, response.status);
 			if (snapshotBase && (response.ok || response.status === 429)) {
 				const observedAt = Date.now();
-				if (options.primeUnusedSubscription && needsSubscriptionFirstUse(snapshotBase, observedAt)) {
+				const priming = options.primeUnusedSubscription && needsSubscriptionFirstUse(snapshotBase, observedAt);
+				if (response.ok) {
 					try {
 						await finishSubscriptionFirstUse(response, timeoutMs);
-						return { ...snapshotBase, observedAt, model, primingObservedAt: Date.now(), primingCompleted: true };
+						return {...snapshotBase, observedAt, model, responseCompleted: true, ...(priming ? {primingObservedAt: Date.now(), primingCompleted: true} : {})};
 					} catch (error) {
-						// Keep valid quota data without retrying an accepted inference.
-						if (error instanceof FirstUseProbeError) return { ...snapshotBase, observedAt, model, primingObservedAt: Date.now(), primingFailure: error.reason };
+						if (error instanceof FirstUseProbeError) return {...snapshotBase, observedAt, model, responseCompleted: false, tokenInvalidated: error.tokenInvalidated, ...(priming ? {primingObservedAt: Date.now(), primingFailure: error.reason} : {})};
 						throw error;
 					}
 				}
-				try {
-					await response.body?.cancel();
-				} catch {
-					// Best effort cancellation.
-				}
-				return { ...snapshotBase, observedAt, model };
+				await response.body?.cancel().catch(() => undefined);
+				return {...snapshotBase, observedAt, model, responseCompleted: false};
 			}
 
 			// Quota headers can accompany authentication failures. They are useful

@@ -1,5 +1,6 @@
 import { createUsageStreamScanner } from "../usage/usage-extraction.js";
 import { isRecord } from "../utils.js";
+import { isResponsesTokenInvalidationEvent } from "../request/rate-limit-decision.js";
 import type { CodexQuotaSnapshot } from "../quota-probe.js";
 
 /** Only personal included subscriptions may receive an automatic first-use probe. */
@@ -17,7 +18,7 @@ export function needsSubscriptionFirstUse(snapshot: Omit<CodexQuotaSnapshot, "mo
 }
 
 export class FirstUseProbeError extends Error {
-	constructor(readonly reason: "timed out" | "stream ended early" | "upstream failed" | "response too large" | "network error" = "stream ended early") {
+	constructor(readonly reason: "timed out" | "stream ended early" | "upstream failed" | "response too large" | "network error" = "stream ended early", readonly tokenInvalidated = false) {
 		super(`First-use probe did not complete (${reason}); reset timer is unconfirmed.`);
 	}
 }
@@ -26,11 +27,14 @@ export class FirstUseProbeError extends Error {
 export async function finishSubscriptionFirstUse(response: Response, timeoutMs: number): Promise<void> {
 	if (!response.body) throw new FirstUseProbeError();
 	const reader = response.body.getReader();
-	let completed = false, failed = false, bytes = 0;
-	const scanner = createUsageStreamScanner({ contentType: "text/event-stream", onEvent(event) {
+	let completed = false, failed = false, tokenInvalidated = false, bytes = 0;
+	const scanner = createUsageStreamScanner({ contentType: response.headers.get("content-type")?.includes("json") ? "application/json" : "text/event-stream", onEvent(event) {
 		if (!isRecord(event)) return;
-		if (event.type === "response.completed" || (event.type === "response.done" && isRecord(event.response) && event.response.status === "completed")) completed = true;
-		if (["response.failed", "response.incomplete", "error"].includes(String(event.type))) failed = true;
+		const responseStatus = isRecord(event.response) ? event.response.status : event.object === "response" ? event.status : undefined;
+		const type = event.type === "response.done" || event.object === "response" ? `response.${String(responseStatus)}` : event.type;
+		if (type === "response.completed" && (responseStatus === undefined || responseStatus === "completed")) completed = true;
+		if (["response.failed", "response.incomplete", "response.cancelled", "error"].includes(String(type))) failed = true;
+		tokenInvalidated ||= isResponsesTokenInvalidationEvent({...event, type});
 	} });
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const expired = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new FirstUseProbeError("timed out")), timeoutMs); });
@@ -42,7 +46,7 @@ export async function finishSubscriptionFirstUse(response: Response, timeoutMs: 
 			if (bytes > 1024 * 1024) throw new FirstUseProbeError("response too large");
 			scanner.push(chunk.value);
 		}
-		if (!completed || failed) throw new FirstUseProbeError(failed ? "upstream failed" : "stream ended early");
+		if (!completed || failed) throw new FirstUseProbeError(failed ? "upstream failed" : "stream ended early", tokenInvalidated);
 	} catch (error) { throw error instanceof FirstUseProbeError ? error : new FirstUseProbeError("network error"); }
 	finally {
 		clearTimeout(timer);

@@ -87,7 +87,12 @@ async function write(path: string, entries: PendingAuth[]): Promise<void> {
 }
 
 export async function capturePendingAuth(storagePath: string, accounts: readonly AccountMetadataV3[] | null | undefined) {
-	return {entries: await read(getPendingAuthPath(storagePath)), accounts: structuredClone(accounts ?? [])};
+	const entries = await read(getPendingAuthPath(storagePath)).catch(error => {
+		const code = typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH";
+		log.warn("Failed to capture pending rotated credentials", {code});
+		throw Object.assign(new Error("Failed to observe pending account recovery"), {code});
+	});
+	return {entries, accounts: structuredClone(accounts ?? [])};
 }
 
 /** Record a rotated credential beside the account pool. */
@@ -153,11 +158,11 @@ export async function recordPendingAuth(
 export async function applyPendingAuth(
 	storagePath: string,
 	storage: AccountStorageV3 | null,
+	entries?: Awaited<ReturnType<typeof capturePendingAuth>>["entries"],
 ): Promise<AccountStorageV3 | null> {
 	if (!storage) return storage;
-	let entries: PendingAuth[];
 	try {
-		entries = await read(getPendingAuthPath(storagePath));
+		entries ??= await read(getPendingAuthPath(storagePath));
 	} catch (error) {
 		// Loading must still work; the file is left untouched for a later load.
 		log.error("Pending rotated credentials could not be read; affected accounts may need a re-login if this persists", {

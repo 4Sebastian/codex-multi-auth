@@ -232,7 +232,8 @@ describe("compact quota reset timestamps", () => {
 		secondaryReset: number | undefined,
 	): CodexQuotaSnapshot =>
 		({
-			status: "ok",
+			status: 200,
+			responseCompleted: true,
 			planType: "plus",
 			model: "gpt-5.3-codex",
 			primary: {
@@ -245,7 +246,7 @@ describe("compact quota reset timestamps", () => {
 				windowMinutes: 10080,
 				resetAtMs: secondaryReset,
 			},
-		}) as unknown as CodexQuotaSnapshot;
+		});
 
 	it("formatQuotaResetAt uses local 24h time, adds the day when not today", () => {
 		expect(formatQuotaResetAt(SAME_DAY, NOW)).toBe(localTime(SAME_DAY));
@@ -348,6 +349,7 @@ describe("compact quota reset timestamps", () => {
 	it("does not restore quota text when both windows are uninformative", () => {
 		const allHidden = {
 			status: 200,
+			responseCompleted: true,
 			planType: "plus",
 			model: "gpt-5.3-codex",
 			primary: { usedPercent: 0 },

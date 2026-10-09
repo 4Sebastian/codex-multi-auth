@@ -28,6 +28,16 @@ it("does not clear a newer disk revocation after adopting its credential generat
     Object.assign(local.accounts[0]!, {authInvalidatedAt: undefined, authInvalidationErrorCode: undefined, accountLabel: "Local"});
     expect(mergeAccountRuntimeObservations(base, disk, local).accounts[0]).toMatchObject({accessToken: "fixture-B", refreshToken: "fixture-B-refresh", authInvalidatedAt: 2500, authInvalidationErrorCode: "token_invalidated", accountLabel: "External"});
 });
+it("does not persist an old bearer's auth cooldown over a same-refresh login", () => {
+    const base=fixture();base.accounts[0]!.accessToken="fixture-A";
+    const disk=structuredClone(base), local=structuredClone(base);
+    disk.accounts[0]!.accessToken="fixture-B";
+    Object.assign(local.accounts[0]!,{authInvalidatedAt:1500,authInvalidationErrorCode:"token_invalidated",coolingDownUntil:60000,cooldownReason:"auth-failure"});
+    const saved=mergeAccountRuntimeObservations(base,disk,local);
+    expect(saved.accounts[0]?.accessToken).toBe("fixture-B");
+    expect(saved.accounts[0]?.authInvalidatedAt).toBeUndefined();
+    expect(saved.accounts[0]?.coolingDownUntil).toBeUndefined();
+});
 it("preserves independently added accounts and workspace edits during an old runtime save", () => {
     const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
     disk.accounts.push({ recordId: "b", accountId: "b", refreshToken: "fixture-b", addedAt: 2, lastUsed: 2 });

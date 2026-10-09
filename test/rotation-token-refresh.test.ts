@@ -110,6 +110,18 @@ afterEach(async () => {
 });
 
 describe("ensureFreshAccessToken", () => {
+	it("does not invalidate a newer login after an older refresh fails", async () => {
+		const manager=managerWith(STALE_EXPIRES), params=refreshParams(manager);
+		let release!: () => void, entered!: () => void;
+		const gate=new Promise<void>(r=>release=r), ready=new Promise<void>(r=>entered=r);
+		queuedRefreshMock.mockImplementation(async()=>{entered();await gate;return {type:"failed",reason:"http_error",statusCode:401,message:"OAuth token has been invalidated"};});
+		const pending=ensureFreshAccessToken(params);await ready;
+		manager.updateFromAuth(params.account,{type:"oauth",access:"access-new-login",refresh:"refresh-new-login",expires:FRESH_EXPIRES});
+		release();await pending;
+		expect(params.account.authInvalidatedAt).toBeUndefined();
+		expect(params.account.coolingDownUntil).toBeUndefined();
+		expect(params.account.consecutiveAuthFailures ?? 0).toBe(0);
+	});
 	it("uses a fresh token as-is without touching the refresh queue", async () => {
 		const accountManager = managerWith(FRESH_EXPIRES);
 

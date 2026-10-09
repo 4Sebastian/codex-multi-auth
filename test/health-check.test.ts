@@ -100,6 +100,7 @@ function emptyCache(): QuotaCacheData {
 
 function snapshot() {
 	return {
+		responseCompleted: true,
 		status: 200,
 		model: "gpt-5-codex",
 		primary: { usedPercent: 10, windowMinutes: 300, resetAtMs: REAL_NOW + 1 },
@@ -255,6 +256,14 @@ describe("runHealthCheck live probe", () => {
 		expect(logged()).toContain("0 signed in only");
 	});
 
+	it.each(["quota-only", "failed", "cancelled", "incomplete", "priming-failed"])("does not recover invalidated accounts from unconfirmed quota observations (%s)", async outcome => {
+		const storage=storageWith([account("a",{enabled:false,authInvalidatedAt:REAL_NOW-60000,authInvalidationErrorCode:"token_revoked"})]);
+		loadAccountsMock.mockResolvedValue(storage);
+		fetchCodexQuotaSnapshotMock.mockResolvedValue({...snapshot(),responseCompleted:outcome === "quota-only" ? undefined : false,...(outcome === "priming-failed" ? {primingFailure:"upstream failed"} : {})});
+		await runHealthCheck({liveProbe:true});
+		expect(storage.accounts[0]).toMatchObject({enabled:false,authInvalidatedAt:REAL_NOW-60000,authInvalidationErrorCode:"token_revoked"});
+		expect(saveAccountsMock).not.toHaveBeenCalled();
+	});
 	it("clears a stale invalidation after a successful live probe", async () => {
 		const storage = storageWith([
 			account("a", {

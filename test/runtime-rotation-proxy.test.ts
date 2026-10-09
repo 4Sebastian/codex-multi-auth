@@ -8559,6 +8559,53 @@ describe('earned reset last-resort integration',()=>{
  });
 });
 
+describe("submitted credential generation regressions", () => {
+	it.each([false,true].flatMap(native => [false,true].map(relogin => ({native,relogin}))))("scopes delayed socket revocation to its submitted bearer %j", async ({native,relogin}) => {
+		let entered!:()=>void, release!:()=>void;
+		const ready=new Promise<void>(r=>entered=r), gate=new Promise<void>(r=>release=r);
+		const append=vi.spyOn(usageLedger,"appendUsageLedgerRow");
+		let creates=0;
+		const upstream=await startTestWebSocketUpstream({onConnection:ws=>ws.once("message",async()=>{creates++;entered();await gate;ws.send(JSON.stringify({type:"response.failed",response:{status:"failed",error:{code:"token_invalidated"},usage:{input_tokens:10,output_tokens:2}}}));})});
+		const manager=new AccountManager(undefined,createStorage(Date.now(),2));
+		const account=manager.getAccountByIndex(0)!;
+		const proxy=await startProxy({accountManager:manager,fetchImpl:async()=>Response.json({models:[{slug:"gpt-6-astra"}]}),options:{nativeOpenai:native,upstreamBaseUrl:upstream.baseUrl}});
+		const client=await connectWebSocket(proxy.baseUrl.replace("http:","ws:")+"/responses");
+		try {
+			client.send(JSON.stringify({type:"response.create",model:"gpt-6-astra",input:[]}));await ready;
+			if(relogin) manager.updateFromAuth(account,{type:"oauth",access:"fixture-new-login",refresh:"fixture-new-refresh",expires:Date.now()+7200000});
+			release();await vi.waitFor(()=>expect(append).toHaveBeenCalledTimes(1));
+			expect(account.authInvalidatedAt !== undefined).toBe(!relogin);
+			expect(account.cooldownReason === "auth-failure").toBe(!relogin);
+			expect(account.enabled).not.toBe(false);
+			expect(manager.getAccountByIndex(1)?.authInvalidatedAt).toBeUndefined();
+			expect(creates).toBe(1);
+		} finally {release();client.terminate();await upstream.close();append.mockRestore();}
+	});
+	it.each(["http-401","http-sse","custom-handshake","native-handshake"])("does not apply late auth failure to a newer generation (%s)",async transport=>{
+		let entered!:()=>void, release!:()=>void;
+		const ready=new Promise<void>(r=>entered=r), gate=new Promise<void>(r=>release=r);
+		const manager=new AccountManager(undefined,createStorage(Date.now(),2)), account=manager.getAccountByIndex(0)!;
+		const body=JSON.stringify({error:{code:"token_invalidated",message:"OAuth token has been invalidated"}});
+		const server=createHttpServer();
+		server.on("upgrade",async(_req,socket)=>{entered();await gate;socket.end(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);});
+		server.listen(0,"127.0.0.1");await once(server,"listening");
+		const address=server.address();if(!address || typeof address === "string") throw Error("Missing fixture address");
+		const proxy=await startProxy({accountManager:manager,fetchImpl:async(_url,init)=>{
+			if(init?.method !== "POST") return Response.json({models:[{slug:"gpt-6-astra"}]});
+			entered();await gate;
+			return transport === "http-401" ? new Response(body,{status:401}) : new Response(`data: ${JSON.stringify({type:"response.failed",response:{status:"failed",error:{code:"token_invalidated"}}})}\n\n`,{headers:{"content-type":"text/event-stream"}});
+		},options:{nativeOpenai:transport === "native-handshake",upstreamBaseUrl:`http://127.0.0.1:${address.port}`}});
+		let client:WebSocket|undefined;
+		try {
+			let result:Promise<unknown>;
+			if(transport.endsWith("handshake")) {client=await connectWebSocket(proxy.baseUrl.replace("http:","ws:")+"/responses");result=transport === "custom-handshake" ? nextWebSocketClose(client) : nextWebSocketMessage(client);client.send(JSON.stringify({type:"response.create",model:"gpt-6-astra",input:[]}));}
+			else result=fetch(`${proxy.baseUrl}/responses`,{method:"POST",headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({model:"gpt-6-astra",input:[]})}).then(r=>r.text());
+			await ready;manager.updateFromAuth(account,{type:"oauth",access:"fixture-new-login",refresh:"fixture-new-refresh",expires:Date.now()+7200000});release();await result;
+			expect(account.authInvalidatedAt).toBeUndefined();expect(account.coolingDownUntil).toBeUndefined();expect(account.enabled).not.toBe(false);
+		} finally {release();client?.terminate();await new Promise<void>(r=>server.close(()=>r()));}
+	});
+});
+
 describe("handoff lifecycle regressions", () => {
 	it.each([false, true].flatMap(replacement => ["close", "error", "cancel"].map(event => ({replacement, event}))))("owns sockets throughout selection persistence %j", async ({replacement, event}) => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));

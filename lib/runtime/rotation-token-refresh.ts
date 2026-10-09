@@ -19,7 +19,9 @@ export function applyMonotonicAuthCooldown(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	cooldownMs: number,
+	submittedAccessToken = account.access,
 ): void {
+	if (accountManager.getAccountByIndex(account.index) !== account || account.access !== submittedAccessToken) return;
 	const existing = accountManager.getAccountByIndex(account.index)?.coolingDownUntil ?? 0;
 	// Intentionally Date.now(), not the proxy's injected now(): coolingDownUntil is
 	// written by markAccountCoolingDown via nowMs() (== Date.now()), so both sides of
@@ -53,12 +55,13 @@ async function commitRefreshedAuthOnce(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	auth: OAuthAuthDetails,
+	priorRefreshToken: string,
 ): Promise<ManagedAccount | null> {
 	const key = [
 		account.index,
 		account.accountId ?? "",
 		account.email ?? "",
-		account.refreshToken,
+		priorRefreshToken,
 	].join("\0");
 	let queue = runtimeRefreshCommitQueues.get(accountManager);
 	if (!queue) {
@@ -93,7 +96,14 @@ export async function ensureFreshAccessToken(params: {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
-	const refreshResult = await queuedRefresh(account.refreshToken);
+	const submittedAccessToken = account.access, submittedRefreshToken = account.refreshToken;
+	const refreshResult = await queuedRefresh(submittedRefreshToken);
+	if ((account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
+		!(refreshResult.type === "success" && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
+		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
+			? {ok: true, accessToken: account.access ?? "", account}
+			: {ok: false, retryable: true};
+	}
 	if (refreshResult.type === "failed") {
 		accountManager.recordFailure(account, family, model);
 		accountManager.incrementAuthFailures(account);
@@ -103,12 +113,13 @@ export async function ensureFreshAccessToken(params: {
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
 		if (invalidated) {
-			accountManager.markAuthInvalidated(account);
+			accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
 		}
 		applyMonotonicAuthCooldown(
 			accountManager,
 			account,
 			invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+			submittedAccessToken,
 		);
 		accountManager.saveToDiskDebounced();
 		return { ok: false, retryable: isTokenRefreshRetryable(refreshResult), invalidated };
@@ -125,6 +136,7 @@ export async function ensureFreshAccessToken(params: {
 			accountManager,
 			account,
 			auth,
+			submittedRefreshToken,
 		);
 		// If commit succeeded, use the stored access token from the committed
 		// account — this also handles the dedup case where two concurrent callers
@@ -144,6 +156,7 @@ export async function ensureFreshAccessToken(params: {
 			account: resolvedAccount,
 		};
 	} catch {
+		if (account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
 		accountManager.recordFailure(account, family, model);
 		accountManager.markAccountCoolingDown(
 			account,

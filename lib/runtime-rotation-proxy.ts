@@ -1135,6 +1135,7 @@ interface PreparedWebSocketRequest {
 }
 
 interface ActiveWebSocketRequest {
+	accessToken: string | undefined;
 	request: PreparedWebSocketRequest;
 	accountManager: AccountManager;
 	account: ManagedAccount;
@@ -1585,19 +1586,22 @@ function applyWebSocketTerminalAccountFailure(
 	}
 	if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 		accountManager.refundToken(account, context.family, context.model);
+		if (account.access !== active.accessToken) return;
 		accountManager.recordFailure(account, context.family, context.model);
 		if (terminal.tokenInvalidated) {
-			accountManager.markAuthInvalidated(account, "token_invalidated");
+			accountManager.markAuthInvalidated(account, "token_invalidated", undefined, active.accessToken);
 			applyMonotonicAuthCooldown(
 				accountManager,
 				account,
 				state.tokenInvalidationCooldownMs,
+				active.accessToken,
 			);
 		} else {
 			applyMonotonicAuthCooldown(
 				accountManager,
 				account,
 				DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+				active.accessToken,
 			);
 		}
 		forgetAffinity();
@@ -1614,6 +1618,7 @@ function applyWebSocketTerminalAccountFailure(
 	) {
 		accountManager.refundToken(account, context.family, context.model);
 		accountManager.recordFailure(account, context.family, context.model);
+		if (account.access !== active.accessToken) return;
 		accountManager.setAccountEnabled(account.index, false);
 		forgetAffinity();
 		accountManager.saveToDiskDebounced();
@@ -2092,18 +2097,20 @@ async function connectManagedWebSocket(
 			const bodyText = handshakeError?.bodyText ?? "";
 			state.sessionAffinityStore?.forgetSession(context.sessionKey);
 			if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
-				accountManager.recordFailure(account, context.family, context.model);
+				if (account.access === accessToken) accountManager.recordFailure(account, context.family, context.model);
 				if (isTokenInvalidationError(bodyText)) {
 					accountManager.markAuthInvalidated(
 						account,
 						"token_invalidated",
+						undefined, accessToken,
 					);
 					applyMonotonicAuthCooldown(
 						accountManager,
 						account,
 						state.tokenInvalidationCooldownMs,
+						accessToken,
 					);
-					await accountManager.saveToDisk();
+					if (account.access === accessToken) await accountManager.saveToDisk();
 					await request.usageRecorder.record({
 						outcome: "failure",
 						statusCode,
@@ -2120,6 +2127,7 @@ async function connectManagedWebSocket(
 					accountManager,
 					account,
 					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+					accessToken,
 				);
 			} else if (statusCode === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const retryAfterMs =
@@ -2177,6 +2185,7 @@ function bridgeWebSocketConnection(
 	let upstream: WebSocket | null = null;
 	let boundAccountManager: AccountManager | null = null;
 	let boundAccount: ManagedAccount | null = null;
+	let boundAccessToken: string | undefined;
 	let pendingInitialRequest: PreparedWebSocketRequest | null = null;
 	let pendingHandshake: PreparedWebSocketAccount | null = null;
 	let connecting = false;
@@ -2388,6 +2397,7 @@ function bridgeWebSocketConnection(
 				upstream = null;
 				boundAccountManager = null;
 				boundAccount = null;
+				boundAccessToken = undefined;
 				if (staleUpstream) {
 					mirrorWebSocketClose(staleUpstream, 1000, "account_rotation");
 				}
@@ -2430,7 +2440,7 @@ function bridgeWebSocketConnection(
 			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
 			throw error;
 		}
-		activeRequests.push({request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
+		activeRequests.push({accessToken: boundAccessToken, request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2563,6 +2573,7 @@ function bridgeWebSocketConnection(
 			const connectedUpstream = connected.upstream;
 			boundAccountManager = connected.prepared.accountManager;
 			boundAccount = connected.prepared.account;
+			boundAccessToken = connected.prepared.accessToken;
 			state.status.streamsStarted += 1;
 			connectedUpstream.on("message", (data, isBinary) => {
 				if (closed || upstream !== connectedUpstream) return;
@@ -2614,6 +2625,7 @@ function bridgeWebSocketConnection(
 				upstream = null;
 				boundAccountManager = null;
 				boundAccount = null;
+				boundAccessToken = undefined;
 				settlePendingHandshake("failure", "upstream_websocket_closed", true);
 				if (activeRequests.length === 0) { drainPending(); return; }
 				if (
@@ -4490,7 +4502,7 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				if (refreshed.account.access === refreshed.accessToken) accountManager.recordFailure(refreshed.account, context.family, context.model);
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
 					// cooldown prevents cascade invalidation: rapidly presenting each
@@ -4500,17 +4512,19 @@ async function handleRequestInner(
 					accountManager.markAuthInvalidated(
 						refreshed.account,
 						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
+						undefined, refreshed.accessToken,
 					);
 					applyMonotonicAuthCooldown(
 						accountManager,
 						refreshed.account,
 						state.tokenInvalidationCooldownMs,
+						refreshed.accessToken,
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					// The invalidation marker must be durable before returning the 401.
 					// A delayed save would allow a proxy restart to reload and route the
 					// revoked account again.
-					await accountManager.saveToDisk();
+					if (refreshed.account.access === refreshed.accessToken) await accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -4530,6 +4544,7 @@ async function handleRequestInner(
 					accountManager,
 					refreshed.account,
 					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+					refreshed.accessToken,
 				);
 				accountManager.saveToDiskDebounced();
 				exhaustionReason = "auth-failure";
@@ -4673,10 +4688,9 @@ async function handleRequestInner(
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (isResponsesTokenInvalidationEvent(event)) {
-						accountManager.markAuthInvalidated(refreshed.account, "token_invalidated");
+					if (isResponsesTokenInvalidationEvent(event) && accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, refreshed.accessToken)) {
 						accountManager.recordFailure(refreshed.account, context.family, context.model);
-						applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs);
+						applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs, refreshed.accessToken);
 						state.sessionAffinityStore?.forgetSession(context.sessionKey);
 						accountManager.saveToDiskDebounced();
 					}

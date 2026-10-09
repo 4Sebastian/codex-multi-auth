@@ -2577,7 +2577,7 @@ async function saveAccountsUnlocked(
 	options?: { expectedOnDiskAccounts?: readonly AccountMetadataV3[] | null },
 ): Promise<void> {
 	const path = getStoragePath();
-	const observed = await capturePendingAuth(path, options?.expectedOnDiskAccounts ?? getTransactionSnapshotState()?.snapshot?.accounts).catch(() => undefined);
+	const observed = await capturePendingAuth(path, options?.expectedOnDiskAccounts ?? getTransactionSnapshotState()?.snapshot?.accounts);
 	await saveAccountsUnlockedToDisk(storage, options);
 	// A persisted (or superseded) pending rotated credential is no longer needed —
 	// unless a restorable backup/WAL snapshot still carries the token it replaces,
@@ -2586,7 +2586,7 @@ async function saveAccountsUnlocked(
 		collectRestorableCredentials(path), observed,
 	).catch((error) => {
 		log.warn("Failed to prune pending rotated credentials", { code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH" });
-		if (observed?.entries.length) throw new Error("Failed to reconcile pending account recovery");
+		throw new Error("Failed to reconcile pending account recovery");
 	});
 }
 
@@ -2755,13 +2755,18 @@ async function loadPrimaryAccountsForMerge(): Promise<AccountStorageV3 | null> {
 		if (!normalized) throw new Error("Invalid primary account storage");
 		// The merge base must carry pending rotated credentials too, or a merge
 		// would keep the spent token that is still on disk.
-		return applyPendingAuth(path, normalized);
+		const observed = await capturePendingAuth(path, normalized.accounts);
+		return applyPendingAuth(path, normalized, observed.entries);
 	} catch (cause) {
 		const code = (cause as NodeJS.ErrnoException).code;
 		// The journal is written before the primary and removed after it, so a
 		// journal beside a missing primary is the newest state, not a stale
 		// backup. Without one, the deletion is authoritative.
-		if (code === "ENOENT") return applyPendingAuth(path, await loadAccountsFromJournal(path, { silent: true }));
+		if (code === "ENOENT") {
+			const recovered = await loadAccountsFromJournal(path, {silent: true});
+			const observed = await capturePendingAuth(path, recovered?.accounts);
+			return applyPendingAuth(path, recovered, observed.entries);
+		}
 		// A locked or torn primary may hold newer state than any backup, so it is
 		// never replaced by a recovered copy here.
 		throw Object.assign(
