@@ -138,7 +138,7 @@ function turn(
 			const event = JSON.parse(raw.toString());
 			events.push(event);
 			if (
-				["response.completed", "response.failed", "error"].includes(event.type)
+				["response.completed", "response.done", "response.failed", "error"].includes(event.type)
 			) {
 				clearTimeout(timer);
 				ws.off("message", onMessage);
@@ -169,6 +169,24 @@ it("uses real upstream WebSockets and reuses the socket for a continuation", asy
 		store: false,
 	});
 	expect(f.calls[0]).not.toHaveProperty("stream");
+});
+it.each(["completed", "failed", "cancelled"])("retains only completed response.done continuation context (%s)", async status => {
+	const f = await fixture((ws, _body, id) => {
+		ws.send(JSON.stringify({type: "response.done", response: {id, status, output: [{type: "message", role: "assistant", content: [{type: "output_text", text: "OAuth token has been invalidated"}]}]}}));
+		return true;
+	});
+	const ws = await f.connect();
+	const first = await turn(ws, {model: "shared", input: [{role: "user", content: "hello"}]});
+	expect(first.at(-1)).toMatchObject({type: "response.done", response: {status}});
+	const second = await turn(ws, {model: "shared", previous_response_id: "resp_1", input: [{role: "user", content: "again"}]});
+	if (status === "completed") {
+		expect(second.at(-1)?.type).toBe("response.done");
+		expect(f.calls).toHaveLength(2);
+		expect(f.connections()).toBe(1);
+	} else {
+		expect(second.at(-1)).toMatchObject({type: "error", error: {code: "previous_response_not_found"}});
+		expect(f.calls).toHaveLength(1);
+	}
 });
 it("rejects unknown or cross-pool continuations without sending them upstream", async () => {
 	const f = await fixture();

@@ -6584,6 +6584,87 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 });
 
 describe("review transport boundary regressions", () => {
+	it.each(["shared", "api/shared", "zdr/shared"])("rejects a disabled bearer despite an unrelated concurrent invalidation (%s)", async model => {
+		const disk = createStorage(Date.now(), 2);
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		let release!: () => void, captured!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const reading = new Promise<void>(resolve => {captured = resolve;});
+		const overlay = pendingAuth.applyPendingAuth;
+		const {calls, fetchImpl} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "shared"}]}) : textEventStream());
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
+		const warm = await postResponses(proxy, {model: "shared", input: []}); await warm.text(); calls.length = 0;
+		disk.accounts[0]!.enabled = false;
+		const pending = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementation(async (path, storage) => {captured(); await barrier; return overlay(path, storage);});
+		const request = postResponses(proxy, {model, input: []}, "/responses", {authorization: "Bearer access-1"});
+		try {
+			await reading;
+			manager.markAuthInvalidated(manager.getAccountByIndex(1)!, "token_invalidated");
+			release();
+			const response = await request;
+			expect(response.status).toBe(401); await response.text();
+			expect(manager.getAccountByIndex(0)?.enabled).toBe(false);
+			expect(manager.getAccountByIndex(1)?.authInvalidatedAt).toBeDefined();
+			expect(calls).toHaveLength(0);
+		} finally {release(); await request.then(response => response.body?.cancel().catch(() => undefined)); pending.mockRestore();}
+	});
+
+	it.each([false, true])("does not revoke credentials when successful custom/HTTP output quotes auth errors (HTTP=%s)", async http => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const event = {type: "response.done", response: {id: "quoted", status: "completed", output: [{type: "message", role: "assistant", content: [{type: "output_text", text: "OAuth token has been invalidated"}]}], usage: {input_tokens: 10, output_tokens: 2}}};
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", () => ws.send(JSON.stringify(event)))});
+		const {fetchImpl} = createRecordingFetch(() => textEventStream(`data: ${JSON.stringify(event)}\n\n`));
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {upstreamBaseUrl: upstream.baseUrl}});
+		let client: WebSocket | undefined;
+		try {
+			if (http) {const response = await postResponses(proxy, {model: "shared", input: [], stream: true}); expect(response.status).toBe(200); expect(await response.text()).toContain('"status":"completed"');}
+			else {client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses"); const done = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); expect(JSON.parse(await done)).toMatchObject(event);}
+			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+			expect(manager.getAccountByIndex(0)?.cooldownReason).not.toBe("auth-failure");
+		} finally {client?.terminate(); await upstream.close();}
+	});
+
+	it.each([false, true])("rechecks prepared custom requests against replacement-account model quota (already connected=%s)", async alreadyConnected => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		manager.markRateLimitedWithReason(manager.getAccountByIndex(1)!, 60000, "gpt-5.2", "tokens", "gpt-5-codex");
+		const sockets: WebSocket[] = [], creates: Array<{account: number; model: string}> = [];
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {
+			const account = sockets.length; sockets.push(ws);
+			ws.on("message", raw => {const body = JSON.parse(raw.toString()); creates.push({account, model: body.model}); if (creates.length === 1) ws.send(JSON.stringify({type: "response.completed", response: {id: "warm"}}));});
+		}});
+		let release!: () => void, captured!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const reading = new Promise<void>(resolve => {captured = resolve;});
+		let releaseReplacement!: () => void, preparingReplacement!: () => void, evaluations = 0;
+		const replacementBarrier = new Promise<void>(resolve => {releaseReplacement = resolve;});
+		const replacementStarted = new Promise<void>(resolve => {preparingReplacement = resolve;});
+		const evaluate = runtimePolicy.evaluateRuntimePolicy;
+		const policy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async (...args) => {
+			const decision = await evaluate(...args); evaluations++;
+			if (args[0].model === "gpt-5-codex") {captured(); await barrier;}
+			else if (evaluations === 3) {preparingReplacement(); await replacementBarrier;}
+			return decision;
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const warm = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); await warm;
+			client.send(JSON.stringify({type: "response.create", model: "gpt-5-codex", input: []})); await reading;
+			manager.markAccountCoolingDown(manager.getAccountByIndex(0)!, 60000, "network-error");
+			const closed = nextWebSocketClose(client); void closed.catch(() => undefined);
+			sockets[0]!.terminate(); await new Promise(resolve => setTimeout(resolve, 20));
+			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+			await replacementStarted;
+			expect(manager.getManagedAccountRuntimeSkipReason(manager.getAccountByIndex(1)!, "gpt-5.2", "gpt-5-codex")).toBe("rate-limited");
+			if (alreadyConnected) {
+				releaseReplacement(); await vi.waitFor(() => expect(sockets).toHaveLength(2)); release();
+			} else {
+				release(); await new Promise(resolve => setImmediate(resolve)); releaseReplacement();
+			}
+			expect((await closed).code).toBe(1013);
+			expect(creates).toEqual([{account: 0, model: "shared"}, {account: 1, model: "shared"}]);
+		} finally {release(); releaseReplacement(); client.terminate(); await upstream.close(); policy.mockRestore();}
+	});
 	it("never replays a sent native create after a silent upstream timeout", async () => {
 		let creates = 0, disconnected = false;
 		const rows: unknown[] = [];

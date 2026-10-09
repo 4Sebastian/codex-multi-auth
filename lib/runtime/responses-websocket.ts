@@ -1,5 +1,5 @@
 import { extractResponsesUsage } from "../usage/usage-extraction.js";
-import { isTokenInvalidationError } from "../request/rate-limit-decision.js";
+import { isTokenInvalidationError, isResponsesTokenInvalidationEvent } from "../request/rate-limit-decision.js";
 import { ClientCancellationError } from "../request/client-cancellation.js";
 import type { Duplex } from "node:stream";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -307,7 +307,7 @@ class SocketSession {
 					let event: unknown = JSON.parse(text);
 					if (!isRecord(event) || typeof event.type !== "string")
 						throw Error("Invalid response event");
-					if ((event.type === "error" || event.type === "response.failed" || event.type === "response.done") && isTokenInvalidationError(text)) {
+					if (isResponsesTokenInvalidationEvent(event)) {
 						const source = isRecord(event.response) ? event.response : event;
 						const response: Json = {status: "failed", error: {type: "authentication_error", code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}};
 						if (typeof source.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(source.id)) response.id = source.id;
@@ -656,8 +656,9 @@ export class ResponsesWebSocketGateway {
 									if (!isRecord(parsed)) throw Error("invalid_response_event");
 									outputHistory.observe(parsed);
 									if (
-										parsed.type === "response.completed" &&
 										isRecord(parsed.response) &&
+										(parsed.type === "response.completed" ||
+											(parsed.type === "response.done" && parsed.response.status === "completed")) &&
 										typeof parsed.response.id === "string"
 									) {
 										const output = outputHistory.finish(parsed.response.output);
