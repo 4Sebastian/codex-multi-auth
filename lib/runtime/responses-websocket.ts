@@ -642,12 +642,12 @@ export class ResponsesWebSocketGateway {
 								buffer += decoder.decode(chunk, { stream: true });
 								if (Buffer.byteLength(buffer) > this.maxBytes)
 									throw Error("websocket_event_too_large");
-								let index: number;
-								while ((index = buffer.indexOf("\n\n")) >= 0) {
-									const frame = buffer.slice(0, index);
-									buffer = buffer.slice(index + 2);
+								let boundary: RegExpExecArray | null;
+								while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+									const frame = buffer.slice(0, boundary.index);
+									buffer = buffer.slice(boundary.index + boundary[0].length);
 									const data = frame
-										.split("\n")
+										.split(/\r?\n/)
 										.filter((line) => line.startsWith("data:"))
 										.map((line) => line.slice(5).trimStart())
 										.join("\n");

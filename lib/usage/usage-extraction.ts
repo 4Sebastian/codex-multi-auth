@@ -11,7 +11,7 @@ import type { UsageServiceTier, UsageTokenCounts } from "./types.js";
  */
 
 /** Cap on retained bytes so a hostile or unterminated body cannot grow forever. */
-const MAX_BUFFERED_BYTES = 1_048_576;
+const MAX_BUFFERED_BYTES = 64 * 1024 * 1024;
 /** Terminal Responses stream events that carry the final `usage` object. */
 const TERMINAL_EVENT_TYPES = new Set([
 	"response.completed",
@@ -157,7 +157,8 @@ export function createUsageStreamScanner(options: {
 }): UsageStreamScanner {
 	const sse = (options.contentType ?? "").toLowerCase().includes("text/event-stream");
 	const decoder = new TextDecoder("utf-8");
-	let pending = "";
+	let pending: string[] = [];
+	let pendingSize = 0;
 	let bufferedBytes = 0;
 	let overflowed = false;
 	let latest: UsageTokenCounts | null = null;
@@ -195,39 +196,60 @@ export function createUsageStreamScanner(options: {
 		if (line.length === 0) { consumeEvent(); return; }
 		if (droppingEvent || !line.startsWith("data:")) return;
 		const value = line.slice(5).replace(/^ /, "");
-		eventSize += value.length + 1;
+		eventSize += Buffer.byteLength(value) + 1;
 		if (eventSize > MAX_BUFFERED_BYTES) {
 			droppingEvent = true; eventData = []; eventSize = 0; return;
 		}
 		eventData.push(value);
 	};
 
+	const retainFragment = (fragment: string): void => {
+		if (fragment.length === 0) return;
+		const last = pending.at(-1);
+		if (last !== undefined && last.length < 8192 && fragment.length < 8192) pending[pending.length - 1] = last + fragment;
+		else pending.push(fragment);
+	};
+
+	const appendPartialLine = (fragment: string): void => {
+		if (droppingLine) return;
+		pendingSize += Buffer.byteLength(fragment);
+		if (pendingSize > MAX_BUFFERED_BYTES) {
+			droppingEvent = true;
+			droppingLine = true;
+			eventData = [];
+			eventSize = 0;
+			pending = [];
+			pendingSize = 0;
+			return;
+		}
+		retainFragment(fragment);
+	};
+
 	return {
 		push: (chunk) => {
 			try {
 				if (overflowed || chunk.byteLength === 0) return;
-				bufferedBytes += chunk.byteLength;
-				pending += decoder.decode(chunk, { stream: true });
+				const text = decoder.decode(chunk, { stream: true });
 				if (!sse) {
+					bufferedBytes += chunk.byteLength;
 					if (bufferedBytes > MAX_BUFFERED_BYTES) {
 						overflowed = true;
-						pending = "";
-					}
+						pending = [];
+					} else retainFragment(text);
 					return;
 				}
-				let newlineAt = pending.indexOf("\n");
+				let offset = 0;
+				let newlineAt = text.indexOf("\n", offset);
 				while (newlineAt !== -1) {
-                    if (droppingLine) droppingLine = false;
-                    else consumeLine(pending.slice(0, newlineAt));
-					pending = pending.slice(newlineAt + 1);
-					newlineAt = pending.indexOf("\n");
+					appendPartialLine(text.slice(offset, newlineAt));
+					if (!droppingLine) consumeLine(pending.join(""));
+					droppingLine = false;
+					pending = [];
+					pendingSize = 0;
+					offset = newlineAt + 1;
+					newlineAt = text.indexOf("\n", offset);
 				}
-				// A single unterminated line this long is not SSE any more; stop
-				// retaining it rather than growing the buffer for the whole body.
-				if (pending.length > MAX_BUFFERED_BYTES || droppingLine) {
-                    droppingEvent = true; droppingLine = true;
-                    eventData = []; eventSize = 0; pending = "";
-                }
+				if (offset < text.length) appendPartialLine(text.slice(offset));
 			} catch {
 				// Usage accounting must never break the forwarded response.
 			}
@@ -235,16 +257,17 @@ export function createUsageStreamScanner(options: {
 		result: () => {
 			try {
 				if (overflowed) return latest;
-				pending += decoder.decode();
+				appendPartialLine(decoder.decode());
+				const payload = pending.join("");
+				pending = [];
+				pendingSize = 0;
 				if (sse) {
-					if (pending.length > 0) consumeLine(pending);
-					pending = "";
+					if (payload.length > 0 && !droppingLine) consumeLine(payload);
 					consumeEvent();
 					return latest;
 				}
-				if (pending.trim().length === 0) return latest;
-				const parsed: unknown = JSON.parse(pending);
-				pending = "";
+				if (payload.trim().length === 0) return latest;
+				const parsed: unknown = JSON.parse(payload);
 				options.onEvent?.(parsed);
 				latest = extractResponsesUsage(parsed) ?? latest;
 				return latest;

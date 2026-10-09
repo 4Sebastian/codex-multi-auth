@@ -477,6 +477,30 @@ function rejectingUpstream(status: number, headers: Record<string, string>, onPo
 	return upstream;
 }
 
+it.each(["response.completed", "response.done"])("retains HTTP fallback continuation through split CRLF %s frames", async type => {
+	const calls: Record<string, unknown>[] = [];
+	const upstream = createServer(async (req, res) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of req) chunks.push(Buffer.from(chunk));
+		calls.push(JSON.parse(Buffer.concat(chunks).toString()));
+		res.writeHead(200, {"content-type": "text/event-stream"});
+		const event = {type, response: {id: `crlf-${calls.length}`, status: "completed", output: [{type: "message", role: "assistant", content: [{type: "output_text", text: "HTTP history"}]}]}};
+		const frame = `event: ${type}\r\ndata: ${JSON.stringify(event)}\r\n\r\n`;
+		for (const byte of Buffer.from(frame)) {res.write(Buffer.from([byte])); await new Promise(resolve => setImmediate(resolve));}
+		res.end();
+	});
+	upstream.on("upgrade", (_req, socket) => socket.end("HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+	const g = await customGateway({upstream});
+	const ws = await g.connect();
+	expect((await turn(ws, {model: "api/shared", input: [{role: "user", content: "first"}]})).at(-1)).toMatchObject({type, response: {id: "crlf-1"}});
+	expect((await turn(ws, {model: "api/shared", previous_response_id: "crlf-1", input: [{role: "user", content: "second"}]})).at(-1)).toMatchObject({type, response: {id: "crlf-2"}});
+	expect(calls[1]?.input).toEqual([
+		{role: "user", content: "first"}, {type: "message", role: "assistant", content: [{type: "output_text", text: "HTTP history"}]}, {role: "user", content: "second"},
+	]);
+	expect((await turn(ws, {model: "shared", previous_response_id: "crlf-2", input: []})).at(-1)).toMatchObject({type: "error", error: {code: "model_route_pool_mismatch"}});
+	expect(calls).toHaveLength(2);
+});
+
 it("keeps Retry-After and quota headers from a rejected upstream handshake", async () => {
 	const g = await customGateway({
 		upstream: rejectingUpstream(429, { "retry-after": "120", "x-codex-primary-used-percent": "100" }),

@@ -1093,6 +1093,7 @@ const MAX_WEBSOCKET_RECOVERY_DELAY_MS = 60_000;
 const WEBSOCKET_CLOSE_POLICY_VIOLATION = 1008;
 const WEBSOCKET_CLOSE_TRY_AGAIN_LATER = 1013;
 const MAX_WEBSOCKET_HANDSHAKE_ERROR_BODY_BYTES = 64 * 1024;
+const MAX_QUEUED_WEBSOCKET_FRAMES = 16;
 const WEBSOCKET_AUTH_FAILURE_CODES: ReadonlySet<string> = new Set([
 	"authentication_error",
 	"invalid_api_key",
@@ -1105,6 +1106,7 @@ interface PendingWebSocketFrame {
 	isBinary: boolean;
 	recoveryAttempts?: number;
 	upstreamConnection?: WebSocket;
+	usageRecorder?: RuntimeUsageRecorder;
 	request?: PreparedWebSocketRequest;
 }
 
@@ -1141,6 +1143,7 @@ interface ActiveWebSocketRequest {
 interface WebSocketTerminalEvent {
 	record: Parameters<RuntimeUsageRecorder["record"]>[0];
 	rawBody: string;
+	errorMessage: string | null;
 	tokenInvalidated: boolean;
 	retryAfterMs: number | null;
 	retryHeaders: Headers | null;
@@ -1287,20 +1290,28 @@ function buildWebSocketUpstreamUrl(req: IncomingMessage, upstreamBaseUrl: string
 async function prepareWebSocketRequest(
 	state: RotationProxyState,
 	req: IncomingMessage,
-	frame: RawData,
+	frame: PendingWebSocketFrame,
 ): Promise<PreparedWebSocketRequest> {
-	const context = buildWebSocketRequestContext(req, frame);
+	const existing = frame.request;
+	const context = existing?.context ?? buildWebSocketRequestContext(req, frame.data);
 	if (!context) {
 		throw new CodexValidationError("WebSocket message must be response.create.");
 	}
-	state.status.totalRequests += 1;
+	if (!frame.usageRecorder) state.status.totalRequests += 1;
+	const recorderInput: Parameters<typeof createRuntimeUsageRecorder>[0] = {
+		source: "runtime-proxy",
+		operation: "responses",
+		model: context.model,
+		projectKey: null,
+		requestId: randomUUID(),
+		startedAt: state.now(),
+	};
+	const usageRecorder = frame.usageRecorder ??= existing?.usageRecorder ?? createRuntimeUsageRecorder(recorderInput);
 	const startedAt = state.now();
-	const requestId = randomUUID();
-	let projectKey: string | null = null;
 	let policyDecision: RuntimePolicyDecision;
 	try {
 		const policyState = await loadRuntimePolicyState();
-		projectKey = policyState.project.projectKey;
+		recorderInput.projectKey = policyState.project.projectKey;
 		policyDecision = await evaluateRuntimePolicy({
 			state: policyState,
 			accounts: state.activeAccountManager.getAccountsSnapshot(),
@@ -1319,14 +1330,6 @@ async function prepareWebSocketRequest(
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		state.status.lastError = message;
-		const usageRecorder = createRuntimeUsageRecorder({
-			source: "runtime-proxy",
-			operation: "responses",
-			model: context.model,
-			projectKey,
-			requestId,
-			startedAt,
-		});
 		await usageRecorder.record({
 			outcome: "failure",
 			statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -1338,14 +1341,6 @@ async function prepareWebSocketRequest(
 			"runtime_policy_unavailable",
 		);
 	}
-	const usageRecorder = createRuntimeUsageRecorder({
-		source: "runtime-proxy",
-		operation: "responses",
-		model: context.model,
-		projectKey,
-		requestId,
-		startedAt,
-	});
 	if (!policyDecision.allowed) {
 		await usageRecorder.record({
 			outcome: "blocked",
@@ -1484,14 +1479,15 @@ function websocketTerminalUsage(
 		readStringRecordValue(error ?? {}, "code") ??
 		readStringRecordValue(parsed, "code") ??
 		readStringRecordValue(error ?? {}, "type");
-	const rawBody = body.toString("utf8");
+	const rawBody = JSON.stringify({error: error ?? {}});
+	const errorMessage = readStringRecordValue(error ?? {}, "message");
 	const tokenInvalidated = isResponsesTokenInvalidationEvent(parsed);
 	const statusCode =
 		(tokenInvalidated ? HTTP_STATUS.UNAUTHORIZED : null) ??
 		readWebSocketStatusCode(parsed, response, error) ??
 		(outcome === "success"
 			? HTTP_STATUS.OK
-			: inferWebSocketFailureStatus(errorCode, JSON.stringify(error ?? {})));
+			: inferWebSocketFailureStatus(errorCode, JSON.stringify({code: errorCode, message: errorMessage})));
 	return {
 		record: {
 			outcome,
@@ -1500,6 +1496,7 @@ function websocketTerminalUsage(
 			...(usage ?? {}),
 		},
 		rawBody,
+		errorMessage,
 		tokenInvalidated,
 		retryAfterMs:
 			readFiniteNumber(parsed, "retry_after_ms") ??
@@ -1595,7 +1592,7 @@ function applyWebSocketTerminalAccountFailure(
 		isWorkspaceDisabledError(
 			statusCode,
 			terminal.record.errorCode,
-			terminal.rawBody,
+			terminal.errorMessage ?? "",
 		)
 	) {
 		accountManager.refundToken(account, context.family, context.model);
@@ -2132,6 +2129,12 @@ function bridgeWebSocketConnection(
 ): void {
 	const pending: PendingWebSocketFrame[] = [];
 	const activeRequests: ActiveWebSocketRequest[] = [];
+	const queuedFrames = new Set<PendingWebSocketFrame>();
+	let queuedBytes = 0;
+	let settlingTurn = false;
+	const releaseFrame = (frame: PendingWebSocketFrame): void => {
+		if (queuedFrames.delete(frame)) queuedBytes -= rawDataToBuffer(frame.data).byteLength;
+	};
 	let upstream: WebSocket | null = null;
 	let boundAccountManager: AccountManager | null = null;
 	let boundAccount: ManagedAccount | null = null;
@@ -2190,18 +2193,23 @@ function bridgeWebSocketConnection(
 		outcome: "failure" | "cancelled",
 		errorCode: string,
 	): void => {
-		for (const frame of pending.splice(0)) {
-			if (!frame.request) continue;
-			void frame.request.usageRecorder.record({
-				outcome,
-				statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
-				errorCode,
+		pending.splice(0);
+		for (const frame of queuedFrames) {
+			releaseFrame(frame);
+			const context = frame.request?.context ?? buildWebSocketRequestContext(req, frame.data);
+			if (!context) continue;
+			if (!frame.usageRecorder) state.status.totalRequests += 1;
+			const recorder = frame.usageRecorder ?? frame.request?.usageRecorder ?? createRuntimeUsageRecorder({
+				source: "runtime-proxy", operation: "responses", model: context.model,
+				projectKey: null, requestId: randomUUID(), startedAt: state.now(),
 			});
+			void recorder.record({outcome, statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null, errorCode});
 		}
 	};
 	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
 		if (closed) return;
 		closed = true;
+		settlePending("failure", "websocket_proxy_closed");
 		if (reconnectTimer) {
 			clearTimeout(reconnectTimer);
 			reconnectTimer = null;
@@ -2228,6 +2236,7 @@ function bridgeWebSocketConnection(
 		state.status.lastError = error instanceof Error ? error.message : String(error);
 		settlePendingHandshake("failure", "websocket_proxy_failed");
 		settleAll("failure", "websocket_proxy_failed");
+		settlePending("failure", "websocket_proxy_failed");
 		const policyViolation =
 			error instanceof CodexValidationError || isRuntimeProxyHttpError(error);
 		closeBoth(
@@ -2241,18 +2250,20 @@ function bridgeWebSocketConnection(
 		frame: PendingWebSocketFrame,
 		preparedHandshake?: PreparedWebSocketAccount,
 	): Promise<void> => {
-		if (closed) {
+		if (closed || !queuedFrames.has(frame)) {
 			if (preparedHandshake) settlePendingHandshake("cancelled", "client_websocket_closed");
-			else if (readStringRecordValue(parseRequestBody(rawDataToBuffer(frame.data)) ?? {}, "type") === "response.create") {
-				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame.data);
-				await request.usageRecorder.record({outcome: "failure", errorCode: "client_websocket_closed"});
-			}
+			return;
+		}
+		const type = readStringRecordValue(parseRequestBody(rawDataToBuffer(frame.data)) ?? {}, "type");
+		if (type === "response.create" && (activeRequests.length > 0 || settlingTurn)) {
+			pending.push(frame);
 			return;
 		}
 		if (upstream?.readyState !== WebSocket.OPEN || (hasConnectionScopedContinuation(frame) && frame.upstreamConnection !== upstream)) {
 			if (hasConnectionScopedContinuation(frame)) {
-				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame.data);
+				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame);
 				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
+				releaseFrame(frame);
 				reportConnectionScopedContinuationLoss();
 			} else {
 				pending.push(frame);
@@ -2261,15 +2272,17 @@ function bridgeWebSocketConnection(
 			return;
 		}
 		const forwardingUpstream = upstream;
-		let request = preparedHandshake?.request ?? frame.request;
+		let request = preparedHandshake?.request;
 		let consumedForFrame = false;
 		if (!request) {
-			const parsed = parseRequestBody(rawDataToBuffer(frame.data));
-			if (readStringRecordValue(parsed ?? {}, "type") !== "response.create") {
+			if (type !== "response.create") {
+				releaseFrame(frame);
+				if (type === "response.cancel") settlePending("cancelled", "response_cancelled");
 				upstream.send(frame.data, { binary: frame.isBinary });
 				return;
 			}
-			request = await prepareWebSocketRequest(state, req, frame.data);
+			request = await prepareWebSocketRequest(state, req, frame);
+			frame.request = request;
 			if (closed) {
 				await request.usageRecorder.record({outcome: "failure", errorCode: "client_websocket_closed"});
 				return;
@@ -2277,11 +2290,12 @@ function bridgeWebSocketConnection(
 			if (upstream !== forwardingUpstream || upstream.readyState !== WebSocket.OPEN) {
 				if (hasConnectionScopedContinuation(frame)) {
 					await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
+					releaseFrame(frame);
 					reportConnectionScopedContinuationLoss();
 				} else if (upstream?.readyState === WebSocket.OPEN) {
-					enqueueClientFrame({...frame, request});
+					enqueueClientFrame(frame);
 				} else {
-					pending.push({...frame, request});
+					pending.push(frame);
 					void initialize();
 				}
 				return;
@@ -2304,13 +2318,6 @@ function bridgeWebSocketConnection(
 				);
 			} catch (error) {
 				if (!isRecoverableWebSocketAccountError(error)) throw error;
-				if (activeRequests.length > 0) {
-					void request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_active_turn_interrupted", account: boundAccount});
-					settleAll("failure", "websocket_active_turn_interrupted");
-					settlePending("failure", "websocket_active_turn_interrupted");
-					closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "Active WebSocket turn interrupted");
-					return;
-				}
 				const staleUpstream = upstream;
 				const staleAccount = boundAccount;
 				upstream = null;
@@ -2326,14 +2333,12 @@ function bridgeWebSocketConnection(
 						errorCode: "websocket_continuation_lost",
 						account: staleAccount ?? undefined,
 					});
+					releaseFrame(frame);
 					reportConnectionScopedContinuationLoss();
 					return;
 				}
-				pending.unshift({
-					...frame,
-					recoveryAttempts: frame.recoveryAttempts ?? 0,
-					request,
-				});
+				frame.recoveryAttempts ??= 0;
+				pending.unshift(frame);
 				void initialize();
 				return;
 			}
@@ -2346,6 +2351,7 @@ function bridgeWebSocketConnection(
 				"websocket_account_unavailable",
 			);
 		}
+		releaseFrame(frame);
 		activeRequests.push({request, accountManager: boundAccountManager, account: boundAccount, frame, sawUpstreamEvent: false});
 		try {
 			upstream.send(frame.data, { binary: frame.isBinary });
@@ -2385,6 +2391,11 @@ function bridgeWebSocketConnection(
 			.then(() => forwardClientFrame(frame, preparedHandshake))
 			.catch(rejectConnection);
 	};
+	const drainPending = (): void => {
+		if (closed || activeRequests.length > 0 || settlingTurn) return;
+		if (upstream?.readyState !== WebSocket.OPEN) { void initialize(); return; }
+		for (const frame of pending.splice(0)) enqueueClientFrame(frame);
+	};
 	const handshakeLifecycle: WebSocketHandshakeLifecycle = {
 		onPrepared: (prepared) => {
 			pendingHandshake = prepared;
@@ -2408,14 +2419,14 @@ function bridgeWebSocketConnection(
 			while (pending[0] && hasConnectionScopedContinuation(pending[0])) {
 				const lost = pending[0];
 				pending.shift();
-				const request = lost.request ?? await prepareWebSocketRequest(state, req, lost.data);
+				releaseFrame(lost);
+				const request = lost.request ?? await prepareWebSocketRequest(state, req, lost);
 				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
 				reportConnectionScopedContinuationLoss();
 			}
 			const firstFrame = pending[0];
 			if (!firstFrame) return;
-			const firstRequest =
-				firstFrame.request ?? await prepareWebSocketRequest(state, req, firstFrame.data);
+			const firstRequest = await prepareWebSocketRequest(state, req, firstFrame);
 			firstFrame.request = firstRequest;
 			pendingInitialRequest = firstRequest;
 			if (closed) {
@@ -2478,7 +2489,6 @@ function bridgeWebSocketConnection(
 						applyWebSocketTerminalAccountSuccess(state, settled, terminal);
 						applyWebSocketTerminalAccountFailure(state, settled, terminal);
 						if (
-							terminal.record.outcome === "success" &&
 							settled.request.context.stableSessionKey &&
 							settled.request.context.model &&
 							typeof terminal.record.inputTokens === "number" &&
@@ -2494,10 +2504,14 @@ function bridgeWebSocketConnection(
 								},
 							);
 						}
+						settlingTurn = true;
 						void settled.request.usageRecorder.record({
 							...terminal.record,
 							account: settled.account,
-						});
+						}).then(() => {
+							settlingTurn = false;
+							drainPending();
+						}).catch(rejectConnection);
 					}
 				}
 				if (terminal?.record.outcome === "failure" && terminal.tokenInvalidated) {
@@ -2515,7 +2529,7 @@ function bridgeWebSocketConnection(
 				boundAccountManager = null;
 				boundAccount = null;
 				settlePendingHandshake("failure", "upstream_websocket_closed", true);
-				if (activeRequests.length === 0) return;
+				if (activeRequests.length === 0) { drainPending(); return; }
 				if (
 					activeRequests.length === 1 &&
 					activeRequests[0]?.sawUpstreamEvent === false
@@ -2531,18 +2545,21 @@ function bridgeWebSocketConnection(
 								account: interrupted.account,
 							});
 							reportConnectionScopedContinuationLoss();
+							drainPending();
 							return;
 						}
-						pending.unshift({
-							...interrupted.frame,
-							recoveryAttempts: interrupted.frame.recoveryAttempts ?? 0,
-							request: interrupted.request,
-						});
+						const frame = interrupted.frame;
+						frame.recoveryAttempts ??= 0;
+						frame.request = interrupted.request;
+						queuedFrames.add(frame);
+						queuedBytes += rawDataToBuffer(frame.data).byteLength;
+						pending.unshift(frame);
 						void initialize();
 						return;
 					}
 				}
 				settleAll("failure", "upstream_websocket_closed", true);
+				settlePending("failure", "upstream_websocket_closed");
 				closed = true;
 				mirrorWebSocketClose(client, code, reason);
 			});
@@ -2564,11 +2581,20 @@ function bridgeWebSocketConnection(
 		}
 	}
 	client.on("message", (data, isBinary) => {
-		if (upstream?.readyState === WebSocket.OPEN) {
-			enqueueClientFrame({ data, isBinary, upstreamConnection: upstream });
+		if (closed) return;
+		const bytes = rawDataToBuffer(data).byteLength;
+		if (queuedFrames.size >= MAX_QUEUED_WEBSOCKET_FRAMES || queuedBytes + bytes > state.maxRequestBodyBytes) {
+			rejectConnection(new CodexValidationError("WebSocket queue limit exceeded."));
 			return;
 		}
-		pending.push({ data, isBinary });
+		const frame: PendingWebSocketFrame = {data, isBinary, upstreamConnection: upstream ?? undefined};
+		queuedFrames.add(frame);
+		queuedBytes += bytes;
+		if (upstream?.readyState === WebSocket.OPEN) {
+			enqueueClientFrame(frame);
+			return;
+		}
+		pending.push(frame);
 		void initialize();
 	});
 	client.on("close", (code, reason) => {
@@ -2956,18 +2982,19 @@ async function handleRequestInner(
                 for (const previous of accounts) {
                     const current = carryTarget(previous);
                     const live = current && accountManager.getAccountByIndex(current.index);
-                    if (!live) continue;
+                    if (!current || !live) continue;
                     const previousLive = previousManager.getAccountByIndex(previous.index);
                     if (previousLive) accountManager.inheritNativeAuthObservation(live, previousManager, previousLive);
-                    live.enabled = previous.enabled;
-                    if (previous.access === live.access && previous.authInvalidatedAt) {
-                        live.authInvalidatedAt = previous.authInvalidatedAt;
-                        live.authInvalidationErrorCode = previous.authInvalidationErrorCode;
-                    }
+                    live.access = previous.access;
+                    live.refreshToken = previous.refreshToken;
+                    live.expires = previous.expires;
+                    live.enabled = previous.enabled !== false && current.enabled !== false;
+                    live.authInvalidatedAt = previous.authInvalidatedAt;
+                    live.authInvalidationErrorCode = previous.authInvalidationErrorCode;
                     for (const [key, until] of Object.entries(previous.rateLimitResetTimes)) {
                         if (typeof until === "number" && until > state.now()) live.rateLimitResetTimes[key] = Math.max(live.rateLimitResetTimes[key] ?? 0, until);
                     }
-                    if (previous.access === live.access && (previous.coolingDownUntil ?? 0) > (live.coolingDownUntil ?? 0)) {
+                    if ((previous.coolingDownUntil ?? 0) > (live.coolingDownUntil ?? 0)) {
                         live.coolingDownUntil = previous.coolingDownUntil; live.cooldownReason = previous.cooldownReason;
                     }
                 }
