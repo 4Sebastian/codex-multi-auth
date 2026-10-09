@@ -5072,6 +5072,43 @@ describe("AccountManager", () => {
 	});
 });
 
+describe("committed authorization observations", () => {
+	it.each(["save", "refresh"].flatMap(mode => [false, true].map(failed => ({mode, failed}))))("preserves newer credential invalidation during awaited persistence %j", async ({mode, failed}) => {
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [
+			{recordId: "first", accountId: "first", refreshToken: "first-refresh", accessToken: "first-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, enabled: true},
+			{recordId: "second", accountId: "second", refreshToken: "second-refresh", accessToken: "second-access", expiresAt: Date.now() + 3600000, addedAt: 2, lastUsed: 2, enabled: true},
+		]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		disk.accounts[0]!.enabled = false;
+		let release!: () => void, prepared!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {prepared = resolve;});
+		const {withAccountStorageTransaction} = await import("../lib/storage.js");
+		vi.mocked(withAccountStorageTransaction).mockImplementation(async handler => handler(structuredClone(disk), async committed => {
+			prepared(); await barrier;
+			if (failed) throw Object.assign(Error("write rejected"), {code: "EINVAL"});
+			disk = structuredClone(committed);
+		}));
+		const account = manager.getAccountByIndex(1)!;
+		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(account, {type: "oauth", access: "rotated-once", refresh: "rotated-once-refresh", expires: Date.now() + 7200000});
+		void saving.catch(() => undefined);
+		try {
+			await ready;
+			manager.updateFromAuth(account, {type: "oauth", access: "rotated-twice", refresh: "rotated-twice-refresh", expires: Date.now() + 10800000});
+			manager.markAuthInvalidated(account, "token_invalidated", 1500);
+			manager.markAccountCoolingDown(account, 60000, "auth-failure");
+			release();
+			if (failed) await expect(saving).rejects.toThrow(); else await saving;
+			expect(account).toMatchObject({access: "rotated-twice", refreshToken: "rotated-twice-refresh", authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (!failed) {
+				expect(manager.getAccountByIndex(0)?.enabled).toBe(false);
+				await manager.saveToDisk();
+				expect(disk.accounts[1]).toMatchObject({accessToken: "rotated-twice", authInvalidatedAt: 1500});
+			}
+		} finally {release(); await saving.catch(() => undefined);}
+	});
+});
+
 describe("workspace preference persistence", () => {
 	it("preserves external additions, deletions and workspace exclusions across repeated daemon saves", async () => {
 		const initial:AccountStorageV3={version:3,activeIndex:0,accounts:[{recordId:"first",accountId:"first",refreshToken:"fixture-first",addedAt:1,lastUsed:1,workspaces:[{id:"personal",enabled:true},{id:"business",enabled:true}]},{recordId:"removed",accountId:"removed",refreshToken:"fixture-removed",addedAt:2,lastUsed:2}]};

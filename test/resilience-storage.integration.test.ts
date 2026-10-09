@@ -3,6 +3,7 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
+import { promises as filesystem } from "node:fs";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
 import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
 import { AccountManager } from "../lib/accounts.js";
@@ -144,6 +145,72 @@ it("does not replace a readable inventory after initially loading no snapshot",a
  await setup();const manager=new AccountManager(undefined,null);await manager.saveToDisk();
  expect((await loadAccounts())?.accounts.map(a=>a.accountId)).toEqual(["first"]);
 });
+it.each(["ordinary", "refresh", "rescue", "runtime"])("adopts committed authorization after a %s save before an older native read", async mode => {
+ await setup();
+ const initial = (await loadAccounts())!;
+ Object.assign(initial.accounts[0]!, {accessToken: "fixture-access", expiresAt: Date.now() + 3600000, enabled: true});
+ initial.accounts.push({recordId: "second", accountId: "second", refreshToken: "fixture-second", accessToken: "fixture-second-access", expiresAt: Date.now() + 3600000, addedAt: 2, lastUsed: 2});
+ await saveAccounts(initial);
+ const manager = new AccountManager(undefined, await loadAccounts());
+ const account = manager.getAccountByIndex(0)!;
+ const disk = (await loadAccounts())!;
+ disk.accounts[0]!.enabled = false;
+ disk.accounts[0]!.workspaces![1]!.enabled = false;
+ disk.accounts.push({recordId: "external", accountId: "external", refreshToken: "fixture-external", addedAt: 3, lastUsed: 3});
+ if (mode === "rescue" || mode === "runtime") {account.accountLabel = "Local"; disk.accounts[0]!.accountLabel = "External";}
+ await saveAccounts(disk);
+ const read = createNativeAccountStorageReader(undefined, getStoragePath());
+ let release!: () => void, captured!: () => void;
+ const barrier = new Promise<void>(resolve => {release = resolve;});
+ const ready = new Promise<void>(resolve => {captured = resolve;});
+ const apply = pendingAuth.applyPendingAuth;
+ const overlay = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementationOnce(async (path, storage) => {captured(); await barrier; return apply(path, storage);});
+ const oldRead = read();
+ try {
+  await ready;
+  if (mode === "runtime") manager.markAuthInvalidated(account, "token_invalidated", 1500);
+  if (mode === "ordinary" || mode === "runtime") {manager.getAccountByIndex(1)!.lastUsed = 20; await manager.saveToDisk(mode === "runtime");}
+  else await manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "fixture-fresh-second", refresh: "fixture-rotated-second", expires: Date.now() + 7200000});
+  expect(account.enabled).toBe(false);
+  expect(account.workspaces?.[1]?.enabled).toBe(false);
+  expect((await loadAccounts())?.accounts[0]?.enabled).toBe(false);
+  release();
+  const snapshot = await oldRead;
+  syncNativeAccountCredentials(manager, snapshot.storage!, snapshot.capturedAt);
+  expect(account.enabled).toBe(false);
+  if (mode === "runtime") expect(account.authInvalidatedAt).toBe(1500);
+  if (mode === "rescue" || mode === "runtime") {
+   expect(account.accountLabel).toBe("Local");
+   await expect(manager.saveToDisk()).rejects.toMatchObject({code: "ESTALE"});
+   account.accountLabel = "External";
+  }
+  await manager.saveToDisk();
+  expect((await loadAccounts())?.accounts.map(row => row.recordId)).toEqual(["first", "second", "external"]);
+  if (mode === "runtime") expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(1500);
+ } finally {release(); await oldRead; overlay.mockRestore();}
+});
+
+it("does not grant failed persistence authority over a captured disable", async () => {
+ const manager = await setup();
+ const account = manager.getAccountByIndex(0)!;
+ const disk = (await loadAccounts())!;
+ disk.accounts[0]!.enabled = false;
+ await saveAccounts(disk);
+ const capturedAt = performance.now();
+ const rename = filesystem.rename;
+ const failure = vi.spyOn(filesystem, "rename").mockImplementation(async (source, target) => {
+  if (target === getStoragePath()) throw Object.assign(Error("write rejected"), {code: "EINVAL"});
+  return rename(source, target);
+ });
+ try {
+  await expect(manager.saveToDisk()).rejects.toThrow();
+  expect(manager.isNativeSnapshotCurrent(account, capturedAt)).toBe(true);
+  expect(account.enabled).toBe(true);
+  syncNativeAccountCredentials(manager, disk, capturedAt);
+  expect(account.enabled).toBe(false);
+ } finally {failure.mockRestore();}
+});
+
 it("treats explicit enabled defaults as unchanged during an external disable",async()=>{
  await setup();const initial=(await loadAccounts())!;initial.accounts[0]!.enabled=true;await saveAccounts(initial);
  const manager=new AccountManager(undefined,await loadAccounts());const disk=(await loadAccounts())!;disk.accounts[0]!.enabled=false;await saveAccounts(disk);

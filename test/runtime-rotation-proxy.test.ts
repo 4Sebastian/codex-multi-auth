@@ -4,6 +4,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
 import * as nativeStorageReader from "../lib/runtime/native-account-storage.js";
 import * as tokenRefreshRuntime from "../lib/runtime/rotation-token-refresh.js";
+import * as websocketTransport from "../lib/runtime/responses-websocket.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer as createHttpServer, request } from "node:http";
 import { createConnection } from "node:net";
@@ -6580,6 +6581,136 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 			reasoningTokens: 200,
 			totalTokens: 1500,
 		});
+	});
+});
+
+describe("committed authorization and receive-order regressions", () => {
+	it.each(["shared", "api/shared", "zdr/shared", "upgrade", "turn"].flatMap(target => [false, true].flatMap(rebuild => ["save", "refresh"].map(mode => ({target, rebuild, mode})))))("refuses disk-disabled bearers after a merged save %j", async ({target, rebuild, mode}) => {
+		let disk = createStorage(Date.now(), 2);
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		const {calls, fetchImpl} = createRecordingFetch(() => Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]}));
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk), readApiRoutes: async () => [{id: "paid-fixture", label: "Fixture", kind: target.startsWith("zdr/") ? "zdr" : "api", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}]}});
+		let client: WebSocket | undefined;
+		if (target === "turn") client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", "access-1");
+		disk.accounts[0]!.enabled = false;
+		if (rebuild) {disk.accounts.push(createStorage(Date.now(), 3).accounts[2]!); disk.accounts.reverse();}
+		let release!: () => void, captured!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {captured = resolve;});
+		const apply = pendingAuth.applyPendingAuth;
+		const overlay = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementationOnce(async (path, storage) => {captured(); await barrier; return apply(path, storage);});
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async committed => {disk = structuredClone(committed);}));
+		let request: Promise<number>;
+		if (target === "upgrade") {
+			client = new WebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", {headers: {authorization: "Bearer access-1"}});
+			request = new Promise<number>((resolve, reject) => {client!.once("unexpected-response", (_req, response) => {response.resume(); resolve(response.statusCode ?? 0);}); client!.once("open", () => resolve(101)); client!.once("error", reject);});
+		} else if (target === "turn") {
+			request = nextWebSocketMessage(client!).then(raw => JSON.parse(raw).status);
+			client!.send(JSON.stringify({type: "response.create", model: "api/shared", input: []}));
+		} else request = postResponses(proxy, {model: target, input: [], stream: true}, "/responses", {authorization: "Bearer access-1"}).then(async response => {await response.text(); return response.status;});
+		try {
+			await ready;
+			const other = manager.getAccountByIndex(1)!;
+			if (mode === "refresh") await manager.commitRefreshedAuth(other, {type: "oauth", access: "new-access-2", refresh: "new-refresh-2", expires: Date.now() + 7200000});
+			else {other.lastUsed = Date.now(); await manager.saveToDisk();}
+			expect(disk.accounts.find(row => row.accountId === "acc_1")?.enabled).toBe(false);
+			expect(manager.getAccountByIndex(0)?.enabled).toBe(false);
+			release();
+			expect(await request).toBe(401);
+			expect(calls).toHaveLength(0);
+			await manager.saveToDisk();
+			expect(disk.accounts.some(row => row.accountId === "acc_3")).toBe(rebuild);
+		} finally {release(); await request.catch(() => undefined); client?.terminate(); overlay.mockRestore();}
+	});
+
+	it.each(["active", "connecting", "policy"].flatMap(stage => [false, true].flatMap(queued => [false, true].map(doubleCancel => ({stage, queued, doubleCancel})))))("keeps post-cancel custom creates in a receive burst %j", async ({stage, queued, doubleCancel}) => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let release!: () => void, prepared!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {prepared = resolve;});
+		const evaluate = runtimePolicy.evaluateRuntimePolicy;
+		const policy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async input => {
+			const decision = await evaluate(input);
+			if (stage === "policy" && input.model === "A-model") {prepared(); await barrier;}
+			return decision;
+		});
+		const sent: string[] = [], events: Array<Record<string, unknown>> = [];
+		let source!: WebSocket, sawCancel!: () => void, cancelled = false;
+		const cancellation = new Promise<void>(resolve => {sawCancel = resolve;});
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {source = ws; ws.on("message", raw => {
+			const body = JSON.parse(raw.toString());
+			if (body.type === "response.cancel") {sawCancel(); return;}
+			if (body.type !== "response.create") return;
+			sent.push(body.input[0]);
+			if (sent.length === 1) ws.send(JSON.stringify({type: "response.output_text.delta", response_id: "A", delta: "visible A"}));
+			else {expect(cancelled).toBe(true); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0], usage: {input_tokens: 20, output_tokens: 4}}}));}
+		});}});
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			client.on("message", raw => events.push(JSON.parse(raw.toString())));
+			const visible = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
+			if (stage === "active") await visible;
+			if (stage === "policy") await ready;
+			if (queued) client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]}));
+			client.send(JSON.stringify({type: "response.cancel"}));
+			if (doubleCancel) client.send(JSON.stringify({type: "response.cancel"}));
+			client.send(JSON.stringify({type: "response.create", model: "D-model", input: ["D"]}));
+			release();
+			await cancellation;
+			await visible;
+			expect(sent).toEqual(["A"]);
+			cancelled = true;
+			source.send(JSON.stringify({type: "response.cancelled", response: {id: "A", status: "cancelled", usage: {input_tokens: 10, output_tokens: 2}}}));
+			await vi.waitFor(() => expect(events.some(event => event.type === "response.completed" && (event.response as {id: string}).id === "D")).toBe(true));
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(queued ? 3 : 2));
+			expect(sent).toEqual(["A", "D"]);
+			expect(append.mock.calls.filter(([row]) => row.model === "D-model").map(([row]) => row.outcome)).toEqual(["success"]);
+			expect(append.mock.calls.filter(([row]) => row.model === "A-model").map(([row]) => row.outcome)).toEqual(["cancelled"]);
+			if (queued) expect(append.mock.calls.filter(([row]) => row.model === "B-model").map(([row]) => row.outcome)).toEqual(["cancelled"]);
+		} finally {release(); client.terminate(); await upstream.close(); append.mockRestore(); policy.mockRestore();}
+	});
+
+	it.each(["api", "zdr"].flatMap(kind => ["completed", "failed", "cancelled"].flatMap(status => [false, true].map(socket => ({kind, status, socket})))))("measures paid context before the next stable-session turn %j", async ({kind, status, socket}) => {
+		const model = `${kind}/shared`;
+		const windows = vi.spyOn(config, "getContextBudgetGuardModelWindowOverrides").mockReturnValue({[model]: 1000});
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
+		process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT = "10";
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let creates = 0;
+		const terminal = {type: "response.done", response: {id: "paid-A", status, service_tier: "priority", usage: {input_tokens: 110, output_tokens: 12, total_tokens: 122, input_tokens_details: {cached_tokens: 20}, output_tokens_details: {reasoning_tokens: 10}}, ...(status === "failed" ? {error: {code: "fixture_error"}} : {})}};
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", () => {creates++; ws.send(JSON.stringify({type: "response.created", response: {id: "paid-A"}})); ws.send(JSON.stringify(terminal));})});
+		const {fetchImpl} = createRecordingFetch(call => {
+			if (call.url.endsWith("/models")) return Response.json({data: [{id: "shared"}], models: [{slug: "shared"}]});
+			creates++; return new Response(`data: ${JSON.stringify(terminal)}\n\n`, {headers: {"content-type": "text/event-stream"}});
+		});
+		const NativeGateway = websocketTransport.ResponsesWebSocketGateway;
+		const transport = vi.spyOn(websocketTransport, "ResponsesWebSocketGateway").mockImplementation(function(...args) {
+			const gateway = new NativeGateway(...args);
+			const original = gateway.fetch;
+			const fixtureFetch: typeof fetch = (input, init) => original(String(input) === "https://api.openai.com/v1/responses" ? `${upstream.baseUrl}/responses` : input, init);
+			Object.defineProperty(gateway, "fetch", {value: fixtureFetch});
+			return gateway;
+		});
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "paid-budget", label: "Fixture", kind: kind === "api" ? "api" : "zdr", apiKey: "fixture-api-key", enabled: true, priority: 0, visibleModels: ["shared"]}]}});
+		let client: WebSocket | undefined;
+		const body = {model, input: [], stream: true, prompt_cache_key: "paid-stable-session"};
+		try {
+			if (socket) {
+				client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+				const first = new Promise<void>(resolve => {const message = (raw: WebSocket.RawData) => {if (JSON.parse(raw.toString()).type === "response.done") {client!.off("message", message); resolve();}}; client!.on("message", message);});
+				client.send(JSON.stringify({type: "response.create", ...body})); await first;
+			} else {const response = await postResponses(proxy, body); expect(response.status).toBe(200); await response.text();}
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: status === "completed" ? "success" : "failure", inputTokens: 110, outputTokens: 2, reasoningTokens: 10, cachedInputTokens: 20, serviceTier: "priority"});
+			if (client) {const pause = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", ...body})); expect(JSON.parse(await pause).type).toBe("response.created");}
+			else {const response = await postResponses(proxy, body); expect(response.headers.get("x-codex-plugin-error-type")).toBe("context_budget_pause"); await response.text();}
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			expect(append.mock.calls[1]?.[0]).toMatchObject({outcome: "blocked", errorCode: "context_budget_guard_paused"});
+			expect(creates).toBe(1);
+		} finally {client?.terminate(); await upstream.close(); windows.mockRestore(); append.mockRestore(); transport.mockRestore();}
 	});
 });
 

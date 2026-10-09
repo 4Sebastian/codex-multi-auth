@@ -719,11 +719,6 @@ export class AccountManager {
 			const saved = (matches.length === 1 ? matches[0] : undefined) ?? account;
 			this.persistedWorkspaceSelections.set(account, saved.workspaces?.[saved.currentWorkspaceIndex ?? 0]?.id);
 			this.persistedWorkspaces.set(account, structuredClone(saved.workspaces));
-			if (snapshot && saved.authInvalidatedAt === account.authInvalidatedAt && (saved.enabled !== false) === (account.enabled !== false)) this.nativeAuthSnapshots.set(account, {
-				authInvalidatedAt: saved.authInvalidatedAt,
-				enabled: saved.enabled !== false,
-				observedAt: performance.now(),
-			});
 		});
 		this.hadPersistedStorage ||= existsSync(this.resolveSelectionStoragePath());
 	}
@@ -1892,50 +1887,32 @@ export class AccountManager {
 							liveAccount.authInvalidationErrorCode,
 					};
 
+					const previousObservation = this.nativeAuthSnapshots.get(liveAccount);
 					this.updateFromAuth(liveAccount, auth);
 					liveAccount.enabled = true;
 					this.clearAccountCooldown(liveAccount);
 					this.clearAuthFailures(liveAccount);
+					const attemptedState = structuredClone(liveAccount);
+					const attemptedObservation = this.nativeAuthSnapshots.get(liveAccount);
 
 					try {
 						await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
-						this.rememberWorkspaceSelections(nextStorage);
 					} catch (error) {
-						liveAccount.access = previousLiveAccountState.access;
-						liveAccount.refreshToken = previousLiveAccountState.refreshToken;
-						liveAccount.expires = previousLiveAccountState.expires;
-						liveAccount.accountId = previousLiveAccountState.accountId;
-						liveAccount.accountIdSource =
-							previousLiveAccountState.accountIdSource;
-						liveAccount.email = previousLiveAccountState.email;
-						liveAccount.enabled = previousLiveAccountState.enabled;
-						liveAccount.consecutiveAuthFailures =
-							previousLiveAccountState.consecutiveAuthFailures;
-						if (previousLiveAccountState.authInvalidatedAt === undefined) {
-							delete liveAccount.authInvalidatedAt;
-						} else {
-							liveAccount.authInvalidatedAt =
-								previousLiveAccountState.authInvalidatedAt;
+						const observationUnchanged = this.nativeAuthSnapshots.get(liveAccount)?.observedAt === attemptedObservation?.observedAt;
+						const authFields = ["access", "refreshToken", "expires", "accountId", "accountIdSource", "email", "authInvalidatedAt", "authInvalidationErrorCode"] as const;
+						if (observationUnchanged && authFields.every(field => liveAccount[field] === attemptedState[field])) {
+							for (const field of authFields) Object.assign(liveAccount, {[field]: previousLiveAccountState[field]});
 						}
-						if (
-							previousLiveAccountState.authInvalidationErrorCode === undefined
-						) {
-							delete liveAccount.authInvalidationErrorCode;
-						} else {
-							liveAccount.authInvalidationErrorCode =
-								previousLiveAccountState.authInvalidationErrorCode;
+						for (const field of ["enabled", "consecutiveAuthFailures"] as const) {
+							if (observationUnchanged && liveAccount[field] === attemptedState[field]) Object.assign(liveAccount, {[field]: previousLiveAccountState[field]});
 						}
-						if (previousLiveAccountState.coolingDownUntil === undefined) {
-							delete liveAccount.coolingDownUntil;
-						} else {
-							liveAccount.coolingDownUntil =
-								previousLiveAccountState.coolingDownUntil;
+						if (observationUnchanged && liveAccount.coolingDownUntil === attemptedState.coolingDownUntil && liveAccount.cooldownReason === attemptedState.cooldownReason) {
+							liveAccount.coolingDownUntil = previousLiveAccountState.coolingDownUntil;
+							liveAccount.cooldownReason = previousLiveAccountState.cooldownReason;
 						}
-						if (previousLiveAccountState.cooldownReason === undefined) {
-							delete liveAccount.cooldownReason;
-						} else {
-							liveAccount.cooldownReason =
-								previousLiveAccountState.cooldownReason;
+						if (observationUnchanged) {
+							if (previousObservation) this.nativeAuthSnapshots.set(liveAccount, previousObservation);
+							else this.nativeAuthSnapshots.delete(liveAccount);
 						}
 						throw error;
 					}
@@ -1944,7 +1921,6 @@ export class AccountManager {
 				}
 
 				await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
-				this.rememberWorkspaceSelections(nextStorage);
 				log.warn("Unable to resolve refreshed live account after persistence", {
 					sourceIndex: source.index,
 				});
@@ -2292,6 +2268,52 @@ export class AccountManager {
 	}
 
  private async persistSnapshot(current: AccountStorageV3 | null, proposed: AccountStorageV3, persist: (storage: AccountStorageV3) => Promise<void>, refreshed?: AccountStorageV3["accounts"][number], runtimeOnConflict = false): Promise<void> {
+  const before = new Map(this.accounts.map(account => [account, structuredClone(account)]));
+  const observedAt = performance.now();
+  const acceptCommitted = (storage: AccountStorageV3): void => {
+   for (const account of this.accounts) {
+    const prior = before.get(account);
+    if (!prior) continue;
+    const byRecord = storage.accounts.filter(row => row.recordId && row.recordId === prior.recordId);
+    const key = getAccountIdentityKey(prior);
+    const matches = byRecord.length ? byRecord : storage.accounts.filter(row => key && getAccountIdentityKey(row) === key);
+    if (matches.length > 1) continue;
+    const saved = matches[0];
+    if (!saved) {
+     this.setAccountEnabled(account.index, false);
+     continue;
+    }
+    const matchingRow = (rows: AccountStorageV3["accounts"]) => rows.find(row => row.recordId === prior.recordId)
+     ?? rows.find(row => key && getAccountIdentityKey(row) === key);
+    const requested = matchingRow(proposed.accounts);
+    const baseline = matchingRow(this.persistenceBaseline?.accounts ?? []);
+    const authUnchanged = this.isNativeSnapshotCurrent(account, observedAt) &&
+     (["access", "refreshToken", "expires", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => account[field] === prior[field]) &&
+     requested !== undefined && (["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => requested[field] === saved[field] || requested[field] === baseline?.[field]);
+    const cooldown = mergeAccountCooldown(prior, saved, account);
+    if (authUnchanged) {
+     account.access = saved.accessToken;
+     account.refreshToken = saved.refreshToken;
+     account.expires = saved.expiresAt;
+     account.authInvalidatedAt = isAuthInvalidationSuperseded(saved.accessToken, saved.authInvalidatedAt) ? undefined : saved.authInvalidatedAt;
+     account.authInvalidationErrorCode = account.authInvalidatedAt ? saved.authInvalidationErrorCode : undefined;
+    }
+    const enabledChanged = (account.enabled !== false) === (prior.enabled !== false) && (account.enabled !== false) !== (saved.enabled !== false);
+    if ((account.enabled !== false) === (prior.enabled !== false)) account.enabled = saved.enabled !== false;
+    Object.assign(account, cooldown);
+    if (JSON.stringify([account.workspaces, account.currentWorkspaceIndex]) === JSON.stringify([prior.workspaces, prior.currentWorkspaceIndex])) {
+     account.workspaces = saved.workspaces ? structuredClone(saved.workspaces) : undefined;
+     account.currentWorkspaceIndex = saved.currentWorkspaceIndex;
+    }
+    const observation = this.nativeAuthSnapshots.get(account);
+    this.nativeAuthSnapshots.set(account, {
+     authInvalidatedAt: authUnchanged ? account.authInvalidatedAt : observation?.authInvalidatedAt,
+     enabled: saved.enabled !== false,
+     observedAt: Math.max(observation?.observedAt ?? 0, authUnchanged || enabledChanged ? observedAt : 0),
+    });
+   }
+   this.rememberWorkspaceSelections(storage);
+  };
   // Preserve initial/missing-store creation. An intentionally cleared store has
   // distinct metadata and must still win over this manager's stale inventory.
   let merged: AccountStorageV3;
@@ -2300,7 +2322,9 @@ export class AccountManager {
    merged = current ? mergeAccountSnapshot(this.persistenceBaseline, current, proposed) : proposed;
   } catch (error) {
    if (runtimeOnConflict && (error as NodeJS.ErrnoException).code === "ESTALE" && current && this.persistenceBaseline) {
-    await persist(mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed));
+    const committed = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
+    await persist(committed);
+    acceptCommitted(committed);
     log.warn("Saved runtime observations; conflicting account edits remain pending and require reload or reconciliation.");
     return;
    }
@@ -2334,13 +2358,7 @@ export class AccountManager {
    Object.assign(row, cooldown);
   }
   await persist(merged);
-  if (refreshed) {
-   const saved = merged.accounts.find(row => row.recordId === refreshed.recordId);
-   const live = this.accounts.find(row => row.recordId === refreshed.recordId);
-   // A successful refresh must retain blockers learned by another request,
-   // including an observation made while the storage write was pending.
-   if (saved && live) Object.assign(live, mergeAccountCooldown(refreshed, saved, live));
-  }
+  acceptCommitted(merged);
   // Keep the baseline in this manager's inventory/intent space. Adopting added
   // disk records here would misread their absence in the next save as deletion.
   this.persistenceBaseline = rescuedBaseline ?? structuredClone(proposed);
@@ -2364,7 +2382,6 @@ export class AccountManager {
 				this.syncWorkspaceSelections(current);
 				const snapshot = this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current);
 				await this.persistSnapshot(current, snapshot, persist, undefined, runtimeOnConflict);
-				this.rememberWorkspaceSelections(snapshot);
 			});
 		});
 	}

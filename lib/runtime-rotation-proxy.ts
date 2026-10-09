@@ -1102,6 +1102,7 @@ const WEBSOCKET_AUTH_FAILURE_CODES: ReadonlySet<string> = new Set([
 ]);
 
 interface PendingWebSocketFrame {
+	order: number;
 	data: RawData;
 	isBinary: boolean;
 	recoveryAttempts?: number;
@@ -2131,6 +2132,7 @@ function bridgeWebSocketConnection(
 	const activeRequests: ActiveWebSocketRequest[] = [];
 	const queuedFrames = new Set<PendingWebSocketFrame>();
 	let queuedBytes = 0;
+	let nextFrameOrder = 0;
 	let settlingTurn = false;
 	const releaseFrame = (frame: PendingWebSocketFrame): void => {
 		if (queuedFrames.delete(frame)) queuedBytes -= rawDataToBuffer(frame.data).byteLength;
@@ -2192,11 +2194,13 @@ function bridgeWebSocketConnection(
 	const settlePending = (
 		outcome: "failure" | "cancelled",
 		errorCode: string,
+		before?: PendingWebSocketFrame,
 	): void => {
-		pending.splice(0);
 		for (const frame of queuedFrames) {
-			releaseFrame(frame);
+			if (before && frame.order >= before.order) continue;
 			const context = frame.request?.context ?? buildWebSocketRequestContext(req, frame.data);
+			if (before && !context) continue;
+			releaseFrame(frame);
 			if (!context) continue;
 			if (!frame.usageRecorder) state.status.totalRequests += 1;
 			const recorder = frame.usageRecorder ?? frame.request?.usageRecorder ?? createRuntimeUsageRecorder({
@@ -2204,6 +2208,10 @@ function bridgeWebSocketConnection(
 				projectKey: null, requestId: randomUUID(), startedAt: state.now(),
 			});
 			void recorder.record({outcome, statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null, errorCode});
+		}
+		for (let i = pending.length - 1; i >= 0; i--) {
+			const frame = pending[i];
+			if (frame && !queuedFrames.has(frame)) pending.splice(i, 1);
 		}
 	};
 	const closeBoth = (code = WEBSOCKET_CLOSE_TRY_AGAIN_LATER, reason = "WebSocket proxy closed"): void => {
@@ -2276,8 +2284,8 @@ function bridgeWebSocketConnection(
 		let consumedForFrame = false;
 		if (!request) {
 			if (type !== "response.create") {
+				if (type === "response.cancel") settlePending("cancelled", "response_cancelled", frame);
 				releaseFrame(frame);
-				if (type === "response.cancel") settlePending("cancelled", "response_cancelled");
 				upstream.send(frame.data, { binary: frame.isBinary });
 				return;
 			}
@@ -2587,7 +2595,7 @@ function bridgeWebSocketConnection(
 			rejectConnection(new CodexValidationError("WebSocket queue limit exceeded."));
 			return;
 		}
-		const frame: PendingWebSocketFrame = {data, isBinary, upstreamConnection: upstream ?? undefined};
+		const frame: PendingWebSocketFrame = {order: nextFrameOrder++, data, isBinary, upstreamConnection: upstream ?? undefined};
 		queuedFrames.add(frame);
 		queuedBytes += bytes;
 		if (upstream?.readyState === WebSocket.OPEN) {
@@ -3274,11 +3282,19 @@ async function handleRequestInner(
 				const attemptedCredential = attemptedCredentialIndex === undefined ? undefined : apiRoutes[attemptedCredentialIndex];
 				if (!forwarded && attemptedCredential) apiRuntime.recordStreamFailure(attemptedCredential, context.model, body, responseOutcome.rejection);
 				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
+				const usageTokens = scanner.result();
+				if (usageTokens && context.stableSessionKey && context.model) {
+					state.contextBudgetGuard.update(context.stableSessionKey, {
+						model: context.model,
+						contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
+						updatedAt: state.now(),
+					});
+				}
 				await usageRecorder.record({
 					outcome: forwarded && upstream.ok ? "success" : "failure",
 					statusCode: upstream.status,
 					errorCode: responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
-					...(scanner.result() ?? {}),
+					...(usageTokens ?? {}),
 				});
             } catch (error) {
                 if (error instanceof ClientCancellationError || res.destroyed) {
