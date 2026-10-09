@@ -5072,6 +5072,55 @@ describe("AccountManager", () => {
 	});
 });
 
+describe("commit and retryable rescue ordering", () => {
+	it.each(["EACCES", "EBUSY", "EPERM", "ELOCKED", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "rotate", "disable"].map(mutation => ({code, mutation}))))("retains live authorization during retryable rescue %j", async ({code, mutation}) => {
+		const storageModule = await import("../lib/storage.js");
+		const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, enabled: true, addedAt: 1, lastUsed: 1}]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		const account = manager.getAccountByIndex(0)!;
+		let release!: () => void, writing!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {writing = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => handler(structuredClone(disk), async () => {writing(); await gate; throw Object.assign(Error("write blocked"), {code});}));
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		try {
+			await ready;
+			if (mutation === "rotate") manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000});
+			else if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else {manager.setAccountEnabled(0, false); disk.accounts[0]!.enabled = false;}
+			release(); await refreshing;
+			if (mutation === "rotate") {expect(account.access).toBe("fixture-newest"); expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({priorRefreshToken: "fixture-old", refreshToken: "fixture-newest-refresh", accessToken: "fixture-newest"}));}
+			else {
+				if (mutation === "invalidate") {
+					expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+					expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({accessToken: "fixture-attempted", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"}));
+				} else {
+					expect(account.enabled).toBe(false);
+					expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({enabled: false}));
+				}
+			}
+			vi.mocked(storageModule.withAccountStorageTransaction).mockImplementation(async handler => handler(structuredClone(disk), async saved => {disk = structuredClone(saved);}));
+			await manager.flushPendingSave();
+			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
+			expect(restarted.access).toBe(account.access);
+			expect(restarted.authInvalidatedAt).toBe(account.authInvalidatedAt);
+			expect(restarted.enabled).toBe(account.enabled);
+		} finally {release(); await refreshing; await manager.flushPendingSave(); journal.mockRestore();}
+	});
+
+	it("orders runtime-conflict commits after snapshots captured while writing", async () => {
+		const storageModule = await import("../lib/storage.js");
+		const disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-first", accessToken: "fixture-access", authInvalidatedAt: 1500, addedAt: 1, lastUsed: 1, accountLabel: "Before"}]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		manager.getAccountByIndex(0)!.accountLabel = "Local"; disk.accounts[0]!.accountLabel = "External";
+		let capturedAt = 0;
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementation(async handler => handler(disk, async () => {capturedAt = performance.now(); await Promise.resolve();}));
+		await manager.saveToDisk(true);
+		expect(manager.isNativeSnapshotCurrent(manager.getAccountByIndex(0)!, capturedAt)).toBe(false);
+	});
+});
+
 describe("committed authorization observations", () => {
 	it.each(["save", "refresh"].flatMap(mode => [false, true].map(failed => ({mode, failed}))))("preserves newer credential invalidation during awaited persistence %j", async ({mode, failed}) => {
 		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [

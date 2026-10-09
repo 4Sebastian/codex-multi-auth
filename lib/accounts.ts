@@ -211,7 +211,7 @@ function findAccountIndexByIdentity<
 	return undefined;
 }
 
-const RETRYABLE_AUTH_PERSISTENCE_CODES = new Set(["EAGAIN", "EBUSY", "EPERM"]);
+const RETRYABLE_AUTH_PERSISTENCE_CODES = new Set([ACCOUNT_STORAGE_UNREADABLE, "ELOCKED", "EACCES", "EAGAIN", "EBUSY", "EPERM"]);
 
 function isRetryableAuthPersistenceError(error: unknown): boolean {
 	if (!error || typeof error !== "object") {
@@ -1817,6 +1817,10 @@ export class AccountManager {
 	): Promise<ManagedAccount | null> {
 		const nextAccountId = extractAccountId(auth.access)?.trim() || undefined;
 		const nextEmail = sanitizeEmail(extractAccountEmail(auth.access));
+		const initialLive = this.getAccountByIdentity(source, auth);
+		const initialState = initialLive ? structuredClone(initialLive) : undefined;
+		const initialObservation = initialLive ? this.nativeAuthSnapshots.get(initialLive) : undefined;
+		const priorRefreshToken = initialState?.refreshToken ?? source.refreshToken;
 		try {
 			return await withAccountStorageTransaction(async (_current, persist) => {
 				if (!_current && this.hadPersistedStorage) throw Object.assign(new Error("Account storage was removed; reload before saving."), {code:"ESTALE"});
@@ -1898,6 +1902,7 @@ export class AccountManager {
 					try {
 						await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
 					} catch (error) {
+						if (isRetryableAuthPersistenceError(error)) throw error;
 						const observationUnchanged = this.nativeAuthSnapshots.get(liveAccount)?.observedAt === attemptedObservation?.observedAt;
 						const authFields = ["access", "refreshToken", "expires", "accountId", "accountIdSource", "email", "authInvalidatedAt", "authInvalidationErrorCode"] as const;
 						if (observationUnchanged && authFields.every(field => liveAccount[field] === attemptedState[field])) {
@@ -1933,36 +1938,53 @@ export class AccountManager {
 			// persist it once the file can be read.
 			// A write that still fails after the storage retries (e.g. a Windows lock)
 			// spends the old token just the same, so it is rescued like an unreadable file.
-			const live = [ACCOUNT_STORAGE_UNREADABLE, "ELOCKED", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "") || isRetryableAuthPersistenceError(error)
-				? this.getAccountByIdentity(source, auth)
-				: null;
+			const live = isRetryableAuthPersistenceError(error) ? this.getAccountByIdentity(source, auth) : null;
 			if (live) {
-				const priorRefreshToken = live.refreshToken;
-				this.updateFromAuth(live, auth);
-				live.enabled = true;
-				if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
-				this.clearAuthFailures(live);
+				if (live === initialLive && initialState && live.enabled !== false &&
+					this.nativeAuthSnapshots.get(live)?.observedAt === initialObservation?.observedAt &&
+					(["access", "refreshToken", "expires", "authInvalidatedAt", "authInvalidationErrorCode"] as const).every(field => live[field] === initialState[field])) {
+					this.updateFromAuth(live, auth);
+					if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
+					this.clearAuthFailures(live);
+				}
 				// The debounced save needs this process to survive and the file to
 				// unlock. Journal the rotated credential beside the pool so the next
 				// load (any process) applies it even if neither happens.
 				try {
-					await runWithStoragePathState(this.storagePathState, () =>
+					if (live.access && live.expires !== undefined) {
+					this.isAccountAuthInvalidated(live);
+					const retainedAuth = {refreshToken: live.refreshToken, accessToken: live.access, expiresAt: live.expires, authInvalidatedAt: live.authInvalidatedAt, authInvalidationErrorCode: live.authInvalidationErrorCode, enabled: live.enabled === false ? false : undefined} satisfies Omit<Parameters<typeof recordPendingAuth>[1], "priorRefreshToken" | "recordId" | "at">;
+					const retainedObservation = this.nativeAuthSnapshots.get(live);
+					const journaled = await runWithStoragePathState(this.storagePathState, () =>
 						recordPendingAuth(getStoragePath(), {
 							priorRefreshToken,
 							recordId: live.recordId,
-							refreshToken: auth.refresh,
-							accessToken: auth.access,
-							expiresAt: auth.expires,
+							...retainedAuth,
 							at: nowMs(),
 						}),
 					);
 					// Loads now see the journaled token, so it is the persisted state
 					// that later merges (and a further rotation) compare against.
 					const baselineRow = this.persistenceBaseline?.accounts.find(row => row.refreshToken === priorRefreshToken);
-					if (baselineRow) Object.assign(baselineRow, { refreshToken: auth.refresh, accessToken: auth.access, expiresAt: auth.expires });
+					if (baselineRow) Object.assign(baselineRow, journaled);
+					if (this.nativeAuthSnapshots.get(live)?.observedAt === retainedObservation?.observedAt && live.access === retainedAuth.accessToken && live.refreshToken === retainedAuth.refreshToken && live.authInvalidatedAt === retainedAuth.authInvalidatedAt && (live.enabled === false) === (retainedAuth.enabled === false)) {
+						if (live.access !== journaled.accessToken || live.refreshToken !== journaled.refreshToken) this.updateFromAuth(live, {type: "oauth", access: journaled.accessToken, refresh: journaled.refreshToken, expires: journaled.expiresAt});
+						live.authInvalidatedAt = journaled.authInvalidatedAt;
+						live.authInvalidationErrorCode = journaled.authInvalidationErrorCode;
+						if (journaled.enabled === false) live.enabled = false;
+						this.nativeAuthSnapshots.set(live, {authInvalidatedAt: live.authInvalidatedAt, enabled: live.enabled !== false, observedAt: performance.now()});
+					} else {
+						const observation = this.nativeAuthSnapshots.get(live);
+						this.nativeAuthSnapshots.set(live, {
+							authInvalidatedAt: observation?.authInvalidatedAt,
+							enabled: observation?.enabled ?? live.enabled !== false,
+							observedAt: performance.now(),
+						});
+					}
 					log.warn("Account storage could not be read or written; rotated credential journaled until it can be saved", {
 						sourceIndex: source.index,
 					});
+					}
 				} catch (journalError) {
 					log.error("Account storage could not be read or written and the rotated credential could not be journaled; it is only in memory. Keep this process running until the accounts file is readable, or the account will need a re-login.", {
 						sourceIndex: source.index,
@@ -2271,6 +2293,7 @@ export class AccountManager {
   const before = new Map(this.accounts.map(account => [account, structuredClone(account)]));
   const observedAt = performance.now();
   const acceptCommitted = (storage: AccountStorageV3): void => {
+   const committedAt = performance.now();
    for (const account of this.accounts) {
     const prior = before.get(account);
     if (!prior) continue;
@@ -2298,7 +2321,6 @@ export class AccountManager {
      account.authInvalidatedAt = isAuthInvalidationSuperseded(saved.accessToken, saved.authInvalidatedAt) ? undefined : saved.authInvalidatedAt;
      account.authInvalidationErrorCode = account.authInvalidatedAt ? saved.authInvalidationErrorCode : undefined;
     }
-    const enabledChanged = (account.enabled !== false) === (prior.enabled !== false) && (account.enabled !== false) !== (saved.enabled !== false);
     if ((account.enabled !== false) === (prior.enabled !== false)) account.enabled = saved.enabled !== false;
     Object.assign(account, cooldown);
     if (JSON.stringify([account.workspaces, account.currentWorkspaceIndex]) === JSON.stringify([prior.workspaces, prior.currentWorkspaceIndex])) {
@@ -2309,7 +2331,7 @@ export class AccountManager {
     this.nativeAuthSnapshots.set(account, {
      authInvalidatedAt: authUnchanged ? account.authInvalidatedAt : observation?.authInvalidatedAt,
      enabled: saved.enabled !== false,
-     observedAt: Math.max(observation?.observedAt ?? 0, authUnchanged || enabledChanged ? observedAt : 0),
+     observedAt: Math.max(observation?.observedAt ?? 0, committedAt),
     });
    }
    this.rememberWorkspaceSelections(storage);
@@ -2335,8 +2357,19 @@ export class AccountManager {
    const prior = this.persistenceBaseline?.accounts.find(matches);
    const index = current.accounts.findIndex(matches);
    const disk = current.accounts[index];
-   if (!prior || !disk || disk.refreshToken !== prior.refreshToken || disk.enabled === false || disk.authInvalidatedAt) throw error;
-   merged = structuredClone(current);
+   if (!prior || !disk || !this.persistenceBaseline || disk.refreshToken !== prior.refreshToken || disk.enabled === false || disk.authInvalidatedAt) throw error;
+   merged = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
+   // Persist revocations of unchanged sibling credentials even when user edits conflict.
+   for (const saved of merged.accounts) {
+    const previous = this.persistenceBaseline.accounts.find(candidate => candidate.recordId === saved.recordId);
+    const requested = proposed.accounts.find(candidate => candidate.recordId === saved.recordId);
+    if (previous && requested && saved.accessToken === requested.accessToken &&
+     requested.authInvalidatedAt !== previous.authInvalidatedAt &&
+     (requested.authInvalidatedAt ?? 0) > (saved.authInvalidatedAt ?? 0)) {
+     saved.authInvalidatedAt = requested.authInvalidatedAt;
+     saved.authInvalidationErrorCode = requested.authInvalidationErrorCode;
+    }
+   }
    const row = merged.accounts[index];
    if (!row || !this.persistenceBaseline) throw error;
    rescuedBaseline = structuredClone(this.persistenceBaseline);

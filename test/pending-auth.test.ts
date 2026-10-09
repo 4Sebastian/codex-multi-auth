@@ -199,6 +199,31 @@ it("keeps every entry when the recovery-source scan fails", async () => {
 	expect(kept.entries.some((entry) => entry.prior === sha("spent-a"))).toBe(true);
 });
 
+it.each(["invalidated", "disabled"] as const)("replays journaled credentials without removing %s authorization", async state => {
+	const auth = {
+		...rotation("spent-a", "new-a"),
+		...(state === "invalidated"
+			? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"}
+			: {enabled: false as const}),
+	};
+	await recordPendingAuth(storagePath, auth);
+	const restored = await applyPendingAuth(storagePath, storage());
+	expect(restored?.accounts[0]).toMatchObject({refreshToken: "new-a", accessToken: "access-new-a"});
+	if (state === "invalidated") expect(restored?.accounts[0]).toMatchObject({authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"});
+	else expect(restored?.accounts[0]?.enabled).toBe(false);
+});
+
+it("never rewinds a chained rotation when a delayed rescue journals its older attempt", async () => {
+	await recordPendingAuth(storagePath, rotation("a", "b"));
+	await recordPendingAuth(storagePath, rotation("b", "c"));
+	const retained = await recordPendingAuth(storagePath, {...rotation("a", "b"), at: 1000});
+	expect(retained).toMatchObject({refreshToken: "c", accessToken: "access-c"});
+	for (const token of ["a", "b"]) {
+		const pool = {version: 3 as const, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]};
+		expect((await applyPendingAuth(storagePath, pool))?.accounts[0]?.refreshToken).toBe("c");
+	}
+});
+
 it("covers an intermediate spent token when rotations chain", async () => {
 	// a -> b -> c with only journaled state: a restore can resurface either
 	// spent token, so BOTH must map to the newest credential.

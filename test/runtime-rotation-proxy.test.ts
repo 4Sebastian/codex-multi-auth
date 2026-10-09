@@ -6584,6 +6584,100 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 	});
 });
 
+describe("commit-window and receipt cancellation regressions", () => {
+	it.each(["shared", "api/shared", "zdr/shared", "catalog", "upgrade", "turn"].flatMap(target => ["save", "refresh"].map(mode => ({target, mode}))))("rejects a snapshot captured inside the write window %j", async ({target, mode}) => {
+		let disk = createStorage(Date.now(), 2);
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		const {calls, fetchImpl} = createRecordingFetch(() => Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]}));
+		const NativeGateway = websocketTransport.ResponsesWebSocketGateway;
+		const transport = vi.spyOn(websocketTransport, "ResponsesWebSocketGateway").mockImplementation(function(...args) {
+			const gateway = new NativeGateway(...args), original = gateway.fetch;
+			const fixtureFetch: typeof fetch = (input, init) => String(input).endsWith("/responses") ? fetchImpl(input, init) : original(input, init);
+			Object.defineProperty(gateway, "fetch", {value: fixtureFetch}); return gateway;
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk), readApiRoutes: async () => [{id: "paid-commit", label: "Fixture", kind: target.startsWith("zdr/") ? "zdr" : "api", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}]}});
+		let client: WebSocket | undefined;
+		if (target === "turn") client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", "access-1");
+		manager.markAuthInvalidated(manager.getAccountByIndex(0)!, "token_invalidated", 1500);
+		let releaseWrite!: () => void, writing!: () => void, releaseRead!: () => void, reading!: () => void;
+		const writeGate = new Promise<void>(resolve => {releaseWrite = resolve;});
+		const writeReady = new Promise<void>(resolve => {writing = resolve;});
+		const readGate = new Promise<void>(resolve => {releaseRead = resolve;});
+		const readReady = new Promise<void>(resolve => {reading = resolve;});
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async committed => {writing(); await writeGate; disk = structuredClone(committed);}));
+		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "new-access-2", refresh: "new-refresh-2", expires: Date.now() + 7200000});
+		await writeReady;
+		const apply = pendingAuth.applyPendingAuth;
+		const overlay = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementationOnce(async (path, storage) => {reading(); await readGate; return apply(path, storage);});
+		let request: Promise<number>;
+		if (target === "upgrade") {
+			client = new WebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", {headers: {authorization: "Bearer access-1"}});
+			request = new Promise<number>((resolve, reject) => {client!.once("unexpected-response", (_req, response) => {response.resume(); resolve(response.statusCode ?? 0);}); client!.once("open", () => resolve(101)); client!.once("error", reject);});
+		} else if (target === "turn") {
+			request = nextWebSocketMessage(client!).then(raw => JSON.parse(raw).status);
+			client!.send(JSON.stringify({type: "response.create", model: "api/shared", input: []}));
+		} else if (target === "catalog") request = fetch(proxy.baseUrl + "/models", {headers: {authorization: "Bearer access-1"}}).then(async response => {await response.text(); return response.status;});
+		else request = postResponses(proxy, {model: target, input: [], stream: true}, "/responses", {authorization: "Bearer access-1"}).then(async response => {await response.text(); return response.status;});
+		try {
+			await readReady; releaseWrite(); await saving;
+			expect(disk.accounts[0]?.authInvalidatedAt).toBe(1500);
+			releaseRead(); expect(await request).toBe(401);
+			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBe(1500);
+			expect(calls).toHaveLength(0);
+		} finally {releaseWrite(); releaseRead(); await saving; await request.catch(() => undefined); client?.terminate(); overlay.mockRestore(); transport.mockRestore();}
+	});
+
+	it("cancels an unsent B during policy preparation and preserves D", async () => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let release!: () => void, preparing!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {preparing = resolve;});
+		const evaluate = runtimePolicy.evaluateRuntimePolicy;
+		const policy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async input => {const result = await evaluate(input); if (input.model === "B-model") {preparing(); await gate;} return result;});
+		const sent: string[] = [], completed: string[] = [];
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type !== "response.create") return; sent.push(body.input[0]); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0], usage: {input_tokens: 10, output_tokens: 2}}}));})});
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			client.on("message", raw => {const event = JSON.parse(raw.toString()); if (event.type === "response.completed") completed.push(event.response.id);});
+			client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]})); await ready;
+			client.send(JSON.stringify({type: "response.cancel"}));
+			client.send(JSON.stringify({type: "response.create", model: "D-model", input: ["D"]}));
+			await vi.waitFor(() => expect(append.mock.calls.filter(([row]) => row.model === "B-model").map(([row]) => row.outcome)).toEqual(["cancelled"]));
+			release();
+			await vi.waitFor(() => expect(completed).toEqual(["A", "D"]));
+			expect(sent).toEqual(["A", "D"]);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(3));
+		} finally {client.terminate(); release(); await upstream.close(); append.mockRestore(); policy.mockRestore();}
+	});
+
+	it.each([false, true].flatMap(idle => [false, true].map(doubleCancel => ({idle, doubleCancel}))))("never connects a cancellation before later full creates %j", async ({idle, doubleCancel}) => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let source!: WebSocket, disconnected!: () => void;
+		const closed = new Promise<void>(resolve => {disconnected = resolve;});
+		const sent: string[] = [], completed: string[] = [];
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {source = ws; ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type !== "response.create") return; sent.push(body.input[0]); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0], usage: {input_tokens: 10, output_tokens: 2}}}));});}});
+		const emit = WebSocket.prototype.emit;
+		const observer = vi.spyOn(WebSocket.prototype, "emit").mockImplementation(function(this: WebSocket, event, ...args) {const result = emit.call(this, event, ...args); if (event === "close" && this.url?.startsWith(upstream.baseUrl.replace("http:", "ws:"))) disconnected(); return result;});
+		const proxy = await startProxy({accountManager: new AccountManager(undefined, createStorage(Date.now(), 1)), fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			client.on("message", raw => {const event = JSON.parse(raw.toString()); if (event.type === "response.completed") completed.push(event.response.id);});
+			if (idle) {client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]})); await vi.waitFor(() => expect(completed).toEqual(["A"])); source.close(1000); await closed;}
+			for (const label of ["D", "E"]) {
+				client.send(JSON.stringify({type: "response.cancel"})); if (doubleCancel) client.send(JSON.stringify({type: "response.cancel"}));
+				client.send(JSON.stringify({type: "response.create", model: `${label}-model`, input: [label]}));
+				await vi.waitFor(() => expect(completed).toContain(label));
+			}
+			expect(sent).toEqual(idle ? ["A", "D", "E"] : ["D", "E"]);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(idle ? 3 : 2));
+		} finally {client.terminate(); await upstream.close(); append.mockRestore(); observer.mockRestore();}
+	});
+});
+
 describe("committed authorization and receive-order regressions", () => {
 	it.each(["shared", "api/shared", "zdr/shared", "upgrade", "turn"].flatMap(target => [false, true].flatMap(rebuild => ["save", "refresh"].map(mode => ({target, rebuild, mode})))))("refuses disk-disabled bearers after a merged save %j", async ({target, rebuild, mode}) => {
 		let disk = createStorage(Date.now(), 2);
@@ -6642,7 +6736,7 @@ describe("committed authorization and receive-order regressions", () => {
 			if (body.type === "response.cancel") {sawCancel(); return;}
 			if (body.type !== "response.create") return;
 			sent.push(body.input[0]);
-			if (sent.length === 1) ws.send(JSON.stringify({type: "response.output_text.delta", response_id: "A", delta: "visible A"}));
+			if (body.input[0] === "A") ws.send(JSON.stringify({type: "response.output_text.delta", response_id: "A", delta: "visible A"}));
 			else {expect(cancelled).toBe(true); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0], usage: {input_tokens: 20, output_tokens: 4}}}));}
 		});}});
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
@@ -6650,22 +6744,25 @@ describe("committed authorization and receive-order regressions", () => {
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
 			client.on("message", raw => events.push(JSON.parse(raw.toString())));
-			const visible = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
-			if (stage === "active") await visible;
+			const visible = stage === "active" ? nextWebSocketMessage(client) : undefined;
+			client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
+			if (visible) await visible;
+			cancelled = stage !== "active";
 			if (stage === "policy") await ready;
 			if (queued) client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]}));
 			client.send(JSON.stringify({type: "response.cancel"}));
 			if (doubleCancel) client.send(JSON.stringify({type: "response.cancel"}));
 			client.send(JSON.stringify({type: "response.create", model: "D-model", input: ["D"]}));
 			release();
-			await cancellation;
-			await visible;
-			expect(sent).toEqual(["A"]);
-			cancelled = true;
-			source.send(JSON.stringify({type: "response.cancelled", response: {id: "A", status: "cancelled", usage: {input_tokens: 10, output_tokens: 2}}}));
+			if (stage === "active") {
+				await cancellation;
+				expect(sent).toEqual(["A"]);
+				cancelled = true;
+				source.send(JSON.stringify({type: "response.cancelled", response: {id: "A", status: "cancelled", usage: {input_tokens: 10, output_tokens: 2}}}));
+			}
 			await vi.waitFor(() => expect(events.some(event => event.type === "response.completed" && (event.response as {id: string}).id === "D")).toBe(true));
 			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(queued ? 3 : 2));
-			expect(sent).toEqual(["A", "D"]);
+			expect(sent).toEqual(stage === "active" ? ["A", "D"] : ["D"]);
 			expect(append.mock.calls.filter(([row]) => row.model === "D-model").map(([row]) => row.outcome)).toEqual(["success"]);
 			expect(append.mock.calls.filter(([row]) => row.model === "A-model").map(([row]) => row.outcome)).toEqual(["cancelled"]);
 			if (queued) expect(append.mock.calls.filter(([row]) => row.model === "B-model").map(([row]) => row.outcome)).toEqual(["cancelled"]);

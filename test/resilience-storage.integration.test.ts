@@ -19,6 +19,50 @@ async function setup() {
     await saveAccounts({ version: 3, activeIndex: 0, accounts: [{ recordId: "first", accountId: "first", refreshToken: "fixture-first", addedAt: 1, lastUsed: 1, workspaces: [{ id: "personal", enabled: true }, { id: "business", enabled: true }], currentWorkspaceIndex: 0 }] });
     return new AccountManager(undefined, await loadAccounts());
 }
+it.each(["ordinary", "refresh", "rescue"])("orders a snapshot captured during the atomic %s write before its commit", async mode => {
+ await setup();
+ const initial = (await loadAccounts())!;
+ Object.assign(initial.accounts[0]!, {accessToken: "fixture-access", expiresAt: Date.now() + 3600000});
+ initial.accounts.push({recordId: "second", accountId: "second", refreshToken: "fixture-second", addedAt: 2, lastUsed: 2});
+ await saveAccounts(initial);
+ const manager = new AccountManager(undefined, await loadAccounts());
+ const account = manager.getAccountByIndex(0)!;
+ if (mode === "rescue") {
+  manager.getAccountByIndex(1)!.accountLabel = "Local";
+  const disk = (await loadAccounts())!; disk.accounts[1]!.accountLabel = "External"; await saveAccounts(disk);
+ }
+ manager.markAuthInvalidated(account, "token_invalidated", 1500);
+ let releaseWrite!: () => void, writing!: () => void, releaseRead!: () => void, reading!: () => void;
+ const writeGate = new Promise<void>(resolve => {releaseWrite = resolve;});
+ const writeReady = new Promise<void>(resolve => {writing = resolve;});
+ const readGate = new Promise<void>(resolve => {releaseRead = resolve;});
+ const readReady = new Promise<void>(resolve => {reading = resolve;});
+ const rename = filesystem.rename;
+ const writer = vi.spyOn(filesystem, "rename").mockImplementation(async (source, target) => {
+  if (target === getStoragePath()) {writing(); await writeGate;}
+  return rename(source, target);
+ });
+ const saving = mode === "ordinary" ? manager.saveToDisk() : manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 7200000});
+ await writeReady;
+ const apply = pendingAuth.applyPendingAuth;
+ const overlay = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementationOnce(async (path, storage) => {reading(); await readGate; return apply(path, storage);});
+ const read = createNativeAccountStorageReader(undefined, getStoragePath());
+ const oldRead = read();
+ try {
+  await readReady; releaseWrite(); await saving;
+  expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(1500);
+  releaseRead(); const old = await oldRead;
+  expect(old.storage?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+  syncNativeAccountCredentials(manager, old.storage!, old.capturedAt);
+  expect(account.authInvalidatedAt).toBe(1500);
+  expect(manager.isNativeSnapshotCurrent(account, old.capturedAt)).toBe(false);
+  const probe = (await loadAccounts())!; delete probe.accounts[0]!.authInvalidatedAt; delete probe.accounts[0]!.authInvalidationErrorCode;
+  await saveAccounts(probe);
+  const fresh = await read(); syncNativeAccountCredentials(manager, fresh.storage!, fresh.capturedAt);
+  expect(account.authInvalidatedAt).toBeUndefined();
+ } finally {releaseWrite(); releaseRead(); await saving; await oldRead; writer.mockRestore(); overlay.mockRestore();}
+});
+
 it("orders delayed native snapshots before durable invalidation and later probe recovery", async () => {
     await setup();
     const initial = (await loadAccounts())!;

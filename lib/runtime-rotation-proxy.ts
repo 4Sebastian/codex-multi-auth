@@ -2258,8 +2258,11 @@ function bridgeWebSocketConnection(
 		frame: PendingWebSocketFrame,
 		preparedHandshake?: PreparedWebSocketAccount,
 	): Promise<void> => {
-		if (closed || !queuedFrames.has(frame)) {
-			if (preparedHandshake) settlePendingHandshake("cancelled", "client_websocket_closed");
+		if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame)) {
+			if (preparedHandshake) {
+				refundPreparedWebSocketToken(preparedHandshake);
+				if (pendingHandshake === preparedHandshake) settlePendingHandshake("cancelled", "response_cancelled");
+			}
 			return;
 		}
 		const type = readStringRecordValue(parseRequestBody(rawDataToBuffer(frame.data)) ?? {}, "type");
@@ -2267,9 +2270,15 @@ function bridgeWebSocketConnection(
 			pending.push(frame);
 			return;
 		}
+		if (type !== "response.create") {
+			releaseFrame(frame);
+			if (upstream?.readyState === WebSocket.OPEN && frame.upstreamConnection === upstream) upstream.send(frame.data, {binary: frame.isBinary});
+			return;
+		}
 		if (upstream?.readyState !== WebSocket.OPEN || (hasConnectionScopedContinuation(frame) && frame.upstreamConnection !== upstream)) {
 			if (hasConnectionScopedContinuation(frame)) {
 				const request = frame.request ?? await prepareWebSocketRequest(state, req, frame);
+				if (closed || !queuedFrames.has(frame)) return;
 				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
 				releaseFrame(frame);
 				reportConnectionScopedContinuationLoss();
@@ -2283,18 +2292,9 @@ function bridgeWebSocketConnection(
 		let request = preparedHandshake?.request;
 		let consumedForFrame = false;
 		if (!request) {
-			if (type !== "response.create") {
-				if (type === "response.cancel") settlePending("cancelled", "response_cancelled", frame);
-				releaseFrame(frame);
-				upstream.send(frame.data, { binary: frame.isBinary });
-				return;
-			}
 			request = await prepareWebSocketRequest(state, req, frame);
 			frame.request = request;
-			if (closed) {
-				await request.usageRecorder.record({outcome: "failure", errorCode: "client_websocket_closed"});
-				return;
-			}
+			if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame)) return;
 			if (upstream !== forwardingUpstream || upstream.readyState !== WebSocket.OPEN) {
 				if (hasConnectionScopedContinuation(frame)) {
 					await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
@@ -2309,9 +2309,11 @@ function bridgeWebSocketConnection(
 				return;
 			}
 		}
+		const forwardingAccountManager = preparedHandshake?.accountManager ?? boundAccountManager;
+		const forwardingAccount = preparedHandshake?.account ?? boundAccount;
 		// Only the initial handshake has already admitted this turn to this account.
 		if (!preparedHandshake) {
-			if (!boundAccountManager || !boundAccount) {
+			if (!forwardingAccountManager || !forwardingAccount) {
 				throw createRuntimeProxyHttpError(
 					"The account bound to this WebSocket connection is unavailable.",
 					HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -2321,10 +2323,11 @@ function bridgeWebSocketConnection(
 			try {
 				await consumeWebSocketRequestForAccount(
 					request,
-					boundAccountManager,
-					boundAccount,
+					forwardingAccountManager,
+					forwardingAccount,
 				);
 			} catch (error) {
+				if (closed || !queuedFrames.has(frame)) return;
 				if (!isRecoverableWebSocketAccountError(error)) throw error;
 				const staleUpstream = upstream;
 				const staleAccount = boundAccount;
@@ -2352,24 +2355,29 @@ function bridgeWebSocketConnection(
 			}
 			consumedForFrame = true;
 		}
-		if (!boundAccountManager || !boundAccount) {
+		if (!forwardingAccountManager || !forwardingAccount) {
 			throw createRuntimeProxyHttpError(
 				"The account bound to this WebSocket connection is unavailable.",
 				HTTP_STATUS.SERVICE_UNAVAILABLE,
 				"websocket_account_unavailable",
 			);
 		}
-		releaseFrame(frame);
-		activeRequests.push({request, accountManager: boundAccountManager, account: boundAccount, frame, sawUpstreamEvent: false});
+		if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame) || upstream !== forwardingUpstream || forwardingUpstream.readyState !== WebSocket.OPEN) {
+			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
+			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
+			if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(frame)) enqueueClientFrame(frame);
+			return;
+		}
+		activeRequests.push({request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
 		try {
-			upstream.send(frame.data, { binary: frame.isBinary });
+			forwardingUpstream.send(frame.data, { binary: frame.isBinary });
 		} catch (error) {
 			const active = activeRequests.pop();
 			if (active) applyWebSocketTransportAccountFailure(state, active);
 			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
-			else if (consumedForFrame && boundAccountManager && boundAccount) {
-				boundAccountManager.refundToken(
-					boundAccount,
+			else if (consumedForFrame) {
+				forwardingAccountManager.refundToken(
+					forwardingAccount,
 					request.context.family,
 					request.context.model,
 				);
@@ -2378,10 +2386,11 @@ function bridgeWebSocketConnection(
 				outcome: "failure",
 				statusCode: HTTP_STATUS.BAD_GATEWAY,
 				errorCode: "websocket_send_failed",
-				account: boundAccount,
+				account: forwardingAccount,
 			});
 			throw error;
 		}
+		releaseFrame(frame);
 		if (preparedHandshake) {
 			preparedHandshake.tokenRefundable = false;
 			preparedHandshake.abortHandshake = null;
@@ -2397,28 +2406,17 @@ function bridgeWebSocketConnection(
 	): void => {
 		clientFrameQueue = clientFrameQueue
 			.then(() => forwardClientFrame(frame, preparedHandshake))
-			.catch(rejectConnection);
+			.catch(error => {if (!closed && queuedFrames.has(frame)) rejectConnection(error);});
 	};
 	const drainPending = (): void => {
 		if (closed || activeRequests.length > 0 || settlingTurn) return;
 		if (upstream?.readyState !== WebSocket.OPEN) { void initialize(); return; }
 		for (const frame of pending.splice(0)) enqueueClientFrame(frame);
 	};
-	const handshakeLifecycle: WebSocketHandshakeLifecycle = {
-		onPrepared: (prepared) => {
-			pendingHandshake = prepared;
-			if (!closed) return true;
-			settlePendingHandshake("cancelled", "client_websocket_closed");
-			return false;
-		},
-		onReleased: (prepared) => {
-			if (pendingHandshake === prepared) pendingHandshake = null;
-		},
-		isClosed: () => closed,
-	};
 	async function initialize(): Promise<void> {
 		if (connecting || reconnectTimer || upstream || pending.length === 0) return;
 		connecting = true;
+		let firstFrame: PendingWebSocketFrame | undefined;
 		try {
 			// previous_response_id is scoped to the upstream WebSocket connection.
 			// If the proxy needs a new upstream connection, replaying that delta frame
@@ -2427,27 +2425,40 @@ function bridgeWebSocketConnection(
 			while (pending[0] && hasConnectionScopedContinuation(pending[0])) {
 				const lost = pending[0];
 				pending.shift();
-				releaseFrame(lost);
+				firstFrame = lost;
 				const request = lost.request ?? await prepareWebSocketRequest(state, req, lost);
+				if (closed || !queuedFrames.has(lost)) continue;
 				await request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_continuation_lost"});
+				releaseFrame(lost);
 				reportConnectionScopedContinuationLoss();
 			}
-			const firstFrame = pending[0];
+			firstFrame = pending[0];
 			if (!firstFrame) return;
 			const firstRequest = await prepareWebSocketRequest(state, req, firstFrame);
 			firstFrame.request = firstRequest;
+			if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(firstFrame)) return;
 			pendingInitialRequest = firstRequest;
-			if (closed) {
-				settlePendingHandshake("cancelled", "client_websocket_closed");
-				return;
-			}
+			const handshakeFrame = firstFrame;
 			const connected = await connectManagedWebSocket(
 				state,
 				req,
 				firstRequest,
-				handshakeLifecycle,
+				{
+					onPrepared: prepared => {
+						pendingHandshake = prepared;
+						if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(handshakeFrame)) return true;
+						settlePendingHandshake("cancelled", "response_cancelled");
+						return false;
+					},
+					onReleased: prepared => {if (pendingHandshake === prepared) pendingHandshake = null;},
+					isClosed: () => closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(handshakeFrame),
+				},
 				firstFrame.recoveryAttempts === undefined,
 			);
+			if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(firstFrame)) {
+				if (connected) {refundPreparedWebSocketToken(connected.prepared); mirrorWebSocketClose(connected.upstream, 1000, "Request cancelled");}
+				return;
+			}
 			if (!connected) {
 				pendingInitialRequest = null;
 				if (firstFrame.recoveryAttempts !== undefined) {
@@ -2480,11 +2491,6 @@ function bridgeWebSocketConnection(
 			const connectedUpstream = connected.upstream;
 			boundAccountManager = connected.prepared.accountManager;
 			boundAccount = connected.prepared.account;
-			if (closed || client.readyState !== WebSocket.OPEN) {
-				settlePendingHandshake("cancelled", "client_websocket_closed");
-				mirrorWebSocketClose(connectedUpstream, 1000, "Local client closed");
-				return;
-			}
 			state.status.streamsStarted += 1;
 			connectedUpstream.on("message", (data, isBinary) => {
 				if (closed || upstream !== connectedUpstream) return;
@@ -2583,9 +2589,10 @@ function bridgeWebSocketConnection(
 				enqueueClientFrame(frame);
 			}
 		} catch (error) {
-			rejectConnection(error);
+			if (!closed && (!firstFrame || queuedFrames.has(firstFrame))) rejectConnection(error);
 		} finally {
 			connecting = false;
+			if (!closed && !upstream && pending.length > 0 && !reconnectTimer) void initialize();
 		}
 	}
 	client.on("message", (data, isBinary) => {
@@ -2598,6 +2605,11 @@ function bridgeWebSocketConnection(
 		const frame: PendingWebSocketFrame = {order: nextFrameOrder++, data, isBinary, upstreamConnection: upstream ?? undefined};
 		queuedFrames.add(frame);
 		queuedBytes += bytes;
+		if (readStringRecordValue(parseRequestBody(rawDataToBuffer(data)) ?? {}, "type") === "response.cancel") {
+			settlePending("cancelled", "response_cancelled", frame);
+			if (pendingInitialRequest?.usageRecorder.hasRecorded()) settlePendingHandshake("cancelled", "response_cancelled");
+			if (upstream?.readyState !== WebSocket.OPEN) {releaseFrame(frame); return;}
+		}
 		if (upstream?.readyState === WebSocket.OPEN) {
 			enqueueClientFrame(frame);
 			return;

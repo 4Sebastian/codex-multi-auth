@@ -23,6 +23,9 @@ const entrySchema = z.object({
 	refreshToken: z.string().min(1),
 	accessToken: z.string().min(1),
 	expiresAt: z.number(),
+	authInvalidatedAt: z.number().positive().optional(),
+	authInvalidationErrorCode: z.string().optional(),
+	enabled: z.literal(false).optional(),
 	at: z.number(),
 });
 /** The writer keeps the journal at this size; the reader accepts any size so an
@@ -73,17 +76,26 @@ async function write(path: string, entries: PendingAuth[]): Promise<void> {
 /** Record a rotated credential beside the account pool. */
 export async function recordPendingAuth(
 	storagePath: string,
-	auth: { priorRefreshToken: string; recordId?: string; refreshToken: string; accessToken: string; expiresAt: number; at: number },
-): Promise<void> {
+	auth: Omit<PendingAuth, "prior"> & {priorRefreshToken: string},
+): Promise<Omit<PendingAuth, "prior">> {
 	const path = getPendingAuthPath(storagePath);
-	await withFileTransactionLock(path, async () => {
+	return withFileTransactionLock(path, async () => {
         try {
             await fs.stat(getIntentionalResetMarkerPath(storagePath));
             throw Object.assign(new Error("Account pool was reset; rotated credentials were not retained."), {code:"ESTALE"});
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const prior = hash(auth.priorRefreshToken);
-		const entries = (await read(path)).filter(
-			(entry) => entry.prior !== prior && entry.prior !== hash(auth.refreshToken),
+		const existing = await read(path);
+		let retained: Omit<PendingAuth, "prior"> = auth;
+		const followed = new Set<string>();
+		for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next && next.refreshToken !== retained.refreshToken; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
+			if (followed.has(next.prior)) throw Error("Cyclic pending credential rotation");
+			followed.add(next.prior);
+			retained = next;
+		}
+		const replacement: Omit<PendingAuth, "prior"> = {recordId: auth.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, authInvalidatedAt: retained.authInvalidatedAt, authInvalidationErrorCode: retained.authInvalidationErrorCode, enabled: retained.enabled, at: retained.at};
+		const entries = existing.filter(
+			(entry) => entry.prior !== prior && entry.prior !== hash(replacement.refreshToken),
 		);
 		// Rotating a token that is itself only journaled: extend that entry to the
 		// newest credential, but ALSO keep an entry keyed by the token this
@@ -92,8 +104,8 @@ export async function recordPendingAuth(
 		// recovery source can surface — a stale-snapshot restore then self-heals
 		// straight to the newest credential instead of reviving a spent token.
 		const chained = entries.find((entry) => entry.refreshToken === auth.priorRefreshToken);
-		if (chained) Object.assign(chained, { recordId: chained.recordId ?? auth.recordId, refreshToken: auth.refreshToken, accessToken: auth.accessToken, expiresAt: auth.expiresAt, at: auth.at });
-		const current: PendingAuth = { prior, recordId: auth.recordId, refreshToken: auth.refreshToken, accessToken: auth.accessToken, expiresAt: auth.expiresAt, at: auth.at };
+		if (chained) Object.assign(chained, {...replacement, recordId: chained.recordId ?? auth.recordId});
+		const current: PendingAuth = {prior, ...replacement};
 		entries.push(current);
 		const excess = entries.length - MAX_ENTRIES;
 		if (excess > 0) {
@@ -101,9 +113,10 @@ export async function recordPendingAuth(
 			const dropped = new Set(entries.filter((entry) => entry !== current).sort((a, b) => a.at - b.at).slice(0, excess));
 			log.warn("Pending rotated credentials exceeded the journal cap; dropped the oldest entries", { dropped: dropped.size });
 			await write(path, entries.filter((entry) => !dropped.has(entry)));
-			return;
+			return replacement;
 		}
 		await write(path, entries);
+		return replacement;
 	});
 }
 
@@ -132,9 +145,10 @@ export async function applyPendingAuth(
 		account.refreshToken = entry.refreshToken;
 		account.accessToken = entry.accessToken;
 		account.expiresAt = entry.expiresAt;
-		delete account.authInvalidatedAt;
-		delete account.authInvalidationErrorCode;
-		if (account.cooldownReason === "auth-failure") {
+		account.authInvalidatedAt = entry.authInvalidatedAt;
+		account.authInvalidationErrorCode = entry.authInvalidationErrorCode;
+		if (entry.enabled === false) account.enabled = false;
+		if (!entry.authInvalidatedAt && account.cooldownReason === "auth-failure") {
 			delete account.coolingDownUntil;
 			delete account.cooldownReason;
 		}
