@@ -2916,6 +2916,7 @@ export async function startRuntimeRotationProxy(
 	});
 	server.on("upgrade", (req, socket, head) => {
 		if (state.nativeOpenai) return;
+		socket.on("error", () => socket.destroy());
 		let incomingUrl: URL;
 		try {
 			incomingUrl = new URL(req.url ?? "/", "http://127.0.0.1");
