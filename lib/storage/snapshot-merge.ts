@@ -200,6 +200,9 @@ export function mergeAccountRuntimeObservations(base: AccountStorageV3, current:
         if (next.enabled === false) prior.enabled = false;
         const disk = current.accounts.find(row => matches(prior, row));
         if (disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken) {
+            prior.accessToken = disk.accessToken;
+            prior.refreshToken = disk.refreshToken;
+            prior.expiresAt = disk.expiresAt;
             prior.authInvalidatedAt = next.authInvalidatedAt;
             prior.authInvalidationErrorCode = next.authInvalidationErrorCode;
         }

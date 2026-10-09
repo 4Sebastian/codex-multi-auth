@@ -1709,7 +1709,7 @@ function openUpstreamWebSocket(
 	headers: Record<string, string>,
 	timeoutMs: number,
 	signal: AbortSignal,
-): Promise<WebSocket> {
+): Promise<{upstream: WebSocket; release: () => void; error?: Error}> {
 	return new Promise((resolve, reject) => {
 		const upstream = new WebSocket(url, {
 		headers,
@@ -1719,19 +1719,29 @@ function openUpstreamWebSocket(
 		let settled = false;
 		let readingUnexpectedResponse = false;
 		let unexpectedResponse: IncomingMessage | null = null;
+		const connection: {upstream: WebSocket; release: () => void; error?: Error} = {upstream, release: () => {
+			signal.removeEventListener("abort", onAbort);
+			upstream.off("error", onError);
+			upstream.off("close", onClose);
+		}};
 		const finish = (error?: Error): void => {
 			if (settled) return;
 			settled = true;
-			signal.removeEventListener("abort", onAbort);
 			upstream.off("open", onOpen);
-			upstream.off("error", onError);
 			upstream.off("unexpected-response", onUnexpectedResponse);
-			if (error) reject(error);
-			else resolve(upstream);
+			if (error) {upstream.terminate(); if (upstream.readyState === WebSocket.CLOSED) connection.release(); reject(error);}
+			else resolve(connection);
 		};
 		const onOpen = (): void => finish();
 		const onError = (error: Error): void => {
-			if (!readingUnexpectedResponse) finish(error);
+			connection.error = error;
+			if (settled) upstream.terminate();
+			else if (!readingUnexpectedResponse) finish(error);
+		};
+		const onClose = (): void => {
+			connection.error ??= new Error("Upstream WebSocket closed before dispatch.");
+			if (!readingUnexpectedResponse) finish(connection.error);
+			if (settled) connection.release();
 		};
 		const onAbort = (): void => {
 			try {
@@ -1765,7 +1775,8 @@ function openUpstreamWebSocket(
 			});
 		};
 		upstream.once("open", onOpen);
-		upstream.once("error", onError);
+		upstream.on("error", onError);
+		upstream.once("close", onClose);
 		upstream.once("unexpected-response", onUnexpectedResponse);
 		signal.addEventListener("abort", onAbort, { once: true });
 		if (signal.aborted) onAbort();
@@ -1992,7 +2003,7 @@ async function connectManagedWebSocket(
 	request: PreparedWebSocketRequest,
 	lifecycle: WebSocketHandshakeLifecycle,
 	allowStaleRecovery: boolean,
-): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount } | null> {
+): Promise<{ upstream: WebSocket; prepared: PreparedWebSocketAccount; release: () => void; connectionError: () => Error | undefined } | null> {
 	const attemptedIndexes = new Set<number>();
 	const skipReasons = new Map<number, string>();
 	const attemptBudget: WebSocketAttemptBudget = {
@@ -2029,15 +2040,16 @@ async function connectManagedWebSocket(
 			refundPreparedWebSocketToken(prepared);
 			break;
 		}
+		let connection: Awaited<ReturnType<typeof openUpstreamWebSocket>> | undefined;
 		try {
 			state.status.upstreamRequests += 1;
-			const upstream = await openUpstreamWebSocket(
+			connection = await openUpstreamWebSocket(
 				buildWebSocketUpstreamUrl(req, state.upstreamBaseUrl),
 				createWebSocketOutboundHeaders(context.headers, account, accessToken, accountId),
 				state.fetchTimeoutMs,
 				abortController.signal,
 			);
-			prepared.abortHandshake = null;
+			const {upstream} = connection;
 			if (lifecycle.isClosed()) {
 				refundPreparedWebSocketToken(prepared);
 				lifecycle.onReleased(prepared);
@@ -2059,8 +2071,17 @@ async function connectManagedWebSocket(
 				isPinned,
 				WEBSOCKET_SCHEDULING_STRATEGY,
 			);
-			return { upstream, prepared };
+			if (lifecycle.isClosed() || !prepared.tokenRefundable) {
+				upstream.terminate();
+				refundPreparedWebSocketToken(prepared);
+				lifecycle.onReleased(prepared);
+				break;
+			}
+			if (connection.error || upstream.readyState !== WebSocket.OPEN) throw connection.error ?? new Error("Upstream WebSocket closed before dispatch.");
+			const connected = connection;
+			return { upstream, prepared, release: connection.release, connectionError: () => connected.error };
 		} catch (error) {
+			connection?.upstream.terminate();
 			prepared.abortHandshake = null;
 			lifecycle.onReleased(prepared);
 			refundPreparedWebSocketToken(prepared);
@@ -2501,8 +2522,14 @@ function bridgeWebSocketConnection(
 				firstFrame.recoveryAttempts === undefined,
 			);
 			if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(firstFrame)) {
-				if (connected) {refundPreparedWebSocketToken(connected.prepared); mirrorWebSocketClose(connected.upstream, 1000, "Request cancelled");}
+				if (connected) {refundPreparedWebSocketToken(connected.prepared); connected.upstream.terminate();}
 				return;
+			}
+			if (connected && (connected.connectionError() || connected.upstream.readyState !== WebSocket.OPEN)) {
+				connected.upstream.terminate();
+				refundPreparedWebSocketToken(connected.prepared);
+				applyWebSocketTransportAccountFailure(state, {request: connected.prepared.request, accountManager: connected.prepared.accountManager, account: connected.prepared.account});
+				throw connected.connectionError() ?? new Error("Upstream WebSocket closed before dispatch.");
 			}
 			if (!connected) {
 				pendingInitialRequest = null;
@@ -2627,6 +2654,8 @@ function bridgeWebSocketConnection(
 				state.status.lastError = error.message;
 				connectedUpstream.terminate();
 			});
+			connected.release();
+			connected.prepared.abortHandshake = null;
 			const queued = pending.splice(0);
 			const queuedFirst = queued.shift();
 			if (queuedFirst) enqueueClientFrame(queuedFirst, connected.prepared);

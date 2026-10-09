@@ -8559,6 +8559,50 @@ describe('earned reset last-resort integration',()=>{
  });
 });
 
+describe("handoff lifecycle regressions", () => {
+	it.each([false, true].flatMap(replacement => ["close", "error", "cancel"].map(event => ({replacement, event}))))("owns sockets throughout selection persistence %j", async ({replacement, event}) => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow"), failure = vi.spyOn(manager, "recordFailure"), refund = vi.spyOn(manager, "refundToken");
+		const saving = vi.spyOn(manager, "saveToDiskDebounced").mockImplementation(() => undefined);
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		let selections = 0;
+		const selection = vi.spyOn(manager, "syncCodexCliActiveSelectionForIndex").mockImplementation(async () => {if (++selections === (replacement ? 2 : 1)) {entered(); await gate;}});
+		const sources: WebSocket[] = [], creates: string[] = [];
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {sources.push(ws); ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type !== "response.create") return; creates.push(body.input[0]); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0]}}));});}});
+		let proxySocket: WebSocket | undefined;
+		const emit = WebSocket.prototype.emit;
+		const emitting = vi.spyOn(WebSocket.prototype, "emit").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["emit"]>) {if (args[0] === "open" && this.url?.startsWith(upstream.baseUrl.replace("http:", "ws:"))) proxySocket = this; return emit.apply(this, args);});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			if (replacement) {
+				const warm = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: ["warm"]})); await warm;
+				const closed = once(proxySocket!, "close"); sources[0]!.close(); await closed;
+			}
+			client.send(JSON.stringify({type: "response.create", model: "shared", input: ["A"]})); await ready;
+			const owned = proxySocket!;
+			if (event === "cancel") {
+				client.send(JSON.stringify({type: "response.cancel"}));
+				await vi.waitFor(() => expect(owned.readyState).not.toBe(WebSocket.OPEN));
+				client.send(JSON.stringify({type: "response.create", model: "shared", input: ["D"]}));
+			} else {
+				const closed = new Promise<void>(resolve => owned.once("close", () => resolve()));
+				if (event === "error") expect(() => owned.emit("error", Error("fixture handoff error"))).not.toThrow();
+				else sources.at(-1)!.close();
+				await closed;
+			}
+			const result = nextWebSocketMessage(client); release();
+			expect(JSON.parse(await result).response.id).toBe(event === "cancel" ? "D" : "A");
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes((replacement ? 1 : 0) + (event === "cancel" ? 2 : 1)));
+			expect(creates).toEqual([...(replacement ? ["warm"] : []), event === "cancel" ? "D" : "A"]);
+			expect(refund).toHaveBeenCalledTimes(1);
+			expect(failure).toHaveBeenCalledTimes(event === "cancel" ? 0 : 1);
+			expect(append.mock.calls.filter(([row]) => row.outcome === "cancelled")).toHaveLength(event === "cancel" ? 1 : 0);
+		} finally {release(); client.terminate(); await upstream.close(); emitting.mockRestore(); selection.mockRestore(); saving.mockRestore(); failure.mockRestore(); refund.mockRestore(); append.mockRestore();}
+	});
+});
+
 describe("review boundary regressions", () => {
 	it.each(["disabled", "invalidated", "quota", "circuit", "policy", "account-policy"])("revalidates prepared custom handshake at dispatch (%s)", async mutation => {
 		const disk = createStorage(Date.now(), 1);

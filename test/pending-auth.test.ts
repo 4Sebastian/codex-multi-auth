@@ -261,6 +261,128 @@ it.each([false, true])("only clears disk revocation with replacement issuance ev
 	expect(restored?.accounts[0]?.enabled).toBe(false);
 });
 
+it.each(["probe", "enable", "renewal"])("commits recovery over a journal self-entry (%s)", async mode => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	const access = (iat: number) => `e30.${Buffer.from(JSON.stringify({iat})).toString("base64url")}.fixture`;
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "a", accessToken: access(1), expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	const restriction = mode === "enable" ? {enabled: false as const} : {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"};
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first", accessToken: access(1), expiresAt: 10000, ...restriction});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", accessToken: access(1), expiresAt: 10000, ...restriction});
+	const pool = (await loadAccounts())!;
+	delete pool.accounts[0]!.authInvalidatedAt;
+	delete pool.accounts[0]!.authInvalidationErrorCode;
+	pool.accounts[0]!.enabled = true;
+	if (mode === "renewal") {pool.accounts[0]!.accessToken = access(3); pool.accounts[0]!.expiresAt = 20000;}
+	await saveAccounts(pool);
+	const restored = (await loadAccounts())!;
+	expect(restored.accounts[0]?.authInvalidatedAt).toBeUndefined();
+	expect(restored.accounts[0]?.enabled).not.toBe(false);
+	expect(restored.accounts[0]?.accessToken).toBe(pool.accounts[0]?.accessToken);
+	expect(restored.accounts[0]?.expiresAt).toBe(pool.accounts[0]?.expiresAt);
+	const old = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "a", accessToken: access(1), expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	expect(old?.accounts[0]?.refreshToken).toBe("b");
+	expect(old?.accounts[0]?.accessToken).toBe(pool.accounts[0]?.accessToken);
+	expect(old?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+});
+
+it.each([10000, 20000])("retains a later same-refresh renewal when its persistence also fails (%s)", async expiresAt => {
+	const access = (iat: number) => `e30.${Buffer.from(JSON.stringify({iat})).toString("base64url")}.fixture`;
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), accessToken: access(1), expiresAt: 10000, authInvalidatedAt: 1500});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), accessToken: access(1), expiresAt: 10000, authInvalidatedAt: 1500});
+	const renewed = await recordPendingAuth(storagePath, {...rotation("b", "b"), accessToken: access(3), expiresAt, at: 2});
+	expect(renewed).toMatchObject({accessToken: access(3), expiresAt});
+	expect(renewed.authInvalidatedAt).toBeUndefined();
+	for (const token of ["a", "b"]) {
+		const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]});
+		expect(restored?.accounts[0]?.accessToken).toBe(access(3));
+		expect(restored?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+	}
+	const delayed = await recordPendingAuth(storagePath, {...rotation("b", "b"), accessToken: access(1), expiresAt: 30000, at: 3});
+	expect(delayed).toMatchObject({accessToken: access(3), expiresAt});
+});
+
+it.each(["delayed-old", "new-revocation"])("orders journal writers against committed probe recovery (%s)", async ordering => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	const auth = {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"};
+	await recordPendingAuth(storagePath, auth);
+	const pool = (await loadAccounts())!;
+	delete pool.accounts[0]!.authInvalidatedAt; delete pool.accounts[0]!.authInvalidationErrorCode;
+	let release!: () => void, entered!: () => void;
+	const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+	let saved!: () => void;
+	const committed = new Promise<void>(resolve => {saved = resolve;});
+	const rename = fs.rename.bind(fs);
+	const blocked = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+		if (String(to) === (ordering === "delayed-old" ? getPendingAuthPath(storagePath) : storagePath)) {entered(); await gate;}
+		const result = await rename(from, to);
+		if (String(to) === storagePath) saved();
+		return result;
+	});
+	const first = ordering === "delayed-old" ? recordPendingAuth(storagePath, {...auth, at: 2}) : saveAccounts(pool);
+	try {
+		await ready;
+		if (ordering === "delayed-old") {
+			const recovery = saveAccounts(pool);
+			await committed; release(); await first; await recovery;
+		} else {
+			await recordPendingAuth(storagePath, {...auth, authInvalidatedAt: 2500}); release(); await first;
+		}
+		expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(ordering === "delayed-old" ? undefined : 2500);
+	} finally {release(); await first; blocked.mockRestore();}
+});
+
+it("retains mappings through corrupt recovery sources and failed primary writes", async () => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 1500});
+	const pool = (await loadAccounts())!;
+	delete pool.accounts[0]!.authInvalidatedAt;
+	const rename = fs.rename.bind(fs);
+	const failure = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {if (String(to) === storagePath) throw Error("fixture primary failure"); return rename(from, to);});
+	try {await expect(saveAccounts(pool)).rejects.toThrow("fixture primary failure");} finally {failure.mockRestore();}
+	expect((await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]}))?.accounts[0]?.authInvalidatedAt).toBe(1500);
+	await fs.writeFile(`${storagePath}.bak.2`, "corrupt fixture backup");
+	await saveAccounts(pool);
+	expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+	expect(JSON.parse(await fs.readFile(getPendingAuthPath(storagePath), "utf8")).entries).toHaveLength(1);
+});
+
+it("does not report committed recovery when journal reconciliation fails", async () => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 1500});
+	const pool = (await loadAccounts())!;
+	delete pool.accounts[0]!.authInvalidatedAt;
+	const rename = fs.rename.bind(fs);
+	const failure = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {if (String(to) === getPendingAuthPath(storagePath)) throw Error("fixture journal failure"); return rename(from, to);});
+	try {await expect(saveAccounts(pool)).rejects.toThrow("Failed to reconcile pending account recovery");} finally {failure.mockRestore();}
+	await saveAccounts(pool);
+	expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+});
+
+it("keeps committed self renewal mappings when recovery-source scanning fails", async () => {
+	const {capturePendingAuth} = await import("../lib/storage/pending-auth.js");
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 1500});
+	const pool = (await loadAccounts())!;
+	const observed = await capturePendingAuth(storagePath, pool.accounts);
+	const committed = structuredClone(pool);
+	Object.assign(committed.accounts[0]!, {accessToken: "access-renewed", expiresAt: 20000, authInvalidatedAt: undefined});
+	await prunePendingAuth(storagePath, committed, async () => {throw Error("fixture scan failure");}, observed);
+	const restored = await applyPendingAuth(storagePath, committed);
+	expect(restored?.accounts[0]).toMatchObject({accessToken: "access-renewed", expiresAt: 20000});
+	expect(restored?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+	const old = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1}]});
+	expect(old?.accounts[0]?.accessToken).toBe("access-renewed");
+});
+
 it("covers an intermediate spent token when rotations chain", async () => {
 	// a -> b -> c with only journaled state: a restore can resurface either
 	// spent token, so BOTH must map to the newest credential.

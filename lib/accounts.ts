@@ -2319,6 +2319,14 @@ export class AccountManager {
  private async persistSnapshot(current: AccountStorageV3 | null, proposed: AccountStorageV3, persist: (storage: AccountStorageV3) => Promise<void>, refreshed?: AccountStorageV3["accounts"][number], runtimeOnConflict = false): Promise<void> {
   const before = new Map(this.accounts.map(account => [account, structuredClone(account)]));
   const observedAt = performance.now();
+  const rememberCommittedAuth = (storage: AccountStorageV3): void => {
+   for (const baseline of this.persistenceBaseline?.accounts ?? []) {
+    const matches = (row: AccountStorageV3["accounts"][number]) => baseline.recordId && row.recordId ? baseline.recordId === row.recordId : getAccountIdentityKey(baseline) === getAccountIdentityKey(row);
+    const saved = storage.accounts.find(matches), requested = proposed.accounts.find(matches);
+    if (!saved || !requested || saved.accessToken !== requested.accessToken || saved.refreshToken !== requested.refreshToken) continue;
+    for (const field of ["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode", "enabled"] as const) Object.assign(baseline, {[field]: saved[field]});
+   }
+  };
   const acceptCommitted = (storage: AccountStorageV3): void => {
    const committedAt = performance.now();
    for (const account of this.accounts) {
@@ -2374,12 +2382,7 @@ export class AccountManager {
     const committed = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
     await persist(committed);
     acceptCommitted(committed);
-    for (const baseline of this.persistenceBaseline.accounts) {
-     const matches = (row: AccountStorageV3["accounts"][number]) => baseline.recordId && row.recordId ? baseline.recordId === row.recordId : getAccountIdentityKey(baseline) === getAccountIdentityKey(row);
-     const saved = committed.accounts.find(matches), requested = proposed.accounts.find(matches);
-     if (!saved || !requested || saved.accessToken !== requested.accessToken || saved.refreshToken !== requested.refreshToken) continue;
-     for (const field of ["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode", "enabled"] as const) Object.assign(baseline, {[field]: saved[field]});
-    }
+    rememberCommittedAuth(committed);
     log.warn("Saved runtime observations; conflicting account edits remain pending and require reload or reconciliation.");
     return;
    }
@@ -2417,6 +2420,7 @@ export class AccountManager {
   // Keep the baseline in this manager's inventory/intent space. Adopting added
   // disk records here would misread their absence in the next save as deletion.
   this.persistenceBaseline = rescuedBaseline ?? structuredClone(proposed);
+  rememberCommittedAuth(merged);
   if (refreshed) {
    const saved = merged.accounts.find(row => row.recordId === refreshed.recordId);
    const baseline = this.persistenceBaseline.accounts.find(row => row.recordId === refreshed.recordId);

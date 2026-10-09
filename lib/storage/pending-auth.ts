@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAuthInvalidationSuperseded } from "../auth/token-utils.js";
+import { decodeJWT } from "../auth/auth.js";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -8,7 +9,7 @@ import { createLogger } from "../logger.js";
 import { tempPathFor } from "../temp-path.js";
 import { withFileTransactionLock } from "./file-lock.js";
 import { getIntentionalResetMarkerPath } from "./backup-paths.js";
-import type { AccountStorageV3 } from "./public-types.js";
+import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
 
 /**
  * Rotated OAuth credentials that could not be written to the account pool
@@ -85,6 +86,10 @@ async function write(path: string, entries: PendingAuth[]): Promise<void> {
 	}
 }
 
+export async function capturePendingAuth(storagePath: string, accounts: readonly AccountMetadataV3[] | null | undefined) {
+	return {entries: await read(getPendingAuthPath(storagePath)), accounts: structuredClone(accounts ?? [])};
+}
+
 /** Record a rotated credential beside the account pool. */
 export async function recordPendingAuth(
 	storagePath: string,
@@ -104,7 +109,11 @@ export async function recordPendingAuth(
 			if (followed.has(next.prior)) throw Error("Cyclic pending credential rotation");
 			followed.add(next.prior);
 			const sameToken = next.refreshToken === retained.refreshToken;
-			retained = {...next, ...mergeAuthorization(next.accessToken, [retained, next])};
+			const retainedIssuedAt = decodeJWT(retained.accessToken)?.iat, nextIssuedAt = decodeJWT(next.accessToken)?.iat;
+			const knownIssuance = typeof retainedIssuedAt === "number" && Number.isFinite(retainedIssuedAt) && retainedIssuedAt > 0 && typeof nextIssuedAt === "number" && Number.isFinite(nextIssuedAt) && nextIssuedAt > 0;
+			const newer = knownIssuance ? retainedIssuedAt > nextIssuedAt : retained.expiresAt > next.expiresAt;
+			const credential = sameToken && newer ? retained : next;
+			retained = {...credential, ...mergeAuthorization(credential.accessToken, [retained, next])};
 			if (sameToken) break;
 		}
 		const replacement: Omit<PendingAuth, "prior"> = {recordId: auth.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained.accessToken, [retained]), at: retained.at};
@@ -188,28 +197,58 @@ export async function applyPendingAuth(
 export async function prunePendingAuth(
 	storagePath: string,
 	saved: AccountStorageV3,
-	restorableRefreshTokens?: () => Promise<Iterable<string>>,
+	restorableRefreshTokens?: () => Promise<Iterable<string | Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">>>,
+	observed?: Awaited<ReturnType<typeof capturePendingAuth>>,
 ): Promise<void> {
 	const path = getPendingAuthPath(storagePath);
 	const current = await read(path);
 	if (!current.length) return;
 	await withFileTransactionLock(path, async () => {
 		const spent = new Set(saved.accounts.map((account) => hash(account.refreshToken)));
+		const recovery: Array<string | Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">> = [];
+		let scanFailed = false;
 		if (restorableRefreshTokens) {
 			try {
-				for (const token of await restorableRefreshTokens()) {
-					spent.add(hash(token));
+				for (const source of await restorableRefreshTokens()) {
+					recovery.push(source);
+					spent.add(hash(typeof source === "string" ? source : source.refreshToken));
 				}
 			} catch (error) {
 				log.warn("Recovery-source scan failed; keeping all pending rotated credentials", {
 					code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "UNKNOWN",
 				});
-				return;
+				scanFailed = true;
 			}
 		}
 		const entries = await read(path);
-		const remaining = entries.filter((entry) => spent.has(entry.prior));
-		if (remaining.length !== entries.length) await write(path, remaining);
+		const unchanged = (entry: PendingAuth) => {
+			const previous = (observed?.entries ?? current).find(row => row.prior === entry.prior);
+			return previous !== undefined && JSON.stringify({...entry, at: 0}) === JSON.stringify({...previous, at: 0});
+		};
+		const concurrent = new Set(entries.filter(entry => !unchanged(entry)));
+		const committedEntries = new Set<PendingAuth>();
+		let changed = false;
+		for (const entry of entries) {
+			if (!observed || concurrent.has(entry)) continue;
+			const known = observed.accounts.find(account => account.refreshToken === entry.refreshToken && account.accessToken === entry.accessToken && account.expiresAt === entry.expiresAt &&
+				account.authInvalidatedAt === entry.authInvalidatedAt && account.authInvalidationErrorCode === entry.authInvalidationErrorCode && (account.enabled === false) === (entry.enabled === false) && (!entry.recordId || entry.recordId === account.recordId));
+			if (!known) continue;
+			const committed = saved.accounts.find(account => known.recordId && account.recordId ? known.recordId === account.recordId : known.refreshToken === account.refreshToken);
+			if (!committed?.accessToken || committed.expiresAt === undefined) continue;
+			const before = JSON.stringify(entry);
+			Object.assign(entry, {recordId: committed.recordId ?? entry.recordId, refreshToken: committed.refreshToken, accessToken: committed.accessToken, expiresAt: committed.expiresAt,
+				authInvalidatedAt: committed.authInvalidatedAt, authInvalidationErrorCode: committed.authInvalidationErrorCode, enabled: committed.enabled === false ? false : undefined});
+			committedEntries.add(entry);
+			changed ||= before !== JSON.stringify(entry);
+		}
+		const remaining = entries.filter(entry => {
+			if (scanFailed || concurrent.has(entry)) return true;
+			if (committedEntries.has(entry) && entry.prior === hash(entry.refreshToken) && saved.accounts.some(account => account.refreshToken === entry.refreshToken && account.accessToken === entry.accessToken && account.expiresAt === entry.expiresAt)) {
+				return recovery.some(source => typeof source === "string" ? hash(source) === entry.prior : hash(source.refreshToken) === entry.prior && (source.accessToken !== entry.accessToken || source.expiresAt !== entry.expiresAt));
+			}
+			return spent.has(entry.prior);
+		});
+		if (changed || remaining.length !== entries.length) await write(path, remaining);
 	});
 }
 

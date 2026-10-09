@@ -19,6 +19,15 @@ it.each(["same", "rotated", "disabled", "deleted", "recovered"])("persists confl
     expect(result.accounts[0]!.accountLabel).toBe("External");
     if (state === "disabled") expect(result.accounts[0]!.enabled).toBe(false);
 });
+it("does not clear a newer disk revocation after adopting its credential generation", () => {
+    const base = fixture();
+    Object.assign(base.accounts[0]!, {accessToken: "fixture-A", authInvalidatedAt: 1000, authInvalidationErrorCode: "token_invalidated"});
+    const disk = structuredClone(base), local = structuredClone(base);
+    for (const pool of [disk, local]) Object.assign(pool.accounts[0]!, {accessToken: "fixture-B", refreshToken: "fixture-B-refresh"});
+    Object.assign(disk.accounts[0]!, {authInvalidatedAt: 2500, accountLabel: "External"});
+    Object.assign(local.accounts[0]!, {authInvalidatedAt: undefined, authInvalidationErrorCode: undefined, accountLabel: "Local"});
+    expect(mergeAccountRuntimeObservations(base, disk, local).accounts[0]).toMatchObject({accessToken: "fixture-B", refreshToken: "fixture-B-refresh", authInvalidatedAt: 2500, authInvalidationErrorCode: "token_invalidated", accountLabel: "External"});
+});
 it("preserves independently added accounts and workspace edits during an old runtime save", () => {
     const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
     disk.accounts.push({ recordId: "b", accountId: "b", refreshToken: "fixture-b", addedAt: 2, lastUsed: 2 });

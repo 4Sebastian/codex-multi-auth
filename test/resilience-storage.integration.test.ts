@@ -103,6 +103,32 @@ it("orders delayed native snapshots before durable invalidation and later probe 
     } finally {release(); overlay.mockRestore();}
 });
 
+it.each(["ordinary", "refresh"])("preserves observed credential generation through a runtime conflict (%s)", async mode => {
+    await setup();
+    const initial = (await loadAccounts())!;
+    Object.assign(initial.accounts[0]!, {accessToken: "fixture-A", expiresAt: Date.now() + 3600000});
+    initial.accounts.push({recordId: "second", accountId: "second", refreshToken: "fixture-second", accessToken: "fixture-second-access", expiresAt: Date.now() + 3600000, addedAt: 2, lastUsed: 2});
+    await saveAccounts(initial);
+    const manager = new AccountManager(undefined, await loadAccounts());
+    const disk = (await loadAccounts())!;
+    Object.assign(disk.accounts[0]!, {refreshToken: "fixture-B-refresh", accessToken: "fixture-B", expiresAt: Date.now() + 7200000, accountLabel: "External"});
+    await saveAccounts(disk);
+    syncNativeAccountCredentials(manager, (await loadAccounts())!, performance.now());
+    const account = manager.getAccountByIndex(0)!;
+    account.accountLabel = "Local";
+    manager.markAuthInvalidated(account, "token_invalidated", 1500);
+    manager.setAccountEnabled(0, false);
+    if (mode === "ordinary") await manager.saveToDisk(true);
+    else await manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "fixture-second-new", refresh: "fixture-second-new-refresh", expires: Date.now() + 7200000});
+    const persisted = (await loadAccounts())!;
+    expect(persisted.accounts[0]).toMatchObject({accessToken: "fixture-B", refreshToken: "fixture-B-refresh", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated", enabled: false, accountLabel: "External"});
+    expect(new AccountManager(undefined, persisted).getAccountByIndex(0)?.authInvalidatedAt).toBe(1500);
+    expect(account.accountLabel).toBe("Local");
+    manager.clearAuthInvalidation(account);
+    await manager.saveToDisk(true);
+    expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+    expect((await loadAccounts())?.accounts[0]?.enabled).toBe(false);
+});
 it.each(["invalidated", "disabled"])("persists authorization immediately during an ordinary runtime conflict (%s)", async restriction => {
     const manager = await setup(), account = manager.getAccountByIndex(0)!;
     account.accountLabel = "Local";

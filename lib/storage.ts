@@ -149,7 +149,7 @@ import {
 } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
 import { mergeAccountSnapshot } from "./storage/snapshot-merge.js";
-import { applyPendingAuth, clearPendingAuth, prunePendingAuth, recordPendingAuth } from "./storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, clearPendingAuth, prunePendingAuth, recordPendingAuth } from "./storage/pending-auth.js";
 export { recordPendingAuth };
 const loadedAccountSnapshots = new WeakMap<AccountStorageV3, AccountStorageV3>();
 
@@ -502,25 +502,24 @@ async function readOnDiskCredentialSignature(
  * whose spent token a restore could still resurface must survive pruning, so
  * recovering a throttle-stale backup self-heals to the newest credential via
  * `applyPendingAuth` instead of reviving a token that was spent upstream.
- * Best-effort: unreadable or unparseable sources contribute nothing.
  */
-async function collectRestorableRefreshTokens(path: string): Promise<string[]> {
-	const tokens: string[] = [];
+async function collectRestorableCredentials(path: string): Promise<Array<Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">>> {
+	const tokens: Array<Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">> = [];
 	const collectContent = (raw: string): void => {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);
 		} catch {
-			return;
+			throw new Error("Unparseable account recovery source");
 		}
-		if (!isRecord(parsed) || !Array.isArray(parsed.accounts)) return;
+		if (!isRecord(parsed) || !Array.isArray(parsed.accounts)) throw new Error("Invalid account recovery source");
 		for (const account of parsed.accounts) {
 			if (
 				isRecord(account) &&
 				typeof account.refreshToken === "string" &&
 				account.refreshToken.length > 0
 			) {
-				tokens.push(account.refreshToken);
+				tokens.push({refreshToken: account.refreshToken, accessToken: typeof account.accessToken === "string" ? account.accessToken : undefined, expiresAt: typeof account.expiresAt === "number" ? account.expiresAt : undefined});
 			}
 		}
 	};
@@ -529,19 +528,18 @@ async function collectRestorableRefreshTokens(path: string): Promise<string[]> {
 	)) {
 		try {
 			collectContent(await fs.readFile(candidate, "utf-8"));
-		} catch {
-			// An unreadable candidate contributes nothing.
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
 	try {
 		const walEntry: unknown = JSON.parse(
 			await fs.readFile(getAccountsWalPath(path), "utf-8"),
 		);
-		if (isRecord(walEntry) && typeof walEntry.content === "string") {
-			collectContent(walEntry.content);
-		}
-	} catch {
-		// No usable WAL payload.
+		if (!isRecord(walEntry) || typeof walEntry.content !== "string") throw new Error("Invalid account recovery journal");
+		collectContent(walEntry.content);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	return tokens;
 }
@@ -2578,15 +2576,17 @@ async function saveAccountsUnlocked(
 	storage: AccountStorageV3,
 	options?: { expectedOnDiskAccounts?: readonly AccountMetadataV3[] | null },
 ): Promise<void> {
+	const path = getStoragePath();
+	const observed = await capturePendingAuth(path, options?.expectedOnDiskAccounts ?? getTransactionSnapshotState()?.snapshot?.accounts).catch(() => undefined);
 	await saveAccountsUnlockedToDisk(storage, options);
 	// A persisted (or superseded) pending rotated credential is no longer needed —
 	// unless a restorable backup/WAL snapshot still carries the token it replaces,
 	// in which case the entry stays so a stale-backup recovery self-heals.
-	const path = getStoragePath();
 	await prunePendingAuth(path, storage, () =>
-		collectRestorableRefreshTokens(path),
+		collectRestorableCredentials(path), observed,
 	).catch((error) => {
 		log.warn("Failed to prune pending rotated credentials", { code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH" });
+		if (observed?.entries.length) throw new Error("Failed to reconcile pending account recovery");
 	});
 }
 
