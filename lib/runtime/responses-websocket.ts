@@ -23,6 +23,7 @@ const terminal = new Set([
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
 type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string; requestSent?: boolean };
+export type DispatchAuthorization = (input: string | URL | Request, init: RequestInit) => Promise<void>;
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -116,6 +117,7 @@ class SocketSession {
 		input: string | URL | Request,
 		init: RequestInit,
 		context: Context,
+		authorize?: DispatchAuthorization,
 	): Promise<Response> {
         context.requestSent = false;
         if (context.signal.aborted || this.closed) throw new ClientCancellationError();
@@ -136,9 +138,20 @@ class SocketSession {
 		// API/ZDR credentials are not ChatGPT workspaces: when their WebSocket
 		// handshake is refused, the turn (and the session) uses plain HTTP.
 		const apiCredential = !headers.has("chatgpt-account-id");
+		const dispatchHttp = async () => {
+			await authorize?.(input, init);
+			if (context.signal.aborted || init.signal?.aborted || this.closed) throw new ClientCancellationError();
+			context.requestSent = true;
+			try {
+				return await this.httpFetch(input, init);
+			} catch {
+				if (context.signal.aborted || init.signal?.aborted || this.closed) throw new ClientCancellationError();
+				return new Response(`data: ${JSON.stringify(wireError("upstream_http_disconnected", 502))}\n\n`, {headers: {"content-type": "text/event-stream"}});
+			}
+		};
 		if (apiCredential && this.httpOnly.delete(key)) {
 			this.httpOnly.add(key);
-			return this.httpFetch(input, init);
+			return dispatchHttp();
 		}
 		const body = bodyJson(init.body);
 		delete body.stream;
@@ -259,11 +272,19 @@ class SocketSession {
 					if (oldest !== undefined) this.httpOnly.delete(oldest);
 				}
 				this.httpOnly.add(key);
-				return this.httpFetch(input, init);
+				return dispatchHttp();
 			}
 			this.channels.set(key, socket);
 		}
 		const active = socket;
+		try {
+			await authorize?.(input, init);
+			if (context.signal.aborted || init.signal?.aborted || this.closed) throw new ClientCancellationError();
+		} catch (error) {
+			active.terminate();
+			this.channels.delete(key);
+			throw error;
+		}
 		return new Promise<Response>((resolve, reject) => {
 			let accepted = false,
 				finished = false;
@@ -401,6 +422,7 @@ export class ResponsesWebSocketGateway {
 	};
 	private readonly contexts = new Map<string, Context>();
 	private readonly scope = new AsyncLocalStorage<Context>();
+	private readonly authorization = new AsyncLocalStorage<DispatchAuthorization>();
 	private readonly sessions = new Set<SocketSession>();
 	private readonly wss: WebSocketServer;
 	private readonly maxBytes: number;
@@ -427,14 +449,19 @@ export class ResponsesWebSocketGateway {
 			perMessageDeflate: false,
 		});
 	}
+	withDispatchAuthorization<T>(authorize: DispatchAuthorization, operation: () => T): T {
+		return this.authorization.run(authorize, operation);
+	}
 	readonly fetch: typeof fetch = async (input, init) => {
 		const context = this.scope.getStore();
+		const authorize = this.authorization.getStore();
 		if (
 			context &&
 			init?.method === "POST" &&
 			new URL(String(input)).pathname.endsWith("/responses")
 		)
-			return context.session.fetch(input, init, context);
+			return context.session.fetch(input, init, context, authorize);
+		await authorize?.(input, init ?? {});
 		return this.upstreamFetch(input, init);
 	};
 	requestSent(): boolean {

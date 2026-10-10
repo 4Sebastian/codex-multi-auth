@@ -968,7 +968,7 @@ describe("runtime rotation proxy", () => {
 			}));
 
 			expect(await closed).toMatchObject({ code: 1008 });
-			expect(evaluate).toHaveBeenCalledTimes(3);
+			expect(evaluate).toHaveBeenCalledWith(expect.objectContaining({model: "gpt-5.6-sol"}));
 			expect(upstreamFrames).toHaveLength(1);
 		} finally {
 			socket.terminate();
@@ -1450,8 +1450,8 @@ describe("runtime rotation proxy", () => {
 		});
 		const consumeToken = vi
 			.spyOn(accountManager, "consumeToken")
-			.mockImplementation((account, family, model) => {
-				const consumed = originalConsumeToken(account, family, model);
+			.mockImplementation((account, family, model, options) => {
+				const consumed = originalConsumeToken(account, family, model, options);
 				if (consumed) notifyTokenConsumed();
 				return consumed;
 			});
@@ -2284,9 +2284,9 @@ describe("runtime rotation proxy", () => {
 		let accountZeroConsumptions = 0;
 		const consumeToken = vi
 			.spyOn(accountManager, "consumeToken")
-			.mockImplementation((account, family, model) => {
+			.mockImplementation((account, family, model, options) => {
 				if (account.index === 0 && accountZeroConsumptions++ > 0) return false;
-				return originalConsumeToken(account, family, model);
+				return originalConsumeToken(account, family, model, options);
 			});
 		const { fetchImpl } = createRecordingFetch(() => textEventStream());
 		const proxy = await startProxy({
@@ -2348,9 +2348,9 @@ describe("runtime rotation proxy", () => {
 		let accountZeroConsumptions = 0;
 		const consumeToken = vi
 			.spyOn(accountManager, "consumeToken")
-			.mockImplementation((account, family, model) => {
+			.mockImplementation((account, family, model, options) => {
 				if (account.index === 0 && accountZeroConsumptions++ > 0) return false;
-				return originalConsumeToken(account, family, model);
+				return originalConsumeToken(account, family, model, options);
 			});
 		const { fetchImpl } = createRecordingFetch(() => textEventStream());
 		const proxy = await startProxy({
@@ -7913,7 +7913,7 @@ describe("native inventory read resilience",()=>{
   const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'model-test'}]}):textEventStream());
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});
   for(let i=0;i<3;i++){const response=await postResponses(proxy,{model:'model-test',input:'test'});await response.text();expect(response.status).toBe(200);}
-  expect(read).toHaveBeenCalledTimes(6);expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(3);
+  await expect(read.mock.results[2]?.value).rejects.toMatchObject({code});expect(calls.filter(c=>c.url.endsWith('/responses'))).toHaveLength(3);
  });
  it("never authenticates a managed bearer with a stale snapshot",async()=>{
   const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
@@ -7928,7 +7928,8 @@ describe("native inventory read resilience",()=>{
   const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
   let release!:()=>void,started!:()=>void;
   const gate=new Promise<void>(r=>release=r),entered=new Promise<void>(r=>started=r);
-  const read=vi.fn(async()=>{started();await gate;return createStorage(Date.now(),2);});
+  const current = createStorage(Date.now(),2);
+  const read=vi.fn(async()=>{started();await gate;return structuredClone(current);});
   const original=nativeStorageReader.createNativeAccountStorageReader;
   const readerCalls=vi.fn();
   vi.spyOn(nativeStorageReader,'createNativeAccountStorageReader').mockImplementation((...args)=>{
@@ -7939,8 +7940,9 @@ describe("native inventory read resilience",()=>{
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});mode.mockClear();
   const first=getModels(proxy);await entered;const second=getModels(proxy);
   await vi.waitFor(()=>expect(readerCalls).toHaveBeenCalledTimes(2));
-  release();await Promise.all([first.then(r=>r.text()),second.then(r=>r.text())]);
-  expect(read).toHaveBeenCalledTimes(1);expect(mode).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledTimes(1);
+  release();const responses = await Promise.all([first,second]);await Promise.all(responses.map(response => response.text()));
+  expect(responses.every(response => response.status === 200)).toBe(true);expect(mode).toHaveBeenCalledTimes(1);
  });
  it("preserves unexpired 429 state across inventory changes",async()=>{
   const now=Date.now(),manager=new AccountManager(undefined,createStorage(now,1));
@@ -8910,9 +8912,10 @@ describe("review boundary regressions", () => {
 		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl, forcedAccountIndex: 0}});
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
+			const closed = nextWebSocketClose(client);
 			client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
-			await vi.waitFor(() => expect(proxy.getStatus().streamsStarted).toBe(1));
-			await new Promise(resolve => setImmediate(resolve));
+			expect(await closed).toMatchObject({code: 1008});
+			expect(handshaken).toBe(true);
 			expect(creates).toBe(0);
 		} finally {client.terminate(); await upstream.close(); selection.mockRestore(); policy.mockRestore();}
 	});

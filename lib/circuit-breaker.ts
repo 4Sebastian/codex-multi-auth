@@ -36,7 +36,14 @@ export type CircuitAdmissionResult =
 			retryAfterMs: number;
 	  };
 
+export interface CircuitAdmissionReceipt {
+	readonly breaker: CircuitBreaker;
+	readonly epoch: number;
+	readonly halfOpen: boolean;
+}
+
 export class CircuitBreaker {
+	private epoch = 0;
 	private state: CircuitState = "closed";
 	private failures: number[] = [];
 	private lastStateChange: number = Date.now();
@@ -52,7 +59,7 @@ export class CircuitBreaker {
 	 * object instead of throwing, so reject-heavy callers stay exception-free.
 	 * Admitting a probe still consumes the half-open attempt slot.
 	 */
-	tryCanExecute(): CircuitAdmissionResult {
+	tryCanExecute(onAdmission?: (receipt: CircuitAdmissionReceipt) => void): CircuitAdmissionResult {
 		const now = Date.now();
 
 		if (this.state === "open") {
@@ -86,10 +93,17 @@ export class CircuitBreaker {
 				}
 			}
 			this.halfOpenAttempts += 1;
+			onAdmission?.({breaker: this, epoch: this.epoch, halfOpen: true});
 			return { ok: true };
 		}
 
+		onAdmission?.({breaker: this, epoch: this.epoch, halfOpen: false});
 		return { ok: true };
+	}
+
+	isAdmissionCurrent(receipt: CircuitAdmissionReceipt): boolean {
+		return receipt.breaker === this && receipt.epoch === this.epoch &&
+			(receipt.halfOpen ? this.state === "half-open" : this.state === "closed");
 	}
 
 	canExecute(): boolean {
@@ -182,12 +196,14 @@ export class CircuitBreaker {
 	}
 
 	private transitionToOpen(now: number): void {
+		this.epoch++;
 		this.state = "open";
 		this.lastStateChange = now;
 		this.halfOpenAttempts = 0;
 	}
 
 	private transitionToHalfOpen(now: number): void {
+		this.epoch++;
 		this.state = "half-open";
 		this.lastStateChange = now;
 		this.halfOpenAttempts = 0;
@@ -198,11 +214,13 @@ export class CircuitBreaker {
 	}
 
 	private resetHalfOpenProbeWindow(now: number): void {
+		this.epoch++;
 		this.lastStateChange = now;
 		this.halfOpenAttempts = 0;
 	}
 
 	private resetToClosed(now: number): void {
+		this.epoch++;
 		this.state = "closed";
 		this.lastStateChange = now;
 		this.halfOpenAttempts = 0;

@@ -1,4 +1,5 @@
 import type { NativeAccountSnapshot } from "./native-account-storage.js";
+import type { DispatchAuthorization } from "./responses-websocket.js";
 import type { QuotaCacheData, QuotaCacheEntry } from "../quota-cache.js";
 import type {RuntimeCapabilityFailures} from "./runtime-capability-failures.js";
 import type {RouteModel} from "../model-route-policy.js";
@@ -35,6 +36,7 @@ export interface RotationProxyStateInit {
 	schedulingStrategy: "hybrid" | "sequential";
 	fetchImpl: typeof fetch;
 	webSocketRequestSent?: () => boolean;
+	withDispatchAuthorization?: (authorize: DispatchAuthorization, operation: () => Promise<Response>) => Promise<Response>;
 	upstreamBaseUrl: string;
 	clientApiKey: string;
 	now: () => number;

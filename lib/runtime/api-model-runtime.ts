@@ -103,6 +103,9 @@ export class ApiModelRuntime {
 	private readonly discoveryUpdates = new Map<string, Promise<ApiRouteCredential>>();
 	lastPersistenceError: string | null = null;
 	private readonly failures = new RuntimeCapabilityFailures(() => this.now());
+	supportsDispatch(credential: ApiRouteCredential, model: string, effort?: string, tier?: string): boolean {
+		return this.failures.supports(this.key(credential), model, effort, tier);
+	}
 	cachedCatalogs(): RouteCatalog[] {
 		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot] : []);
 	}
@@ -337,12 +340,7 @@ export class ApiModelRuntime {
 					? body.reasoning.effort
 					: undefined;
 			if (
-				!this.failures.supports(
-					this.key(credential),
-					route.upstreamModel,
-					effort,
-					route.serviceTier,
-				)
+				!this.supportsDispatch(credential, route.upstreamModel, effort, route.serviceTier)
 			)
 				continue;
 			if (signal?.aborted) throw new ClientCancellationError();

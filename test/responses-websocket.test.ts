@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 import WebSocket, { WebSocketServer } from "ws";
-import { ResponsesWebSocketGateway } from "../lib/runtime/responses-websocket.js";
+import { ResponsesWebSocketGateway, type DispatchAuthorization } from "../lib/runtime/responses-websocket.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
 	for (const close of cleanups.splice(0).reverse()) await close();
@@ -406,6 +406,7 @@ async function customGateway(options: {
 	upstream: Server;
 	auth?: (req: IncomingMessage) => number | null;
 	outboundHeaders?: Record<string, string>;
+	authorize?: DispatchAuthorization;
 }) {
 	const upstreamUrl = await listen(options.upstream);
 	cleanups.push(async () => {
@@ -429,11 +430,13 @@ async function customGateway(options: {
 			}
 			const chunks: Buffer[] = [];
 			for await (const chunk of req) chunks.push(Buffer.from(chunk));
-			const response = await gateway.fetch(`${upstreamUrl}/responses`, {
+			const operation = () => gateway.fetch(`${upstreamUrl}/responses`, {
 				method: "POST",
 				headers: { authorization: "Bearer fixture-upstream", "content-type": "application/json", ...options.outboundHeaders },
 				body: Buffer.concat(chunks),
 			});
+			const response = await (options.authorize ? gateway.withDispatchAuthorization(options.authorize, operation) : operation())
+				.catch(() => Response.json({error: {code: "dispatch_denied"}}, {status: 503}));
 			responses.push(response);
 			res.writeHead(response.status, Object.fromEntries(response.headers));
 			if (response.body) for await (const chunk of response.body) res.write(chunk);
@@ -624,6 +627,39 @@ it.each(["api", "zdr"])("bounds refused %s credentials while retaining HTTP fall
 	expect(g.stats.upstreamConnections).toBe(102);
 	expect(posts).toHaveLength(104);
 	expect(g.stats.upstreamRequests).toBe(0);
+});
+
+it.each(["api", "zdr"])("authorizes %s refusal fallback and cached HTTP-only sends at the actual dispatch boundary", async kind => {
+	const posts: string[] = [];
+	let entered: () => void = () => undefined, release: () => void = () => undefined;
+	const started = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const upstream = createServer(async (req, res) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of req) chunks.push(Buffer.from(chunk));
+		posts.push(Buffer.concat(chunks).toString("utf8"));
+		res.writeHead(200, {"content-type": "text/event-stream"});
+		res.end('data: {"type":"response.completed","response":{"id":"paid-fixture","output":[]}}\n\n');
+	});
+	upstream.on("upgrade", (_req, socket) => {
+		entered();
+		void gate.then(() => socket.end("HTTP/1.1 404 Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+	});
+	let allowed = true, authorizations = 0;
+	const g = await customGateway({upstream, authorize: async () => {authorizations++; if (!allowed) throw Error("fixture authority changed");}});
+	const ws = await g.connect();
+	const pending = turn(ws, {model: `${kind}/fixture`, input: []});
+	await started;
+	allowed = false; release();
+	expect((await pending).at(-1)).toMatchObject({type: "error", status: 503});
+	expect(posts).toEqual([]);
+	allowed = true;
+	expect((await turn(ws, {model: `${kind}/fixture`, input: []})).at(-1)).toMatchObject({type: "response.completed"});
+	allowed = false;
+	expect((await turn(ws, {model: `${kind}/fixture`, input: []})).at(-1)).toMatchObject({type: "error", status: 503});
+	expect(posts).toHaveLength(1);
+	expect(authorizations).toBe(3);
+	expect(g.stats.upstreamConnections).toBe(1);
 });
 
 it("does not fall back to HTTP for a ChatGPT workspace whose handshake is refused", async () => {

@@ -49,7 +49,7 @@ import {
 	getAccountIdentityKey,
 	getRuntimeAccountIdentityKey,
 } from "./storage/identity.js";
-import { getCircuitBreaker, resetAllCircuitBreakers, removeCircuitBreaker } from "./circuit-breaker.js";
+import { getCircuitBreaker, resetAllCircuitBreakers, removeCircuitBreaker, type CircuitAdmissionReceipt } from "./circuit-breaker.js";
 import {
 	getStoragePathState,
 	runWithStoragePathState,
@@ -1204,9 +1204,9 @@ export class AccountManager {
 		account: ManagedAccount,
 		family: ModelFamily,
 		model?: string | null,
-		_options: { bypassTokenBucket?: boolean } = {},
+		options: { bypassTokenBucket?: boolean; onAdmission?: (receipt: CircuitAdmissionReceipt) => void } = {},
 	): boolean {
-		return this.consumeTokenWithReason(account, family, model).ok;
+		return this.consumeTokenWithReason(account, family, model, options).ok;
 	}
 
 	/** Return the circuit-breaker admission verdict for a runtime request. */
@@ -1214,9 +1214,9 @@ export class AccountManager {
 		account: ManagedAccount,
 		_family: ModelFamily,
 		_model?: string | null,
-		_options: { bypassTokenBucket?: boolean } = {},
+		options: { bypassTokenBucket?: boolean; onAdmission?: (receipt: CircuitAdmissionReceipt) => void } = {},
 	): { ok: true } | { ok: false; reason: "circuit-open" } {
-		const admission = getCircuitBreaker(getAccountCircuitKey(account)).tryCanExecute();
+		const admission = getCircuitBreaker(getAccountCircuitKey(account)).tryCanExecute(options.onAdmission);
 		if (!admission.ok) {
 			return { ok: false, reason: "circuit-open" };
 		}
@@ -1438,6 +1438,7 @@ export class AccountManager {
 	}
 
 	async isAccountJournalEligible(account: ManagedAccount): Promise<boolean> {
+		if (this.getAccountByIndex(account.index) !== account) return false;
 		const invalidated = this.isAccountAuthInvalidated(account);
 		const row = {
 			recordId: account.recordId, refreshToken: account.refreshToken, accessToken: account.access, expiresAt: account.expires,
@@ -1446,7 +1447,7 @@ export class AccountManager {
 			addedAt: account.addedAt, lastUsed: account.lastUsed,
 		};
 		await applyPendingAuth(this.resolveSelectionStoragePath(), {version: 3, activeIndex: 0, accounts: [row]});
-		return row.refreshToken === account.refreshToken && row.accessToken === account.access && row.expiresAt === account.expires &&
+		return this.getAccountByIndex(account.index) === account && row.refreshToken === account.refreshToken && row.accessToken === account.access && row.expiresAt === account.expires &&
 			row.enabled !== false && !row.authInvalidatedAt && account.enabled !== false && !this.isAccountAuthInvalidated(account);
 	}
 
