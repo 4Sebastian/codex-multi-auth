@@ -52,6 +52,8 @@ export type ProbeResult = {
 	status: Record<string, string>;
 };
 type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
+type CredentialProbeGroup = { lostAt?: number };
+type ProbeCacheEntry = ProbeResult & { group?: CredentialProbeGroup; documented?: string[] };
 
 /** Only the exact model's input declaration can enable native image attachments. */
 function parseInputModalities(id: string, text: string): string[] | undefined {
@@ -106,15 +108,40 @@ export class ApiModelCapabilities {
 		}
 	}
 	private readonly inFlight = new Map<string, Promise<ProbeResult>>();
-	private readonly probes = new Map<
-		string,
-		{
-			at: number;
-			levels: string[];
-			tiers: string[];
-			status: Record<string, string>;
+	private readonly probes = new Map<string, ProbeCacheEntry>();
+	private readonly credentialGroups = new Map<string, CredentialProbeGroup>();
+
+	private credentialGroup(route: ApiRouteCredential): CredentialProbeGroup {
+		const key = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
+		const current = this.credentialGroups.get(key);
+		if (current && (current.lostAt === undefined || current.lostAt + 60_000 > this.now())) return current;
+		if (this.credentialGroups.size >= 1000 && !this.credentialGroups.has(key)) {
+			const oldest = this.credentialGroups.keys().next().value;
+			if (oldest !== undefined) {
+				const retired = this.credentialGroups.get(oldest);
+				if (retired) retired.lostAt ??= this.now();
+				for (const [modelKey, entry] of this.probes) if (entry.group === retired) this.probes.delete(modelKey);
+				this.credentialGroups.delete(oldest);
+			}
 		}
-	>();
+		const group: CredentialProbeGroup = {};
+		this.credentialGroups.set(key, group);
+		return group;
+	}
+
+	private clearVerified(result: ProbeResult, documented: string[]): void {
+		result.levels = [...documented];
+		result.tiers = [];
+		for (const name of Object.keys(result.status)) if (result.status[name] === "verified") result.status[name] = "unverified";
+		result.status.retry = "transient";
+	}
+
+	private revokeGroup(group: CredentialProbeGroup): void {
+		group.lostAt ??= this.now();
+		for (const result of this.probes.values()) {
+			if (result.group === group || !result.group) this.clearVerified(result, result.documented ?? []);
+		}
+	}
 	private readonly cache = new Map<string, DocumentedCapabilities & { at: number }>();
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
@@ -122,12 +149,13 @@ export class ApiModelCapabilities {
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
-		return [...this.probes];
+		return [...this.probes].map(([key, {at, levels, tiers, status}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}}]);
 	}
 	importProbes(entries: Array<[string, ProbeResult]>): void {
 		for (const [key, value] of entries.slice(-1000)) {
 			if (this.probes.has(key) || value.at > this.now()) continue;
-			this.probes.set(key, value);
+			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
+			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}});
 		}
 	}
 	async reasoning(id: string, refresh = false): Promise<string[]> {
@@ -181,6 +209,7 @@ export class ApiModelCapabilities {
 		route: ApiRouteCredential,
 		id: string,
 		documented: string[],
+		group: CredentialProbeGroup,
 		force = false,
 	) {
 		const key = createHash("sha256")
@@ -191,12 +220,14 @@ export class ApiModelCapabilities {
 			.update(id)
 			.digest("hex");
 		const old = this.probes.get(key);
+		if (old) {old.group = group; old.documented = [...documented];}
+		if (group.lostAt !== undefined && old) this.clearVerified(old, documented);
 		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
 		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
 		if (!force && old && old.at + freshFor > this.now()) return old;
 		const running = this.inFlight.get(key);
 		if (running) return running;
-		const pending = this.runProbe(route, id, documented, key).finally(() =>
+		const pending = this.runProbe(route, id, documented, key, group).finally(() =>
 			this.inFlight.delete(key),
 		);
 		this.inFlight.set(key, pending);
@@ -207,6 +238,7 @@ export class ApiModelCapabilities {
 		id: string,
 		documented: string[],
 		key: string,
+		group: CredentialProbeGroup,
 	): Promise<ProbeResult> {
 		const result = {
 			at: this.now(),
@@ -235,14 +267,14 @@ export class ApiModelCapabilities {
 			// An unexplained 403 changes nothing and the probe is retried soon.
 			const denied403 = (data: unknown): string => {
 				const kind = classifyProbe403(data, setting);
-				if (kind === "lost") { credentialUnavailable = true; lostAccess = true; return "unverified"; }
+				if (kind === "lost") { credentialUnavailable = true; lostAccess = true; this.revokeGroup(group); return "unverified"; }
 				if (kind === "model") { modelDenied = true; return "unsupported"; }
 				if (kind === "setting") return "unsupported";
 				credentialUnavailable = true;
 				return "unverified";
 			};
 			return this.withProbeSlot(async () => {
-				if (credentialUnavailable || modelDenied) return "unverified";
+				if (credentialUnavailable || modelDenied || group.lostAt !== undefined) return "unverified";
 				try {
 					const response = await this.fetchImpl(
 						"https://api.openai.com/v1/responses",
@@ -289,7 +321,7 @@ export class ApiModelCapabilities {
 					);
 					if ([401, 429].includes(response.status))
 						credentialUnavailable = true;
-					if (response.status === 401) lostAccess = true;
+					if (response.status === 401) {lostAccess = true; this.revokeGroup(group);}
 					// Probe bodies are tiny, but an upstream error must not grow local memory unboundedly.
 					const reader = response.body?.getReader();
 					if (!reader) return response.status === 403 ? denied403(null) : "unverified";
@@ -400,18 +432,14 @@ export class ApiModelCapabilities {
 			result.tiers = [];
 			for (const name of Object.keys(result.status)) result.status[name] = "unsupported";
 			result.status.responses = "unsupported";
-		} else if (lostAccess) {
-			result.levels = [...documented];
-			result.tiers = [];
-			for (const name of Object.keys(result.status)) {
-				if (result.status[name] === "verified") result.status[name] = "unverified";
-			}
+		} else if (lostAccess || group.lostAt !== undefined) {
+			this.clearVerified(result, documented);
 		}
 		if (credentialUnavailable && !modelDenied) result.status.retry = "transient";
 		result.at = this.now();
 		if (this.probes.size >= 1000)
 			this.probes.delete(this.probes.keys().next().value ?? "");
-		this.probes.set(key, result);
+		this.probes.set(key, {...result, group, documented: [...documented]});
 		return result;
 	}
 	async enrich(
@@ -420,17 +448,17 @@ export class ApiModelCapabilities {
 		route?: ApiRouteCredential,
 		forceProbes = false,
 	): Promise<RouteModel[]> {
-		return mapWithConcurrency(models, 3, async (model) => {
-						const documented = await this.documentation(model.slug, refresh);
+		const group = route?.enabled && route.probeCapabilities ? this.credentialGroup(route) : undefined;
+		const enriched = await mapWithConcurrency(models, 3, async model => {
+			const documented = await this.documentation(model.slug, refresh);
+			const probed = route && group ? await this.probe(route, model.slug, documented.levels, group, forceProbes) : undefined;
+			return {model, documented, probed};
+		});
+		return enriched.map(({model, documented, probed}) => {
 						let levels = documented.levels;
 						let extra: Record<string, unknown> = {};
-						if (route?.enabled && route.probeCapabilities) {
-							const probed = await this.probe(
-								route,
-								model.slug,
-								levels,
-								forceProbes,
-							);
+						if (probed) {
+							if (group?.lostAt !== undefined) this.clearVerified(probed, documented.levels);
 							levels = probed.levels;
 							extra = {
 								service_tiers: probed.tiers.map((id) => ({

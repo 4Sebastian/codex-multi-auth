@@ -15,10 +15,15 @@ import * as refreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import {getPendingAuthPath, recordPendingAuth} from "../lib/storage/pending-auth.js";
 import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
+import {getAccountPolicyKey, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
+import {ApiModelRuntime} from "../lib/runtime/api-model-runtime.js";
+import type {ApiRouteCredential} from "../lib/api-route-store.js";
+import {appendUsageLedgerRow} from "../lib/usage/index.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
+	vi.unstubAllGlobals();
 	for (const close of cleanups.splice(0).reverse()) await close();
 	setStoragePathDirect(null);
 	clearCircuitBreakers();
@@ -35,7 +40,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("Missing fixture address");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(native: boolean, delayed = false) {
+async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse = false) {
 	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-authority-"));
 	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
 	const path = join(root, "accounts.json");
@@ -54,6 +59,7 @@ async function fixture(native: boolean, delayed = false) {
 		entered.resolve();
 		void (delayed ? release.promise : Promise.resolve()).then(() => {
 			if (socket.destroyed) return;
+			if (refuse) {socket.end("HTTP/1.1 404 Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); return;}
 			wss.handleUpgrade(req, socket, head, ws => {
 				connections++;
 				ws.on("message", data => {
@@ -73,13 +79,15 @@ async function fixture(native: boolean, delayed = false) {
 	});
 	const fetched: string[] = [], discoveries: string[] = [];
 	let quotaFailure = false;
+	let postResponse: (() => Promise<Response>) | undefined;
 	const fetchImpl: typeof fetch = async (_url, init) => {
-		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared"}]});}
+		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});}
 		fetched.push(new Headers(init.headers).get("authorization") ?? "");
+		if (postResponse) return postResponse();
 		if (quotaFailure) return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}});
 		return new Response('data: {"type":"response.completed","response":{"id":"http-result","status":"completed","output":[]}}\n\n', {headers: {"content-type": "text/event-stream"}});
 	};
-	const proxy = await startRuntimeRotationProxy({nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
+	const proxy = await startRuntimeRotationProxy({readApiRoutes, nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
 	cleanups.push(async () => {await proxy.close(); await manager.flushPendingSave();});
 	const connect = async () => {
 		const ws = new WebSocket(`${proxy.baseUrl.replace("http:", "ws:")}/responses`, {headers: {authorization: "Bearer fixture-client"}});
@@ -87,9 +95,161 @@ async function fixture(native: boolean, delayed = false) {
 		await once(ws, "open");
 		return ws;
 	};
-	const post = () => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model: "shared", input: []})});
-	return {root, path, pool, manager, proxy, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, connections: () => connections};
+	const post = (model = "shared") => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: []})});
+	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections};
 }
+it.each(["disable", "delete", "remove", "corrupt"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
+	const f = await fixture(false), ws = await f.connect();
+	const first = await turn(ws);
+	expect(first).toMatchObject({type: "response.completed"});
+	const other = new AccountManager(undefined, f.pool);
+	if (mutation === "disable") {other.setAccountEnabled(0, false); await other.saveToDisk();}
+	if (mutation === "delete") {other.removeAccountByIndex(0); await other.saveToDisk();}
+	if (mutation === "remove") await fs.unlink(f.path);
+	if (mutation === "corrupt") await fs.writeFile(f.path, "invalid fixture");
+	const result = await turn(ws, {previous_response_id: first.response.id});
+	expect(result).toMatchObject({type: "error", error: {code: "previous_response_not_found"}});
+	expect(f.creates).toHaveLength(1);
+});
+
+it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", "usage"].map(mutation => ({transport, mutation}))))
+("rejects changed authority during the final journal wait (%j)", async ({transport, mutation}) => {
+	const native = transport === "native";
+	const f = await fixture(native), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const original = f.manager.isAccountJournalEligible.bind(f.manager);
+	let armed = false, observations = 0;
+	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async account => {
+		const eligible = await original(account);
+		if (armed && ++observations === (transport === "custom" ? 2 : 3)) {armed = false; entered.resolve(); await release.promise;}
+		return eligible;
+	});
+	const ws = await f.connect();
+	const first = await turn(ws);
+	expect(first).toMatchObject({type: "response.completed"});
+	await f.manager.flushPendingSave();
+	armed = true;
+	const pending = transport === "http" ? f.post().then(async response => {const body = await response.text(); return {type: response.status >= 400 ? "error" : "success", status: response.status, body};}) :
+		turn(ws, native ? {} : {previous_response_id: first.response.id});
+	await Promise.race([entered.promise, pending.then(result => {throw Error(`Request completed before final journal barrier (${observations} observations): ${JSON.stringify(result)}`);})]);
+	if (mutation === "primary") {
+		const other = new AccountManager(undefined, f.pool);
+		other.setAccountEnabled(0, false); await other.saveToDisk();
+	} else if (mutation === "usage") {
+		await appendUsageLedgerRow({source: "runtime-proxy", operation: "responses", model: "shared", outcome: "success"});
+	} else {
+		await updateAccountPolicyStore(store => {upsertAccountPolicy(store, getAccountPolicyKey(f.manager.getAccountByIndex(0)!), policy => {policy.paused = true;}); return {result: undefined, dirty: true};});
+		cleanups.push(async () => {await updateAccountPolicyStore(store => {upsertAccountPolicy(store, getAccountPolicyKey(f.manager.getAccountByIndex(0)!), policy => {policy.paused = false;}); return {result: undefined, dirty: true};});});
+	}
+	release.resolve();
+	expect((await pending).type).toBe(mutation === "usage" ? transport === "http" ? "success" : "response.completed" : "error");
+	expect(f.creates).toHaveLength(mutation === "usage" && transport !== "http" ? 2 : 1);
+	expect(f.fetched).toEqual(mutation === "usage" && transport === "http" ? ["Bearer A"] : []);
+});
+
+it.each([402, 403].flatMap(status => [false, true].map(workspaces => ({status, workspaces}))))
+("preserves explicit recovery after a delayed workspace refusal (%j)", async ({status, workspaces}) => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const account = f.manager.getAccountByIndex(0)!;
+	if (!workspaces) {account.workspaces = undefined; await f.manager.saveToDisk();}
+	f.setPostResponse(async () => new Response(new ReadableStream({start(controller) {
+		entered.resolve();
+		void release.promise.then(() => {controller.enqueue(new TextEncoder().encode(JSON.stringify({error: {code: "deactivated_workspace"}}))); controller.close();});
+	}}), {status}));
+	const pending = f.post();
+	await entered.promise;
+	f.manager.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+	await f.manager.saveToDisk();
+	f.setPostResponse(undefined);
+	release.resolve();
+	const refused = await pending; await refused.text();
+	expect(refused.status).toBe(status);
+	await f.manager.flushPendingSave();
+	const persisted = JSON.parse(await fs.readFile(f.path, "utf8")).accounts[0];
+	expect(persisted.accessToken).toBe("B");
+	expect(persisted.enabled).not.toBe(false);
+	expect(persisted.workspaces?.some((workspace: {enabled?: boolean}) => workspace.enabled === false)).not.toBe(true);
+	expect(account.enabled).not.toBe(false);
+	const accepted = await f.post(); await accepted.text();
+	expect(accepted.status).toBe(200);
+	expect(f.fetched).toEqual(["Bearer A", "Bearer B"]);
+});
+
+it.each(["api", "zdr"] as const)("rejects a known %s model denial acquired during final route observation", async kind => {
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const routes: ApiRouteCredential[] = [{id: "fixture-paid", kind, label: "Fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}];
+	let reads = 0;
+	const f = await fixture(true, false, async () => {if (++reads === 2) {entered.resolve(); await release.promise;} return routes;});
+	let runtime: ApiModelRuntime | undefined;
+	const original = ApiModelRuntime.prototype.request;
+	vi.spyOn(ApiModelRuntime.prototype, "request").mockImplementation(function(...args) {runtime = this; return original.apply(this, args);});
+	const pending = f.post(`${kind}/shared`);
+	await entered.promise;
+	const advertised = runtime?.cachedCatalogs()[0]?.models[0];
+	if (!advertised) throw Error("Missing fixture catalog");
+	advertised.capability_probe_status = {responses: "unsupported"};
+	release.resolve();
+	const denied = await pending; await denied.text();
+	expect(denied.status).toBe(502);
+	expect(f.fetched).toEqual([]);
+});
+
+function routeApiToFixture(base: string): void {
+	const OriginalURL = URL, target = new OriginalURL(base);
+	vi.stubGlobal("URL", class extends OriginalURL {
+		constructor(input: string | URL, relativeTo?: string | URL) {
+			super(input, relativeTo);
+			if (this.hostname === "api.openai.com" && this.pathname === "/v1/responses") {this.protocol = "http:"; this.host = target.host;}
+		}
+	});
+}
+
+it.each(["api", "zdr"].flatMap(kind => [false, true].map(refuse => ({kind, refuse}))))
+("rejects a known model denial after a real paid handshake (%j)", async ({kind, refuse}) => {
+	const routes: ApiRouteCredential[] = [{id: "fixture-paid", kind: kind === "api" ? "api" : "zdr", label: "Fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}];
+	const f = await fixture(true, true, async () => routes, refuse);
+	routeApiToFixture(f.upstreamBaseUrl);
+	let runtime: ApiModelRuntime | undefined;
+	const original = ApiModelRuntime.prototype.request;
+	vi.spyOn(ApiModelRuntime.prototype, "request").mockImplementation(function(...args) {runtime = this; return original.apply(this, args);});
+	const ws = await f.connect(), pending = turn(ws, {model: `${kind}/shared`});
+	await f.entered.promise;
+	const model = runtime?.cachedCatalogs()[0]?.models[0];
+	if (!model) throw Error("Missing fixture catalog");
+	model.capability_probe_status = {responses: "unsupported"};
+	f.release.resolve();
+	expect(await pending).toMatchObject({type: "error", status: 502});
+	expect(f.creates).toEqual([]);
+	expect(f.fetched).toEqual([]);
+});
+
+it.each(["api", "zdr"] as const)("rejects known %s denial on a cached HTTP-only channel", async kind => {
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const routes: ApiRouteCredential[] = [{id: "fixture-paid", kind, label: "Fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}];
+	let armed = false, reads = 0;
+	const f = await fixture(true, false, async () => {if (armed && ++reads === 2) {entered.resolve(); await release.promise;} return routes;}, true);
+	routeApiToFixture(f.upstreamBaseUrl);
+	let runtime: ApiModelRuntime | undefined;
+	const original = ApiModelRuntime.prototype.request;
+	vi.spyOn(ApiModelRuntime.prototype, "request").mockImplementation(function(...args) {runtime = this; return original.apply(this, args);});
+	const ws = await f.connect();
+	expect(await turn(ws, {model: `${kind}/shared`})).toMatchObject({type: "response.completed"});
+	expect(f.fetched).toEqual(["Bearer fixture-key"]);
+	armed = true;
+	const pending = turn(ws, {model: `${kind}/shared`});
+	await entered.promise;
+	const model = runtime?.cachedCatalogs()[0]?.models[0];
+	if (!model) throw Error("Missing fixture catalog");
+	model.capability_probe_status = {responses: "unsupported"};
+	release.resolve();
+	expect(await pending).toMatchObject({type: "error", status: 502});
+	expect(f.creates).toEqual([]);
+	expect(f.fetched).toEqual(["Bearer fixture-key"]);
+});
+
 function turn(ws: WebSocket, extra: Record<string, unknown> = {}) {
 	const received = once(ws, "message");
 	ws.send(JSON.stringify({type: "response.create", model: "shared", input: [], ...extra}));

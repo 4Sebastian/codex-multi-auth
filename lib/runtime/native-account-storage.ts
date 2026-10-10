@@ -1,7 +1,8 @@
 import { stat } from "node:fs/promises";
+import { captureAuthorityRevision } from "../storage/authority-revision.js";
 import { getStoragePath, normalizeAccountStorage, type AccountStorageV3 } from "../storage.js";
 import { loadAccountsFromPath } from "../storage/storage-parser.js";
-import { applyPendingAuth, capturePendingAuth } from "../storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, getPendingAuthPath } from "../storage/pending-auth.js";
 import { isRecord } from "../utils.js";
 export interface NativeAccountSnapshot {
     storage: AccountStorageV3 | null;
@@ -20,6 +21,7 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
     return () => {
         if (pending) return pending;
         const capturedAt = performance.now();
+        const authorityCurrent = captureAuthorityRevision([path, getPendingAuthPath(path)]);
         pending = (async (): Promise<NativeAccountSnapshot> => {
             let storage: AccountStorageV3 | null;
             let nextSignature: string | undefined;
@@ -36,7 +38,6 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
                 } else {
                     storage = await read();
                 }
-                cached = structuredClone(storage);
             } catch (error) {
                 signature = undefined;
                 const code = (error as NodeJS.ErrnoException).code;
@@ -54,7 +55,14 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
                 if (!verified && (lastSuccess === undefined || performance.now() - lastSuccess >= 30000)) {
                     return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
                 }
+                if (!authorityCurrent()) {
+                    cached = null;
+                    lastSuccess = undefined;
+                    signature = undefined;
+                    return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
+                }
                 if (verified) {
+                    cached = structuredClone(storage);
                     signature = nextSignature;
                     lastSuccess = capturedAt;
                 }

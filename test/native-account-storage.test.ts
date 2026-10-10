@@ -21,6 +21,25 @@ it.each(["EACCES","corrupt"])("never verifies unrestricted primary after journal
  blocked.mockRestore();await rm(getPendingAuthPath(path));
  expect((await read()).verified).toBe(true);
 });
+it("rejects a primary revision changed during journal observation", async () => {
+	const root = await mkdtemp(join(tmpdir(), "native-revision-")); roots.push(root);
+	const path = join(root, "accounts.json");
+	const pool = {version: 3, activeIndex: 0, accounts: [{recordId: "fixture", refreshToken: "refresh", accessToken: "A", addedAt: 1, lastUsed: 1}]};
+	await writeFile(path, JSON.stringify(pool));
+	const original = fs.readFile.bind(fs);
+	let mutated = false;
+	vi.spyOn(fs, "readFile").mockImplementation(async (...args: Parameters<typeof fs.readFile>) => {
+		if (!mutated && String(args[0]) === getPendingAuthPath(path)) {
+			mutated = true;
+			await writeFile(path, JSON.stringify({...pool, accounts: [{...pool.accounts[0], enabled: false}]}));
+		}
+		return original(...args);
+	});
+	const read = createNativeAccountStorageReader(undefined, path);
+	expect(await read()).toMatchObject({verified: false, routingAvailable: false, storage: null});
+	expect((await read()).storage?.accounts[0]?.enabled).toBe(false);
+});
+
 it("caches settled primary storage but adopts credential revocation on change", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-cache-"));
     roots.push(root);

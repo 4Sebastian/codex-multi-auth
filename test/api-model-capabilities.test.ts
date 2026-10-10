@@ -532,6 +532,71 @@ it.each([401, 403].flatMap(status => [false, true].flatMap(previous => [false, t
 	expect(fetcher.mock.calls).toHaveLength(posts);
 });
 
+it.each([401, 403].flatMap(status => [false, true].map(imported => ({status, imported}))))
+("clears cross-model cached and exported positives after credential-wide loss (%j)", async ({status, imported}) => {
+	let lost = false;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		const body = JSON.parse(String(init.body));
+		if (lost && body.model === "Y") return Response.json({error: {code: status === 401 ? "invalid_api_key" : "permission_denied"}}, {status});
+		if (body.tools) return Response.json({output: [{type: "function_call", name: "capability_probe"}]});
+		return Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	let reader = new ApiModelCapabilities(fetcher, () => 1);
+	expect((await reader.enrich([{slug: "X"}], false, route))[0]?.service_tiers).not.toEqual([]);
+	if (imported) {
+		const exported = reader.exportProbes();
+		reader = new ApiModelCapabilities(fetcher, () => 1);
+		reader.importProbes(exported);
+	}
+	const independent = {...route, apiKey: "independent-fixture-key"};
+	expect((await reader.enrich([{slug: "X"}], false, independent))[0]?.service_tiers).not.toEqual([]);
+	lost = true;
+	const results = await reader.enrich([{slug: "X"}, {slug: "Y"}], false, route);
+	for (const model of results) {
+		expect(model.service_tiers).toEqual([]);
+		expect(model.supported_reasoning_levels).toEqual([]);
+		expect(Object.values(model.capability_probe_status as Record<string, string>)).not.toContain("verified");
+	}
+	expect((await reader.enrich([{slug: "X"}], false, independent))[0]?.service_tiers).not.toEqual([]);
+	const restored = new ApiModelCapabilities(fetcher, () => 1);
+	restored.importProbes(reader.exportProbes());
+	expect((await restored.enrich([{slug: "X"}], false, route))[0]?.service_tiers).toEqual([]);
+	expect((await restored.enrich([{slug: "X"}], false, independent))[0]?.service_tiers).not.toEqual([]);
+	expect((await reader.enrich([{slug: "X"}], false, {...route, apiKey: "recovered-fixture-key"}))[0]?.service_tiers).not.toEqual([]);
+});
+
+it.each([401, 403].flatMap(status => [false, true].map(positiveFirst => ({status, positiveFirst}))))
+("discards cross-model positives completing before or after credential loss (%j)", async ({status, positiveFirst}) => {
+	let releaseX: () => void = () => undefined, releaseY: () => void = () => undefined;
+	let enteredX: () => void = () => undefined, enteredY: () => void = () => undefined;
+	const xGate = new Promise<void>(resolve => {releaseX = resolve;});
+	const yGate = new Promise<void>(resolve => {releaseY = resolve;});
+	const xReady = new Promise<void>(resolve => {enteredX = resolve;});
+	const yReady = new Promise<void>(resolve => {enteredY = resolve;});
+	const fetcher: typeof fetch = async (url, init) => {
+		if (init?.method !== "POST") {
+			const id = String(url).split("/").at(-1)?.replace(".md", "");
+			return new Response(`Model ID: \`${id}\`\n\`reasoning.effort\` supports none, minimal, low, medium, high, xhigh, max.`);
+		}
+		const body = JSON.parse(String(init.body));
+		if (body.model === "Y") {enteredY(); await yGate; return Response.json({error: {code: status === 401 ? "invalid_api_key" : "permission_denied"}}, {status});}
+		if (body.tools) {enteredX(); await xGate; return Response.json({output: [{type: "function_call", name: "capability_probe"}]});}
+		return Response.json({service_tier: body.service_tier});
+	};
+	const reader = new ApiModelCapabilities(fetcher, () => 1);
+	const x = reader.enrich([{slug: "X"}], false, route);
+	const y = reader.enrich([{slug: "Y"}], false, route);
+	await Promise.all([xReady, yReady]);
+	if (positiveFirst) {releaseX(); expect((await x)[0]?.service_tiers).not.toEqual([]); releaseY(); await y;}
+	else {releaseY(); await y; releaseX(); await x;}
+	const [model] = await reader.enrich([{slug: "X"}], false, route);
+	expect(model?.service_tiers).toEqual([]);
+	expect(Object.values(model?.capability_probe_status as Record<string, string>)).not.toContain("verified");
+	expect(model?.supported_reasoning_levels).toEqual(expect.arrayContaining([expect.objectContaining({effort: "high"})]));
+	for (const [, result] of reader.exportProbes()) expect(Object.values(result.status)).not.toContain("verified");
+});
+
 it("a setting-specific 403 removes only the denied effort", async () => {
  let now=1, deny=false;
  const fetcher=vi.fn(async (_u:unknown, init?:RequestInit)=>{

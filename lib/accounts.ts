@@ -4,8 +4,10 @@ import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-
 export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
-import { applyPendingAuth } from "./storage/pending-auth.js";
+import { applyPendingAuth, getPendingAuthPath } from "./storage/pending-auth.js";
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
+import { createNativeAccountStorageReader, type NativeAccountSnapshot } from "./runtime/native-account-storage.js";
+import { captureAuthorityRevision } from "./storage/authority-revision.js";
 import { createLogger } from "./logger.js";
 import {
 	getStoragePath,
@@ -323,7 +325,7 @@ export class AccountManager {
 	private pendingSave: Promise<void> | null = null;
 	/** Consecutive debounced-save failures; reset by the next success. */
 	private saveRetryCount = 0;
-	private readonly storagePathState: StoragePathState;
+	private readonly storagePathState: StoragePathState & {currentStoragePath: string};
 	/**
 	 * Manual pin set by the `switch` CLI command, hydrated from disk at
 	 * construction time and refreshed from disk just before each
@@ -461,7 +463,7 @@ export class AccountManager {
 		authFallback?: OAuthAuthDetails,
 		stored?: AccountStorageV3 | null,
 	) {
-		this.storagePathState = { ...getStoragePathState() };
+		this.storagePathState = { ...getStoragePathState(), currentStoragePath: getStoragePath() };
 		this.hadPersistedStorage = existsSync(this.resolveSelectionStoragePath());
 		const fallbackAccountId =
 			extractAccountId(authFallback?.access)?.trim() || undefined;
@@ -1433,12 +1435,23 @@ export class AccountManager {
 	 * current on the calling async context. See `saveToDisk`, which wraps
 	 * `runWithStoragePathState(this.storagePathState, ...)` for the same reason.
 	 */
-	private resolveSelectionStoragePath(): string {
-		return this.storagePathState.currentStoragePath ?? getStoragePath();
+	resolveSelectionStoragePath(): string {
+		return this.storagePathState.currentStoragePath;
+	}
+
+	private dispatchStorageReader?: () => Promise<NativeAccountSnapshot>;
+
+	async readDispatchAccountStorage(): Promise<NativeAccountSnapshot | undefined> {
+		const path = this.resolveSelectionStoragePath();
+		this.hadPersistedStorage ||= existsSync(path);
+		if (!this.hadPersistedStorage) return undefined;
+		this.dispatchStorageReader ??= createNativeAccountStorageReader(undefined, path);
+		return this.dispatchStorageReader();
 	}
 
 	async isAccountJournalEligible(account: ManagedAccount): Promise<boolean> {
 		if (this.getAccountByIndex(account.index) !== account) return false;
+		const journalCurrent = captureAuthorityRevision([getPendingAuthPath(this.resolveSelectionStoragePath())]);
 		const invalidated = this.isAccountAuthInvalidated(account);
 		const row = {
 			recordId: account.recordId, refreshToken: account.refreshToken, accessToken: account.access, expiresAt: account.expires,
@@ -1447,7 +1460,7 @@ export class AccountManager {
 			addedAt: account.addedAt, lastUsed: account.lastUsed,
 		};
 		await applyPendingAuth(this.resolveSelectionStoragePath(), {version: 3, activeIndex: 0, accounts: [row]});
-		return this.getAccountByIndex(account.index) === account && row.refreshToken === account.refreshToken && row.accessToken === account.access && row.expiresAt === account.expires &&
+		return journalCurrent() && this.getAccountByIndex(account.index) === account && row.refreshToken === account.refreshToken && row.accessToken === account.access && row.expiresAt === account.expires &&
 			row.enabled !== false && !row.authInvalidatedAt && account.enabled !== false && !this.isAccountAuthInvalidated(account);
 	}
 

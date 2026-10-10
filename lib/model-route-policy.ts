@@ -84,7 +84,7 @@ export function supportsModelSettings(
 			))
 	);
 }
-function visible(catalog: RouteCatalog, model: RouteModel): boolean {
+export function isRouteModelEligible(catalog: RouteCatalog, model: RouteModel, reasoningEffort?: string, serviceTier?: string): boolean {
 	if (
 		(isRecord(model.capability_probe_status) &&
 			model.capability_probe_status.responses === "unsupported") ||
@@ -93,10 +93,8 @@ function visible(catalog: RouteCatalog, model: RouteModel): boolean {
 		/^(api|zdr|speed)\//.test(model.slug)
 	)
 		return false;
-	return (
-		catalog.kind === "oauth" ||
-		catalog.visibleModels?.includes(model.slug) === true
-	);
+	return (catalog.kind === "oauth" || catalog.visibleModels?.includes(model.slug) === true) &&
+		supportsModelSettings(model, reasoningEffort, serviceTier);
 }
 export function resolveModelRoute(
 	model: string,
@@ -119,8 +117,7 @@ export function resolveModelRoute(
 				c.models.some(
 					(m) =>
 						m.slug === parsed.upstreamModel &&
-						visible(c, m) &&
-						supportsModelSettings(m, settings.reasoningEffort, serviceTier),
+						isRouteModelEligible(c, m, settings.reasoningEffort, serviceTier),
 				),
 		)
 		.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
@@ -131,7 +128,7 @@ export function buildVisibleModelUnion(catalogs: RouteCatalog[]): RouteModel[] {
     const sources = new Map<string, RouteModel[]>();
 	for (const catalog of [...catalogs].sort((a, b) => a.priority - b.priority)) {
 		for (const model of catalog.models) {
-			if (!visible(catalog, model)) continue;
+			if (!isRouteModelEligible(catalog, model)) continue;
 			const prefix = catalog.kind === "oauth" ? "" : `${catalog.kind}/`;
 			const name = `${catalog.kind === "oauth" ? "" : `${catalog.kind.toUpperCase()} · `}${typeof model.display_name === "string" ? model.display_name : model.slug}`;
 			const slug = prefix + model.slug;

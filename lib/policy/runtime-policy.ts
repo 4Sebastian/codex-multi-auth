@@ -1,11 +1,15 @@
+import { captureAuthorityRevision } from "../storage/authority-revision.js";
+import { dirname, join, resolve } from "node:path";
 import type { CapabilityPolicyStore } from "../capability-policy.js";
 import { resolveEntitlementAccountKey } from "../entitlement-cache.js";
 import {
 	getAccountPolicyKey,
+	getAccountPolicyPath,
 	type AccountPolicyStore,
 } from "../account-policy.js";
 import {
 	evaluateBudgetGuard,
+	getBudgetGuardPath,
 	getBudgetWindowStart,
 	normalizeBudgetKey,
 	type BudgetGuardEvaluation,
@@ -13,7 +17,7 @@ import {
 	type BudgetLimit,
 	type BudgetWindow,
 } from "../budget-guard.js";
-import type { ProjectRoutingProfileContext } from "../routing-profiles.js";
+import { getRoutingProfilesPath, type ProjectRoutingProfileContext } from "../routing-profiles.js";
 import {
 	loadAccountPolicyStoreCached,
 	loadBudgetGuardStoreCached,
@@ -21,6 +25,7 @@ import {
 } from "./runtime-policy-cache.js";
 import {
 	appendUsageLedgerRow,
+	getUsageLedgerPaths,
 	readUsageLedgerRows,
 	summarizeUsageRows,
 	type UsageLedgerAppendInput,
@@ -87,6 +92,21 @@ export interface RuntimeUsageRecordInput {
 	 * standard rate.
 	 */
 	serviceTier?: UsageServiceTier;
+}
+
+export function captureRuntimePolicyRevision(startDir = process.cwd()): (includeUsage?: boolean) => boolean {
+	const ledger = getUsageLedgerPaths();
+	const usageCurrent = captureAuthorityRevision([ledger.current, ledger.dir]);
+	const paths = [getAccountPolicyPath(), getBudgetGuardPath(), getRoutingProfilesPath()];
+	let directory = resolve(startDir);
+	for (let depth = 0; depth < 64; depth++) {
+		paths.push(directory, join(directory, ".git"));
+		const parent = dirname(directory);
+		if (parent === directory) break;
+		directory = parent;
+	}
+	const policyCurrent = captureAuthorityRevision(paths);
+	return (includeUsage = false) => policyCurrent() && (!includeUsage || usageCurrent());
 }
 
 export async function loadRuntimePolicyState(

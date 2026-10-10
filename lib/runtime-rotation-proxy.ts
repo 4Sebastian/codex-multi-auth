@@ -3,7 +3,8 @@ import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscripti
 import { ClientCancellationError } from "./request/client-cancellation.js";
 import { getCircuitBreaker, type CircuitAdmissionReceipt } from "./circuit-breaker.js";
 import { createNativeAccountStorageReader } from "./runtime/native-account-storage.js";
-import { PendingAuthObservationError } from "./storage/pending-auth.js";
+import { captureAuthorityRevision } from "./storage/authority-revision.js";
+import { PendingAuthObservationError, getPendingAuthPath } from "./storage/pending-auth.js";
 import { resetSnapshotQuota } from "./runtime/reset-credits.js";
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
 import { recoverResetQuota, applyConfirmedReset } from "./runtime/reset-credit-routing.js";
@@ -18,9 +19,9 @@ import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway, type DispatchAuthorization } from "./runtime/responses-websocket.js";
 import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
 import { saveModelInventory } from "./runtime/model-discovery-status.js";
-import { loadApiRoutes, updateApiModelDiscovery } from "./api-route-store.js";
+import { loadApiRoutes, updateApiModelDiscovery, getApiRoutesPath } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
-import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, supportsModelSettings, type RouteModel } from "./model-route-policy.js";
+import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, isRouteModelEligible, type RouteModel } from "./model-route-policy.js";
 import { isSameNativeAccount, syncNativeAccountCredentials } from "./runtime/native-account-sync.js";
 import { resolveAccountRecordId } from "./storage/record-identity.js";
 import { isNativeClientToken } from "./runtime/native-client-auth.js";
@@ -83,6 +84,7 @@ import {
 	createRuntimeUsageRecorder,
 	evaluateRuntimePolicy,
 	loadRuntimePolicyState,
+	captureRuntimePolicyRevision,
 	type RuntimePolicyDecision,
 	type RuntimeUsageRecorder,
 } from "./policy/runtime-policy.js";
@@ -1132,6 +1134,13 @@ function captureDispatchBinding(accountManager: AccountManager, account: Managed
 	return {accountManager, account, recordId: account.recordId, refreshToken: account.refreshToken, accessToken, expiresAt: account.expires, accountId};
 }
 
+function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDispatchBinding): boolean {
+	const {accountManager, account} = binding;
+	return state.activeAccountManager === accountManager && accountManager.getAccountByIndex(account.index) === account &&
+		account.recordId === binding.recordId && account.access === binding.accessToken && account.refreshToken === binding.refreshToken &&
+		account.expires === binding.expiresAt && workspaceModelScopes(account).some(scope => scope.accountId === binding.accountId && scope.routable);
+}
+
 interface PreparedWebSocketAccount extends AccountDispatchBinding {
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
@@ -1146,11 +1155,8 @@ interface PreparedWebSocketRequest {
 	usageRecorder: RuntimeUsageRecorder;
 }
 
-interface ActiveWebSocketRequest {
-	accessToken: string | undefined;
+interface ActiveWebSocketRequest extends AccountDispatchBinding {
 	request: PreparedWebSocketRequest;
-	accountManager: AccountManager;
-	account: ManagedAccount;
 	frame: PendingWebSocketFrame;
 	sawUpstreamEvent: boolean;
 }
@@ -1438,11 +1444,15 @@ async function validateAccountDispatch(
 	allowNativeGrace?: () => Promise<boolean>,
 ): Promise<string | null> {
 	const {accountManager, account} = binding;
+	const policyCurrent = captureRuntimePolicyRevision();
+	const path = accountManager.resolveSelectionStoragePath();
+	const authorityCurrent = captureAuthorityRevision([path, getPendingAuthPath(path)]);
 	if (accountManager.getAccountByIndex(account.index) !== account) throw createRuntimeProxyHttpError("Account membership changed.", 503, "routing_configuration_changed");
 	const policy = await currentDispatchPolicy(state, context, accountManager);
-	if (state.nativeOpenai && state.readNativeAccountStorage) {
-		const snapshot = await state.readNativeAccountStorage();
-		const storage = snapshot.verified || (snapshot.routingAvailable === true && await allowNativeGrace?.()) ? snapshot.storage : null;
+	const snapshot = state.nativeOpenai && state.readNativeAccountStorage
+		? await state.readNativeAccountStorage() : await accountManager.readDispatchAccountStorage();
+	if (snapshot) {
+		const storage = snapshot.verified || (state.nativeOpenai && snapshot.routingAvailable === true && await allowNativeGrace?.()) ? snapshot.storage : null;
 		if (!storage || state.activeAccountManager !== accountManager) throw createRuntimeProxyHttpError("Native authorization is unavailable.", 503, "routing_configuration_changed");
 		if (syncNativeAccountCredentials(accountManager, storage, snapshot.capturedAt)) {
 			state.modelCatalog = undefined;
@@ -1455,9 +1465,7 @@ async function validateAccountDispatch(
 	} catch {
 		throw createRuntimeProxyHttpError("Journal authorization is unavailable.", 503, "routing_configuration_changed");
 	}
-	if (account.recordId !== binding.recordId || account.access !== binding.accessToken || account.refreshToken !== binding.refreshToken ||
-		account.expires !== binding.expiresAt || (binding.expiresAt ?? 0) <= state.now() ||
-		!workspaceModelScopes(account).some(scope => scope.accountId === binding.accountId && scope.routable)) {
+	if (!authorityCurrent() || !policyCurrent(policy.budgetEvaluations.length > 0) || !isDispatchBindingCurrent(state, binding) || (binding.expiresAt ?? 0) <= state.now()) {
 		throw createRuntimeProxyHttpError("Request-bound authorization changed.", 503, "routing_configuration_changed");
 	}
 	if (policy.blockedAccountIndexes.has(account.index)) throw createRuntimeProxyHttpError("Runtime policy blocked the account.", 403, "policy_blocked");
@@ -1681,7 +1689,7 @@ function applyWebSocketTerminalAccountFailure(
 	}
 	if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 		accountManager.refundToken(account, context.family, context.model);
-		if (account.access !== active.accessToken) return;
+		if (!isDispatchBindingCurrent(state, active)) return;
 		accountManager.recordFailure(account, context.family, context.model);
 		if (terminal.tokenInvalidated) {
 			accountManager.markAuthInvalidated(account, "token_invalidated", undefined, active.accessToken);
@@ -1711,9 +1719,9 @@ function applyWebSocketTerminalAccountFailure(
 			terminal.errorMessage ?? "",
 		)
 	) {
+		if (!isDispatchBindingCurrent(state, active)) return;
 		accountManager.refundToken(account, context.family, context.model);
 		accountManager.recordFailure(account, context.family, context.model);
-		if (account.access !== active.accessToken) return;
 		accountManager.setAccountEnabled(account.index, false);
 		forgetAffinity();
 		accountManager.saveToDiskDebounced();
@@ -2516,7 +2524,7 @@ function bridgeWebSocketConnection(
 			if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(frame)) enqueueClientFrame(frame);
 			return;
 		}
-		activeRequests.push({accessToken: binding.accessToken, request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
+		activeRequests.push({...binding, request, frame, sawUpstreamEvent: false});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2942,7 +2950,7 @@ export async function startRuntimeRotationProxy(
 		readStorageMetaFromDisk().affinityGeneration;
 	const state = createRotationProxyState({
 		nativeOpenai: options.nativeOpenai === true,
-		readNativeAccountStorage: options.readNativeAccountStorage || !options.accountManager ? createNativeAccountStorageReader(options.readNativeAccountStorage) : undefined,
+		readNativeAccountStorage: options.readNativeAccountStorage || !options.accountManager ? createNativeAccountStorageReader(options.readNativeAccountStorage, activeAccountManager.resolveSelectionStoragePath()) : undefined,
 		readApiRoutes: options.readApiRoutes ?? loadApiRoutes,
 		readSubscriptionQuota: options.readSubscriptionQuota ?? (options.accountManager ? undefined : loadQuotaCache),
 		catalogAccount: options.catalogAccount,
@@ -3410,17 +3418,21 @@ async function handleRequestInner(
 				let attemptedCredentialIndex: number | undefined;
 				const authorize: DispatchAuthorization = async (input, init) => {
 					if (init.method !== "POST" || !new URL(String(input)).pathname.endsWith("/responses")) return;
-					await currentDispatchPolicy(state, context, state.activeAccountManager);
+					const policyCurrent = captureRuntimePolicyRevision();
+					const routesCurrent = captureAuthorityRevision([getApiRoutesPath()]);
+					const policy = await currentDispatchPolicy(state, context, state.activeAccountManager);
 					const credential = attemptedCredentialIndex === undefined ? undefined : apiRoutes[attemptedCredentialIndex];
 					const current = (await state.readApiRoutes?.())?.find(route => route.id === credential?.id);
 					const sent = parseRequestBody(Buffer.from(typeof init.body === "string" ? init.body : ""));
 					const model = sent?.model;
 					const effort = isRecord(sent?.reasoning) && typeof sent.reasoning.effort === "string" ? sent.reasoning.effort : undefined;
 					const tier = typeof sent?.service_tier === "string" ? sent.service_tier : undefined;
-					const advertised = apiRuntime.cachedCatalogs().find(catalog => catalog.id === credential?.id)?.models.find(item => item.slug === model);
+					const catalog = apiRuntime.cachedCatalogs().find(item => item.id === credential?.id);
+					const advertised = catalog?.models.find(item => item.slug === model);
 					if (!credential || !current?.enabled || current.apiKey !== credential.apiKey || current.kind !== credential.kind ||
 						new Headers(init.headers).get("authorization") !== `Bearer ${current.apiKey}` || typeof model !== "string" ||
-						!current.visibleModels.includes(model) || !advertised || !supportsModelSettings(advertised, effort, tier) ||
+						!policyCurrent(policy.budgetEvaluations.length > 0) || !routesCurrent() || !catalog || !advertised ||
+						!isRouteModelEligible({...catalog, enabled: current.enabled, kind: current.kind, visibleModels: current.visibleModels}, advertised, effort, tier) ||
 						!apiRuntime.supportsDispatch(current, model, effort, tier) ||
 						state.contextBudgetGuard.getAdvisory(context.stableSessionKey ?? "", state.now(), context.model).level === "hard") {
 						throw createRuntimeProxyHttpError("API dispatch eligibility changed.", 503, "routing_configuration_changed");
@@ -4525,6 +4537,12 @@ async function handleRequestInner(
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				const errorCode = extractErrorCodeFromBody(bodyText);
 				if (isWorkspaceDisabledError(upstream.status, errorCode, bodyText)) {
+					if (!isDispatchBindingCurrent(state, binding)) {
+						res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+						res.end(bodyText);
+						await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode, account: refreshed.account});
+						return;
+					}
      if(requestScope && refreshed.account.workspaces?.length) {
       if(accountManager.disableWorkspace(refreshed.account,requestScope.accountId)) accountManager.saveToDiskDebounced();
       pendingScopes?.shift();
@@ -4623,7 +4641,13 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				if (refreshed.account.access === refreshed.accessToken) accountManager.recordFailure(refreshed.account, context.family, context.model);
+				if (!isDispatchBindingCurrent(state, binding)) {
+					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+					res.end(isTokenInvalidationError(bodyText) ? buildTokenInvalidationBody(bodyText) : bodyText);
+					await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText), account: refreshed.account});
+					return;
+				}
+				accountManager.recordFailure(refreshed.account, context.family, context.model);
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
 					// cooldown prevents cascade invalidation: rapidly presenting each
