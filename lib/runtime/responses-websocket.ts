@@ -92,6 +92,7 @@ class SocketSession {
 		this.channels.clear();
 		this.owners.clear();
 		this.chains.clear();
+		this.httpOnly.clear();
 		this.bytes = 0;
 	}
 	remember(id: string, body: Json, output: unknown[], pool: string) {
@@ -135,7 +136,10 @@ class SocketSession {
 		// API/ZDR credentials are not ChatGPT workspaces: when their WebSocket
 		// handshake is refused, the turn (and the session) uses plain HTTP.
 		const apiCredential = !headers.has("chatgpt-account-id");
-		if (apiCredential && this.httpOnly.has(key)) return this.httpFetch(input, init);
+		if (apiCredential && this.httpOnly.delete(key)) {
+			this.httpOnly.add(key);
+			return this.httpFetch(input, init);
+		}
 		const body = bodyJson(init.body);
 		delete body.stream;
 		delete body.background;
@@ -250,6 +254,10 @@ class SocketSession {
 			);
 			if (rejected) {
 				if (!apiCredential) return rejected;
+				if (this.httpOnly.size >= 100) {
+					const oldest = this.httpOnly.values().next().value;
+					if (oldest !== undefined) this.httpOnly.delete(oldest);
+				}
 				this.httpOnly.add(key);
 				return this.httpFetch(input, init);
 			}

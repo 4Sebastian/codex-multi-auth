@@ -484,3 +484,82 @@ it("preserves the final sanitized setting rejection after trying every ZDR crede
  expect(await response.json()).toEqual({error:{code:"invalid_value",param:"reasoning.effort",message:"Upstream rejected the API request."}});
  expect(fetcher.mock.calls.filter(call=>call[1]?.method==="POST")).toHaveLength(2);
 });
+
+it("releases obsolete large catalogs and visibility during credential churn and removal", async () => {
+	const runtime = new ApiModelRuntime(async () => Response.json({
+		data: Array.from({length: 1024}, (_, i) => ({id: `fixture-${i}`})),
+	}));
+	for (let i = 0; i < 110; i++) {
+		const route = {...credential("fixture"), apiKey: `replacement-${i}`, visibleModels: ["fixture-0"]};
+		const [catalog] = await runtime.catalogs([route]);
+		expect(catalog?.models).toHaveLength(1024);
+		expect(runtime.cachedCatalogs()).toHaveLength(1);
+		for (const state of Object.values(runtime)) {
+			if (state instanceof Map) expect(state.size).toBeLessThanOrEqual(1);
+		}
+	}
+	await runtime.catalogs([]);
+	expect(runtime.cachedCatalogs()).toEqual([]);
+	expect(runtime.statuses([credential("fixture")])[0]?.availableModels).toEqual([]);
+	for (const state of Object.values(runtime)) {
+		if (state instanceof Map) expect(state.size).toBe(0);
+	}
+});
+
+it.each(["fetch", "discovery", "enrichment"])("keeps a retired caller's result without republishing after delayed %s", async phase => {
+	let release!: () => void;
+	let entered!: () => void;
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const started = new Promise<void>(resolve => {entered = resolve;});
+	const old = {...credential("fixture"), apiKey: "old", visibleModels: ["old-0"]};
+	const current = {...old, apiKey: "current", visibleModels: ["current-0"]};
+	const wait = async (stage: string, key: string) => {
+		if (phase === stage && key === old.apiKey) {entered(); await gate;}
+	};
+	const runtime = new ApiModelRuntime(
+		async (_url, init) => {
+			const key = new Headers(init?.headers).get("authorization")?.replace("Bearer ", "") ?? "";
+			await wait("fetch", key);
+			return Response.json({data: Array.from({length: 1024}, (_, i) => ({id: `${key}-${i}`}))});
+		},
+		Date.now,
+		async route => {await wait("discovery", route.apiKey); return route;},
+		async (models, _refresh, route) => {
+			await wait("enrichment", route.apiKey);
+			return models.map(model => ({...model, description: `Completed ${route.apiKey}`}));
+		},
+	);
+	const pending = runtime.catalogs([old]);
+	await started;
+	try {
+		await runtime.catalogs([]);
+		await runtime.catalogs([current]);
+	} finally {release();}
+	const [retired] = await pending;
+	expect(retired?.models).toHaveLength(1024);
+	expect(retired?.models[0]).toMatchObject({slug: "old-0", description: "Completed old"});
+	expect(retired?.visibleModels).toEqual(["old-0"]);
+	expect(runtime.cachedCatalogs()[0]?.models[0]).toMatchObject({slug: "current-0", description: "Completed current"});
+	expect(runtime.statuses([old])[0]?.availableModels).toEqual([]);
+	for (const state of Object.values(runtime)) {
+		if (state instanceof Map) expect(state.size).toBeLessThanOrEqual(1);
+	}
+});
+
+it("does not let a delayed fetch overwrite a newer catalog for the same credential", async () => {
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	let calls = 0;
+	const runtime = new ApiModelRuntime(async () => {
+		const first = ++calls === 1;
+		if (first) await gate;
+		return Response.json({data: [{id: first ? "old" : "current"}]});
+	});
+	const route = credential("fixture");
+	const pending = runtime.catalogs([route], true);
+	try {await runtime.catalogs([{...route, visibleModels: ["current"]}], true);}
+	finally {release();}
+	expect((await pending)[0]?.models[0]?.slug).toBe("old");
+	expect(runtime.cachedCatalogs()[0]?.models[0]?.slug).toBe("current");
+	expect(runtime.statuses([route])[0]?.visibleModels).toEqual(["current"]);
+});

@@ -460,7 +460,7 @@ async function customGateway(options: {
 		ws.once("open", () => resolve(101));
 		ws.once("error", reject);
 	});
-	return { connect, handshakeStatus, responses };
+	return { connect, handshakeStatus, responses, stats: gateway.stats };
 }
 
 function rejectingUpstream(status: number, headers: Record<string, string>, onPost?: (body: string) => void): Server {
@@ -604,11 +604,36 @@ it("falls back to HTTP for an API credential whose WebSocket handshake is refuse
 	expect(JSON.parse(posts[0]!)).toMatchObject({ model: "api/fixture", stream: true });
 });
 
+it.each(["api", "zdr"])("bounds refused %s credentials while retaining HTTP fallback for the current key", async kind => {
+	const posts: string[] = [];
+	const outboundHeaders = {authorization: "Bearer key-0"};
+	const g = await customGateway({upstream: rejectingUpstream(404, {}, body => posts.push(body)), outboundHeaders});
+	const ws = await g.connect();
+	for (let i = 0; i < 101; i++) {
+		outboundHeaders.authorization = `Bearer key-${i}`;
+		expect((await turn(ws, {model: `${kind}/fixture`, input: []})).at(-1)?.type).toBe("response.completed");
+	}
+	expect(g.stats.upstreamConnections).toBe(101);
+	await turn(ws, {model: `${kind}/fixture`, input: []});
+	expect(g.stats.upstreamConnections).toBe(101);
+	outboundHeaders.authorization = "Bearer key-0";
+	expect((await turn(ws, {model: `${kind}/fixture`, input: []})).at(-1)?.type).toBe("response.completed");
+	expect(g.stats.upstreamConnections).toBe(102);
+	outboundHeaders.authorization = "Bearer key-100";
+	await turn(ws, {model: `${kind}/fixture`, input: []});
+	expect(g.stats.upstreamConnections).toBe(102);
+	expect(posts).toHaveLength(104);
+	expect(g.stats.upstreamRequests).toBe(0);
+});
+
 it("does not fall back to HTTP for a ChatGPT workspace whose handshake is refused", async () => {
 	const posts: string[] = [];
 	const g = await customGateway({ upstream: rejectingUpstream(403, {}, (body) => posts.push(body)), outboundHeaders: { "chatgpt-account-id": "acc_fixture" } });
 	const ws = await g.connect();
-	expect((await turn(ws, { model: "shared", input: [] })).at(-1)).toMatchObject({ type: "error", status: 403 });
+	for (let i = 0; i < 2; i++) {
+		expect((await turn(ws, { model: "shared", input: [] })).at(-1)).toMatchObject({ type: "error", status: 403 });
+	}
+	expect(g.stats.upstreamConnections).toBe(2);
 	expect(posts).toHaveLength(0);
 });
 

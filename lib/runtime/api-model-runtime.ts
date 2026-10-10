@@ -103,17 +103,12 @@ export class ApiModelRuntime {
 	private readonly discoveryUpdates = new Map<string, Promise<ApiRouteCredential>>();
 	lastPersistenceError: string | null = null;
 	private readonly failures = new RuntimeCapabilityFailures(() => this.now());
-	private readonly visibility = new Map<string, string[]>();
-	private readonly snapshots = new Map<string, RouteCatalog>();
-	private activeKeys = new Set<string>();
 	cachedCatalogs(): RouteCatalog[] {
-		return [...this.snapshots]
-			.filter(([key]) => this.activeKeys.has(key))
-			.map(([, catalog]) => catalog);
+		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot] : []);
 	}
 	private readonly cache = new Map<
 		string,
-		{ at: number; models: RouteModel[]; error: boolean }
+		{ at: number; models: RouteModel[]; error: boolean; snapshot?: RouteCatalog }
 	>();
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
@@ -145,10 +140,30 @@ export class ApiModelRuntime {
 		waitForPersistence = true,
         requestKind?: "oauth" | "api" | "zdr",
 	): Promise<RouteCatalog[]> {
-		this.activeKeys = new Set(routes.map((route) => this.key(route)));
-		return mapWithConcurrency(requestKind ? routes.filter(route => route.kind === requestKind) : routes, 3, async (route) => {
-					const key = this.key(route),
-						cached = this.cache.get(key);
+		const activeKeys = new Set(routes.map(route => this.key(route)));
+		for (const entries of [this.cache, this.discoveryUpdates]) {
+			for (const key of entries.keys()) if (!activeKeys.has(key)) entries.delete(key);
+		}
+		const work = (requestKind ? routes.filter(route => route.kind === requestKind) : routes).map(route => {
+			const key = this.key(route);
+			const cached = this.cache.get(key);
+			const entry = {
+				at: cached?.at ?? 0,
+				models: cached?.models ?? [],
+				error: cached?.error ?? true,
+				snapshot: cached?.snapshot ? {...cached.snapshot} : undefined,
+			};
+			if (!this.cache.has(key) && this.cache.size >= 100) {
+				const oldest = this.cache.keys().next().value;
+				if (oldest !== undefined) {
+					this.cache.delete(oldest);
+					this.discoveryUpdates.delete(oldest);
+				}
+			}
+			this.cache.set(key, entry);
+			return {route, key, cached, entry};
+		});
+		return mapWithConcurrency(work, 3, async ({route, key, cached, entry}) => {
 					if (
 						route.enabled &&
 						(refresh ||
@@ -194,34 +209,38 @@ export class ApiModelRuntime {
 						} catch {
 							error = true;
 						}
-						if (this.cache.size >= 100)
-							this.cache.delete(this.cache.keys().next().value ?? "");
-						this.cache.set(key, { at: this.now(), models, error });
+						entry.at = this.now();
+						entry.models = models;
+						entry.error = error;
 					}
-					const entry = this.cache.get(key);
-					if (route.enabled && entry && !entry.error && this.updateDiscovery) {
+					if (route.enabled && !entry.error && this.updateDiscovery) {
 						let pending = this.discoveryUpdates.get(key);
 						if (!pending) {
 							pending = this.updateDiscovery(route, entry.models.map(m => m.slug));
-							this.discoveryUpdates.set(key, pending);
-							void pending.then(() => {this.lastPersistenceError = null;}, () => {this.lastPersistenceError = "api_catalog_persistence_failed";}).finally(() => {this.discoveryUpdates.delete(key);});
+							if (this.cache.get(key) === entry) this.discoveryUpdates.set(key, pending);
+							void pending.then(() => {
+								if (this.discoveryUpdates.get(key) === pending) this.lastPersistenceError = null;
+							}, () => {
+								if (this.discoveryUpdates.get(key) === pending) this.lastPersistenceError = "api_catalog_persistence_failed";
+							}).finally(() => {
+								if (this.discoveryUpdates.get(key) === pending) this.discoveryUpdates.delete(key);
+							});
 						}
 						if (waitForPersistence) {
 							try {route = await pending;} catch { /* Keep the explicit policy read for this request; discovery cannot expand it. */ }
 						}
 					}
 
-					this.visibility.set(key, route.visibleModels);
 					const snapshot: RouteCatalog = {
 						id: route.id,
 						kind: route.kind,
 						enabled: route.enabled,
 						priority: route.priority,
-						models: (entry?.models ?? []).map(model => withAccessPrograms(model, route)),
+						models: entry.models.map(model => withAccessPrograms(model, route)),
 						visibleModels: route.visibleModels,
 					};
-					this.snapshots.set(key, snapshot);
-					if (route.enabled && entry && !entry.error && this.enrichModels && (!requestKind || !cached || cached.error)) {
+					entry.snapshot = snapshot;
+					if (route.enabled && !entry.error && this.enrichModels && (!requestKind || !cached || cached.error)) {
 						const pending = this.enrichModels(
 							entry.models.filter((m) => route.visibleModels.includes(m.slug)),
 							refresh,
@@ -231,12 +250,7 @@ export class ApiModelRuntime {
 							const byId = new Map(enriched.map((m) => [m.slug, m]));
 							snapshot.models = entry.models.map((m) => withAccessPrograms(byId.get(m.slug) ?? m, route));
 							// The caller receives its own completed result; only the newest refresh may replace the shared cache.
-							if (
-								this.cache.get(key) !== entry ||
-								this.snapshots.get(key) !== snapshot ||
-								!this.activeKeys.has(key)
-							)
-								return;
+							if (this.cache.get(key) !== entry) return;
 							entry.models = snapshot.models;
 							this.onCatalogUpdated?.();
 						});
@@ -262,13 +276,13 @@ export class ApiModelRuntime {
 				availableModels: c?.models.map((m) => m.slug) ?? [],
 				entitlements: (c?.models ?? [])
 					.filter((m) =>
-						(this.visibility.get(this.key(r)) ?? r.visibleModels).includes(
+						(c?.snapshot?.visibleModels ?? r.visibleModels).includes(
 							m.slug,
 						),
 					)
 					.map(model => modelEntitlements(withAccessPrograms(model, r))),
 				visibleModels: (
-					this.visibility.get(this.key(r)) ?? r.visibleModels
+					c?.snapshot?.visibleModels ?? r.visibleModels
 				).filter((id) => c?.models.some((m) => m.slug === id)),
 			};
 		});
