@@ -122,6 +122,7 @@ export async function recordPendingAuth(
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const prior = hash(auth.priorRefreshToken);
 		const existing = await read(path);
+		const authorities = existing.filter(entry => entry.committed).map(entry => ({...entry}));
 		const recorded = existing.find(entry => entry.prior === prior);
 		// Pruning can remove intermediate aliases, not this predecessor's authoritative mapping.
 		const credential = recorded && !isNewerCredential(auth, recorded) ? recorded : auth;
@@ -153,11 +154,18 @@ export async function recordPendingAuth(
 		}
 		const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
 		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
-		replacement.committed = recorded?.committed && replacement.recordId === recorded.recordId &&
-			replacement.refreshToken === recorded.refreshToken && replacement.accessToken === recorded.accessToken && replacement.expiresAt === recorded.expiresAt &&
-			replacement.authInvalidatedAt === recorded.authInvalidatedAt && replacement.authInvalidationErrorCode === recorded.authInvalidationErrorCode &&
-			(replacement.enabled === false) === (recorded.enabled === false) ? true : undefined;
-		for (const entry of aliases) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
+		const identities = new Set(aliases.map(entry => entry.recordId).filter(id => id !== undefined));
+		if (identities.size === 1) replacement.recordId ??= identities.values().next().value;
+		const committedFor = (candidate: Omit<PendingAuth, "prior">): PendingAuth["committed"] => authorities.some(authority =>
+			(auth.recordId === undefined || auth.recordId === authority.recordId) && candidate.recordId === authority.recordId &&
+			candidate.refreshToken === authority.refreshToken && candidate.accessToken === authority.accessToken && candidate.expiresAt === authority.expiresAt &&
+			candidate.authInvalidatedAt === authority.authInvalidatedAt && candidate.authInvalidationErrorCode === authority.authInvalidationErrorCode &&
+			(candidate.enabled === false) === (authority.enabled === false)) ? true : undefined;
+		replacement.committed = committedFor(replacement);
+		for (const entry of aliases) {
+			const updated = {...replacement, recordId: entry.recordId ?? replacement.recordId};
+			Object.assign(entry, {...updated, committed: committedFor(updated)});
+		}
 		const current: PendingAuth = {prior, ...replacement};
 		entries.push(current);
 		const excess = entries.length - MAX_ENTRIES;

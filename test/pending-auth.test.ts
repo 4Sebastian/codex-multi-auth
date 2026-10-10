@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -441,6 +442,133 @@ it.each(["revocation", "auth-cooldown", "disablement"])("retains committed autho
 	expect(recovered?.authInvalidatedAt).toBeUndefined();
 	expect(recovered?.cooldownReason).toBeUndefined();
 	expect(recovered?.enabled === false).toBe(mode === "disablement");
+});
+
+async function committedPrunedLineage(restriction: "disablement" | "revocation" | "auth-cooldown", legacy = false) {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	const original: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{
+		recordId: "first", refreshToken: "a", accessToken: "access-a", expiresAt: 10000, addedAt: 1, lastUsed: 1,
+		...(restriction === "disablement" ? {enabled: false} : {}),
+		...(restriction === "revocation" ? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"} : {}),
+		...(restriction === "auth-cooldown" ? {cooldownReason: "auth-failure", coolingDownUntil: Date.now() + 60000} : {}),
+	}]};
+	await saveAccounts(original);
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first"});
+	const auth = {...rotation("b", "c"), ...(legacy ? {} : {recordId: "first"})};
+	await recordPendingAuth(storagePath, {...auth, ...(restriction === "disablement" ? {enabled: false} : {})});
+	const current = await loadAccounts();
+	const account = current?.accounts[0];
+	if (!current || !account) throw Error("Fixture account missing");
+	account.enabled = true;
+	delete account.authInvalidatedAt;
+	delete account.authInvalidationErrorCode;
+	delete account.cooldownReason;
+	delete account.coolingDownUntil;
+	await saveAccounts(current);
+	const {capturePendingAuth} = await import("../lib/storage/pending-auth.js");
+	const before = await capturePendingAuth(storagePath, current.accounts);
+	expect(before.entries).toHaveLength(1);
+	expect(before.entries[0]).toMatchObject({recordId: "first", refreshToken: "c", committed: true});
+	expect((await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "b", addedAt: 1, lastUsed: 1}]}))?.accounts[0]?.refreshToken).toBe("b");
+	return {auth, current, original, loadAccounts, capturePendingAuth};
+}
+
+it.each(["disablement", "revocation", "auth-cooldown"] as const)("preserves committed authority after delayed rescue of a pruned predecessor (%s)", async restriction => {
+	const {auth, loadAccounts, capturePendingAuth} = await committedPrunedLineage(restriction);
+	const retained = await recordPendingAuth(storagePath, {...auth, at: 9000});
+	expect(retained).toMatchObject({recordId: "first", refreshToken: "c", accessToken: "access-c", committed: true});
+	const journal = await capturePendingAuth(storagePath, []);
+	expect(journal.entries).toHaveLength(2);
+	for (const entry of journal.entries) expect(entry.committed).toBe(true);
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	const restored = (await loadAccounts())?.accounts[0];
+	expect(restored).toMatchObject({recordId: "first", refreshToken: "c", accessToken: "access-c"});
+	expect(restored?.enabled).not.toBe(false);
+	expect(restored?.authInvalidatedAt).toBeUndefined();
+	expect(restored?.cooldownReason).toBeUndefined();
+});
+
+it("preserves alias identity for a delayed legacy rescue of a pruned predecessor", async () => {
+	const {auth, capturePendingAuth, loadAccounts} = await committedPrunedLineage("disablement", true);
+	const retained = await recordPendingAuth(storagePath, auth);
+	expect(retained).toMatchObject({recordId: "first", committed: true});
+	for (const entry of (await capturePendingAuth(storagePath, [])).entries) {
+		expect(entry).toMatchObject({recordId: "first", committed: true});
+	}
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	expect((await loadAccounts())?.accounts[0]?.enabled).not.toBe(false);
+});
+
+it.each(["identity", "refresh", "access", "expiry", "disablement", "revocation"])("invalidates incompatible committed aliases for a changed %s", async change => {
+	const {auth, capturePendingAuth} = await committedPrunedLineage("disablement");
+	const incoming = {...auth, at: 9000,
+		...(change === "identity" ? {recordId: "different"} : {}),
+		...(change === "refresh" ? {refreshToken: "d", accessToken: "access-d"} : {}),
+		...(change === "access" ? {accessToken: "access-new"} : {}),
+		...(change === "expiry" ? {expiresAt: 20000} : {}),
+		...(change === "disablement" ? {enabled: false as const} : {}),
+		...(change === "revocation" ? {authInvalidatedAt: 2500, authInvalidationErrorCode: "token_invalidated"} : {}),
+		committed: true,
+	};
+	const retained = await recordPendingAuth(storagePath, incoming);
+	expect(retained.committed).toBeUndefined();
+	for (const entry of (await capturePendingAuth(storagePath, [])).entries) {
+		expect(entry.committed).toBe(change === "refresh" && entry.refreshToken === "c" ? true : undefined);
+		if (entry.recordId !== "different") expect(entry.recordId).toBe("first");
+	}
+});
+
+it("keeps current primary and native restrictions after a committed pruned-predecessor rescue", async () => {
+	const {auth, current, loadAccounts} = await committedPrunedLineage("disablement");
+	expect((await recordPendingAuth(storagePath, auth)).committed).toBe(true);
+	Object.assign(current.accounts[0]!, {enabled: false, authInvalidatedAt: 5000, authInvalidationErrorCode: "token_invalidated"});
+	await fs.writeFile(storagePath, JSON.stringify(current));
+	expect((await loadAccounts())?.accounts[0]).toMatchObject({enabled: false, authInvalidatedAt: 5000});
+	const {createNativeAccountStorageReader} = await import("../lib/runtime/native-account-storage.js");
+	expect((await createNativeAccountStorageReader(undefined, storagePath)()).storage?.accounts[0]).toMatchObject({enabled: false, authInvalidatedAt: 5000});
+});
+
+it("recovers committed pruned-predecessor authority through a real WAL", async () => {
+	const {auth, original, loadAccounts} = await committedPrunedLineage("disablement");
+	expect((await recordPendingAuth(storagePath, auth)).committed).toBe(true);
+	const content = JSON.stringify(original);
+	await fs.writeFile(`${storagePath}.wal`, JSON.stringify({version: 1, createdAt: Date.now(), path: storagePath,
+		checksum: createHash("sha256").update(content).digest("hex"), content}));
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	const restored = (await loadAccounts())?.accounts[0];
+	expect(restored).toMatchObject({recordId: "first", refreshToken: "c", accessToken: "access-c"});
+	expect(restored?.enabled).not.toBe(false);
+	expect(JSON.parse(await fs.readFile(storagePath, "utf8")).accounts[0].enabled).not.toBe(false);
+});
+
+it("does not derive new credential authority from a committed alias mutated during chaining", async () => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "a", addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first"});
+	await saveAccounts((await loadAccounts())!);
+	const {capturePendingAuth} = await import("../lib/storage/pending-auth.js");
+	expect((await capturePendingAuth(storagePath, [])).entries[0]?.committed).toBe(true);
+	const retained = await recordPendingAuth(storagePath, {...rotation("b", "c"), recordId: "first"});
+	expect(retained.committed).toBeUndefined();
+	for (const entry of (await capturePendingAuth(storagePath, [])).entries) {
+		expect(entry.refreshToken).toBe("c");
+		expect(entry.committed).toBeUndefined();
+	}
+});
+
+it("keeps alias-local identity instead of sharing another record's committed authority", async () => {
+	const {auth, capturePendingAuth} = await committedPrunedLineage("disablement");
+	const journal = await capturePendingAuth(storagePath, []);
+	const authority = journal.entries[0];
+	if (!authority) throw Error("Fixture authority missing");
+	await fs.writeFile(getPendingAuthPath(storagePath), JSON.stringify({version: 1, entries: [authority,
+		{...authority, prior: createHash("sha256").update("other").digest("hex"), recordId: "other-record", committed: undefined}]}));
+	expect((await recordPendingAuth(storagePath, auth)).committed).toBe(true);
+	const aliases = (await capturePendingAuth(storagePath, [])).entries;
+	expect(aliases.find(entry => entry.recordId === "other-record")?.committed).toBeUndefined();
+	expect(aliases.filter(entry => entry.recordId === "first").every(entry => entry.committed)).toBe(true);
 });
 
 it("never trusts an incoming rescue claim of committed authority", async () => {
