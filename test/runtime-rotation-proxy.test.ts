@@ -7358,6 +7358,10 @@ describe("review transport boundary regressions", () => {
 			expect(account.rateLimitResetTimes["codex:unrelated"]).toBeGreaterThan(Date.now());
 			delete disk.accounts[0]!.authInvalidatedAt;
 			delete disk.accounts[0]!.authInvalidationErrorCode;
+			// Explicit successful recovery clears its auth cooldown, not unrelated quota.
+			delete disk.accounts[0]!.coolingDownUntil;
+			delete disk.accounts[0]!.cooldownReason;
+			expect(disk.accounts[0]!.rateLimitResetTimes?.["codex:unrelated"]).toBeGreaterThan(Date.now());
 			const recovered = await fetch(`${proxy.baseUrl}/models?client_version=1.0.0&refresh_capabilities=1`, {headers: {authorization: `Bearer ${bearer ? "access-1" : DEFAULT_CLIENT_API_KEY}`}});
 			expect(recovered.status).toBe(200);
 			expect((await recovered.json()).models).toEqual(expect.arrayContaining([expect.objectContaining({slug: "first-only"})]));

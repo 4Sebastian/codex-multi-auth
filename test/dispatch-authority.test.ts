@@ -22,7 +22,7 @@ import {getRoutingProfilesPath} from "../lib/routing-profiles.js";
 import {resetRuntimePolicyCacheForTests} from "../lib/policy/runtime-policy-cache.js";
 import {ApiModelRuntime} from "../lib/runtime/api-model-runtime.js";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
-import {appendUsageLedgerRow} from "../lib/usage/index.js";
+import {appendUsageLedgerRow, readUsageLedgerRows} from "../lib/usage/index.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -572,6 +572,48 @@ it("denies a closed-admitted request while another request owns the half-open ep
 	const accepted = await b; await accepted.text();
 	expect(accepted.status).toBe(200);
 	expect(f.fetched).toEqual(["Bearer A"]);
+});
+
+it.each(["http", "custom", "native"])("keeps an already-sent completion out of another half-open epoch (%s)", async transport => {
+	const f = await fixture(transport === "native");
+	const aEntered = deferred(), aRelease = deferred(), bEntered = deferred(), bRelease = deferred();
+	cleanups.push(async () => {aRelease.resolve(); bRelease.resolve();});
+	let sends = 0;
+	const complete = (id: string) => ({type: "response.completed", response: {id, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	if (transport === "http") f.setPostResponse(async () => {
+		const first = ++sends === 1, entered = first ? aEntered : bEntered, release = first ? aRelease : bRelease;
+		return new Response(new ReadableStream({start(controller) {
+			entered.resolve();
+			void release.promise.then(() => {
+				controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(complete(first ? "A" : "B"))}\n\n`));
+				controller.close();
+			});
+		}}), {headers: {"content-type": "text/event-stream"}});
+	});
+	else f.setReply(ws => {const first = ++sends === 1; (first ? aEntered : bEntered).resolve(); void (first ? aRelease : bRelease).promise.then(() => ws.send(JSON.stringify(complete(first ? "A" : "B"))));});
+	const rowsBefore = (await readUsageLedgerRows()).length;
+	const post = () => f.post().then(async response => {const body = await response.text(); expect(response.status, body).toBe(200);});
+	const a = transport === "http" ? post() : turn(await f.connect());
+	await aEntered.promise;
+	const account = f.manager.getAccountByIndex(0)!, breaker = getCircuitBreaker(account.circuitKeyId!);
+	for (let i = 0; i < 3; i++) breaker.recordFailure();
+	const now = Date.now(); vi.spyOn(Date, "now").mockReturnValue(now + 30001);
+	const b = transport === "http" ? post() : turn(await f.connect());
+	void b.catch(() => undefined);
+	await bEntered.promise;
+	expect(breaker.getState()).toBe("half-open");
+	aRelease.resolve(); await a;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).length).toBe(rowsBefore + 1));
+	expect(breaker.getState()).toBe("half-open");
+	expect(breaker.isAvailable()).toBe(false);
+	bRelease.resolve(); await b;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).length).toBe(rowsBefore + 2));
+	expect(breaker.getState()).toBe("closed");
+	const rows = (await readUsageLedgerRows()).slice(rowsBefore);
+	expect(rows.map(row => ({outcome: row.outcome, input: row.tokens.inputTokens, output: row.tokens.outputTokens, total: row.tokens.totalTokens}))).toEqual([
+		{outcome: "success", input: 17, output: 4, total: 21}, {outcome: "success", input: 17, output: 4, total: 21},
+	]);
+	expect(sends).toBe(2);
 });
 
 it("does not dispatch discovery for a deleted or foreign manager member", async () => {

@@ -1149,7 +1149,10 @@ export class AccountManager {
 		account: ManagedAccount,
 		family: ModelFamily,
 		model?: string | null,
+		admission?: CircuitAdmissionReceipt,
 	): void {
+		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
+		if (admission && !breaker.isAdmissionCurrent(admission)) return;
 		const quotaKey = model ? `${family}:${model}` : family;
 		const healthTracker = getHealthTracker();
 		healthTracker.recordSuccess(getRuntimeTrackerKey(account), quotaKey);
@@ -1173,7 +1176,7 @@ export class AccountManager {
 		if (healed) {
 			this.saveToDiskDebounced();
 		}
-		getCircuitBreaker(getAccountCircuitKey(account)).recordSuccess();
+		breaker.recordSuccess(admission);
 	}
 
 	recordRateLimit(
@@ -1190,11 +1193,14 @@ export class AccountManager {
 		account: ManagedAccount,
 		family: ModelFamily,
 		model?: string | null,
+		admission?: CircuitAdmissionReceipt,
 	): void {
+		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
+		if (admission && !breaker.isAdmissionCurrent(admission)) return;
 		const quotaKey = model ? `${family}:${model}` : family;
 		const healthTracker = getHealthTracker();
 		healthTracker.recordFailure(getRuntimeTrackerKey(account), quotaKey);
-		getCircuitBreaker(getAccountCircuitKey(account)).recordFailure();
+		breaker.recordFailure(admission);
 	}
 
 	/**

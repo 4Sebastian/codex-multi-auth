@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CircuitBreaker,
+  type CircuitAdmissionReceipt,
   CircuitOpenError,
   DEFAULT_CIRCUIT_BREAKER_CONFIG,
   getCircuitBreaker,
@@ -99,6 +100,26 @@ describe("Circuit breaker", () => {
     breaker.canExecute();
     breaker.recordFailure();
     expect(breaker.getState()).toBe("open");
+  });
+
+  it.each(["success", "failure"])("ignores stale %s receipts without settling a replacement half-open probe", outcome => {
+    const breaker = new CircuitBreaker({failureThreshold: 1});
+    let a: CircuitAdmissionReceipt | undefined, b: CircuitAdmissionReceipt | undefined;
+    breaker.recordFailure();
+    vi.setSystemTime(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1);
+    expect(breaker.tryCanExecute(receipt => {a = receipt;})).toEqual({ok: true});
+    vi.setSystemTime(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs * 2 + 2);
+    expect(breaker.tryCanExecute(receipt => {b = receipt;})).toEqual({ok: true});
+    expect(a).toBeDefined(); expect(b).toBeDefined();
+    if (!a || !b) throw new Error("Expected admitted probes");
+    if (outcome === "success") breaker.recordSuccess(a); else breaker.recordFailure(a);
+    expect(breaker.getState()).toBe("half-open");
+    expect(breaker.isAdmissionCurrent(b)).toBe(true);
+    expect(breaker.tryCanExecute().ok).toBe(false);
+    breaker.recordSuccess(b);
+    expect(breaker.getState()).toBe("closed");
+    breaker.recordFailure(b);
+    expect(breaker.getFailureCount()).toBe(0);
   });
 
   it("reset returns to closed and clears failures", () => {
