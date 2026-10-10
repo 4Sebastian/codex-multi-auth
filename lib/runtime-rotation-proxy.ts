@@ -1141,6 +1141,14 @@ function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDis
 		account.expires === binding.expiresAt && workspaceModelScopes(account).some(scope => scope.accountId === binding.accountId && scope.routable);
 }
 
+async function applyDispatchRestriction(state: RotationProxyState, binding: AccountDispatchBinding, mutate: () => void): Promise<boolean> {
+	return binding.accountManager.withCurrentAccountCredential(binding.account, binding, () => {
+		if (!isDispatchBindingCurrent(state, binding)) return false;
+		mutate();
+		return true;
+	});
+}
+
 interface PreparedWebSocketAccount extends AccountDispatchBinding {
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
@@ -1647,11 +1655,11 @@ function applyWebSocketTransportAccountFailure(
 	accountManager.saveToDiskDebounced();
 }
 
-function applyWebSocketTerminalAccountFailure(
+async function applyWebSocketTerminalAccountFailure(
 	state: RotationProxyState,
 	active: ActiveWebSocketRequest,
 	terminal: WebSocketTerminalEvent,
-): void {
+): Promise<void> {
 	if (terminal.record.outcome !== "failure") return;
 	const statusCode = terminal.record.statusCode;
 	if (typeof statusCode !== "number") return;
@@ -1689,26 +1697,16 @@ function applyWebSocketTerminalAccountFailure(
 	}
 	if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 		accountManager.refundToken(account, context.family, context.model);
-		if (!isDispatchBindingCurrent(state, active)) return;
-		accountManager.recordFailure(account, context.family, context.model);
-		if (terminal.tokenInvalidated) {
-			accountManager.markAuthInvalidated(account, "token_invalidated", undefined, active.accessToken);
-			applyMonotonicAuthCooldown(
-				accountManager,
-				account,
-				state.tokenInvalidationCooldownMs,
-				active.accessToken,
-			);
-		} else {
-			applyMonotonicAuthCooldown(
-				accountManager,
-				account,
-				DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-				active.accessToken,
-			);
-		}
-		forgetAffinity();
-		accountManager.saveToDiskDebounced();
+		const applied = await applyDispatchRestriction(state, active, () => {
+			accountManager.recordFailure(account, context.family, context.model);
+			if (terminal.tokenInvalidated) {
+				accountManager.markAuthInvalidated(account, "token_invalidated", undefined, active.accessToken);
+				applyMonotonicAuthCooldown(accountManager, account, state.tokenInvalidationCooldownMs, active.accessToken);
+			} else {
+				applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, active.accessToken);
+			}
+		});
+		if (applied) forgetAffinity();
 		return;
 	}
 	if (
@@ -1719,12 +1717,12 @@ function applyWebSocketTerminalAccountFailure(
 			terminal.errorMessage ?? "",
 		)
 	) {
-		if (!isDispatchBindingCurrent(state, active)) return;
 		accountManager.refundToken(account, context.family, context.model);
-		accountManager.recordFailure(account, context.family, context.model);
-		accountManager.setAccountEnabled(account.index, false);
-		forgetAffinity();
-		accountManager.saveToDiskDebounced();
+		const applied = await applyDispatchRestriction(state, active, () => {
+			accountManager.recordFailure(account, context.family, context.model);
+			accountManager.setAccountEnabled(account.index, false);
+		});
+		if (applied) forgetAffinity();
 		return;
 	}
 	if (statusCode >= 500) {
@@ -2092,13 +2090,12 @@ async function prepareWebSocketAccount(
 		if (!accountId) {
 			lifecycle.onReleased(prepared);
 			refundPreparedWebSocketToken(prepared);
-			accountManager.recordFailure(refreshed.account, context.family, context.model);
-			accountManager.markAccountCoolingDown(
-				refreshed.account,
-				DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-				"auth-failure",
-			);
-			accountManager.saveToDiskDebounced();
+			await accountManager.withCurrentAccountCredential(refreshed.account, prepared, () => {
+				if (state.activeAccountManager !== accountManager) return false;
+				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+				return true;
+			});
 			skipReasons.set(refreshed.account.index, "auth-failure");
 			continue;
 		}
@@ -2208,20 +2205,13 @@ async function connectManagedWebSocket(
 			const bodyText = handshakeError?.bodyText ?? "";
 			state.sessionAffinityStore?.forgetSession(context.sessionKey);
 			if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
-				if (account.access === accessToken) accountManager.recordFailure(account, context.family, context.model);
-				if (isTokenInvalidationError(bodyText)) {
-					accountManager.markAuthInvalidated(
-						account,
-						"token_invalidated",
-						undefined, accessToken,
-					);
-					applyMonotonicAuthCooldown(
-						accountManager,
-						account,
-						state.tokenInvalidationCooldownMs,
-						accessToken,
-					);
-					if (account.access === accessToken) await accountManager.saveToDisk();
+				const invalidated = isTokenInvalidationError(bodyText);
+				await applyDispatchRestriction(state, prepared, () => {
+					accountManager.recordFailure(account, context.family, context.model);
+					if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, accessToken);
+					applyMonotonicAuthCooldown(accountManager, account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, accessToken);
+				});
+				if (invalidated) {
 					await request.usageRecorder.record({
 						outcome: "failure",
 						statusCode,
@@ -2234,12 +2224,6 @@ async function connectManagedWebSocket(
 						"token_invalidated",
 					);
 				}
-				applyMonotonicAuthCooldown(
-					accountManager,
-					account,
-					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-					accessToken,
-				);
 			} else if (statusCode === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const retryAfterMs =
 					(handshakeError
@@ -2668,7 +2652,7 @@ function bridgeWebSocketConnection(
 					const settled = activeRequests.shift();
 					if (settled) {
 						applyWebSocketTerminalAccountSuccess(state, settled, terminal);
-						applyWebSocketTerminalAccountFailure(state, settled, terminal);
+						const restriction = applyWebSocketTerminalAccountFailure(state, settled, terminal);
 						if (
 							settled.request.context.stableSessionKey &&
 							settled.request.context.model &&
@@ -2686,10 +2670,10 @@ function bridgeWebSocketConnection(
 							);
 						}
 						settlingTurn = true;
-						void settled.request.usageRecorder.record({
+						void restriction.then(() => settled.request.usageRecorder.record({
 							...terminal.record,
 							account: settled.account,
-						}).then(() => {
+						})).then(() => {
 							settlingTurn = false;
 							drainPending();
 						}).catch(rejectConnection);
@@ -3196,6 +3180,17 @@ async function handleRequestInner(
 			}
             }
 		}
+		if (!state.nativeOpenai && apiKeyClient) {
+			const snapshot = await accountManager.readDispatchAccountStorage();
+			accountManager = state.activeAccountManager;
+			if (snapshot) {
+				if (!snapshot.verified || !snapshot.storage) throw createRuntimeProxyHttpError("Account storage is unavailable.", 503, "routing_configuration_changed");
+				if (syncNativeAccountCredentials(accountManager, snapshot.storage, snapshot.capturedAt)) {
+					state.modelCatalog = undefined;
+					state.modelCatalogs?.clear();
+				}
+			}
+		}
 		// Decide against the synced manager, so a credential revoked or disabled on
 		// disk is refused even though it passed the screen above.
 		if (!apiKeyClient && !(managedStorageVerified && managedOAuthFor(accountManager)) && !(await nativeOAuth())) {
@@ -3661,7 +3656,8 @@ async function handleRequestInner(
 				const clientVersion = catalogClientVersion;
 				if (clientVersion && /^[0-9A-Za-z.+_-]{1,80}$/.test(clientVersion)) url.searchParams.set("client_version", clientVersion);
 				const binding = captureDispatchBinding(discoveryManager, fresh.account, fresh.accessToken, accountId);
-				await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
+				const rejection = await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
+				if (rejection) throw createRuntimeProxyHttpError("Catalog dispatch eligibility changed.", 503, "routing_configuration_changed");
 				const response = await state.fetchImpl(url.toString(), {					method: "GET", redirect: "error",
 					headers: createOutboundHeaders(new Headers(), fresh.account, fresh.accessToken, accountId),
 					signal: AbortSignal.timeout(Math.min(state.fetchTimeoutMs, 15_000))				});
@@ -4220,18 +4216,12 @@ async function handleRequestInner(
    const requestScope = pendingScopes?.[0];
    const accountId = requestScope?.accountId ?? resolveAccountId(refreshed.account, refreshed.accessToken);
 			if (!accountId) {
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
-					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-					"auth-failure",
-				);
-				// Persist the cooldown like every other cooldown branch in this loop
-				// (network-error, 429, server-error, 401). `coolingDownUntil`/
-				// `cooldownReason` are serialized in the V3 snapshot, so without this
-				// a restart inside the cooldown window loses it and immediately
-				// re-selects the still-broken account.
-				accountManager.saveToDiskDebounced();
+				await accountManager.withCurrentAccountCredential(refreshed.account, {recordId: refreshed.account.recordId, accessToken: refreshed.accessToken, refreshToken: refreshed.account.refreshToken}, () => {
+					if (state.activeAccountManager !== accountManager) return false;
+					accountManager.recordFailure(refreshed.account, context.family, context.model);
+					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+					return true;
+				});
 				exhaustionReason = "auth-failure";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -4537,31 +4527,30 @@ async function handleRequestInner(
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				const errorCode = extractErrorCodeFromBody(bodyText);
 				if (isWorkspaceDisabledError(upstream.status, errorCode, bodyText)) {
-					if (!isDispatchBindingCurrent(state, binding)) {
+					const restricted = await applyDispatchRestriction(state, binding, () => {
+						if (requestScope && refreshed.account.workspaces?.length) accountManager.disableWorkspace(refreshed.account, requestScope.accountId);
+						else {
+							accountManager.recordFailure(refreshed.account, context.family, context.model);
+							accountManager.setAccountEnabled(refreshed.account.index, false);
+						}
+					});
+					const alreadyRestricted = state.activeAccountManager === accountManager &&
+						accountManager.getAccountByIndex(refreshed.account.index) === refreshed.account &&
+						refreshed.account.recordId === binding.recordId && refreshed.account.access === binding.accessToken &&
+						refreshed.account.refreshToken === binding.refreshToken &&
+						(refreshed.account.enabled === false || refreshed.account.workspaces?.some(workspace => workspace.id === binding.accountId && workspace.enabled === false));
+					if (!restricted && !alreadyRestricted) {
 						res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
 						res.end(bodyText);
 						await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode, account: refreshed.account});
 						return;
 					}
      if(requestScope && refreshed.account.workspaces?.length) {
-      if(accountManager.disableWorkspace(refreshed.account,requestScope.accountId)) accountManager.saveToDiskDebounced();
       pendingScopes?.shift();
       if(pendingScopes?.length) attemptedIndexes.delete(refreshed.account.index);
       else policyDecision?.blockedAccountIndexes.add(refreshed.account.index);
       state.status.retries++;noteRotation();continue;
      }
-					const accountWasEnabled =
-						accountManager.getAccountByIndex(refreshed.account.index)?.enabled !==
-						false;
-					if (accountWasEnabled) {
-						accountManager.recordFailure(
-							refreshed.account,
-							context.family,
-							context.model,
-						);
-						accountManager.setAccountEnabled(refreshed.account.index, false);
-						accountManager.saveToDiskDebounced();
-					}
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					exhaustionReason = "deactivated";
 					capabilityRejectionIsLatest = false;
@@ -4641,35 +4630,25 @@ async function handleRequestInner(
 
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
-				if (!isDispatchBindingCurrent(state, binding)) {
+				const invalidated = isTokenInvalidationError(bodyText);
+				const restricted = await applyDispatchRestriction(state, binding, () => {
+					accountManager.recordFailure(refreshed.account, context.family, context.model);
+					if (invalidated) accountManager.markAuthInvalidated(refreshed.account, extractErrorCodeFromBody(bodyText) ?? "token_invalidated", undefined, refreshed.accessToken);
+					applyMonotonicAuthCooldown(accountManager, refreshed.account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+				});
+				if (!restricted) {
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
-					res.end(isTokenInvalidationError(bodyText) ? buildTokenInvalidationBody(bodyText) : bodyText);
+					res.end(invalidated ? buildTokenInvalidationBody(bodyText) : bodyText);
 					await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText), account: refreshed.account});
 					return;
 				}
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
-				if (isTokenInvalidationError(bodyText)) {
+				if (invalidated) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
 					// cooldown prevents cascade invalidation: rapidly presenting each
 					// account's token from the same IP triggers OpenAI's anti-abuse
 					// detection and invalidates them in sequence. Return the 401 directly
 					// rather than rotating so the client can prompt for re-login.
-					accountManager.markAuthInvalidated(
-						refreshed.account,
-						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
-						undefined, refreshed.accessToken,
-					);
-					applyMonotonicAuthCooldown(
-						accountManager,
-						refreshed.account,
-						state.tokenInvalidationCooldownMs,
-						refreshed.accessToken,
-					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					// The invalidation marker must be durable before returning the 401.
-					// A delayed save would allow a proxy restart to reload and route the
-					// revoked account again.
-					if (refreshed.account.access === refreshed.accessToken) await accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -4685,13 +4664,7 @@ async function handleRequestInner(
 					});
 					return;
 				}
-				applyMonotonicAuthCooldown(
-					accountManager,
-					refreshed.account,
-					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-					refreshed.accessToken,
-				);
-				accountManager.saveToDiskDebounced();
+
 				exhaustionReason = "auth-failure";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -4829,15 +4802,19 @@ async function handleRequestInner(
 			// and those caps never fire — `budget set --cost 50` would allow
 			// unlimited spend, with only --requests actually enforced.
 			const responseOutcome = new ResponseOutcome(isResponsesRequest && upstream.headers.get("content-type")?.includes("text/event-stream") === true);
+			let responseRestriction: Promise<boolean> | undefined;
 			const usageScanner = createUsageStreamScanner({
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (isResponsesTokenInvalidationEvent(event) && accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, refreshed.accessToken)) {
-						accountManager.recordFailure(refreshed.account, context.family, context.model);
-						applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs, refreshed.accessToken);
-						state.sessionAffinityStore?.forgetSession(context.sessionKey);
-						accountManager.saveToDiskDebounced();
+					if (isResponsesTokenInvalidationEvent(event)) {
+						responseRestriction ??= applyDispatchRestriction(state, binding, () => {
+							accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, refreshed.accessToken);
+							accountManager.recordFailure(refreshed.account, context.family, context.model);
+							applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs, refreshed.accessToken);
+							state.sessionAffinityStore?.forgetSession(context.sessionKey);
+						});
+						void responseRestriction.catch(() => undefined);
 					}
 					const snapshot = readSubscriptionQuotaEvent(event, state.now());
 					if (!snapshot) return;
@@ -4877,6 +4854,7 @@ async function handleRequestInner(
 				{...(budgetAdvisory.level === "soft" ? buildContextBudgetHeaders(budgetAdvisory) : {}),...(state.catalogEtag ? {"x-models-etag":state.catalogEtag} : {})},
 				() => {usageScanner.result();return responseOutcome.finish();},
 			);
+			await responseRestriction;
 			// The client went away mid-stream: no upstream error, and the response was
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;

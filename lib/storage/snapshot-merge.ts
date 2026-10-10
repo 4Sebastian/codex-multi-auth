@@ -73,6 +73,7 @@ export function mergeAccountCooldown(base: CooldownRow, disk: CooldownRow, local
     const keptAccessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
     const current = (row: CooldownRow): CooldownRow => row.cooldownReason === "auth-failure" && (row.refreshToken !== keptToken || row.accessToken !== keptAccessToken)
         ? { ...row, coolingDownUntil: undefined, cooldownReason: undefined } : row;
+    base = current(base);
     disk = current(disk);
     local = current(local);
     const cleared = base.coolingDownUntil !== undefined && (
@@ -92,9 +93,10 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
         if (value !== undefined) limits[key] = value;
     }
     const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
-    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken ? row.authInvalidatedAt : undefined;
+    const refreshToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
+    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && row.refreshToken === refreshToken ? row.authInvalidatedAt : undefined;
     const diskInvalidation = currentInvalidation(disk), localInvalidation = currentInvalidation(local);
-    const clearedInvalidation = base.authInvalidatedAt !== undefined && (
+    const clearedInvalidation = currentInvalidation(base) !== undefined && (
         (disk.accessToken === base.accessToken && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
         (local.accessToken === base.accessToken && local.authInvalidatedAt === undefined && disk.authInvalidatedAt === base.authInvalidatedAt));
     const invalidated = (diskInvalidation ?? 0) >= (localInvalidation ?? 0) ? disk : local;

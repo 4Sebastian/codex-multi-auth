@@ -597,6 +597,73 @@ it.each([401, 403].flatMap(status => [false, true].map(positiveFirst => ({status
 	for (const [, result] of reader.exportProbes()) expect(Object.values(result.status)).not.toContain("verified");
 });
 
+it("retains independent imported credential evidence after an attributed loss", async () => {
+	let revoked = false, posts = 0, now = 1000;
+	const other = {...route, id: "independent", apiKey: "independent-key"};
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		posts++;
+		if (revoked) return Response.json({error: {code: "invalid_api_key"}}, {status: 401});
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const first = new ApiModelCapabilities(fetcher, () => now);
+	await first.enrich([{slug: "X"}], false, route);
+	await first.enrich([{slug: "X"}], false, other);
+	const imported = new ApiModelCapabilities(fetcher, () => now);
+	imported.importProbes(first.exportProbes());
+	revoked = true; now = 3000;
+	await imported.enrich([{slug: "X"}, {slug: "Y"}], false, route);
+	const before = posts;
+	const [independent] = await imported.enrich([{slug: "X"}], false, other);
+	expect(posts).toBe(before);
+	expect(independent?.service_tiers).not.toEqual([]);
+	expect(independent?.capability_probe_status).toMatchObject({responses: "verified"});
+	const changed = imported.exportProbes().filter(([, result]) => !Object.values(result.status).includes("verified"));
+	expect(changed).toHaveLength(2);
+	for (const [, result] of changed) expect(result.at).toBe(3000);
+});
+
+it("forces a fresh restored generation without borrowing or reviving denied inflight work", async () => {
+	let now = 1000, restored = false, release: () => void = () => undefined, entered: () => void = () => undefined, posts = 0;
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const fetcher: typeof fetch = async (url, init) => {
+		if (init?.method !== "POST") {
+			const id = String(url).split("/").at(-1)?.replace(".md", "");
+			return new Response(`Model ID: \`${id}\`\n\`reasoning.effort\` supports none, minimal, low, medium, high, xhigh, max.`);
+		}
+		posts++;
+		const body = JSON.parse(String(init.body));
+		if (!restored && body.model === "X") {entered(); await gate;}
+		if (!restored && body.model === "Y") return Response.json({error: {code: "permission_denied"}}, {status: 403});
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({service_tier: body.service_tier});
+	};
+	const reader = new ApiModelCapabilities(fetcher, () => now);
+	const old = reader.enrich([{slug: "X"}], false, route);
+	await ready;
+	now = 2000;
+	await reader.enrich([{slug: "Y"}], false, route);
+	const lostPosts = posts;
+	await reader.enrich([{slug: "Y"}], false, route);
+	expect(posts).toBe(lostPosts);
+	restored = true; now = 3000;
+	const currentBatch = reader.enrich([{slug: "X"}], false, route, true);
+	try {
+		await vi.waitFor(() => expect(posts).toBeGreaterThan(lostPosts));
+		const [current] = await currentBatch;
+		expect(current?.capability_probe_status).toMatchObject({responses: "verified"});
+		expect(current?.service_tiers).not.toEqual([]);
+	} finally {release();}
+	const [late] = await old;
+	expect(late?.service_tiers).toEqual([]);
+	expect(Object.values(late?.capability_probe_status as Record<string, string>)).not.toContain("verified");
+	expect(late?.capability_checked_at).toBe(2000);
+	const again = await reader.enrich([{slug: "X"}], false, route);
+	expect(again[0]?.capability_probe_status).toMatchObject({responses: "verified"});
+	expect(again[0]?.capability_checked_at).toBe(3000);
+});
+
 it("a setting-specific 403 removes only the denied effort", async () => {
  let now=1, deny=false;
  const fetcher=vi.fn(async (_u:unknown, init?:RequestInit)=>{

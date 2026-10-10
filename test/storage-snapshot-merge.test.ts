@@ -179,6 +179,24 @@ it("keeps an auth-failure cooldown recorded against the refresh token that is ke
     const [row] = mergeAccountSnapshot(base, disk, local).accounts;
     expect(row).toMatchObject({ refreshToken: "fixture-rotated", coolingDownUntil: 900, cooldownReason: "auth-failure" });
 });
+it("does not carry a prior refresh credential's invalidation into a reused access token", () => {
+    const base = fixture();
+    Object.assign(base.accounts[0]!, {accessToken: "fixture-access", authInvalidatedAt: 1500});
+    const disk = structuredClone(base), local = structuredClone(base);
+    disk.accounts[0]!.refreshToken = "fixture-rotated";
+    delete disk.accounts[0]!.authInvalidatedAt;
+    const row = mergeAccountSnapshot(base, disk, local).accounts[0];
+    expect(row).toMatchObject({accessToken: "fixture-access", refreshToken: "fixture-rotated"});
+    expect(row?.authInvalidatedAt).toBeUndefined();
+});
+it("does not let a discarded credential baseline waive a current credential refusal", () => {
+    const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
+    Object.assign(base.accounts[0]!, {coolingDownUntil: 900, cooldownReason: "auth-failure"});
+    Object.assign(disk.accounts[0]!, {refreshToken: "fixture-rotated", coolingDownUntil: 900, cooldownReason: "auth-failure"});
+    local.accounts[0]!.refreshToken = "fixture-rotated";
+    const row = mergeAccountSnapshot(base, disk, local).accounts[0];
+    expect(row).toMatchObject({refreshToken: "fixture-rotated", coolingDownUntil: 900, cooldownReason: "auth-failure"});
+});
 it("drops a local auth-failure cooldown when disk already holds a newer refresh token", () => {
     const base = fixture(), disk = structuredClone(base), local = structuredClone(base);
     disk.accounts[0]!.refreshToken = "fixture-winner";

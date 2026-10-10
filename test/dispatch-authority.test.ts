@@ -1,5 +1,5 @@
 import {once} from "node:events";
-import {promises as fs} from "node:fs";
+import {existsSync, promises as fs} from "node:fs";
 import {createServer, type Server} from "node:http";
 import type {Socket} from "node:net";
 import {tmpdir} from "node:os";
@@ -12,8 +12,9 @@ import {PreemptiveQuotaScheduler} from "../lib/preemptive-quota-scheduler.js";
 import {getModelFamily} from "../lib/prompts/codex.js";
 import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import * as refreshRuntime from "../lib/runtime/rotation-token-refresh.js";
+import * as refreshQueue from "../lib/refresh-queue.js";
 import {getPendingAuthPath, recordPendingAuth} from "../lib/storage/pending-auth.js";
-import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
+import {loadAccounts, setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
 import {getAccountPolicyKey, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
 import {ApiModelRuntime} from "../lib/runtime/api-model-runtime.js";
@@ -24,6 +25,7 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
 	vi.unstubAllGlobals();
+	vi.useRealTimers();
 	for (const close of cleanups.splice(0).reverse()) await close();
 	setStoragePathDirect(null);
 	clearCircuitBreakers();
@@ -55,6 +57,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 	const entered = deferred(), release = deferred();
 	const creates: Array<{token: string | undefined; workspace: string | undefined; body: Record<string, unknown>}> = [];
 	let connections = 0;
+	let reply: ((ws: WebSocket) => void) | undefined;
 	upstream.on("upgrade", (req, socket, head) => {
 		entered.resolve();
 		void (delayed ? release.promise : Promise.resolve()).then(() => {
@@ -64,6 +67,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 				connections++;
 				ws.on("message", data => {
 					creates.push({token: req.headers.authorization, workspace: String(req.headers["chatgpt-account-id"]), body: JSON.parse(String(data))});
+					if (reply) {reply(ws); return;}
 					ws.send(JSON.stringify({type: "response.completed", response: {id: `response-${creates.length}`, status: "completed", output: []}}));
 				});
 			});
@@ -96,7 +100,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		return ws;
 	};
 	const post = (model = "shared") => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: []})});
-	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections};
+	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
 }
 it.each(["disable", "delete", "remove", "corrupt"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
 	const f = await fixture(false), ws = await f.connect();
@@ -194,6 +198,148 @@ it.each(["api", "zdr"] as const)("rejects a known %s model denial acquired durin
 	const denied = await pending; await denied.text();
 	expect(denied.status).toBe(502);
 	expect(f.fetched).toEqual([]);
+});
+
+it.each(["http", "custom", "native", "http-stream", "native-stream"].flatMap(transport =>
+	["workspace", "auth", "cooldown"].filter(kind => !transport.endsWith("stream") || kind === "auth").flatMap(kind =>
+		[false, true].map(lossFirst => ({transport, kind, lossFirst})))))
+("keeps durable recovery separate from delayed response restrictions (%j)", async ({transport, kind, lossFirst}) => {
+	if (kind === "cooldown" && lossFirst && transport !== "custom") vi.useFakeTimers({toFake: ["Date"]});
+	const native = transport.startsWith("native"), stream = transport.endsWith("stream");
+	const f = await fixture(native), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const status = kind === "workspace" ? 402 : 401;
+	const error = {code: kind === "workspace" ? "deactivated_workspace" : kind === "auth" ? "token_invalidated" : "unauthorized"};
+	const payload = stream ? {type: "response.failed", response: {id: "fixture-loss", status: "failed", error}} : {type: "error", status, error};
+	if (transport.startsWith("http")) {
+		f.setPostResponse(async () => new Response(new ReadableStream({start(controller) {
+			entered.resolve();
+			void release.promise.then(() => {controller.enqueue(new TextEncoder().encode(stream ? `data: ${JSON.stringify(payload)}\n\n` : JSON.stringify(payload))); controller.close();});
+		}}), {status: stream ? 200 : status, headers: stream ? {"content-type": "text/event-stream"} : {}}));
+	} else {
+		f.setReply(ws => {entered.resolve(); void release.promise.then(() => ws.send(JSON.stringify(payload)));});
+	}
+	const pending = transport.startsWith("http") ? f.post().then(response => response.text()) : turn(await f.connect());
+	await entered.promise;
+	const recover = async () => {
+		const current = await loadAccounts();
+		if (!current) throw Error("Missing fixture primary");
+		const other = new AccountManager(undefined, current), account = other.getAccountByIndex(0)!;
+		other.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: kind === "workspace" ? f.pool.accounts[0]!.expiresAt! : Date.now() + 7200000});
+		if (lossFirst) {other.setAccountEnabled(0, false); other.setAccountEnabled(0, true);}
+		await other.saveToDisk();
+	};
+	if (lossFirst) {
+		release.resolve(); await pending;
+		await vi.waitFor(async () => {
+			await f.manager.flushPendingSave();
+			const account = JSON.parse(await fs.readFile(f.path, "utf8")).accounts[0];
+			expect(kind === "workspace" ? account.enabled === false || account.workspaces?.some((workspace: {enabled?: boolean}) => workspace.enabled === false) : account.cooldownReason === "auth-failure").toBe(true);
+		});
+		await recover();
+	} else {await recover(); release.resolve(); await pending;}
+	f.setPostResponse(undefined); f.setReply(undefined);
+	await f.manager.flushPendingSave();
+	const reloaded = await loadAccounts();
+	const account = reloaded?.accounts[0];
+	expect(account?.accessToken).toBe("B");
+	expect(account?.refreshToken).toBe("refresh-B");
+	expect(account?.enabled).not.toBe(false);
+	expect(account?.authInvalidatedAt).toBeUndefined();
+	expect(account?.cooldownReason).not.toBe("auth-failure");
+	expect(account?.workspaces?.some(workspace => workspace.enabled === false)).not.toBe(true);
+	if (!lossFirst) expect(f.manager.getAccountByIndex(0)?.cooldownReason).not.toBe("auth-failure");
+	if (kind === "cooldown" && lossFirst && transport !== "custom") {
+		const cooling = await f.post(); const rejection = await cooling.json();
+		expect(cooling.status).toBe(503);
+		expect(rejection.error.reason).toBe("circuit-open");
+		vi.setSystemTime(new Date(rejection.error.reset_at).getTime() + 1);
+	}
+	const accepted = await f.post(); const acceptedBody = await accepted.text();
+	expect(accepted.status, acceptedBody).toBe(200);
+	expect(f.fetched.at(-1)).toBe("Bearer B");
+});
+
+it("rejects a delayed refresh refusal against another manager's durable recovery", async () => {
+	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
+	account.expires = 0;
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	vi.spyOn(refreshQueue, "queuedRefresh").mockImplementation(async () => {entered.resolve(); await release.promise; return {type: "failed", reason: "http_error", statusCode: 401, message: "OAuth token has been invalidated"};});
+	const pending = refreshRuntime.ensureFreshAccessToken({accountManager: f.manager, account, family: "codex", model: null, now: Date.now(), tokenRefreshSkewMs: 30000, tokenInvalidationCooldownMs: 60000});
+	await entered.promise;
+	const other = new AccountManager(undefined, (await loadAccounts())!);
+	other.updateFromAuth(other.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+	await other.saveToDisk(); release.resolve();
+	expect(await pending).toMatchObject({ok: false, retryable: true, invalidated: false});
+	expect(account.authInvalidatedAt).toBeUndefined();
+	expect(account.coolingDownUntil).toBeUndefined();
+	expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+	const durable = (await loadAccounts())?.accounts[0];
+	expect(durable?.accessToken).toBe("B");
+	expect(durable?.authInvalidatedAt).toBeUndefined();
+	expect(durable?.cooldownReason).toBeUndefined();
+});
+
+it("keeps a current refusal authoritative despite a same-credential expiry update", async () => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.setPostResponse(async () => {entered.resolve(); await release.promise; return Response.json({error: {code: "token_invalidated"}}, {status: 401});});
+	const pending = f.post(); await entered.promise;
+	const other = new AccountManager(undefined, (await loadAccounts())!);
+	other.getAccountByIndex(0)!.expires += 3600000;
+	await other.saveToDisk(); release.resolve();
+	await (await pending).text(); await f.manager.flushPendingSave();
+	const durable = (await loadAccounts())?.accounts[0];
+	expect(durable?.authInvalidatedAt).toBeGreaterThan(0);
+	expect(durable?.cooldownReason).toBe("auth-failure");
+});
+
+it.each(["deleted", "unreadable"])("does not mutate restrictions against %s primary authority", async mutation => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.setPostResponse(async () => {entered.resolve(); await release.promise; return Response.json({error: {code: "deactivated_workspace"}}, {status: 403});});
+	const pending = f.post(); await entered.promise;
+	if (mutation === "deleted") await fs.unlink(f.path);
+	else await fs.writeFile(f.path, "{invalid");
+	release.resolve(); await (await pending).text();
+	expect(f.manager.getAccountByIndex(0)?.enabled).not.toBe(false);
+	if (mutation === "deleted") expect(existsSync(f.path)).toBe(false);
+	else expect(await fs.readFile(f.path, "utf8")).toBe("{invalid");
+});
+
+it.each(["circuit", "quota", "allowed"])("honors final discovery runtime admission (%s)", async mutation => {
+	const f = await fixture(true), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const original = refreshRuntime.ensureFreshAccessToken;
+	let held = false;
+	vi.spyOn(refreshRuntime, "ensureFreshAccessToken").mockImplementation(async args => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return original(args);
+	});
+	const pending = fetch(`${f.proxy.baseUrl}/models`, {headers: {authorization: "Bearer fixture-client"}});
+	await entered.promise;
+	const account = f.manager.getAccountByIndex(0)!;
+	if (mutation === "circuit") for (let i = 0; i < 3; i++) f.manager.recordFailure(account, "codex", null);
+	if (mutation === "quota") f.manager.markRateLimitedWithReason(account, 60000, "codex", "quota", null);
+	release.resolve();
+	await (await pending).text();
+	expect(f.discoveries.length).toBe(mutation === "allowed" ? 2 : 0);
+});
+
+it.each(["disk", "login"])("does not relabel an old auth cooldown when adopting %s recovery", async source => {
+	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
+	f.manager.markAccountCoolingDown(account, 60000, "auth-failure");
+	if (source === "disk") {
+		const other = new AccountManager(undefined, f.pool);
+		other.updateFromAuth(other.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+		await other.saveToDisk();
+	} else f.manager.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+	await f.manager.saveToDisk();
+	const disk = (await loadAccounts())?.accounts[0];
+	expect(disk?.accessToken).toBe("B");
+	expect(disk?.coolingDownUntil).toBeUndefined();
+	expect(disk?.cooldownReason).toBeUndefined();
 });
 
 function routeApiToFixture(base: string): void {

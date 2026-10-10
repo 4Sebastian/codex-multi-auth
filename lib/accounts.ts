@@ -1550,15 +1550,18 @@ export class AccountManager {
 		if (observation) this.nativeAuthSnapshots.set(account, {...observation});
 	}
 
-	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}, capturedAt = performance.now(), retainingLiveCredentials = false): boolean {
+	syncAuthInvalidationFromSnapshot(account: ManagedAccount, disk: {accessToken?: string; refreshToken?: string; authInvalidatedAt?: number; authInvalidationErrorCode?: string; enabled?: boolean}, capturedAt = performance.now(), retainingLiveCredentials = false): boolean {
 		if (!this.isNativeSnapshotCurrent(account, capturedAt)) return false;
 		const prior = this.nativeAuthSnapshots.get(account);
 		const before = account.authInvalidatedAt;
 		const wasEnabled = account.enabled !== false;
 		const enabled = disk.enabled !== false;
-		if (!prior || enabled !== prior.enabled) account.enabled = enabled;
+		const replacedCredential = disk.accessToken !== account.access ||
+			(disk.refreshToken !== undefined && disk.refreshToken !== account.refreshToken);
+		if (!prior || enabled !== prior.enabled || (!retainingLiveCredentials && replacedCredential)) account.enabled = enabled;
 		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
-		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt;
+		const unchangedAuthorization = retainingLiveCredentials && (disk.accessToken !== account.access ||
+			(disk.refreshToken !== undefined && disk.refreshToken !== account.refreshToken) || disk.authInvalidatedAt === baseline?.authInvalidatedAt);
 		const diskInvalidatedAt = unchangedAuthorization ? before : disk.authInvalidatedAt;
 		if (diskInvalidatedAt) {
 			if (!unchangedAuthorization && (!before || diskInvalidatedAt > before || disk.accessToken !== account.access)) {
@@ -1622,6 +1625,7 @@ export class AccountManager {
 	}
 
 	updateFromAuth(account: ManagedAccount, auth: OAuthAuthDetails): void {
+		if ((account.access !== auth.access || account.refreshToken !== auth.refresh) && account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
 		account.refreshToken = auth.refresh;
 		account.access = auth.access;
 		account.expires = auth.expires;
@@ -1682,7 +1686,12 @@ export class AccountManager {
 			// so we don't clobber another process's rotation. Equal expiries keep
 			// our copy (no-op); newer in-memory copy wins (our own refresh).
 			const adoptedNewerCredentials = diskExpires > memExpires && !!disk.refreshToken;
+			const replacedCredentials = account.accessToken !== disk.accessToken || account.refreshToken !== disk.refreshToken;
 			if (adoptedNewerCredentials) {
+				if (replacedCredentials && account.cooldownReason === "auth-failure") {
+					delete account.coolingDownUntil;
+					delete account.cooldownReason;
+				}
 				account.refreshToken = disk.refreshToken;
 				account.accessToken = disk.accessToken;
 				account.expiresAt = disk.expiresAt;
@@ -1692,7 +1701,7 @@ export class AccountManager {
 				typeof diskInvalidatedAt === "number" &&
 				Number.isFinite(diskInvalidatedAt) &&
 				diskInvalidatedAt > 0;
-			if (adoptedNewerCredentials && !diskHasValidInvalidation) {
+			if (adoptedNewerCredentials && replacedCredentials && !diskHasValidInvalidation) {
 				// A refresh/re-login in another process supersedes an invalidation of
 				// the prior access token. Do not combine the newer disk credentials
 				// with this manager's stale marker and write the account back unusable.
@@ -1707,7 +1716,7 @@ export class AccountManager {
 			const explicitlyCleared = baseline?.authInvalidatedAt === diskInvalidatedAt && baseline?.authInvalidationErrorCode === disk.authInvalidationErrorCode &&
 				baseline?.accessToken === account.accessToken && baseline?.refreshToken === account.refreshToken &&
 				disk.accessToken === account.accessToken && disk.refreshToken === account.refreshToken;
-			if (diskHasValidInvalidation && disk.accessToken === account.accessToken && !accountHasValidInvalidation && !explicitlyCleared) {
+			if (diskHasValidInvalidation && disk.accessToken === account.accessToken && disk.refreshToken === account.refreshToken && !accountHasValidInvalidation && !explicitlyCleared) {
 				// Ordinary saves must not erase a CURRENT invalidation written by
 				// another AccountManager. A marker older than the token generation is
 				// stale and is intentionally not resurrected.
@@ -2444,6 +2453,33 @@ export class AccountManager {
    if (saved && baseline) Object.assign(baseline, { coolingDownUntil: saved.coolingDownUntil, cooldownReason: saved.cooldownReason });
   }
  }
+
+	async withCurrentAccountCredential(
+		account: ManagedAccount,
+		submitted: {recordId?: string; accessToken: string | undefined; refreshToken: string; accountId?: string},
+		mutate: () => boolean | void,
+	): Promise<boolean> {
+		return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
+			const primaryExists = existsSync(this.resolveSelectionStoragePath());
+			if (this.hadPersistedStorage && !primaryExists) return false;
+			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
+				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken) return false;
+			if (current && primaryExists) {
+				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
+				const row = matches.length === 1 ? matches[0] : undefined;
+				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.enabled === false ||
+					(submitted.accountId && (row.workspaces?.length
+						? !row.workspaces.some(workspace => workspace.id === submitted.accountId && workspace.enabled !== false)
+						: (row.accountId?.trim() || extractAccountId(row.accessToken)?.trim()) !== submitted.accountId))) return false;
+			}
+			if (!await this.isAccountJournalEligible(account)) return false;
+			if (mutate() === false) return false;
+			this.reconcileSelectionFromDisk();
+			this.syncWorkspaceSelections(current);
+			await this.persistSnapshot(current, this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current), persist, undefined, true);
+			return true;
+		}));
+	}
 
 	async saveToDisk(runtimeOnConflict = false): Promise<void> {
 		await runWithStoragePathState(this.storagePathState, async () => {

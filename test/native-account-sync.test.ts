@@ -44,6 +44,15 @@ describe("native record generation matching", () => {
 			refreshToken: "old-refresh", workspaces: [{id: "original", enabled: true}]});
 	});
 
+	it("does not apply an old primary refusal to a retained refreshed credential", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		manager.updateFromAuth(account, {type: "oauth", access: account.access!, refresh: "new-refresh", expires: 3000});
+		disk.accounts[0]!.authInvalidatedAt = 5000;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.refreshToken).toBe("new-refresh");
+		expect(account.authInvalidatedAt).toBeUndefined();
+	});
 	it("keeps a stored record's authority across account and email changes", () => {
 		const storage = fixture();
 		storage.accounts[0]!.recordId = "R1";
@@ -108,6 +117,12 @@ describe("native account credential reload", () => {
 		expect(account.access).toBe("new-access");
 		expect(account.cooldownReason).toBeUndefined();
 		expect(account.rateLimitResetTimes.codex).toBe(99999);
+	});
+	it("preserves an unexpired auth refusal belonging to the adopted credential", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accessToken: "new-access", refreshToken: "new-refresh", coolingDownUntil: Date.now() + 60000});
+		syncNativeAccountCredentials(manager, disk);
+		expect(manager.getAccountByIndex(0)).toMatchObject({access: "new-access", refreshToken: "new-refresh", cooldownReason: "auth-failure", coolingDownUntil: disk.accounts[0]!.coolingDownUntil});
 	});
 	it("keeps cooldown for unchanged credentials but adopts an explicit shorter-lived replacement", () => {
 		const storage = fixture(),

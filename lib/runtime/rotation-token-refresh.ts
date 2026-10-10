@@ -105,24 +105,18 @@ export async function ensureFreshAccessToken(params: {
 			: {ok: false, retryable: true};
 	}
 	if (refreshResult.type === "failed") {
-		accountManager.recordFailure(account, family, model);
-		accountManager.incrementAuthFailures(account);
 		// If the refresh endpoint itself returns an explicit invalidation message
 		// (e.g. Microsoft/Outlook SSO revokes the refresh token server-side), apply
 		// the long cooldown and signal to the caller to stop rotating rather than
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
-		if (invalidated) {
-			accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
-		}
-		applyMonotonicAuthCooldown(
-			accountManager,
-			account,
-			invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-			submittedAccessToken,
-		);
-		accountManager.saveToDiskDebounced();
-		return { ok: false, retryable: isTokenRefreshRetryable(refreshResult), invalidated };
+		const applied = await accountManager.withCurrentAccountCredential(account, {recordId: account.recordId, accessToken: submittedAccessToken, refreshToken: submittedRefreshToken}, () => {
+			accountManager.recordFailure(account, family, model);
+			accountManager.incrementAuthFailures(account);
+			if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
+			applyMonotonicAuthCooldown(accountManager, account, invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submittedAccessToken);
+		});
+		return { ok: false, retryable: !applied || isTokenRefreshRetryable(refreshResult), invalidated: applied && invalidated };
 	}
 
 	const auth: OAuthAuthDetails = {
@@ -157,13 +151,10 @@ export async function ensureFreshAccessToken(params: {
 		};
 	} catch {
 		if (account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
-		accountManager.recordFailure(account, family, model);
-		accountManager.markAccountCoolingDown(
-			account,
-			DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-			"auth-failure",
-		);
-		accountManager.saveToDiskDebounced();
+		await accountManager.withCurrentAccountCredential(account, {recordId: account.recordId, accessToken: submittedAccessToken, refreshToken: submittedRefreshToken}, () => {
+			accountManager.recordFailure(account, family, model);
+			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submittedAccessToken);
+		});
 		return { ok: false, retryable: true };
 	}
 }

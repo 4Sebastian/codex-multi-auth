@@ -48,7 +48,7 @@ import {
 	getTokenTracker,
 	resetTrackers,
 } from "../lib/rotation.js";
-import { setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
+import { loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 import { estimateUsageCostUsd } from "../lib/usage/pricing.js";
 import type { UsageTokenCounts } from "../lib/usage/types.js";
 
@@ -5335,6 +5335,8 @@ describe("runtime rotation proxy", () => {
 	});
 
 	it("persists the cooldown when an account has no resolvable accountId", async () => {
+		const actualStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		withAccountStorageTransactionMock.mockImplementation(actualStorage.withAccountStorageTransaction);
 		const now = Date.now();
 		// Account with no stored accountId and a non-JWT access token, so
 		// resolveAccountId returns null and the missing-accountId cooldown branch
@@ -5359,7 +5361,6 @@ describe("runtime rotation proxy", () => {
 		};
 		const accountManager = new AccountManager(undefined, storage);
 		expect(accountManager.getAccountByIndex(0)?.accountId).toBeUndefined();
-		const saveToDiskDebouncedSpy = vi.spyOn(accountManager, "saveToDiskDebounced");
 		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
@@ -5372,7 +5373,9 @@ describe("runtime rotation proxy", () => {
 		expect(calls).toHaveLength(0);
 		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("auth-failure");
 		expect(accountManager.getAccountByIndex(0)?.coolingDownUntil).toBeGreaterThan(now);
-		expect(saveToDiskDebouncedSpy).toHaveBeenCalled();
+		const persisted = (await loadAccounts())?.accounts.find(account => account.refreshToken === "refresh-1");
+		expect(persisted?.cooldownReason).toBe("auth-failure");
+		expect(persisted?.coolingDownUntil).toBeGreaterThan(now);
 	});
 
 	it("deduplicates concurrent expired-token refresh and persistence", async () => {

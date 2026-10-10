@@ -6,6 +6,7 @@ import {
 import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
+import type {ApiRouteCredential} from "../lib/api-route-store.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 let previousMultiAuthDir: string | undefined;
@@ -368,6 +369,50 @@ it("honours the persisted 15-minute probe cache across fresh CLI processes unles
   vi.unstubAllEnvs();
   await fs.rm(dir, { recursive: true, force: true });
  }
+});
+
+it("persists attributed loss timestamps over a concurrent older positive and preserves independent imports", async () => {
+	const route: ApiRouteCredential = {id: "fixture", kind: "api", label: "Fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["X", "Y"], probeCapabilities: true};
+	const independent = {...route, id: "independent", apiKey: "independent-key", visibleModels: ["X"]};
+	const success = (init?: RequestInit) => {
+		const body = JSON.parse(String(init?.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const positive: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/models")) return Response.json({data: [{id: "X"}]});
+		if (init?.method === "POST") return success(init);
+		return new Response("missing", {status: 404});
+	};
+	const updateApiDiscovery = async (credential: ApiRouteCredential) => credential;
+	await discoverModelInventory(null, [route, independent], {fetchImpl: positive, now: () => 1000, updateApiDiscovery, persistProbes: true});
+	let release: () => void = () => undefined, entered: () => void = () => undefined;
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const denying: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/models")) return Response.json({data: [{id: "X"}, {id: "Y"}]});
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		entered(); await gate;
+		return Response.json({error: {code: "invalid_api_key"}}, {status: 401});
+	};
+	const pending = discoverModelInventory(null, [route], {fetchImpl: denying, now: () => 3000, updateApiDiscovery, persistProbes: true});
+	try {
+		await ready;
+		await discoverModelInventory(null, [route], {fetchImpl: positive, now: () => 2000, updateApiDiscovery, persistProbes: true, forceProbes: true});
+	} finally {release();}
+	await pending;
+	let posts = 0;
+	const reloaded = await discoverModelInventory(null, [route, independent], {fetchImpl: async (url, init) => {if (init?.method === "POST") posts++; return positive(url, init);}, now: () => 4000, updateApiDiscovery, persistProbes: true});
+	expect(posts).toBe(0);
+	const denied = reloaded.entries.find(entry => entry.label === route.label)?.entitlements?.find(model => model.model === "X");
+	const unaffected = reloaded.entries.filter(entry => entry.kind === "api")[1]?.entitlements?.[0];
+	expect(denied?.probes?.responses).toBe("unverified");
+	expect(denied?.serviceTiers).toEqual([]);
+	expect(unaffected?.probes?.responses).toBe("verified");
+	const serialized = await isolationFs.readFile(isolationJoin(multiAuthDir, "api-capability-probes.json"), "utf8");
+	expect(serialized).not.toContain("fixture-key");
+	expect(serialized).not.toContain("independent-key");
+	const entries = JSON.parse(serialized).entries as Array<[string, {at: number; status: Record<string, string>}]>;
+	for (const [, result] of entries.filter(([, result]) => result.status.responses === "unverified")) expect(result.at).toBe(3000);
 });
 
 it("asks a running proxy to force paid probes only for an explicit capability check", async () => {

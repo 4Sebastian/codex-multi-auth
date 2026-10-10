@@ -1,6 +1,7 @@
 import type { AccountManager } from "../accounts.js";
 import { sanitizeEmail } from "../auth/token-utils.js";
 import type { AccountStorageV3 } from "../storage.js";
+import { mergeAccountCooldown } from "../storage/snapshot-merge.js";
 
 type Identity = { recordId?: string; accountId?: string; email?: string; refreshToken?: string };
 /**
@@ -48,13 +49,17 @@ export function syncNativeAccountCredentials(
 			disk.expiresAt === account.expires
 		)
 			continue;
+		const replaced = disk.accessToken !== account.access || disk.refreshToken !== account.refreshToken;
+		const cooldown = mergeAccountCooldown({...account, accessToken: account.access},
+			disk.cooldownReason === "auth-failure" && (disk.coolingDownUntil ?? 0) <= Date.now() ? {...disk, coolingDownUntil: undefined, cooldownReason: undefined} : disk, {
+			accessToken: disk.accessToken, refreshToken: disk.refreshToken,
+			coolingDownUntil: replaced && account.cooldownReason === "auth-failure" ? undefined : account.coolingDownUntil,
+			cooldownReason: replaced && account.cooldownReason === "auth-failure" ? undefined : account.cooldownReason,
+		});
 		account.access = disk.accessToken;
 		account.refreshToken = disk.refreshToken;
 		account.expires = disk.expiresAt;
-		if (disk.accessToken && disk.refreshToken && !manager.isAccountAuthInvalidated(account)) {
-			if (account.cooldownReason === "auth-failure")
-				manager.clearAccountCooldown(account);
-		}
+		Object.assign(account, cooldown);
 		changed = true;
 	}
 	return changed;
