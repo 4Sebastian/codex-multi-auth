@@ -149,7 +149,7 @@ import {
 } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
 import { mergeAccountSnapshot } from "./storage/snapshot-merge.js";
-import { applyPendingAuth, capturePendingAuth, clearPendingAuth, prunePendingAuth, recordPendingAuth } from "./storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, clearPendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth, type PendingAuthRecoveryCredential } from "./storage/pending-auth.js";
 export { recordPendingAuth };
 const loadedAccountSnapshots = new WeakMap<AccountStorageV3, AccountStorageV3>();
 
@@ -326,6 +326,7 @@ async function getAccountsBackupRecoveryCandidatesWithDiscovery(
 			if (entry.name.includes(".rotate.")) continue;
 			if (entry.name.endsWith(ACCOUNTS_WAL_SUFFIX)) continue;
 			const candidatePath = join(directoryPath, entry.name);
+			if (candidatePath === getPendingAuthPath(path)) continue;
 			if (knownCandidateSet.has(candidatePath)) continue;
 			discoveredCandidates.add(candidatePath);
 		}
@@ -503,8 +504,8 @@ async function readOnDiskCredentialSignature(
  * recovering a throttle-stale backup self-heals to the newest credential via
  * `applyPendingAuth` instead of reviving a token that was spent upstream.
  */
-async function collectRestorableCredentials(path: string): Promise<Array<Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">>> {
-	const tokens: Array<Pick<AccountMetadataV3, "refreshToken" | "accessToken" | "expiresAt">> = [];
+async function collectRestorableCredentials(path: string): Promise<PendingAuthRecoveryCredential[]> {
+	const tokens: PendingAuthRecoveryCredential[] = [];
 	const collectContent = (raw: string): void => {
 		let parsed: unknown;
 		try {
@@ -519,7 +520,15 @@ async function collectRestorableCredentials(path: string): Promise<Array<Pick<Ac
 				typeof account.refreshToken === "string" &&
 				account.refreshToken.length > 0
 			) {
-				tokens.push({refreshToken: account.refreshToken, accessToken: typeof account.accessToken === "string" ? account.accessToken : undefined, expiresAt: typeof account.expiresAt === "number" ? account.expiresAt : undefined});
+				tokens.push({
+					refreshToken: account.refreshToken,
+					accessToken: typeof account.accessToken === "string" ? account.accessToken : undefined,
+					expiresAt: typeof account.expiresAt === "number" ? account.expiresAt : undefined,
+					authInvalidatedAt: typeof account.authInvalidatedAt === "number" ? account.authInvalidatedAt : undefined,
+					authInvalidationErrorCode: typeof account.authInvalidationErrorCode === "string" ? account.authInvalidationErrorCode : undefined,
+					enabled: account.enabled === false ? false : undefined,
+					cooldownReason: account.cooldownReason === "auth-failure" ? "auth-failure" : undefined,
+				});
 			}
 		}
 	};
@@ -2403,6 +2412,7 @@ async function loadAccountsInternal(
 						normalizeAccountStorage,
 						isRecord,
 					});
+					backup.normalized = await applyPendingAuth(path, backup.normalized, undefined, {source: "historical-recovery"});
 					if (!backup.normalized) continue;
 					if (looksLikeSyntheticFixtureStorage(backup.normalized)) continue;
 					if (backup.normalized.accounts.length <= 0) continue;
@@ -2457,7 +2467,7 @@ async function loadAccountsInternal(
 			return migratedLegacyStorage;
 		}
 
-		const recoveredFromWal = await loadAccountsFromJournal(path);
+		const recoveredFromWal = await applyPendingAuth(path, await loadAccountsFromJournal(path), undefined, {source: "historical-recovery"});
 		if (recoveredFromWal) {
 			if (persistMigration) {
 				try {
@@ -2484,6 +2494,7 @@ async function loadAccountsInternal(
 						normalizeAccountStorage,
 						isRecord,
 					});
+					backup.normalized = await applyPendingAuth(path, backup.normalized, undefined, {source: "historical-recovery"});
 					if (backup.schemaErrors.length > 0) {
 						log.warn("Backup account storage schema validation warnings", {
 							path: backupPath,

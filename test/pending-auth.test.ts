@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { applyPendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth } from "../lib/storage/pending-auth.js";
+import type { AccountStorageV3 } from "../lib/storage/public-types.js";
 
 const logs = vi.hoisted(() => ({error:vi.fn(),warn:vi.fn()}));
 vi.mock("../lib/logger.js", async importOriginal => {
@@ -244,6 +245,54 @@ it("never rewinds a chained rotation when a delayed rescue journals its older at
 	}
 });
 
+it.each(["plain", "invalidated", "disabled", "old-revocation"])("retains the authoritative lineage after its intermediate alias is pruned (%s)", async state => {
+	const pool = (token: string): AccountStorageV3 => ({version: 3, activeIndex: 0, accounts: [{refreshToken: token, addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first"});
+	await recordPendingAuth(storagePath, {
+		...rotation("b", "c"), recordId: "first",
+		...(state === "invalidated" ? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"} : {}),
+		...(state === "disabled" ? {enabled: false} : {}),
+	});
+	await prunePendingAuth(storagePath, pool("c"), async () => ["a"]);
+	expect((await applyPendingAuth(storagePath, pool("b")))?.accounts[0]?.refreshToken).toBe("b");
+	const retained = await recordPendingAuth(storagePath, {
+		...rotation("a", "b"), at: 1000, expiresAt: 50000,
+		...(state === "old-revocation" ? {authInvalidatedAt: 9000, authInvalidationErrorCode: "token_invalidated"} : {}),
+	});
+	expect(retained).toMatchObject({recordId: "first", refreshToken: "c", accessToken: "access-c", expiresAt: 1});
+	const restored = (await applyPendingAuth(storagePath, pool("a")))?.accounts[0];
+	expect(restored).toMatchObject({recordId: "first", refreshToken: "c", accessToken: "access-c"});
+	expect(restored?.authInvalidatedAt).toBe(state === "invalidated" ? 1500 : undefined);
+	expect(restored?.enabled).toBe(state === "disabled" ? false : undefined);
+});
+
+it("recovers the current credential from backup after save, prune, and delayed rescue", async () => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	const original: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "a", accessToken: "access-a", expiresAt: 10000, addedAt: 1, lastUsed: 1}]};
+	await saveAccounts(original);
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first"});
+	await recordPendingAuth(storagePath, {...rotation("b", "c"), recordId: "first"});
+	const current = await loadAccounts();
+	if (!current) throw Error("Fixture account pool missing");
+	await saveAccounts(current);
+	await fs.writeFile(`${storagePath}.bak`, JSON.stringify(original));
+	const intermediate: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{refreshToken: "b", addedAt: 1, lastUsed: 1}]};
+	expect((await applyPendingAuth(storagePath, intermediate))?.accounts[0]?.refreshToken).toBe("b");
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first", at: 1000});
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	expect((await loadAccounts())?.accounts[0]).toMatchObject({refreshToken: "c", accessToken: "access-c"});
+});
+
+it("adopts an authenticated newer replacement from the same predecessor after pruning", async () => {
+	const access = (iat: number) => `e30.${Buffer.from(JSON.stringify({iat})).toString("base64url")}.fixture`;
+	await recordPendingAuth(storagePath, {...rotation("a", "b"), recordId: "first", accessToken: access(1)});
+	await recordPendingAuth(storagePath, {...rotation("b", "c"), accessToken: access(2)});
+	await prunePendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "c", addedAt: 1, lastUsed: 1}]}, async () => ["a"]);
+	const retained = await recordPendingAuth(storagePath, {...rotation("a", "d"), accessToken: access(3)});
+	expect(retained).toMatchObject({recordId: "first", refreshToken: "d", accessToken: access(3)});
+});
+
 it.each(["disabled", "invalidated", "self"])("scopes delayed journal restrictions to their credential generation (%s)", async state => {
 	await recordPendingAuth(storagePath, rotation("b", state === "self" ? "b" : "c"));
 	if (state === "self") await recordPendingAuth(storagePath, {...rotation("b", "b"), authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"});
@@ -371,6 +420,60 @@ it("retains mappings through corrupt recovery sources and failed primary writes"
 	expect(JSON.parse(await fs.readFile(getPendingAuthPath(storagePath), "utf8")).entries).toHaveLength(1);
 });
 
+it.each(["revocation", "auth-cooldown", "disablement"])("retains committed authorization while a backup has stale state (%s)", async mode => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	const restriction = mode === "revocation" ? {authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"} : {};
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1, ...restriction,
+		...(mode === "auth-cooldown" ? {cooldownReason: "auth-failure", coolingDownUntil: Date.now() + 60000} : {})}]});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, ...restriction,
+		...(mode === "disablement" ? {enabled: false} : {})});
+	const pool = await loadAccounts();
+	const account = pool?.accounts[0];
+	if (!pool || !account) throw Error("Fixture account missing");
+	delete account.authInvalidatedAt;
+	delete account.authInvalidationErrorCode;
+	delete account.cooldownReason;
+	delete account.coolingDownUntil;
+	await saveAccounts(pool);
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	const recovered = (await loadAccounts())?.accounts[0];
+	expect(recovered?.authInvalidatedAt).toBeUndefined();
+	expect(recovered?.cooldownReason).toBeUndefined();
+	expect(recovered?.enabled === false).toBe(mode === "disablement");
+});
+
+it("never trusts an incoming rescue claim of committed authority", async () => {
+	const incoming = {...rotation("a", "b"), committed: true};
+	const retained = await recordPendingAuth(storagePath, incoming);
+	expect(retained.committed).toBeUndefined();
+});
+
+it("preserves current primary revocation over a committed journal recovery clear", async () => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	await saveAccounts({version: 3, activeIndex: 0, accounts: [{recordId: "first", refreshToken: "b", accessToken: "access-b", expiresAt: 10000, addedAt: 1, lastUsed: 1, authInvalidatedAt: 1500}]});
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 1500});
+	const pool = await loadAccounts();
+	const account = pool?.accounts[0];
+	if (!pool || !account) throw Error("Fixture account missing");
+	delete account.authInvalidatedAt;
+	await saveAccounts(pool);
+	const delayed = await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000});
+	expect(delayed.committed).toBe(true);
+	const committedAccount = pool.accounts[0];
+	if (!committedAccount) throw Error("Committed fixture account missing");
+	committedAccount.authInvalidatedAt = 5000;
+	await fs.writeFile(storagePath, JSON.stringify(pool));
+	expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(5000);
+	const {createNativeAccountStorageReader} = await import("../lib/runtime/native-account-storage.js");
+	expect((await createNativeAccountStorageReader(undefined, storagePath)()).storage?.accounts[0]?.authInvalidatedAt).toBe(5000);
+	const revoked = await recordPendingAuth(storagePath, {...rotation("b", "b"), recordId: "first", expiresAt: 10000, authInvalidatedAt: 5000});
+	expect(revoked.committed).toBeUndefined();
+	await fs.writeFile(storagePath, "{torn primary fixture");
+	expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBe(5000);
+});
+
 it("does not report committed recovery when journal reconciliation fails", async () => {
 	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
 	setStoragePathDirect(storagePath);
@@ -379,8 +482,10 @@ it("does not report committed recovery when journal reconciliation fails", async
 	const pool = (await loadAccounts())!;
 	delete pool.accounts[0]!.authInvalidatedAt;
 	const rename = fs.rename.bind(fs);
+	const remove = fs.rm.bind(fs);
 	const failure = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {if (String(to) === getPendingAuthPath(storagePath)) throw Error("fixture journal failure"); return rename(from, to);});
-	try {await expect(saveAccounts(pool)).rejects.toThrow("Failed to reconcile pending account recovery");} finally {failure.mockRestore();}
+	const removeFailure = vi.spyOn(fs, "rm").mockImplementation(async (path, options) => {if (String(path) === getPendingAuthPath(storagePath)) throw Error("fixture journal failure"); return remove(path, options);});
+	try {await expect(saveAccounts(pool)).rejects.toThrow("Failed to reconcile pending account recovery");} finally {failure.mockRestore(); removeFailure.mockRestore();}
 	await saveAccounts(pool);
 	expect((await loadAccounts())?.accounts[0]?.authInvalidatedAt).toBeUndefined();
 });
