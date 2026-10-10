@@ -624,6 +624,57 @@ it("retains independent imported credential evidence after an attributed loss", 
 	for (const [, result] of changed) expect(result.at).toBe(3000);
 });
 
+it("forces a fresh healthy batch instead of sharing an earlier in-flight probe", async () => {
+	let entered!: () => void, release!: () => void, posts = 0;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return new Response("Model ID: `fixture`\nReasoning.effort supports: low.");
+		if (++posts === 1) {entered(); await gate;}
+		const body = JSON.parse(String(init.body));
+		return Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default", output: [{type: "function_call", name: "capability_probe"}]});
+	};
+	const reader = new ApiModelCapabilities(fetcher);
+	const older = reader.enrich([{slug: "fixture"}], false, route);
+	await ready;
+	try {
+		let finished = false;
+		const fresh = reader.enrich([{slug: "fixture"}], false, route, true).then(result => {finished = true; return result;});
+		await vi.waitFor(() => expect(finished).toBe(true));
+		expect((await fresh)[0]?.capability_probe_status).toMatchObject({responses: "verified", fast: "verified"});
+	} finally {release(); await older;}
+});
+
+it("does not let a retired documentation-delayed batch mutate newer cached positives", async () => {
+	let now = 1, blockDoc = false, revoked = false;
+	let entered!: () => void, release!: () => void;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const reader = new ApiModelCapabilities(async (_url, init) => {
+		if (init?.method !== "POST") {
+			if (blockDoc) {blockDoc = false; entered(); await gate;}
+			return new Response("missing", {status: 404});
+		}
+		if (revoked) return Response.json({error: {code: "invalid_api_key"}}, {status: 401});
+		const body = JSON.parse(String(init.body));
+		return Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default", output: [{type: "function_call", name: "capability_probe"}]});
+	}, () => now);
+	await reader.enrich([{slug: "fixture"}], false, route);
+	now = 900002; blockDoc = true;
+	const older = reader.enrich([{slug: "fixture"}], true, route);
+	await ready;
+	try {
+		revoked = true; await reader.enrich([{slug: "denied"}], false, route);
+		now++; revoked = false;
+		const fresh = (await reader.enrich([{slug: "fixture"}], false, route, true))[0];
+		expect(fresh?.capability_probe_status).toMatchObject({"effort:low": "verified"});
+		const exported = reader.exportProbes();
+		release(); await older;
+		expect(reader.exportProbes()).toEqual(exported);
+		expect((await reader.enrich([{slug: "fixture"}], false, route))[0]?.capability_probe_status).toMatchObject({"effort:low": "verified"});
+	} finally {release(); await older;}
+});
+
 it("forces a fresh restored generation without borrowing or reviving denied inflight work", async () => {
 	let now = 1000, restored = false, release: () => void = () => undefined, entered: () => void = () => undefined, posts = 0;
 	const gate = new Promise<void>(resolve => {release = resolve;});

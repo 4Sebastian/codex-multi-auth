@@ -114,7 +114,7 @@ export class ApiModelCapabilities {
 	private credentialGroup(route: ApiRouteCredential, force: boolean): CredentialProbeGroup {
 		const key = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
 		const current = this.credentialGroups.get(key);
-		if (current && (current.lostAt === undefined || (!force && current.lostAt + 60_000 > this.now()))) return current;
+		if (current && !force && (current.lostAt === undefined || current.lostAt + 60_000 > this.now())) return current;
 		if (this.credentialGroups.size >= 1000 && !this.credentialGroups.has(key)) {
 			const oldest = this.credentialGroups.keys().next().value;
 			if (oldest !== undefined) {
@@ -218,6 +218,8 @@ export class ApiModelCapabilities {
 		force = false,
 	) {
 		const key = this.probeKey(route, id);
+		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
+		if (this.credentialGroups.get(owner) !== group) return {at: group.lostAt ?? this.now(), levels: [...documented], tiers: [], status: {responses: "unverified", retry: "transient"}} satisfies ProbeResult;
 		const old = this.probes.get(key);
 		if (old) {old.group = group; old.documented = [...documented];}
 		if (group.lostAt !== undefined && old) this.clearVerified(old, documented, group.lostAt);
