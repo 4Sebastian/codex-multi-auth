@@ -85,7 +85,7 @@ it("never logs journal contents on read or post-save prune failures",async()=>{
  const {saveAccounts,setStoragePathDirect}=await import("../lib/storage.js");
  setStoragePathDirect(storagePath);
  await fs.writeFile(getPendingAuthPath(storagePath),'fixture-secret');
- await applyPendingAuth(storagePath,storage());
+ await expect(applyPendingAuth(storagePath,storage())).rejects.toThrow("Failed to observe pending account recovery");
  await expect(saveAccounts(storage())).rejects.toThrow("Failed to observe pending account recovery");
  expect(logs.error).toHaveBeenCalled();expect(logs.warn).toHaveBeenCalled();
  expect(JSON.stringify([logs.error.mock.calls,logs.warn.mock.calls])).not.toContain("fixture-secret");

@@ -121,7 +121,9 @@ Per request it applies policy before picking an account, refreshes tokens throug
 
 The local Pi integration also accepts authenticated WebSocket upgrades on the Responses routes. Custom-provider sockets keep their upstream account until it becomes unavailable, using drain-first selection independently of HTTP scheduling. Each `response.create` rechecks policy, circuit-breaker admission, and the optional context budget guard, and records normalized usage including reasoning tokens and service tier. Lost connection-scoped continuations return `previous_response_not_found` so the client can resend complete context. Native OpenAI sockets instead use `lib/runtime/responses-websocket.ts` and the native HTTP routing boundary, including workspace capabilities and explicit API/ZDR pools. Only one transport handles each upgrade.
 
-Runtime admission does not impose a synthetic requests-per-minute cap. Upstream quota responses, cooldowns, account policies, and circuit breakers still apply. A successful live health probe or a newer access-token generation clears an obsolete auth-invalidation marker; quota headers on a 401 never count as proof of recovery.
+Runtime admission does not impose a synthetic requests-per-minute cap. Upstream quota responses, cooldowns, account policies, and circuit breakers still apply. Explicit recovery requires successful refresh or a completed live response probe. A later JWT timestamp alone does not clear revocation, and quota headers on a 401 do not prove recovery.
+
+HTTP dispatch and each WebSocket create require a readable pending-auth journal. An unreadable or corrupt journal denies dispatch rather than trusting cached credentials. Native routing permits up to 30 seconds of primary-file availability grace for independently authenticated clients, but still reconciles the journal on every read. The grace uses a monotonic clock, never extends on failed reads, and cannot authenticate a managed bearer.
 
 ### 4. Local governance
 
@@ -150,6 +152,8 @@ Account storage uses the V3 format (`AccountStorageV3`) under the multi-auth roo
 - Per-project pools: `~/.codex/multi-auth/projects/<project-key>/openai-codex-accounts.json`, keyed by repo identity root so linked Git worktrees share one pool
 - Durability: write-ahead journal (`.wal`), temp-file-then-rename writes `0600`, and a throttled `.bak`/`.bak.1`/`.bak.2` rotation, plus named backups under `backups/`
 - Recovery: flagged-account sidecar (`openai-codex-flagged-accounts.json`), pending-auth journal, and `verify`/`fix`/`doctor` repair commands
+
+Each credential rotation advances every retained predecessor to the newest credential. Pruning retains predecessors that backups or the WAL can restore. Only verified primary saves establish committed recovery authorization. Unchanged aliases preserve that authorization, while current primary disablement and revocation remain authoritative.
 
 The active selection is mirrored into the official `~/.codex/auth.json` / `accounts.json` so plain forwarded Codex commands keep the intended account.
 

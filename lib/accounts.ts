@@ -4,6 +4,7 @@ import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-
 export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
+import { applyPendingAuth } from "./storage/pending-auth.js";
 import { createLogger } from "./logger.js";
 import {
 	getStoragePath,
@@ -1437,6 +1438,19 @@ export class AccountManager {
 	 */
 	private resolveSelectionStoragePath(): string {
 		return this.storagePathState.currentStoragePath ?? getStoragePath();
+	}
+
+	async isAccountJournalEligible(account: ManagedAccount): Promise<boolean> {
+		const invalidated = this.isAccountAuthInvalidated(account);
+		const row = {
+			recordId: account.recordId, refreshToken: account.refreshToken, accessToken: account.access, expiresAt: account.expires,
+			enabled: account.enabled, authInvalidatedAt: invalidated ? account.authInvalidatedAt : undefined,
+			authInvalidationErrorCode: invalidated ? account.authInvalidationErrorCode : undefined,
+			addedAt: account.addedAt, lastUsed: account.lastUsed,
+		};
+		await applyPendingAuth(this.resolveSelectionStoragePath(), {version: 3, activeIndex: 0, accounts: [row]});
+		return row.refreshToken === account.refreshToken && row.accessToken === account.access && row.expiresAt === account.expires &&
+			row.enabled !== false && !row.authInvalidatedAt && account.enabled !== false && !this.isAccountAuthInvalidated(account);
 	}
 
 	markAccountCoolingDown(

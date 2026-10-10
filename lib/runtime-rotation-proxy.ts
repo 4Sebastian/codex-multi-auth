@@ -3,6 +3,7 @@ import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscripti
 import { ClientCancellationError } from "./request/client-cancellation.js";
 import { getCircuitBreaker } from "./circuit-breaker.js";
 import { createNativeAccountStorageReader } from "./runtime/native-account-storage.js";
+import { PendingAuthObservationError } from "./storage/pending-auth.js";
 import { resetSnapshotQuota } from "./runtime/reset-credits.js";
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
 import { recoverResetQuota, applyConfirmedReset } from "./runtime/reset-credit-routing.js";
@@ -1380,13 +1381,16 @@ async function prepareWebSocketRequest(
 	return { context, policyDecision, usageRecorder };
 }
 
-function validateWebSocketRequestForAccount(
+async function validateWebSocketRequestForAccount(
 	state: RotationProxyState,
 	request: PreparedWebSocketRequest,
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	ownsAdmission = false,
-): void {
+): Promise<void> {
+	if (!await accountManager.isAccountJournalEligible(account)) {
+		throw createRuntimeProxyHttpError("Journal authorization changed before WebSocket dispatch.", HTTP_STATUS.SERVICE_UNAVAILABLE, "websocket_account_unavailable");
+	}
 	if (request.policyDecision.blockedAccountIndexes.has(account.index)) {
 		void request.usageRecorder.record({
 			outcome: "blocked",
@@ -1432,13 +1436,13 @@ function validateWebSocketRequestForAccount(
 	}
 }
 
-function consumeWebSocketRequestForAccount(
+async function consumeWebSocketRequestForAccount(
 	state: RotationProxyState,
 	request: PreparedWebSocketRequest,
 	accountManager: AccountManager,
 	account: ManagedAccount,
-): void {
-	validateWebSocketRequestForAccount(state, request, accountManager, account);
+): Promise<void> {
+	await validateWebSocketRequestForAccount(state, request, accountManager, account);
 	if (!accountManager.consumeToken(account, request.context.family, request.context.model)) {
 		throw createRuntimeProxyHttpError(
 			"The account bound to this WebSocket connection is temporarily unavailable.",
@@ -1900,6 +1904,10 @@ async function prepareWebSocketAccount(
 			break;
 		}
 		attemptedIndexes.add(selected.index);
+		if (!await accountManager.isAccountJournalEligible(selected)) {
+			skipReasons.set(selected.index, "auth-failure");
+			continue;
+		}
 		const quotaScheduleKey = buildQuotaScheduleKey(
 			selected,
 			context.family,
@@ -2047,6 +2055,9 @@ async function connectManagedWebSocket(
 		}
 		let connection: Awaited<ReturnType<typeof openUpstreamWebSocket>> | undefined;
 		try {
+			await validateWebSocketRequestForAccount(state, request, accountManager, account, true);
+			if (account.access !== accessToken || (account.expires ?? 0) <= state.now()) throw createRuntimeProxyHttpError("WebSocket credentials changed during preparation.", HTTP_STATUS.SERVICE_UNAVAILABLE, "websocket_account_unavailable");
+			if (lifecycle.isClosed() || !prepared.tokenRefundable) throw new ClientCancellationError();
 			state.status.upstreamRequests += 1;
 			connection = await openUpstreamWebSocket(
 				buildWebSocketUpstreamUrl(req, state.upstreamBaseUrl),
@@ -2091,6 +2102,7 @@ async function connectManagedWebSocket(
 			lifecycle.onReleased(prepared);
 			refundPreparedWebSocketToken(prepared);
 			if (lifecycle.isClosed()) break;
+			if (isRuntimeProxyHttpError(error)) throw error;
 			state.status.lastError = error instanceof Error ? error.message : String(error);
 			const handshakeError = error instanceof WebSocketHandshakeError ? error : null;
 			const statusCode = handshakeError?.statusCode ?? null;
@@ -2304,7 +2316,7 @@ function bridgeWebSocketConnection(
 		settleAll("failure", "websocket_proxy_failed");
 		settlePending("failure", "websocket_proxy_failed");
 		const policyViolation =
-			error instanceof CodexValidationError || isRuntimeProxyHttpError(error);
+			error instanceof CodexValidationError || (isRuntimeProxyHttpError(error) && !(error instanceof PendingAuthObservationError));
 		closeBoth(
 			policyViolation
 				? WEBSOCKET_CLOSE_POLICY_VIOLATION
@@ -2383,7 +2395,7 @@ function bridgeWebSocketConnection(
 				);
 			}
 			try {
-				consumeWebSocketRequestForAccount(
+				await consumeWebSocketRequestForAccount(
 					state,
 					request,
 					forwardingAccountManager,
@@ -2426,19 +2438,19 @@ function bridgeWebSocketConnection(
 				"websocket_account_unavailable",
 			);
 		}
-		if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame) || upstream !== forwardingUpstream || forwardingUpstream.readyState !== WebSocket.OPEN) {
-			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
-			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
-			if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(frame)) enqueueClientFrame(frame);
-			return;
-		}
 		try {
-			validateWebSocketRequestForAccount(state, request, forwardingAccountManager, forwardingAccount, true);
+			await validateWebSocketRequestForAccount(state, request, forwardingAccountManager, forwardingAccount, true);
 			if (preparedHandshake && (preparedHandshake.accessToken !== forwardingAccount.access || (forwardingAccount.expires ?? 0) <= state.now())) throw createRuntimeProxyHttpError("WebSocket credentials changed during preparation.", HTTP_STATUS.SERVICE_UNAVAILABLE, "websocket_account_unavailable");
 		} catch (error) {
 			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
 			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
 			throw error;
+		}
+		if (closed || client.readyState !== WebSocket.OPEN || !queuedFrames.has(frame) || upstream !== forwardingUpstream || forwardingUpstream.readyState !== WebSocket.OPEN) {
+			if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
+			else if (consumedForFrame) forwardingAccountManager.refundToken(forwardingAccount, request.context.family, request.context.model);
+			if (!closed && client.readyState === WebSocket.OPEN && queuedFrames.has(frame)) enqueueClientFrame(frame);
+			return;
 		}
 		activeRequests.push({accessToken: boundAccessToken, request, accountManager: forwardingAccountManager, account: forwardingAccount, frame, sawUpstreamEvent: false});
 		try {
@@ -3059,7 +3071,7 @@ async function handleRequestInner(
                 return;
             }
             nativeStorageMissing = snapshot.storage === null && !snapshot.transientFailure;
-            if (snapshot.verified && snapshot.storage !== null) {
+            if ((snapshot.verified || snapshot.routingAvailable === true) && snapshot.storage !== null) {
 			let accounts = accountManager.getAccountsSnapshot();
 			const sameInventory = accounts.length === disk.accounts.length && accounts.every((a, i) => isSameNativeAccount(a, disk.accounts[i]));
 			if (!sameInventory) {
@@ -3428,6 +3440,7 @@ async function handleRequestInner(
 			await usageRecorder?.record({ outcome: "failure", statusCode: rejection.status, errorCode: "upstream_capability_rejected", account: rejection.account });
 		};
         let catalogEligibleKeys: Set<string> | undefined;
+        let catalogScopeEligible: ((key: string) => boolean) | undefined;
         const catalogExcludedIndexes = (): number[] => {
             const eligible = catalogEligibleKeys;
             return eligible ? accountManager.getAccountsSnapshot().filter(account => !workspaceCandidates.has(account.index)).map(account => account.index) : [];
@@ -3556,6 +3569,7 @@ async function handleRequestInner(
 				url.pathname = url.pathname.replace(/\/+$/, "") + "/codex/models";
 				const clientVersion = catalogClientVersion;
 				if (clientVersion && /^[0-9A-Za-z.+_-]{1,80}$/.test(clientVersion)) url.searchParams.set("client_version", clientVersion);
+				if (!await state.activeAccountManager.isAccountJournalEligible(fresh.account) || fresh.account.access !== fresh.accessToken) throw new Error("Account authorization changed");
 				const response = await state.fetchImpl(url.toString(), {					method: "GET", redirect: "error",
 					headers: createOutboundHeaders(new Headers(), fresh.account, fresh.accessToken, accountId),
 					signal: AbortSignal.timeout(Math.min(state.fetchTimeoutMs, 15_000))				});
@@ -3716,6 +3730,7 @@ async function handleRequestInner(
 			const effort = isRecord(requestedBody?.reasoning) && typeof requestedBody.reasoning.effort === "string" ? requestedBody.reasoning.effort : undefined;
 			const requestedTier = typeof requestedBody?.service_tier === "string" ? requestedBody.service_tier : undefined;
 			const failures = state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now);
+			catalogScopeEligible = key => failures.supports(key, requestedModel, effort, requestedTier) && modelCatalog.supportsForRouting(key, requestedModel, effort, requestedTier);
 			await modelCatalog.prepareRouting(
 				eligible.flatMap(workspaceModelScopes).filter(scope => scope.routable).map(scope => scope.id),
 				requestedModel, effort, requestedTier, key => failures.supports(key, requestedModel, effort, requestedTier),
@@ -3728,7 +3743,7 @@ async function handleRequestInner(
     const scopes=workspaceModelScopes(account).filter(scope=>scope.routable).sort((a,b)=>Number(b.selected)-Number(a.selected)||Number(b.bound)-Number(a.bound));
     for(const scope of scopes) {
      // Fail open: an unknown catalog (outage/throttle) stays routable; only a fetched one excludes.
-     if(failures.supports(scope.id,requestedModel,effort,requestedTier) && modelCatalog.supportsForRouting(scope.id,requestedModel,effort,requestedTier)) candidates.push(scope);
+     if(catalogScopeEligible(scope.id)) candidates.push(scope);
     }
     if(candidates.length){
      candidates.sort((a,b)=>compareSubscriptionQuota(subscriptionQuotaPreference(quotaForScope(account,a),state.now()),subscriptionQuotaPreference(quotaForScope(account,b),state.now())));
@@ -4025,6 +4040,10 @@ async function handleRequestInner(
 			// rejected rather than re-deriving it: a second evaluation reports the
 			// first blocker it finds (a live cooldown would mask a drained bucket)
 			// and cannot see a half-open probe slot that was just claimed.
+			if (!await accountManager.isAccountJournalEligible(selected)) {
+				accountSkipReasons.set(selected.index, "auth-failure");
+				continue;
+			}
 			const admission = accountManager.consumeTokenWithReason(
 				selected,
 				context.family,
@@ -4133,26 +4152,38 @@ async function handleRequestInner(
 				continue;
 			}
 
+			try {
 			if (state.nativeOpenai && state.readNativeAccountStorage) {
 				const latestSnapshot = await state.readNativeAccountStorage();
-                const latest = latestSnapshot.storage;
-                const retained = latestSnapshot.transientFailure && latestSnapshot.routingAvailable === true && (apiKeyClient || await nativeOAuth())
-                    ? state.activeAccountManager.getAccountsSnapshot().find(item => item.recordId === refreshed.account.recordId)
-                    : undefined;
+                const latest = latestSnapshot.verified || (latestSnapshot.routingAvailable === true && (apiKeyClient || await nativeOAuth()))
+                    ? latestSnapshot.storage : null;
 				const disk = latest?.accounts.find(item => item.recordId && item.recordId === refreshed.account.recordId)
-					?? latest?.accounts.find(item => item.accountId === refreshed.account.accountId && sanitizeEmail(item.email) === sanitizeEmail(refreshed.account.email)) ?? retained;
+					?? latest?.accounts.find(item => item.accountId === refreshed.account.accountId && sanitizeEmail(item.email) === sanitizeEmail(refreshed.account.email));
 				const workspace = disk?.workspaces?.find(item => item.id.trim() === accountId);
 				// Derive the stored binding exactly as workspaceModelScopes does: trimmed,
 				// falling back to the token's workspace claim when no id was stored.
-				// A stored record carries accessToken; the transient-grace fallback is a live account (access).
-				const diskToken = (disk as { accessToken?: string } | undefined)?.accessToken ?? (disk as { access?: string } | undefined)?.access;
+				const diskToken = disk?.accessToken;
 				const diskBoundId = disk ? disk.accountId?.trim() || extractAccountId(diskToken)?.trim() : undefined;
 				const stillEligible = disk && disk.enabled !== false && !disk.authInvalidatedAt && !accountManager.isAccountAuthInvalidated(refreshed.account) &&
 					(workspace ? workspace.enabled !== false : accountId === diskBoundId);
 				if (!stillEligible) {
-					writeJson(res, 503, {error:{code:"routing_configuration_changed",message:"Routing eligibility changed while preparing the request. Retry with the current configuration."}});
-					return;
+					throw createRuntimeProxyHttpError("Routing eligibility changed while preparing the request. Retry with the current configuration.", HTTP_STATUS.SERVICE_UNAVAILABLE, "routing_configuration_changed");
 				}
+			}
+			if (!await accountManager.isAccountJournalEligible(refreshed.account) || refreshed.account.access !== refreshed.accessToken || (refreshed.account.expires ?? 0) <= state.now()) {
+				throw createRuntimeProxyHttpError("Journal authorization changed before dispatch.", HTTP_STATUS.SERVICE_UNAVAILABLE, "routing_configuration_changed");
+			}
+			if (clientGone()) throw new ClientCancellationError();
+			} catch (error) {
+				accountManager.refundToken(selected, context.family, context.model);
+				throw error;
+			}
+			if (requestScope && (!catalogScopeEligible?.(requestScope.id) || !workspaceModelScopes(refreshed.account).some(scope => scope.id === requestScope.id && scope.routable))) {
+				accountManager.refundToken(selected, context.family, context.model);
+				pendingScopes?.shift();
+				if (pendingScopes?.length) attemptedIndexes.delete(refreshed.account.index);
+				accountSkipReasons.set(refreshed.account.index, "model-not-supported");
+				continue;
 			}
 			const accountIdentity = accountIdentityFromAccount(refreshed.account, state.now());
 			recordLastRuntimeAccount(state.status, accountIdentity, accountId);

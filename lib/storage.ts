@@ -149,7 +149,7 @@ import {
 } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
 import { mergeAccountSnapshot } from "./storage/snapshot-merge.js";
-import { applyPendingAuth, capturePendingAuth, clearPendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth, type PendingAuthRecoveryCredential } from "./storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, clearPendingAuth, getPendingAuthPath, PendingAuthObservationError, prunePendingAuth, recordPendingAuth, type PendingAuthRecoveryCredential } from "./storage/pending-auth.js";
 export { recordPendingAuth };
 const loadedAccountSnapshots = new WeakMap<AccountStorageV3, AccountStorageV3>();
 
@@ -2437,6 +2437,7 @@ async function loadAccountsInternal(
 					}
 					return backup.normalized;
 				} catch (backupError) {
+					if (backupError instanceof PendingAuthObservationError) throw backupError;
 					const backupCode = (backupError as NodeJS.ErrnoException).code;
 					if (backupCode !== "ENOENT") {
 						log.warn(
@@ -2453,6 +2454,7 @@ async function loadAccountsInternal(
 
 		return normalized;
 	} catch (error) {
+		if (error instanceof PendingAuthObservationError) throw error;
 		// The primary could not be parsed (or read). Whatever file we stat'd is
 		// the state the WAL/backup recovery persists below deliberately replace,
 		// so record it as known — otherwise those intentional recovery saves
@@ -2519,6 +2521,7 @@ async function loadAccountsInternal(
 						return backup.normalized;
 					}
 				} catch (backupError) {
+					if (backupError instanceof PendingAuthObservationError) throw backupError;
 					const backupCode = (backupError as NodeJS.ErrnoException).code;
 					if (backupCode !== "ENOENT") {
 						log.warn("Failed to load backup account storage", {
@@ -2769,6 +2772,7 @@ async function loadPrimaryAccountsForMerge(): Promise<AccountStorageV3 | null> {
 		const observed = await capturePendingAuth(path, normalized.accounts);
 		return applyPendingAuth(path, normalized, observed.entries);
 	} catch (cause) {
+		if (cause instanceof PendingAuthObservationError) throw cause;
 		const code = (cause as NodeJS.ErrnoException).code;
 		// The journal is written before the primary and removed after it, so a
 		// journal beside a missing primary is the newest state, not a stale

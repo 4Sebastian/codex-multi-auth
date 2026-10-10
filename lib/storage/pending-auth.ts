@@ -100,11 +100,20 @@ async function write(path: string, entries: PendingAuth[]): Promise<void> {
 	}
 }
 
+export class PendingAuthObservationError extends Error {
+	readonly code = "EPENDINGAUTHUNREADABLE";
+	readonly statusCode = 503;
+	constructor() {
+		super("Failed to observe pending account recovery");
+		this.name = "PendingAuthObservationError";
+	}
+}
+
 export async function capturePendingAuth(storagePath: string, accounts: readonly AccountMetadataV3[] | null | undefined) {
 	const entries = await read(getPendingAuthPath(storagePath)).catch(error => {
 		const code = typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH";
 		log.warn("Failed to capture pending rotated credentials", {code});
-		throw Object.assign(new Error("Failed to observe pending account recovery"), {code});
+		throw new PendingAuthObservationError();
 	});
 	return {entries, accounts: structuredClone(accounts ?? [])};
 }
@@ -147,11 +156,9 @@ export async function recordPendingAuth(
 		// intermediate token, and pruning now keeps entries whose spent token any
 		// recovery source can surface — a stale-snapshot restore then self-heals
 		// straight to the newest credential instead of reviving a spent token.
-		const chained = entries.find((entry) => entry.refreshToken === auth.priorRefreshToken);
-		if (chained) {
-			Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, chained]));
-			Object.assign(chained, {...replacement, recordId: chained.recordId ?? auth.recordId});
-		}
+		const chained = entries.filter(entry => entry.refreshToken === auth.priorRefreshToken);
+		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...chained]));
+		for (const entry of chained) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
 		const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
 		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
 		const identities = new Set(aliases.map(entry => entry.recordId).filter(id => id !== undefined));
@@ -192,12 +199,11 @@ export async function applyPendingAuth(
 	try {
 		entries ??= await read(getPendingAuthPath(storagePath));
 	} catch (error) {
-		// Loading must still work; the file is left untouched for a later load.
 		log.error("Pending rotated credentials could not be read; affected accounts may need a re-login if this persists", {
 			path: getPendingAuthPath(storagePath),
 			code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
 		});
-		return storage;
+		throw new PendingAuthObservationError();
 	}
 	if (!entries.length) return storage;
 	for (const account of storage.accounts) {
@@ -266,8 +272,12 @@ export async function prunePendingAuth(
 		let changed = false;
 		for (const entry of entries) {
 			if (!observed || concurrent.has(entry)) continue;
-			const known = observed.accounts.find(account => account.refreshToken === entry.refreshToken && account.accessToken === entry.accessToken && account.expiresAt === entry.expiresAt &&
-				account.authInvalidatedAt === entry.authInvalidatedAt && account.authInvalidationErrorCode === entry.authInvalidationErrorCode && (account.enabled === false) === (entry.enabled === false) && (!entry.recordId || entry.recordId === account.recordId));
+			const known = observed.accounts.find(account => {
+				const effective = mergeAuthorization(entry.accessToken, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
+				return account.refreshToken === entry.refreshToken && account.accessToken === entry.accessToken && account.expiresAt === entry.expiresAt &&
+					account.authInvalidatedAt === effective.authInvalidatedAt && account.authInvalidationErrorCode === effective.authInvalidationErrorCode &&
+					(account.enabled === false) === (effective.enabled === false) && (!entry.recordId || entry.recordId === account.recordId);
+			});
 			if (!known) continue;
 			const committed = saved.accounts.find(account => known.recordId && account.recordId ? known.recordId === account.recordId : known.refreshToken === account.refreshToken);
 			if (!committed?.accessToken || committed.expiresAt === undefined) continue;

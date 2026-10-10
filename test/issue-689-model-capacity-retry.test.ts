@@ -252,7 +252,6 @@ describe("runtime proxy waits out a model-capacity response", () => {
 			});
 			openServers.push(proxy);
 
-			const refundSpy = vi.spyOn(accountManager, "refundToken");
 			const response = await postResponses(proxy);
 
 			expect(response.status).toBe(200);
@@ -270,14 +269,17 @@ describe("runtime proxy waits out a model-capacity response", () => {
 			const account = accountManager.getAccountByIndex(0);
 			expect(account?.rateLimitResetTimes ?? {}).toEqual({});
 			expect(account?.coolingDownUntil).toBeUndefined();
-			// ...and the pool token the attempt debited must come back, or a
-			// sustained capacity event drains healthy accounts until later
-			// requests are refused admission with `token-exhausted`.
-			expect(refundSpy).toHaveBeenCalled();
+			// Capacity retries must not exhaust subsequent admission. The old
+			// refundable RPM bucket is gone; exercise the actual admission result.
+			for (const candidate of accountManager.getAccountsSnapshot()) {
+				for (let i = 0; i < 121; i++) {
+					expect(accountManager.consumeToken(candidate, "codex", "gpt-5.4")).toBe(true);
+				}
+			}
 		},
 	);
 
-	it("refunds the pool token for every capacity retry, not just the first", async () => {
+	it("preserves admission after repeated capacity retries without imposing an RPM cap", async () => {
 		const path = storagePath();
 		const storage = createStorage(2);
 		writeFileSync(path, JSON.stringify(storage), "utf8");
@@ -289,7 +291,6 @@ describe("runtime proxy waits out a model-capacity response", () => {
 			() => capacityResponse(503),
 			() => streamResponse(),
 		]);
-		const refundSpy = vi.spyOn(accountManager, "refundToken");
 
 		const proxy = await startRuntimeRotationProxy({
 			accountManager,
@@ -304,7 +305,11 @@ describe("runtime proxy waits out a model-capacity response", () => {
 
 		expect(response.status).toBe(200);
 		expect(calls()).toBe(3);
-		expect(refundSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+		for (const account of accountManager.getAccountsSnapshot()) {
+			for (let i = 0; i < 121; i++) {
+				expect(accountManager.consumeToken(account, "codex", "gpt-5.4")).toBe(true);
+			}
+		}
 	});
 
 	it("stops waiting when the client disconnects mid-wait", async () => {

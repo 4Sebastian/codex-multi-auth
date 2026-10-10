@@ -45,14 +45,16 @@ it("caches settled primary storage but adopts credential revocation on change", 
 });
 it("bounds the fallback grace and never labels cached credentials as verified", async () => {
     let now = 10000;
-    vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.spyOn(performance, "now").mockImplementation(() => now);
     const readFile = vi.fn().mockResolvedValueOnce({ version: 3, activeIndex: 0, accounts: [] }).mockRejectedValue(Object.assign(Error("locked"), { code: "EBUSY" }));
     const read = createNativeAccountStorageReader(readFile, "unused");
     expect((await read()).verified).toBe(true);
     expect((await read()).verified).toBe(false);
     now += 2001;
+    expect((await read()).routingAvailable).toBe(true);
+    now += 28000;
     expect((await read()).storage).toBeNull();
-    expect(readFile).toHaveBeenCalledTimes(3);
+    expect(readFile).toHaveBeenCalledTimes(4);
 });
 
 it("refreshes the bounded fallback age after a verified settled cache hit", async () => {

@@ -773,6 +773,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValue({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: {},
 			secondary: {},
 		});
@@ -3167,7 +3168,7 @@ describe("codex manager cli commands", () => {
 			expect(codexCliWriterMocks.setCodexCliActiveSelection).toHaveBeenCalledTimes(1);
 			expect(
 				logSpy.mock.calls.some((call) =>
-					String(call[0]).includes("Result: 2 Codex available"),
+					String(call[0]).includes("Result: 0 Codex available | 2 signed in only"),
 				),
 			).toBe(true);
 		} finally {
@@ -3398,6 +3399,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValueOnce({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: {
 				usedPercent: 70,
 				windowMinutes: 300,
@@ -3448,6 +3450,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValueOnce({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: { usedPercent: 70, windowMinutes: 300 },
 			secondary: { usedPercent: 10, windowMinutes: 10080, resetAtMs: 0 },
 		});

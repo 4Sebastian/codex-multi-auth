@@ -13,50 +13,57 @@ export interface NativeAccountSnapshot {
 }
 /** Cache parsed primary storage only; backup recovery must never resurrect revoked credentials. */
 export function createNativeAccountStorageReader(read?: () => Promise<AccountStorageV3 | null>, path = getStoragePath()): () => Promise<NativeAccountSnapshot> {
-    const reconciled = async (storage: AccountStorageV3 | null): Promise<AccountStorageV3 | null> => {
-        const observed = await capturePendingAuth(path, storage?.accounts);
-        return applyPendingAuth(path, storage, observed.entries);
-    };
     let cached: AccountStorageV3 | null = null;
     let signature: string | undefined;
-    let lastSuccess = 0;
+    let lastSuccess: number | undefined;
     let pending: Promise<NativeAccountSnapshot> | undefined;
     return () => {
-        if (pending)
-            return pending;
+        if (pending) return pending;
         const capturedAt = performance.now();
-        pending = (async () => {
+        pending = (async (): Promise<NativeAccountSnapshot> => {
+            let storage: AccountStorageV3 | null;
+            let nextSignature: string | undefined;
+            let verified = true;
             try {
-                let nextSignature: string | undefined;
                 if (!read) {
                     const info = await stat(path);
                     nextSignature = `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
                     if (cached && nextSignature === signature && Date.now() - Math.max(info.mtimeMs, info.ctimeMs) > 2000) {
-                        const storage = await reconciled(structuredClone(cached));
-                        lastSuccess = Date.now();
-                        return {storage, verified: true, capturedAt};
+                        storage = structuredClone(cached);
+                    } else {
+                        storage = (await loadAccountsFromPath(path, {normalizeAccountStorage, isRecord})).normalized;
                     }
+                } else {
+                    storage = await read();
                 }
-                const storage = read ? await read() : (await loadAccountsFromPath(path, { normalizeAccountStorage, isRecord })).normalized;
-                const snapshot = await reconciled(structuredClone(storage));
                 cached = structuredClone(storage);
-                signature = nextSignature;
-                lastSuccess = Date.now();
-                return {storage: snapshot, verified: true, capturedAt};
-            }
-            catch (error) {
-                const code = (error as NodeJS.ErrnoException).code;
-                if (["EBUSY", "EPERM", "EACCES"].includes(code ?? "")) {
-                    // Availability grace is bounded, never refreshes its own age, and cannot
-                    // authenticate a managed bearer. Retry the changed file on the next request.
-                    signature = undefined;
-                    return { storage: Date.now() - lastSuccess < 2000 ? structuredClone(cached) : null, verified: false, capturedAt, transientFailure: true, routingAvailable: cached !== null && Date.now() - lastSuccess < 30000 };
-                }
-                cached = null;
+            } catch (error) {
                 signature = undefined;
-                return { storage: null, verified: false, capturedAt };
+                const code = (error as NodeJS.ErrnoException).code;
+                const transientFailure = ["EBUSY", "EPERM", "EACCES"].includes(code ?? "");
+                if (!transientFailure) cached = null;
+                if (!transientFailure || cached === null || lastSuccess === undefined || performance.now() - lastSuccess >= 30000) {
+                    return {storage: null, verified: false, capturedAt, transientFailure, routingAvailable: false};
+                }
+                storage = structuredClone(cached);
+                verified = false;
             }
-        })().finally(() => { pending = undefined; });
+            try {
+                const observed = await capturePendingAuth(path, storage?.accounts);
+                const snapshot = await applyPendingAuth(path, structuredClone(storage), observed.entries);
+                if (!verified && (lastSuccess === undefined || performance.now() - lastSuccess >= 30000)) {
+                    return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
+                }
+                if (verified) {
+                    signature = nextSignature;
+                    lastSuccess = capturedAt;
+                }
+                return {storage: snapshot, verified, capturedAt, transientFailure: !verified, routingAvailable: snapshot !== null};
+            } catch {
+                signature = undefined;
+                return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
+            }
+        })().finally(() => {pending = undefined;});
         return pending;
     };
 }

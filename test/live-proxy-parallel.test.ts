@@ -229,7 +229,7 @@ function tokensRemaining(manager: AccountManager, index: number): number {
 }
 
 describe("live proxy concurrency (routing-mutex enabled)", () => {
-	it("25 concurrent requests: one selection commit each, no double-spend, fair spread", async () => {
+	it("25 concurrent requests: one selection commit and upstream dispatch each, fair spread", async () => {
 		const TOTAL = 25;
 		const upstream = await startUpstream({ barrierCount: TOTAL });
 		const { proxy, manager } = await startProxyStack(upstream.port);
@@ -263,7 +263,7 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 
 		// Spread across the healthy pool. Selection is fully deterministic here
 		// (all 25 selections commit before the barrier releases any response);
-		// token drain + lastUsed refresh penalize re-picks, so the distribution
+		// Cursor updates and lastUsed refresh penalize re-picks, so the distribution
 		// must stay near even — a stampede onto one account is the bug being
 		// guarded against.
 		const counts = new Map<number, number>();
@@ -275,11 +275,8 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 		for (const [index, count] of counts) {
 			expect(count).toBeGreaterThanOrEqual(4);
 			expect(count).toBeLessThanOrEqual(16);
-			// No double-spend: tokens debited for this account equal its real
-			// upstream hit count (bucket starts at 50, small refill over the run).
-			const consumed = 50 - tokensRemaining(manager, index);
-			expect(consumed).toBeGreaterThanOrEqual(count - 1);
-			expect(consumed).toBeLessThanOrEqual(count + 0.01);
+			// Runtime admission must not debit the legacy RPM bookkeeping.
+			expect(tokensRemaining(manager, index)).toBe(50);
 		}
 
 		// L4 contract: exactly one mutex-held cursor commit per selection. The
@@ -288,7 +285,7 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 		expect(commitSpy).toHaveBeenCalledTimes(TOTAL);
 	}, 20_000);
 
-	it("the last healthy account is not double-spent under 12 concurrent requests", async () => {
+	it("dispatches exactly once per request on the last healthy account under concurrency", async () => {
 		const TOTAL = 12;
 		const upstream = await startUpstream({});
 		const { proxy, manager } = await startProxyStack(upstream.port);
@@ -311,12 +308,8 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 		for (const hit of upstream.hits) {
 			expect(hit.accountIndex).toBe(2);
 		}
-		// Twelve debits, twelve real requests — no extra slot was spent.
-		const consumed = 50 - tokensRemaining(manager, 2);
-		expect(consumed).toBeGreaterThanOrEqual(TOTAL - 1);
-		expect(consumed).toBeLessThanOrEqual(TOTAL + 0.01);
-		expect(50 - tokensRemaining(manager, 0)).toBeLessThanOrEqual(0.01);
-		expect(50 - tokensRemaining(manager, 1)).toBeLessThanOrEqual(0.01);
+		// Exact dispatch counts above prove no replay. Admission has no RPM debit.
+		for (const index of [0, 1, 2]) expect(tokensRemaining(manager, index)).toBe(50);
 		expect(commitSpy).toHaveBeenCalledTimes(TOTAL);
 	}, 20_000);
 
