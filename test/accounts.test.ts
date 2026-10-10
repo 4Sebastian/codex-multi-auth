@@ -1014,6 +1014,14 @@ describe("AccountManager", () => {
 		expect(selected?.index).toBe(0);
 	});
 
+	it("uses the committed cursor to break equal hybrid scores within one clock tick", () => {
+		const now = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const manager = new AccountManager(undefined, {version: 3, activeIndex: 0, accounts: Array.from({length: 3}, (_, i) => ({refreshToken: `tie-${i}`, addedAt: now, lastUsed: now}))});
+		const selected = Array.from({length: 9}, () => manager.getCurrentOrNextForFamilyHybrid("codex", undefined, {pidOffsetEnabled: false})?.index);
+		expect(selected).toEqual([0, 1, 2, 0, 1, 2, 0, 1, 2]);
+	});
+
 	describe("removeAccount", () => {
 		it("removes an account and updates indices", () => {
 			const now = Date.now();

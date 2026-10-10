@@ -1106,7 +1106,9 @@ export class AccountManager {
 		const healthTracker = getHealthTracker();
 		const tokenTracker = getTokenTracker();
 
-		const accountsWithMetrics: AccountWithMetrics[] = this.accounts
+		const cursor = this.cursorByFamily[family];
+		// Equal millisecond scores follow the committed cursor rather than array order.
+		const accountsWithMetrics: AccountWithMetrics[] = [...this.accounts.slice(cursor), ...this.accounts.slice(0, cursor)]
 			.map((account): AccountWithMetrics | null => {
 				if (!account) return null;
 				if (account.enabled === false) return null;

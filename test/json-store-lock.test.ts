@@ -8,6 +8,7 @@ import {
 	readdir,
 	realpath,
 	rm,
+	symlink,
 	utimes,
 	writeFile,
 } from "node:fs/promises";
@@ -56,6 +57,8 @@ async function fixture() {
 	// Compile only the modules under test into the fixture dir so each child is
 	// a real, independent process; never import build output.
 	await writeFile(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+	// Child processes use the same installed dependencies as their compiled modules.
+	await symlink(join(process.cwd(), "node_modules"), join(dir, "node_modules"), "junction");
 	const sources: Array<[string, string, Array<[string, string]>]> = [
 		["lib/budget-guard.ts", "budget-guard.js", [['"./storage/json-store-lock.js"', '"./json-store-lock.js"']]],
 		["lib/account-policy.ts", "account-policy.js", [['"./storage/json-store-lock.js"', '"./json-store-lock.js"']]],
