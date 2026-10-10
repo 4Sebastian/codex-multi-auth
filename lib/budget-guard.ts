@@ -1,4 +1,5 @@
-import { existsSync, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
+import {z} from "zod";
 import { basename, join } from "node:path";
 import { logWarn } from "./logger.js";
 import { getCodexMultiAuthDir } from "./runtime-paths.js";
@@ -158,12 +159,20 @@ export function normalizeBudgetKey(value: string): string | null {
 	return normalizeKey(value);
 }
 
-export async function loadBudgetGuardStore(): Promise<BudgetGuardStore> {
+const budgetObservationSchema = z.object({version: z.literal(1), limits: z.record(z.string().min(1), z.object({
+	window: z.enum(["hour", "day", "week", "month"]),
+	maxRequests: z.number().positive().optional(), maxTokens: z.number().positive().optional(), maxCostUsd: z.number().positive().optional(),
+	updatedAt: z.number().optional(),
+}))});
+
+export async function loadBudgetGuardStore(options: {strict?: boolean} = {}): Promise<BudgetGuardStore> {
 	const path = getBudgetGuardPath();
-	if (!existsSync(path)) return emptyStore();
 	try {
-		return normalizeStore(JSON.parse(await readFileWithRetry(path)) as unknown);
+		const parsed: unknown = JSON.parse(await readFileWithRetry(path));
+		return normalizeStore(options.strict ? budgetObservationSchema.parse(parsed) : parsed);
 	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStore();
+		if (options.strict) throw error;
 		logWarn(
 			`Failed to load budget guards from ${basename(path)}: ${
 				error instanceof Error ? error.message : String(error)

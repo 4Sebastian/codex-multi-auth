@@ -121,7 +121,7 @@ const MTIME_SETTLE_MS = 2_000;
 const STORE_CACHE_TTL_MS = 30_000;
 const STORE_CACHE_MAX_ENTRIES = 32;
 // Retries while the file's fingerprint keeps moving across a load (a writer
-// racing us). Beyond this bound the freshest value is returned uncached.
+// racing us). Beyond this bound the observation fails closed.
 const STORE_LOAD_MAX_ATTEMPTS = 3;
 const PROJECT_RESOLUTION_TTL_MS = 5_000;
 const PROJECT_RESOLUTION_MAX_ENTRIES = 64;
@@ -167,20 +167,18 @@ function evictOldest<K, V>(map: Map<K, V>, maxEntries: number): void {
 /**
  * mtime+ctime+size-fingerprinted wrapper around an existing store loader. On
  * a fingerprint hit the cached store is returned WITHOUT re-reading or
- * re-parsing the file; on a miss the real loader runs (preserving its retry,
- * normalization, and warn-on-corrupt semantics) and the entry is keyed on a
+ * re-parsing the file; on a miss the strict loader runs (preserving its retry
+ * and normalization while propagating observation failures), keyed on a
  * fingerprint that must be stable ACROSS the load — re-statting after the
  * read catches a concurrent rewrite that would otherwise pin the old parse
- * under the new file's fingerprint once the new mtime settles. A load that
- * returns the empty store while the file still exists is a failed or
- * undecodable read, never a cacheable "empty file" answer. The returned
- * object is the cached instance — callers must not mutate it.
+ * under the new file's fingerprint once the new mtime settles. Valid empty
+ * stores can be cached; failed observations cannot. Callers must not mutate
+ * the returned cached instance.
  */
 async function loadStoreCached<T>(input: {
 	path: string;
 	cache: Map<string, StoreCacheEntry<T>>;
 	load: () => Promise<T>;
-	isEmptyStore: (value: T) => boolean;
 }): Promise<T> {
 	const now = Date.now();
 	const sample = statFile(input.path);
@@ -201,20 +199,8 @@ async function loadStoreCached<T>(input: {
 		const value = await input.load();
 		const after = statFile(input.path);
 		if (before !== after.fingerprint) {
-			// The file moved under the read: `value` may predate the bytes the
-			// new fingerprint describes. Retry while the writer is still
-			// racing; on the last attempt the value is still a real read, it
-			// is simply not safe to cache.
-			if (attempt + 1 === STORE_LOAD_MAX_ATTEMPTS) return value;
+			// Never authorize bytes under a fingerprint from another version.
 			continue;
-		}
-		if (after.stat !== null && input.isEmptyStore(value)) {
-			// The loaders resolve exhausted EBUSY/EPERM reads and corrupt JSON
-			// to the empty store — indistinguishable from a legitimately empty
-			// file except that bytes still exist on disk. Serve it, but do
-			// not cache: the next request retries the read instead of hiding
-			// an existing policy for the full TTL.
-			return value;
 		}
 		input.cache.set(input.path, {
 			fingerprint: after.fingerprint,
@@ -224,7 +210,7 @@ async function loadStoreCached<T>(input: {
 		evictOldest(input.cache, STORE_CACHE_MAX_ENTRIES);
 		return value;
 	}
-	// Unreachable: every iteration returns or continues past the bound.
+	// Continued writes or unavailable metadata cannot establish current authority.
 	throw new Error("runtime policy cache load attempts exhausted");
 }
 
@@ -236,8 +222,7 @@ export function loadAccountPolicyStoreCached(): Promise<AccountPolicyStore> {
 	return loadStoreCached({
 		path: getAccountPolicyPath(),
 		cache: ACCOUNT_POLICY_CACHE,
-		load: loadAccountPolicyStore,
-		isEmptyStore: (store) => Object.keys(store.accounts).length === 0,
+		load: () => loadAccountPolicyStore({strict: true}),
 	});
 }
 
@@ -249,8 +234,7 @@ export function loadBudgetGuardStoreCached(): Promise<BudgetGuardStore> {
 	return loadStoreCached({
 		path: getBudgetGuardPath(),
 		cache: BUDGET_GUARD_CACHE,
-		load: loadBudgetGuardStore,
-		isEmptyStore: (store) => Object.keys(store.limits).length === 0,
+		load: () => loadBudgetGuardStore({strict: true}),
 	});
 }
 
@@ -258,8 +242,7 @@ function loadRoutingProfileStoreCached(): Promise<RoutingProfileStore> {
 	return loadStoreCached({
 		path: getRoutingProfilesPath(),
 		cache: ROUTING_PROFILES_CACHE,
-		load: loadRoutingProfileStore,
-		isEmptyStore: (store) => Object.keys(store.profiles).length === 0,
+		load: () => loadRoutingProfileStore({strict: true}),
 	});
 }
 
@@ -348,6 +331,10 @@ function resolveProjectCached(startDir: string): ProjectResolution {
 	return resolution;
 }
 
+export function getProjectAuthorityPaths(startDir: string): string[] {
+	return resolveProjectCached(startDir).watchDirs.flatMap(directory => [directory, join(directory, ".git")]);
+}
+
 /**
  * Cached variant of `resolveProjectRoutingProfile` for the per-request path.
  * The project context (root/identity/key) comes from the bounded resolution
@@ -360,6 +347,7 @@ export async function resolveProjectRoutingProfileCached(
 	startDir = process.cwd(),
 ): Promise<ProjectRoutingProfileContext> {
 	const resolution = resolveProjectCached(startDir);
+	const store = await loadRoutingProfileStoreCached();
 	if (
 		!resolution.projectRoot ||
 		!resolution.identityRoot ||
@@ -373,7 +361,6 @@ export async function resolveProjectRoutingProfileCached(
 			profile: null,
 		};
 	}
-	const store = await loadRoutingProfileStoreCached();
 	return {
 		startDir,
 		projectRoot: resolution.projectRoot,

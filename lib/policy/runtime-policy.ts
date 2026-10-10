@@ -1,5 +1,4 @@
 import { captureAuthorityRevision } from "../storage/authority-revision.js";
-import { dirname, join, resolve } from "node:path";
 import type { CapabilityPolicyStore } from "../capability-policy.js";
 import { resolveEntitlementAccountKey } from "../entitlement-cache.js";
 import {
@@ -21,6 +20,7 @@ import { getRoutingProfilesPath, type ProjectRoutingProfileContext } from "../ro
 import {
 	loadAccountPolicyStoreCached,
 	loadBudgetGuardStoreCached,
+	getProjectAuthorityPaths,
 	resolveProjectRoutingProfileCached,
 } from "./runtime-policy-cache.js";
 import {
@@ -97,14 +97,7 @@ export interface RuntimeUsageRecordInput {
 export function captureRuntimePolicyRevision(startDir = process.cwd()): (includeUsage?: boolean) => boolean {
 	const ledger = getUsageLedgerPaths();
 	const usageCurrent = captureAuthorityRevision([ledger.current, ledger.dir]);
-	const paths = [getAccountPolicyPath(), getBudgetGuardPath(), getRoutingProfilesPath()];
-	let directory = resolve(startDir);
-	for (let depth = 0; depth < 64; depth++) {
-		paths.push(directory, join(directory, ".git"));
-		const parent = dirname(directory);
-		if (parent === directory) break;
-		directory = parent;
-	}
+	const paths = [getAccountPolicyPath(), getBudgetGuardPath(), getRoutingProfilesPath(), ...getProjectAuthorityPaths(startDir)];
 	const policyCurrent = captureAuthorityRevision(paths);
 	return (includeUsage = false) => policyCurrent() && (!includeUsage || usageCurrent());
 }

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { getAccountPolicyKey } from "../lib/account-policy.js";
 import {
 	createRuntimeUsageRecorder,
+	captureRuntimePolicyRevision,
 	evaluateRuntimePolicy,
 	type RuntimePolicyState,
 } from "../lib/policy/runtime-policy.js";
@@ -42,6 +43,32 @@ describe("runtime policy", () => {
 			process.env.CODEX_MULTI_AUTH_DIR = originalDir;
 		}
 		await removeWithRetry(tempDir, { recursive: true, force: true });
+	});
+
+	it("rejects unreadable profile authority even without a resolved project", async () => {
+		const {loadRuntimePolicyState} = await import("../lib/policy/runtime-policy.js");
+		const {getRoutingProfilesPath} = await import("../lib/routing-profiles.js");
+		const root = join(tempDir, "rootless"); await fs.mkdir(root);
+		await fs.writeFile(getRoutingProfilesPath(), "fixture corrupt profile authority");
+		await expect(loadRuntimePolicyState(root)).rejects.toThrow();
+	});
+
+	it("watches project resolution without unrelated ancestor directory churn", async () => {
+		const parent = join(tempDir, "parent"), root = join(parent, "repo"), child = join(root, "src");
+		await fs.mkdir(join(root, ".git"), {recursive: true}); await fs.mkdir(child);
+		const current = captureRuntimePolicyRevision(child);
+		await fs.mkdir(join(parent, "unrelated-sibling"));
+		expect(current()).toBe(true);
+		await fs.writeFile(join(child, ".git"), "gitdir: fixture-new-root");
+		expect(current()).toBe(false);
+	});
+
+	it("watches higher ancestors when a project has no git boundary", async () => {
+		const root = join(tempDir, "rootless"), child = join(root, "src");
+		await fs.mkdir(child, {recursive: true});
+		const current = captureRuntimePolicyRevision(child);
+		await fs.mkdir(join(root, ".git"));
+		expect(current()).toBe(false);
 	});
 
 	it("blocks paused accounts and adds profile score boosts", async () => {

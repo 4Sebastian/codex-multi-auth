@@ -16,7 +16,10 @@ import * as refreshQueue from "../lib/refresh-queue.js";
 import {getPendingAuthPath, recordPendingAuth} from "../lib/storage/pending-auth.js";
 import {loadAccounts, setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
-import {getAccountPolicyKey, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
+import {getAccountPolicyKey, getAccountPolicyPath, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
+import {getBudgetGuardPath} from "../lib/budget-guard.js";
+import {getRoutingProfilesPath} from "../lib/routing-profiles.js";
+import {resetRuntimePolicyCacheForTests} from "../lib/policy/runtime-policy-cache.js";
 import {ApiModelRuntime} from "../lib/runtime/api-model-runtime.js";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
 import {appendUsageLedgerRow} from "../lib/usage/index.js";
@@ -474,6 +477,29 @@ it.each(["credential", "workspace"].flatMap(mutation => [false, true].map(contin
 		expect(f.creates[1]).toMatchObject(mutation === "credential" ? {token: "Bearer B"} : {workspace: "W2"});
 		expect(f.connections()).toBe(2);
 	}
+});
+
+it.each(["account", "budget", "profile"].flatMap(store => ["corrupt", "shape", "row", "unreadable"].map(failure => ({store, failure}))))
+("denies dispatch when governance cannot be observed (%j)", async ({store, failure}) => {
+	const f = await fixture(true);
+	const path = store === "account" ? getAccountPolicyPath() : store === "budget" ? getBudgetGuardPath() : getRoutingProfilesPath();
+	const contents = failure === "corrupt" ? "{fixture corrupt governance" : failure === "shape" ? JSON.stringify({version: 1}) :
+		JSON.stringify(store === "account" ? {version: 1, accounts: {"sha256:fixture": failure === "row" ? {paused: "false"} : {}}} :
+			store === "budget" ? {version: 1, limits: {default: failure === "row" ? {window: "day", maxRequests: "1"} : {window: "day", maxRequests: 1}}} :
+			{version: 1, profiles: {fixture: failure === "row" ? {modelDenylist: "shared"} : {}}});
+	await fs.mkdir(join(path, ".."), {recursive: true}); await fs.writeFile(path, contents);
+	resetRuntimePolicyCacheForTests();
+	const read = fs.readFile.bind(fs);
+	if (failure === "unreadable") vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+		if (String(args[0]) === path) throw Object.assign(Error("fixture read denied"), {code: "EACCES"});
+		return read(...args);
+	});
+	cleanups.push(async () => {await fs.rm(path, {force: true}); resetRuntimePolicyCacheForTests();});
+	const response = await f.post(); const text = await response.text();
+	expect(response.status, text).toBe(503);
+	expect(JSON.parse(text).error.code).toBe("runtime_policy_unavailable");
+	expect(f.fetched).toEqual([]);
+	expect(f.creates).toEqual([]);
 });
 
 it("honors a durable runtime clear after this manager persisted its own restrictions", async () => {

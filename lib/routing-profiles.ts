@@ -1,4 +1,5 @@
-import { existsSync, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
+import {z} from "zod";
 import { basename, join } from "node:path";
 import { logWarn } from "./logger.js";
 import { getCodexMultiAuthDir } from "./runtime-paths.js";
@@ -157,12 +158,21 @@ export function getRoutingProfilesPath(): string {
 	return join(getCodexMultiAuthDir(), ROUTING_PROFILES_FILE_NAME);
 }
 
-export async function loadRoutingProfileStore(): Promise<RoutingProfileStore> {
+const profileObservationSchema = z.object({version: z.literal(1), profiles: z.record(z.string(), z.object({
+	projectKey: z.string().optional(), projectName: z.string().optional(), identityRoot: z.string().optional(),
+	preferredTags: z.array(z.string()).optional(), avoidTags: z.array(z.string()).optional(),
+	modelAllowlist: z.array(z.string()).optional(), modelDenylist: z.array(z.string()).optional(),
+	accountWeightByKey: z.record(z.string(), z.number()).optional(), budgetKey: z.string().nullable().optional(), updatedAt: z.number().optional(),
+}))});
+
+export async function loadRoutingProfileStore(options: {strict?: boolean} = {}): Promise<RoutingProfileStore> {
 	const path = getRoutingProfilesPath();
-	if (!existsSync(path)) return emptyStore();
 	try {
-		return normalizeStore(JSON.parse(await readFileWithRetry(path)) as unknown);
+		const parsed: unknown = JSON.parse(await readFileWithRetry(path));
+		return normalizeStore(options.strict ? profileObservationSchema.parse(parsed) : parsed);
 	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStore();
+		if (options.strict) throw error;
 		logWarn(
 			`Failed to load routing profiles from ${basename(path)}: ${
 				error instanceof Error ? error.message : String(error)

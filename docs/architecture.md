@@ -138,6 +138,8 @@ File-backed, local-only, and enforced on the rotation path by `evaluateRuntimePo
 | Quota snapshots | `quota-cache.json` | `limits`, `check`, `forecast --live`, `report` |
 | Operator view | runtime observability + all of the above | `codex-multi-auth monitor` |
 
+Actual-send governance reads distinguish absent policy stores from malformed or unreadable authority. Account policies, budget guards and routing profiles use strict observation at this boundary; failures deny dispatch rather than supplying empty defaults. Cached reads require a stable file revision. Project revision watches stop at the established Git root, but still observe lower markers and all ancestors when no Git boundary exists.
+
 Budgets are **advisory**: evaluations read a pre-request ledger snapshot, so racing requests can briefly overshoot a limit. Ledger rows are redacted — hashed account identity and request metadata, never prompts or credentials.
 
 ### 5. Local bridge (optional)

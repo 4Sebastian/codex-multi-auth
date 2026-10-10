@@ -5,12 +5,8 @@ import { tmpdir } from "node:os";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
 
 /**
- * Fault injection for the account-policy loader the cache wraps. The real
- * loader folds read failures into the empty store and cannot be raced
- * deterministically from the outside, so the module is mocked with a
- * passthrough that can (a) rewrite the file mid-load — the proxy's load
- * racing a CLI write — and (b) resolve to the empty store the way an
- * exhausted EBUSY/EPERM read or corrupt JSON does.
+ * The passthrough injects a file rewrite during a real load or an observation
+ * failure, honoring the caller's strict authorization-read contract.
  */
 const accountPolicyReadFaults = vi.hoisted(() => ({
 	/** Set: the next load returns the pre-write parse after replacing the file. */
@@ -25,11 +21,12 @@ vi.mock("../lib/account-policy.js", async (importOriginal) => {
 	const { promises: fsPromises } = await import("node:fs");
 	return {
 		...actual,
-		loadAccountPolicyStore: async () => {
+		loadAccountPolicyStore: async (options?: Parameters<typeof actual.loadAccountPolicyStore>[0]) => {
 			if (accountPolicyReadFaults.returnEmptyStore) {
+				if (options?.strict) throw new Error("fixture policy observation failed");
 				return { version: 1 as const, accounts: {} };
 			}
-			const value = await actual.loadAccountPolicyStore();
+			const value = await actual.loadAccountPolicyStore(options);
 			const write = accountPolicyReadFaults.writeAfterRead;
 			if (write) {
 				accountPolicyReadFaults.writeAfterRead = null;
@@ -242,7 +239,7 @@ describe("runtime policy cache", () => {
 		}
 	});
 
-	it("does not cache the empty store produced by a failed read", async () => {
+	it("rejects a failed observation without caching it as an empty store", async () => {
 		const { loadAccountPolicyStoreCached } = await import(
 			"../lib/policy/runtime-policy-cache.js"
 		);
@@ -267,11 +264,9 @@ describe("runtime policy cache", () => {
 		const old = new Date(Date.now() - 60_000);
 		await fs.utimes(path, old, old);
 
-		// An exhausted EBUSY/EPERM read resolves to the empty store while real
-		// bytes still exist on disk.
+		// Strict authorization reads reject failure while real policy bytes remain.
 		accountPolicyReadFaults.returnEmptyStore = true;
-		const failed = await loadAccountPolicyStoreCached();
-		expect(Object.keys(failed.accounts)).toHaveLength(0);
+		await expect(loadAccountPolicyStoreCached()).rejects.toThrow("fixture policy observation failed");
 		accountPolicyReadFaults.returnEmptyStore = false;
 
 		// The failed result must not be cached: the very next call observes the
