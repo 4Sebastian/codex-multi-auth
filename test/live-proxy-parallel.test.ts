@@ -53,6 +53,7 @@ const savedMutexEnv = process.env.CODEX_AUTH_ROUTING_MUTEX;
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 	if (savedMutexEnv === undefined) {
 		delete process.env.CODEX_AUTH_ROUTING_MUTEX;
 	} else {
@@ -230,6 +231,8 @@ function tokensRemaining(manager: AccountManager, index: number): number {
 
 describe("live proxy concurrency (routing-mutex enabled)", () => {
 	it("25 concurrent requests: one selection commit and upstream dispatch each, fair spread", async () => {
+		// This measures within-process mutex fairness, not the weighted cross-process PID bias.
+		vi.stubEnv("CODEX_AUTH_PID_OFFSET_ENABLED", "0");
 		const TOTAL = 25;
 		const upstream = await startUpstream({ barrierCount: TOTAL });
 		const { proxy, manager } = await startProxyStack(upstream.port);
@@ -326,7 +329,7 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 			),
 		);
 		for (const response of responses) {
-			expect(response.status).toBe(200);
+			expect(response.status, response.status === 200 ? undefined : await response.text()).toBe(200);
 		}
 
 		const attemptsOnVictim = upstream.hits.filter(

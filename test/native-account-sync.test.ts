@@ -45,13 +45,23 @@ describe("native record generation matching", () => {
 	});
 
 	it("does not apply an old primary refusal to a retained refreshed credential", () => {
-		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const storage = fixture();
+		storage.accounts[0]!.authInvalidatedAt = 5000;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
 		const account = manager.getAccountByIndex(0)!;
 		manager.updateFromAuth(account, {type: "oauth", access: account.access!, refresh: "new-refresh", expires: 3000});
-		disk.accounts[0]!.authInvalidatedAt = 5000;
 		syncNativeAccountCredentials(manager, disk);
 		expect(account.refreshToken).toBe("new-refresh");
 		expect(account.authInvalidatedAt).toBeUndefined();
+	});
+	it("enforces a newly observed durable revocation against a memory-only recovery", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		manager.updateFromAuth(account, {type: "oauth", access: "new-access", refresh: "new-refresh", expires: 3000});
+		disk.accounts[0]!.authInvalidatedAt = 5000;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.access).toBe("new-access");
+		expect(account.authInvalidatedAt).toBe(5000);
 	});
 	it("keeps a stored record's authority across account and email changes", () => {
 		const storage = fixture();

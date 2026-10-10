@@ -116,16 +116,21 @@ it.each(["disable", "delete", "remove", "corrupt"])("rejects durable custom rest
 	expect(f.creates).toHaveLength(1);
 });
 
-it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", "usage"].map(mutation => ({transport, mutation}))))
-("rejects changed authority during the final journal wait (%j)", async ({transport, mutation}) => {
+it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", "usage", "metadata", "churn"].map(mutation => ({transport, mutation}))))
+("rechecks changed authority during the final journal wait (%j)", async ({transport, mutation}) => {
 	const native = transport === "native";
 	const f = await fixture(native), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	const original = f.manager.isAccountJournalEligible.bind(f.manager);
-	let armed = false, observations = 0;
+	let armed = false, observations = 0, repeatedChange = false;
 	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async account => {
 		const eligible = await original(account);
 		if (armed && ++observations === (transport === "custom" ? 2 : 3)) {armed = false; entered.resolve(); await release.promise;}
+		else if (mutation === "churn" && !armed && observations > 0 && !repeatedChange) {
+			repeatedChange = true;
+			f.pool.accounts[0]!.accountLabel = "Second fixture label change";
+			await fs.writeFile(f.path, JSON.stringify(f.pool));
+		}
 		return eligible;
 	});
 	const ws = await f.connect();
@@ -139,6 +144,9 @@ it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", 
 	if (mutation === "primary") {
 		const other = new AccountManager(undefined, f.pool);
 		other.setAccountEnabled(0, false); await other.saveToDisk();
+	} else if (mutation === "metadata" || mutation === "churn") {
+		f.pool.accounts[0]!.accountLabel = "Fixture label change";
+		await fs.writeFile(f.path, JSON.stringify(f.pool));
 	} else if (mutation === "usage") {
 		await appendUsageLedgerRow({source: "runtime-proxy", operation: "responses", model: "shared", outcome: "success"});
 	} else {
@@ -146,9 +154,12 @@ it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", 
 		cleanups.push(async () => {await updateAccountPolicyStore(store => {upsertAccountPolicy(store, getAccountPolicyKey(f.manager.getAccountByIndex(0)!), policy => {policy.paused = false;}); return {result: undefined, dirty: true};});});
 	}
 	release.resolve();
-	expect((await pending).type).toBe(mutation === "usage" ? transport === "http" ? "success" : "response.completed" : "error");
-	expect(f.creates).toHaveLength(mutation === "usage" && transport !== "http" ? 2 : 1);
-	expect(f.fetched).toEqual(mutation === "usage" && transport === "http" ? ["Bearer A"] : []);
+	const result = await pending;
+	const permitted = mutation === "usage" || mutation === "metadata";
+	expect(result.type).toBe(permitted ? transport === "http" ? "success" : "response.completed" : "error");
+	if (mutation === "policy" && transport === "custom" && "closeCode" in result) expect(result.closeCode).toBe(1008);
+	expect(f.creates).toHaveLength(permitted && transport !== "http" ? 2 : 1);
+	expect(f.fetched).toEqual(permitted && transport === "http" ? ["Bearer A"] : []);
 });
 
 it.each([402, 403].flatMap(status => [false, true].map(workspaces => ({status, workspaces}))))
@@ -397,9 +408,13 @@ it.each(["api", "zdr"] as const)("rejects known %s denial on a cached HTTP-only 
 });
 
 function turn(ws: WebSocket, extra: Record<string, unknown> = {}) {
-	const received = once(ws, "message");
+	const listeners = new AbortController();
+	const received = Promise.race([
+		once(ws, "message", {signal: listeners.signal}).then(([data]) => JSON.parse(String(data))),
+		once(ws, "close", {signal: listeners.signal}).then(([closeCode, reason]) => ({type: "error", closeCode, reason: String(reason)})),
+	]).finally(() => listeners.abort());
 	ws.send(JSON.stringify({type: "response.create", model: "shared", input: [], ...extra}));
-	return received.then(([data]) => JSON.parse(String(data)));
+	return received;
 }
 
 it.each(["quota", "scheduler", "circuit", "revoked", "journal"])("rechecks native %s authority after a delayed real handshake", async mutation => {

@@ -1560,8 +1560,7 @@ export class AccountManager {
 			(disk.refreshToken !== undefined && disk.refreshToken !== account.refreshToken);
 		if (!prior || enabled !== prior.enabled || (!retainingLiveCredentials && replacedCredential)) account.enabled = enabled;
 		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
-		const unchangedAuthorization = retainingLiveCredentials && (disk.accessToken !== account.access ||
-			(disk.refreshToken !== undefined && disk.refreshToken !== account.refreshToken) || disk.authInvalidatedAt === baseline?.authInvalidatedAt);
+		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt;
 		const diskInvalidatedAt = unchangedAuthorization ? before : disk.authInvalidatedAt;
 		if (diskInvalidatedAt) {
 			if (!unchangedAuthorization && (!before || diskInvalidatedAt > before || disk.accessToken !== account.access)) {

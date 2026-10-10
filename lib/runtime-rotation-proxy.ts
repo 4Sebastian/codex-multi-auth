@@ -1450,6 +1450,7 @@ async function validateAccountDispatch(
 	admission?: CircuitAdmissionReceipt,
 	admittedCooldown?: Pick<ManagedAccount, "coolingDownUntil" | "cooldownReason">,
 	allowNativeGrace?: () => Promise<boolean>,
+	retryChangedAuthority = true,
 ): Promise<string | null> {
 	const {accountManager, account} = binding;
 	const policyCurrent = captureRuntimePolicyRevision();
@@ -1473,9 +1474,12 @@ async function validateAccountDispatch(
 	} catch {
 		throw createRuntimeProxyHttpError("Journal authorization is unavailable.", 503, "routing_configuration_changed");
 	}
-	if (!authorityCurrent() || !policyCurrent(policy.budgetEvaluations.length > 0) || !isDispatchBindingCurrent(state, binding) || (binding.expiresAt ?? 0) <= state.now()) {
+	const bindingCurrent = isDispatchBindingCurrent(state, binding) && (binding.expiresAt ?? 0) > state.now();
+	if (!authorityCurrent() || !policyCurrent(policy.budgetEvaluations.length > 0)) {
+		if (retryChangedAuthority && bindingCurrent) return validateAccountDispatch(state, context, binding, admission, admittedCooldown, allowNativeGrace, false);
 		throw createRuntimeProxyHttpError("Request-bound authorization changed.", 503, "routing_configuration_changed");
 	}
+	if (!bindingCurrent) throw createRuntimeProxyHttpError("Request-bound authorization changed.", 503, "routing_configuration_changed");
 	if (policy.blockedAccountIndexes.has(account.index)) throw createRuntimeProxyHttpError("Runtime policy blocked the account.", 403, "policy_blocked");
 	if (state.contextBudgetGuard.getAdvisory(context.stableSessionKey ?? "", state.now(), context.model).level === "hard") {
 		throw createRuntimeProxyHttpError("Context budget paused dispatch.", 503, "context_budget_guard_paused");
@@ -4245,9 +4249,13 @@ async function handleRequestInner(
 			const binding = captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, accountId);
 			const validate = () => validateAccountDispatch(state, context, binding, circuitAdmission, admittedCooldown, async () => apiKeyClient || await nativeOAuth());
 			const scopeEligible = () => !requestScope || (catalogScopeEligible?.(requestScope.id) === true && workspaceModelScopes(refreshed.account).some(scope => scope.id === requestScope.id && scope.routable));
+			let finalAdmissionSkip: string | null = null;
+			let dispatchAuthorized = false;
 			const authorize: DispatchAuthorization = async () => {
-				if (await validate() || !scopeEligible()) throw createRuntimeProxyHttpError("Dispatch eligibility changed.", 503, "routing_configuration_changed");
+				finalAdmissionSkip = await validate();
+				if (finalAdmissionSkip || !scopeEligible()) throw createRuntimeProxyHttpError("Dispatch eligibility changed.", 503, "routing_configuration_changed");
 				if (clientGone()) throw new ClientCancellationError();
+				dispatchAuthorized = true;
 				state.status.upstreamRequests++;
 				recordLastRuntimeAccount(state.status, accountIdentity, accountId);
 				if (isResponsesRequest || isImageRequest) recordRuntimeInferenceRequest(inferenceAccountKey(refreshed.account), state.now());
@@ -4334,6 +4342,13 @@ async function handleRequestInner(
                 }
 				if (isRuntimeProxyHttpError(error) || error instanceof PendingAuthObservationError) {
 					accountManager.refundToken(selected, context.family, context.model);
+					if (finalAdmissionSkip && !dispatchAuthorized && !state.webSocketRequestSent?.()) {
+						accountSkipReasons.set(selected.index, finalAdmissionSkip);
+						exhaustionReason = "rate-limit";
+						capabilityRejectionIsLatest = false;
+						if (isPinned) break;
+						continue;
+					}
 					throw error;
 				}
 				// errors-logging-08: a custom fetchImpl, a proxy agent, or an undici
