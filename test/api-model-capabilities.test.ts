@@ -471,6 +471,67 @@ it("stops advertising a credential's verified settings once it loses access", as
 	expect(after?.supported_reasoning_levels ?? []).not.toEqual(expect.arrayContaining([expect.objectContaining({ effort: "xhigh" })]));
 });
 
+it.each([401, 403].flatMap(status => [false, true].flatMap(previous => [false, true].map(revocationFirst => ({status, previous, revocationFirst})))))
+("removes every probe-derived positive after late credential loss (%j)", async ({status, previous, revocationFirst}) => {
+	let now = 1, denying = !previous;
+	let releaseFast: () => void = () => undefined, releaseRevocation: () => void = () => undefined;
+	let entered: () => void = () => undefined, finishedFirst: () => void = () => undefined;
+	const fastGate = new Promise<void>(resolve => {releaseFast = resolve;});
+	const revocationGate = new Promise<void>(resolve => {releaseRevocation = resolve;});
+	const started = new Promise<void>(resolve => {entered = resolve;});
+	const firstFinished = new Promise<void>(resolve => {finishedFirst = resolve;});
+	let waiting = 0;
+	const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+		if (init?.method !== "POST") return new Response("Model ID: `fixture`\n`reasoning.effort` supports low, high.");
+		const body = JSON.parse(String(init.body));
+		if (denying && body.service_tier) {
+			if (++waiting === 2) entered();
+			const revoked = body.service_tier === "ultrafast";
+			await (revoked ? revocationGate : fastGate);
+			const response = revoked
+				? Response.json({error: {code: status === 401 ? "invalid_api_key" : "permission_denied"}}, {status})
+				: Response.json({service_tier: "priority"});
+			if (revoked === revocationFirst) {
+				const stream = response.body!;
+				const getReader = stream.getReader.bind(stream);
+				vi.spyOn(stream, "getReader").mockImplementation(() => {
+					const reader = getReader();
+					const cancel = reader.cancel.bind(reader);
+					vi.spyOn(reader, "cancel").mockImplementation(async reason => {await cancel(reason); finishedFirst();});
+					return reader;
+				});
+			}
+			return response;
+		}
+		if (body.tools) return Response.json({output: [{type: "function_call", name: "capability_probe"}]});
+		return Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	});
+	const reader = new ApiModelCapabilities(fetcher, () => now);
+	const enrich = async () => (await reader.enrich([{slug: "fixture"}], false, route))[0];
+	if (previous) {
+		expect((await enrich())?.service_tiers).toEqual(expect.arrayContaining([expect.objectContaining({id: "priority"})]));
+		denying = true; now += 900001;
+	}
+	const pending = enrich();
+	await started;
+	(revocationFirst ? releaseRevocation : releaseFast)();
+	await firstFinished;
+	(revocationFirst ? releaseFast : releaseRevocation)();
+	const model = await pending;
+	expect(model?.service_tiers).toEqual([]);
+	expect(model?.additional_speed_tiers).toEqual([]);
+	expect(model?.supported_reasoning_levels).toEqual([
+		{effort: "low", description: "low reasoning effort"},
+		{effort: "high", description: "high reasoning effort"},
+		{effort: "ultra", description: "Proactive multi-agent mode using a supported API reasoning effort"},
+	]);
+	expect(Object.values(model?.capability_probe_status ?? {})).not.toContain("verified");
+	expect(model?.capability_probe_status).toMatchObject({responses: "unverified", retry: "transient"});
+	const posts = fetcher.mock.calls.length;
+	expect(JSON.parse(JSON.stringify(await enrich()))).toEqual(JSON.parse(JSON.stringify(model)));
+	expect(fetcher.mock.calls).toHaveLength(posts);
+});
+
 it("a setting-specific 403 removes only the denied effort", async () => {
  let now=1, deny=false;
  const fetcher=vi.fn(async (_u:unknown, init?:RequestInit)=>{

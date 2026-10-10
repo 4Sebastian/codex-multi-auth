@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
-import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
+import { isSameNativeAccount, syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
 import { workspaceModelScopes } from "../lib/runtime/workspace-model-scopes.js";
 const fixture = (): AccountStorageV3 => ({
 	version: 3,
@@ -21,6 +21,40 @@ const fixture = (): AccountStorageV3 => ({
 		},
 	],
 });
+describe("native record generation matching", () => {
+	it.each([
+		{left: "R1", right: "R2", expected: false},
+		{left: " R1 ", right: "R1", expected: true},
+		{left: "R1", right: undefined, expected: true},
+		{left: undefined, right: "R1", expected: true},
+	])("matches explicit generations without losing legacy identity (%j)", ({left, right, expected}) => {
+		const identity = {accountId: "a", email: "a@example.test", refreshToken: "fixture"};
+		expect(isSameNativeAccount({...identity, recordId: left}, {...identity, recordId: right})).toBe(expected);
+	});
+
+	it("does not reconcile replacement credentials or workspace policy into a deleted record", () => {
+		const storage = fixture();
+		Object.assign(storage.accounts[0]!, {recordId: "R1", workspaces: [{id: "original", enabled: true}]});
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {recordId: "R2", accessToken: "replacement", refreshToken: "replacement-refresh",
+			workspaces: [{id: "replacement-workspace", enabled: true}]});
+		const manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({recordId: "R1", enabled: false, access: "old-access",
+			refreshToken: "old-refresh", workspaces: [{id: "original", enabled: true}]});
+	});
+
+	it("keeps a stored record's authority across account and email changes", () => {
+		const storage = fixture();
+		storage.accounts[0]!.recordId = "R1";
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accountId: "new-account", email: "renamed@example.test", accessToken: "replacement"});
+		const manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({recordId: "R1", access: "replacement", enabled: true});
+	});
+});
+
 describe("native account credential reload", () => {
 	it("adopts external workspace inventory and disablement without changing credentials", () => {
 		const storage=fixture();

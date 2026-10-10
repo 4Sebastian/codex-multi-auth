@@ -22,7 +22,7 @@ import { loadApiRoutes, updateApiModelDiscovery } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
 import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, type RouteModel } from "./model-route-policy.js";
 import { isSameNativeAccount, syncNativeAccountCredentials } from "./runtime/native-account-sync.js";
-import { sanitizeEmail } from "./auth/token-utils.js";
+import { resolveAccountRecordId } from "./storage/record-identity.js";
 import { isNativeClientToken } from "./runtime/native-client-auth.js";
 import { CatalogRetryError, AccountModelCatalog, clampCatalogRetryMs } from "./runtime/account-model-catalog.js";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -1381,6 +1381,30 @@ async function prepareWebSocketRequest(
 	return { context, policyDecision, usageRecorder };
 }
 
+function dispatchRuntimeSkipReason(
+	state: RotationProxyState,
+	accountManager: AccountManager,
+	account: ManagedAccount,
+	context: { family: ModelFamily; model: string | null },
+	ownsAdmission: boolean,
+	admittedCooldown?: Pick<ManagedAccount, "coolingDownUntil" | "cooldownReason">,
+): string | null {
+	if (accountManager.getAccountByIndex(account.index) !== account ||
+		(state.nativeOpenai && state.activeAccountManager !== accountManager)) return "missing";
+	let reason = accountManager.getManagedAccountRuntimeSkipReason(account, context.family, context.model);
+	if (reason?.startsWith("cooling-down") && admittedCooldown?.coolingDownUntil !== undefined &&
+		account.coolingDownUntil === admittedCooldown.coolingDownUntil && account.cooldownReason === admittedCooldown.cooldownReason) {
+		reason = account.circuitKeyId && !getCircuitBreaker(account.circuitKeyId).isAvailable() ? "circuit-open" : null;
+	}
+	if (reason === "circuit-open" && ownsAdmission && account.circuitKeyId &&
+		getCircuitBreaker(account.circuitKeyId).getState() === "half-open") reason = null;
+	if (!reason && ownsAdmission && account.circuitKeyId && getCircuitBreaker(account.circuitKeyId).getState() === "open") reason = "circuit-open";
+	const deferral = state.preemptiveQuotaScheduler.getDeferral(
+		buildQuotaScheduleKey(account, context.family, context.model), state.now(),
+	);
+	return reason ?? (deferral.defer ? "rate-limited" : null);
+}
+
 async function validateWebSocketRequestForAccount(
 	state: RotationProxyState,
 	request: PreparedWebSocketRequest,
@@ -1404,14 +1428,7 @@ async function validateWebSocketRequestForAccount(
 			"policy_blocked",
 		);
 	}
-	let runtimeSkipReason = accountManager.getAccountByIndex(account.index) !== account ? "missing" : accountManager.getManagedAccountRuntimeSkipReason(
-		account,
-		request.context.family,
-		request.context.model,
-	);
-	if (runtimeSkipReason === "circuit-open" && ownsAdmission && account.circuitKeyId && getCircuitBreaker(account.circuitKeyId).getState() === "half-open") runtimeSkipReason = null;
-	const deferral = state.preemptiveQuotaScheduler.getDeferral(buildQuotaScheduleKey(account, request.context.family, request.context.model), state.now());
-	if (!runtimeSkipReason && deferral.defer) runtimeSkipReason = "rate-limited";
+	const runtimeSkipReason = dispatchRuntimeSkipReason(state, accountManager, account, request.context, ownsAdmission);
 	if (runtimeSkipReason) {
 		const recoverable =
 			runtimeSkipReason === "rate-limited" ||
@@ -3086,15 +3103,9 @@ async function handleRequestInner(
                 // accountId nor an email share no identity and match only by refresh token.
                 const rebuilt = accountManager.getAccountsSnapshot();
                 const claimed = new Set<number>();
-                const identityOf = (a: { accountId?: string; email?: string; refreshToken?: string }) => {
-                    const id = a.accountId?.trim(), email = sanitizeEmail(a.email);
-                    return id || email ? JSON.stringify([id ?? null, email ?? null]) : a.refreshToken?.trim() ? `refresh:${a.refreshToken.trim()}` : null;
-                };
                 const carryTarget = (previous: (typeof accounts)[number]) => {
-                    const unclaimed = rebuilt.filter(a => !claimed.has(a.index));
-                    const identity = identityOf(previous);
-                    const found = unclaimed.find(a => a.recordId && a.recordId === previous.recordId)
-                        ?? (identity === null ? undefined : unclaimed.find(a => identityOf(a) === identity));
+                    const persisted = disk.accounts.find(row => isSameNativeAccount(previous, row));
+                    const found = persisted && rebuilt.find(a => !claimed.has(a.index) && a.recordId === resolveAccountRecordId(persisted));
                     if (found) claimed.add(found.index);
                     return found;
                 };
@@ -4006,6 +4017,9 @@ async function handleRequestInner(
 				break;
 			}
 			attemptedIndexes.add(selected.index);
+			const admittedCooldown = isPinned && transientAttempts > 0
+				? {coolingDownUntil: selected.coolingDownUntil, cooldownReason: selected.cooldownReason}
+				: undefined;
 			const quotaScheduleKey = buildQuotaScheduleKey(
 				selected,
 				context.family,
@@ -4157,8 +4171,7 @@ async function handleRequestInner(
 				const latestSnapshot = await state.readNativeAccountStorage();
                 const latest = latestSnapshot.verified || (latestSnapshot.routingAvailable === true && (apiKeyClient || await nativeOAuth()))
                     ? latestSnapshot.storage : null;
-				const disk = latest?.accounts.find(item => item.recordId && item.recordId === refreshed.account.recordId)
-					?? latest?.accounts.find(item => item.accountId === refreshed.account.accountId && sanitizeEmail(item.email) === sanitizeEmail(refreshed.account.email));
+				const disk = latest?.accounts.find(item => isSameNativeAccount(refreshed.account, item));
 				const workspace = disk?.workspaces?.find(item => item.id.trim() === accountId);
 				// Derive the stored binding exactly as workspaceModelScopes does: trimmed,
 				// falling back to the token's workspace claim when no id was stored.
@@ -4177,6 +4190,15 @@ async function handleRequestInner(
 			} catch (error) {
 				accountManager.refundToken(selected, context.family, context.model);
 				throw error;
+			}
+			const runtimeSkipReason = dispatchRuntimeSkipReason(state, accountManager, refreshed.account, context, true, admittedCooldown);
+			if (runtimeSkipReason) {
+				accountManager.refundToken(selected, context.family, context.model);
+				accountSkipReasons.set(selected.index, runtimeSkipReason);
+				exhaustionReason = "rate-limit";
+				capabilityRejectionIsLatest = false;
+				if (isPinned) break;
+				continue;
 			}
 			if (requestScope && (!catalogScopeEligible?.(requestScope.id) || !workspaceModelScopes(refreshed.account).some(scope => scope.id === requestScope.id && scope.routable))) {
 				accountManager.refundToken(selected, context.family, context.model);

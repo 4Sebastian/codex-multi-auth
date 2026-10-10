@@ -5,6 +5,7 @@ export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
 import { applyPendingAuth } from "./storage/pending-auth.js";
+import { isSameNativeAccount } from "./runtime/native-account-sync.js";
 import { createLogger } from "./logger.js";
 import {
 	getStoragePath,
@@ -674,9 +675,7 @@ export class AccountManager {
 		let changed = false;
 		for (const account of this.accounts) {
 			if (!this.isNativeSnapshotCurrent(account, capturedAt)) continue;
-			const matches = current.accounts.filter(disk => disk.recordId && disk.recordId === account.recordId);
-			const key = getAccountIdentityKey(account);
-			const candidates = matches.length ? matches : current.accounts.filter(disk => key && getAccountIdentityKey(disk) === key);
+			const candidates = current.accounts.filter(disk => isSameNativeAccount(account, disk));
 			if (candidates.length !== 1) continue;
 			const disk = candidates[0];
 			if (!disk) continue;
@@ -712,9 +711,7 @@ export class AccountManager {
 			// recordId first; the identity key only when defined and unique, since
 			// duplicate identities (or two missing ones) would pick another row's baseline.
 			const rows = snapshot?.accounts ?? [];
-			const byRecord = account.recordId ? rows.filter(row => row.recordId === account.recordId) : [];
-			const key = getAccountIdentityKey(account);
-			const matches = byRecord.length ? byRecord : key ? rows.filter(row => getAccountIdentityKey(row) === key) : [];
+			const matches = rows.filter(row => isSameNativeAccount(account, row));
 			const saved = (matches.length === 1 ? matches[0] : undefined) ?? account;
 			this.persistedWorkspaceSelections.set(account, saved.workspaces?.[saved.currentWorkspaceIndex ?? 0]?.id);
 			this.persistedWorkspaces.set(account, structuredClone(saved.workspaces));
@@ -1546,8 +1543,7 @@ export class AccountManager {
 		const wasEnabled = account.enabled !== false;
 		const enabled = disk.enabled !== false;
 		if (!prior || enabled !== prior.enabled) account.enabled = enabled;
-		const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId === account.recordId)
-			?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === getAccountIdentityKey(account));
+		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
 		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt;
 		const diskInvalidatedAt = unchangedAuthorization ? before : disk.authInvalidatedAt;
 		if (diskInvalidatedAt) {
@@ -1568,8 +1564,7 @@ export class AccountManager {
 	}
 
 	acceptNativeCredentials(account: ManagedAccount, disk: AccountStorageV3["accounts"][number]): boolean {
-		const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId === account.recordId)
-			?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === getAccountIdentityKey(account));
+		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
 		if (baseline && disk.accessToken === baseline.accessToken && disk.refreshToken === baseline.refreshToken &&
 			(account.access !== baseline.accessToken || account.refreshToken !== baseline.refreshToken ||
 				(disk.expiresAt === baseline.expiresAt && account.expires !== baseline.expiresAt))) return false;
@@ -1648,7 +1643,9 @@ export class AccountManager {
 	): AccountStorageV3 {
 		if (!current || !Array.isArray(current.accounts)) return snapshot;
 		const diskByIdentity = new Map<string, (typeof current.accounts)[number]>();
+		const diskByRecord = new Map<string, (typeof current.accounts)[number]>();
 		for (const diskAccount of current.accounts) {
+			if (diskAccount.recordId?.trim()) diskByRecord.set(diskAccount.recordId.trim(), diskAccount);
 			const key = getAccountIdentityKey({
 				accountId: diskAccount.accountId,
 				email: diskAccount.email,
@@ -1662,9 +1659,9 @@ export class AccountManager {
 				email: account.email,
 				refreshToken: account.refreshToken,
 			});
-			if (!key) continue;
-			const disk = diskByIdentity.get(key);
-			if (!disk) continue;
+			const disk = (account.recordId?.trim() ? diskByRecord.get(account.recordId.trim()) : undefined)
+				?? (key ? diskByIdentity.get(key) : undefined);
+			if (!disk || !isSameNativeAccount(account, disk)) continue;
 			const diskExpires = disk.expiresAt ?? 0;
 			const memExpires = account.expiresAt ?? 0;
 			// Disk holds a strictly-newer token than our in-memory copy: adopt it
@@ -1692,8 +1689,7 @@ export class AccountManager {
 				typeof account.authInvalidatedAt === "number" &&
 				Number.isFinite(account.authInvalidatedAt) &&
 				account.authInvalidatedAt > 0;
-			const baseline = this.persistenceBaseline?.accounts.find(row => row.recordId && row.recordId === account.recordId)
-				?? this.persistenceBaseline?.accounts.find(row => getAccountIdentityKey(row) === key);
+			const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
 			const explicitlyCleared = baseline?.authInvalidatedAt === diskInvalidatedAt && baseline?.authInvalidationErrorCode === disk.authInvalidationErrorCode &&
 				baseline?.accessToken === account.accessToken && baseline?.refreshToken === account.refreshToken &&
 				disk.accessToken === account.accessToken && disk.refreshToken === account.refreshToken;
@@ -2329,7 +2325,7 @@ export class AccountManager {
   const observedAt = performance.now();
   const rememberCommittedAuth = (storage: AccountStorageV3): void => {
    for (const baseline of this.persistenceBaseline?.accounts ?? []) {
-    const matches = (row: AccountStorageV3["accounts"][number]) => baseline.recordId && row.recordId ? baseline.recordId === row.recordId : getAccountIdentityKey(baseline) === getAccountIdentityKey(row);
+    const matches = (row: AccountStorageV3["accounts"][number]) => isSameNativeAccount(baseline, row);
     const saved = storage.accounts.find(matches), requested = proposed.accounts.find(matches);
     if (!saved || !requested || saved.accessToken !== requested.accessToken || saved.refreshToken !== requested.refreshToken) continue;
     for (const field of ["accessToken", "refreshToken", "expiresAt", "authInvalidatedAt", "authInvalidationErrorCode", "enabled"] as const) Object.assign(baseline, {[field]: saved[field]});
@@ -2340,17 +2336,14 @@ export class AccountManager {
    for (const account of this.accounts) {
     const prior = before.get(account);
     if (!prior) continue;
-    const byRecord = storage.accounts.filter(row => row.recordId && row.recordId === prior.recordId);
-    const key = getAccountIdentityKey(prior);
-    const matches = byRecord.length ? byRecord : storage.accounts.filter(row => key && getAccountIdentityKey(row) === key);
+    const matches = storage.accounts.filter(row => isSameNativeAccount(prior, row));
     if (matches.length > 1) continue;
     const saved = matches[0];
     if (!saved) {
      this.setAccountEnabled(account.index, false);
      continue;
     }
-    const matchingRow = (rows: AccountStorageV3["accounts"]) => rows.find(row => row.recordId === prior.recordId)
-     ?? rows.find(row => key && getAccountIdentityKey(row) === key);
+    const matchingRow = (rows: AccountStorageV3["accounts"]) => rows.find(row => isSameNativeAccount(prior, row));
     const requested = matchingRow(proposed.accounts);
     const baseline = matchingRow(this.persistenceBaseline?.accounts ?? []);
     const authUnchanged = this.isNativeSnapshotCurrent(account, observedAt) &&

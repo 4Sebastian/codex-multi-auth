@@ -8499,6 +8499,183 @@ describe("learned limits across a native inventory rebuild",()=>{
  });
 });
 
+describe("final asynchronous admission", () => {
+	it.each([false, true])("blocks a request suspended in journal observation after a concurrent quota 429 (native=%s)", async nativeOpenai => {
+		const storage = createStorage(Date.now(), 1);
+		const manager = new AccountManager(undefined, storage);
+		let admitted = false, held = false;
+		let release: () => void = () => undefined, entered: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const started = new Promise<void>(resolve => {entered = resolve;});
+		const consume = manager.consumeTokenWithReason.bind(manager);
+		vi.spyOn(manager, "consumeTokenWithReason").mockImplementation((...args) => {
+			const result = consume(...args); admitted ||= result.ok; return result;
+		});
+		const journal = manager.isAccountJournalEligible.bind(manager);
+		vi.spyOn(manager, "isAccountJournalEligible").mockImplementation(async account => {
+			if (admitted && !held) {held = true; entered(); await gate;}
+			return journal(account);
+		});
+		const {fetchImpl, calls} = createRecordingFetch(call => call.url.includes("/models")
+			? Response.json({models: [{slug: "model-test"}]})
+			: Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}}));
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+			nativeOpenai, forcedAccountIndex: 0, readNativeAccountStorage: async () => structuredClone(storage),
+		}});
+		const pending = postResponses(proxy, {model: "model-test", input: "suspended"});
+		try {
+			await started;
+			const concurrent = await postResponses(proxy, {model: "model-test", input: "quota"});
+			await concurrent.text();
+			expect(manager.getAccountRuntimeSkipReason(0, getModelFamily("model-test"), "model-test")).toBe("rate-limited");
+			release();
+			const response = await pending; await response.text();
+			expect(response.status).toBe(503);
+			expect(calls.filter(call => call.url.endsWith("/responses")).map(call => JSON.parse(call.bodyText).input)).toEqual(["quota"]);
+		} finally {release(); await pending;}
+	});
+
+	it.each(["cooldown", "circuit", "expired-circuit", "preemptive"])("blocks a new %s restriction applied during final journal observation", async restriction => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const account = manager.getAccountByIndex(0)!;
+		if (restriction === "expired-circuit") getCircuitBreaker(getAccountIdentityKey(account)!, {resetTimeoutMs: 0});
+		let admitted = false, held = false;
+		const consume = manager.consumeTokenWithReason.bind(manager);
+		vi.spyOn(manager, "consumeTokenWithReason").mockImplementation((...args) => {
+			const result = consume(...args); admitted ||= result.ok; return result;
+		});
+		const journal = manager.isAccountJournalEligible.bind(manager);
+		vi.spyOn(manager, "isAccountJournalEligible").mockImplementation(async selected => {
+			const eligible = await journal(selected);
+			if (admitted && !held) {
+				held = true;
+				if (restriction === "cooldown") manager.markAccountCoolingDown(account, 60000, "network-error");
+				if (restriction === "circuit" || restriction === "expired-circuit") for (let i = 0; i < 3; i++) getCircuitBreaker(account.circuitKeyId!).recordFailure();
+				if (restriction === "preemptive") vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral").mockReturnValue({defer: true, waitMs: 60000});
+			}
+			return eligible;
+		});
+		const {fetchImpl, calls} = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {forcedAccountIndex: 0}});
+		const response = await postResponses(proxy, {model: "gpt-5-codex", input: "fixture"}); await response.text();
+		expect(held).toBe(true);
+		expect(response.status).toBe(503);
+		expect(calls).toHaveLength(0);
+	});
+
+	it.each(["cooldown", "circuit"])("does not waive a concurrent %s while preparing a pinned cooldown retry", async restriction => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const account = manager.getAccountByIndex(0)!;
+		let admissions = 0, held = false;
+		const consume = manager.consumeTokenWithReason.bind(manager);
+		vi.spyOn(manager, "consumeTokenWithReason").mockImplementation((...args) => {
+			const result = consume(...args); if (result.ok) admissions++; return result;
+		});
+		const journal = manager.isAccountJournalEligible.bind(manager);
+		vi.spyOn(manager, "isAccountJournalEligible").mockImplementation(async selected => {
+			const eligible = await journal(selected);
+			if (admissions === 2 && !held) {
+				held = true;
+				if (restriction === "cooldown") manager.markAccountCoolingDown(account, 120000, "auth-failure");
+				else for (let i = 0; i < 3; i++) getCircuitBreaker(account.circuitKeyId!).recordFailure();
+			}
+			return eligible;
+		});
+		const {fetchImpl, calls} = createRecordingFetch(() => {throw new TypeError("fixture network failure");});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {forcedAccountIndex: 0}});
+		const response = await postResponses(proxy, {model: "gpt-5-codex", input: "fixture"}); await response.text();
+		expect(held).toBe(true);
+		expect(response.status).toBe(503);
+		expect(calls).toHaveLength(1);
+	});
+
+	it("keeps the owned half-open HTTP probe without consuming another admission", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const account = manager.getAccountByIndex(0)!;
+		const now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+		const breaker = getCircuitBreaker(getAccountIdentityKey(account)!, {resetTimeoutMs: 30000});
+		for (let i = 0; i < 3; i++) breaker.recordFailure();
+		clock.mockReturnValue(now + 30001);
+		const consume = vi.spyOn(breaker, "tryCanExecute");
+		const {fetchImpl, calls} = createRecordingFetch(() => {
+			expect(breaker.getState()).toBe("half-open"); return textEventStream();
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {forcedAccountIndex: 0}});
+		const response = await postResponses(proxy, {model: "gpt-5-codex", input: "fixture"}); await response.text();
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(consume).toHaveBeenCalledTimes(1);
+		expect(breaker.getState()).toBe("closed");
+		clock.mockRestore();
+	});
+});
+
+describe("native record generation authority", () => {
+	it("denies the deleted generation when the final primary read observes its replacement", async () => {
+		const storage = createStorage(Date.now(), 1);
+		storage.accounts[0]!.recordId = "R1";
+		let disk = structuredClone(storage), admitted = false, held = false;
+		const manager = new AccountManager(undefined, storage);
+		const consume = manager.consumeTokenWithReason.bind(manager);
+		vi.spyOn(manager, "consumeTokenWithReason").mockImplementation((...args) => {
+			const result = consume(...args); admitted ||= result.ok; return result;
+		});
+		let release: () => void = () => undefined, entered: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const started = new Promise<void>(resolve => {entered = resolve;});
+		const refresh = tokenRefreshRuntime.ensureFreshAccessToken;
+		vi.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken").mockImplementation(async args => {
+			if (admitted && !held) {held = true; entered(); await gate;}
+			return refresh(args);
+		});
+		const {fetchImpl, calls} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "model-test"}]}) : textEventStream());
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
+		const pending = postResponses(proxy, {model: "model-test", input: "fixture"});
+		try {
+			await started;
+			disk = structuredClone(storage);
+			Object.assign(disk.accounts[0]!, {recordId: "R2", accessToken: "replacement", refreshToken: "replacement-refresh"});
+			release();
+			const response = await pending; await response.text();
+			expect(response.status).toBe(503);
+			expect(calls.filter(call => call.url.endsWith("/responses"))).toHaveLength(0);
+		} finally {release(); await pending;}
+	});
+
+	it("rebuilds with replacement credentials without inheriting predecessor restrictions", async () => {
+		const storage = createStorage(Date.now(), 1);
+		Object.assign(storage.accounts[0]!, {recordId: "R1", enabled: false, authInvalidatedAt: 5000,
+			coolingDownUntil: Date.now() + 60000, cooldownReason: "auth-failure", rateLimitResetTimes: {codex: Date.now() + 60000}});
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {recordId: "R2", accessToken: "replacement", refreshToken: "replacement-refresh", enabled: true});
+		delete disk.accounts[0]!.authInvalidatedAt;
+		delete disk.accounts[0]!.coolingDownUntil;
+		delete disk.accounts[0]!.cooldownReason;
+		delete disk.accounts[0]!.rateLimitResetTimes;
+		const manager = new AccountManager(undefined, storage);
+		const {fetchImpl, calls} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "model-test"}]}) : textEventStream());
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
+		const response = await postResponses(proxy, {model: "model-test", input: "fixture"}); await response.text();
+		expect(response.status).toBe(200);
+		expect(calls.filter(call => call.url.endsWith("/responses")).map(call => call.headers.get("authorization"))).toEqual(["Bearer replacement"]);
+	});
+
+	it("does not adopt replacement auth or workspace policy during a stale manager save", async () => {
+		const storage = createStorage(Date.now(), 1);
+		Object.assign(storage.accounts[0]!, {recordId: "R1", workspaces: [{id: "original", enabled: true}]});
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {recordId: "R2", accessToken: "replacement", refreshToken: "replacement-refresh",
+			expiresAt: Date.now() + 7200000, workspaces: [{id: "replacement-workspace", enabled: true}]});
+		const manager = new AccountManager(undefined, storage);
+		const persist = vi.fn(async (_next: AccountStorageV3) => undefined);
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), persist));
+		await manager.saveToDisk();
+		expect(manager.getAccountByIndex(0)).toMatchObject({recordId: "R1", access: "access-1", enabled: false, workspaces: [{id: "original", enabled: true}]});
+		expect(persist.mock.calls[0]?.[0].accounts).toEqual(disk.accounts);
+	});
+});
+
 describe("pre-dispatch eligibility re-read",()=>{
  const tokenFor=(workspace:string)=>{
   const part=(value:unknown)=>Buffer.from(JSON.stringify(value)).toString("base64url");

@@ -400,6 +400,12 @@ export class ApiModelCapabilities {
 			result.tiers = [];
 			for (const name of Object.keys(result.status)) result.status[name] = "unsupported";
 			result.status.responses = "unsupported";
+		} else if (lostAccess) {
+			result.levels = [...documented];
+			result.tiers = [];
+			for (const name of Object.keys(result.status)) {
+				if (result.status[name] === "verified") result.status[name] = "unverified";
+			}
 		}
 		if (credentialUnavailable && !modelDenied) result.status.retry = "transient";
 		result.at = this.now();
