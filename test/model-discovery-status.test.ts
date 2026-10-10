@@ -7,6 +7,9 @@ import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
+import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
+import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
+import {getPendingAuthPath} from "../lib/storage/pending-auth.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 let previousMultiAuthDir: string | undefined;
@@ -17,10 +20,53 @@ beforeEach(async () => {
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
 });
 afterEach(async () => {
+	vi.restoreAllMocks();
+	setStoragePathDirect(null);
 	if (previousMultiAuthDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
 	else process.env.CODEX_MULTI_AUTH_DIR = previousMultiAuthDir;
 	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
+it.each(["invalidated", "cooldown", "quota"])("does not submit initially restricted OAuth discovery (%s)", async restriction => {
+	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+	const account = storage.accounts[0]!;
+	if (restriction === "invalidated") account.authInvalidatedAt = Date.now();
+	if (restriction === "cooldown") Object.assign(account, {coolingDownUntil: Date.now() + 60000, cooldownReason: "auth-failure"});
+	if (restriction === "quota") account.rateLimitResetTimes = {codex: Date.now() + 60000};
+	const path = isolationJoin(multiAuthDir, "accounts.json");
+	setStoragePathDirect(path); await isolationFs.writeFile(path, JSON.stringify(storage));
+	const fetcher = vi.fn(async () => Response.json({models: [{slug: "fixture"}]}));
+	const inventory = await discoverModelInventory(storage, [], {fetchImpl: fetcher});
+	expect(fetcher).not.toHaveBeenCalled();
+	expect(inventory.entries[0]).toMatchObject({error: true, models: [], visibleModels: []});
+});
+
+it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journal"])("rechecks OAuth discovery authority after refresh (%s)", async mutation => {
+	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, workspaces: [{id: "W1", enabled: true}]}]};
+	const path = isolationJoin(multiAuthDir, "accounts.json");
+	setStoragePathDirect(path); await isolationFs.writeFile(path, JSON.stringify(storage));
+	let entered!: () => void, release!: () => void;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const refresh = tokenRefresh.ensureFreshAccessToken;
+	vi.spyOn(tokenRefresh, "ensureFreshAccessToken").mockImplementation(async args => {const result = await refresh(args); entered(); await gate; return result;});
+	const fetcher = vi.fn(async () => Response.json({models: [{slug: "fixture"}]}));
+	const pending = discoverModelInventory(storage, [], {fetchImpl: fetcher});
+	await ready;
+	try {
+		if (mutation === "disabled") storage.accounts[0]!.enabled = false;
+		if (mutation === "deleted") storage.accounts = [];
+		if (mutation === "invalidated") storage.accounts[0]!.authInvalidatedAt = Date.now();
+		if (mutation === "credential") Object.assign(storage.accounts[0]!, {accessToken: "fixture-B", refreshToken: "fixture-refresh-B"});
+		if (mutation === "workspace") storage.accounts[0]!.workspaces![0]!.enabled = false;
+		if (mutation === "journal") await isolationFs.writeFile(getPendingAuthPath(path), "fixture corrupt journal");
+		else await isolationFs.writeFile(path, JSON.stringify(storage));
+		release();
+		const inventory = await pending;
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(inventory.entries[0]).toMatchObject({error: true, models: [], visibleModels: []});
+	} finally {release(); await pending;}
+});
+
 describe("model discovery reporting", () => {
 	it("reports each credential independently including API-only and hidden IDs", async () => {
 		const fetcher = vi.fn(async () =>

@@ -10,7 +10,10 @@ import { join, dirname } from "node:path";
 import { z } from "zod";
 import { modelScopeId, workspaceModelScopes } from "./workspace-model-scopes.js";
 import { AccountManager } from "../accounts.js";
-import { type AccountStorageV3, loadAccounts } from "../storage.js";
+import { type AccountStorageV3, loadAccounts, getStoragePath } from "../storage.js";
+import {captureAuthorityRevision} from "../storage/authority-revision.js";
+import {getPendingAuthPath} from "../storage/pending-auth.js";
+import {syncNativeAccountCredentials} from "./native-account-sync.js";
 import {
 	type ApiRouteCredential,
 	loadApiRoutes,
@@ -106,7 +109,7 @@ export async function discoverModelInventory(
  const catalog = new AccountModelCatalog(async (key) => {
   const scope = scopes.find(item=>item.id===key);
 		const account = scope?.enabled ? manager.getAccountByIndex(scope.accountIndex) : null;
-		if (!account || account.enabled === false) throw Error("Disabled");
+		if (!account || account.enabled === false || manager.getManagedAccountRuntimeSkipReason(account, "codex", null)) throw Error("Account unavailable");
 		const fresh = await ensureFreshAccessToken({
 			accountManager: manager,
 			account,
@@ -123,6 +126,18 @@ export async function discoverModelInventory(
 		const version = options.clientVersion;
 		if (version && /^[0-9A-Za-z.+_-]{1,80}$/.test(version))
 			url.searchParams.set("client_version", version);
+		const binding = {recordId: account.recordId, refreshToken: account.refreshToken, expires: account.expires};
+		const authorityCurrent = captureAuthorityRevision([getStoragePath(), getPendingAuthPath(getStoragePath())]);
+		const snapshot = await manager.readDispatchAccountStorage();
+		if (snapshot) {
+			if (!snapshot.verified || !snapshot.storage) throw Error("Account authority unavailable");
+			syncNativeAccountCredentials(manager, snapshot.storage, snapshot.capturedAt);
+		}
+		if (!await manager.isAccountJournalEligible(account) || !authorityCurrent() ||
+			manager.getAccountByIndex(account.index) !== account || account.recordId !== binding.recordId ||
+			account.refreshToken !== binding.refreshToken || account.access !== fresh.accessToken || account.expires !== binding.expires ||
+			(account.expires ?? 0) <= now() || manager.getManagedAccountRuntimeSkipReason(account, "codex", null) ||
+			!workspaceModelScopes(account).some(current => current.id === key && current.accountId === id && current.routable)) throw Error("Account authority changed");
 		const response = await fetcher(url, {
 			headers: createCodexHeaders({
 				accountId: id,
