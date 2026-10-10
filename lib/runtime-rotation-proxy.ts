@@ -625,6 +625,10 @@ function catalogAccountKey(account: ManagedAccount): string {
 	return workspaceModelScopes(account).find(scope=>scope.bound)?.id ?? "unavailable";
 }
 
+function capabilityFailureKey(scope: string, credential: Pick<AccountDispatchBinding, "accessToken" | "refreshToken" | "expiresAt">): string {
+	return createHash("sha256").update(JSON.stringify([scope, credential.accessToken, credential.refreshToken, credential.expiresAt])).digest("hex");
+}
+
 function isAuthorizedClient(headers: Headers, clientApiKey: string): boolean {
 	const authorization = headers.get("authorization") ?? "";
 	const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
@@ -3830,10 +3834,17 @@ async function handleRequestInner(
 			const effort = isRecord(requestedBody?.reasoning) && typeof requestedBody.reasoning.effort === "string" ? requestedBody.reasoning.effort : undefined;
 			const requestedTier = typeof requestedBody?.service_tier === "string" ? requestedBody.service_tier : undefined;
 			const failures = state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now);
-			catalogScopeEligible = key => failures.supports(key, requestedModel, effort, requestedTier) && modelCatalog.supportsForRouting(key, requestedModel, effort, requestedTier);
+			const scopeAccounts = new Map(eligible.flatMap(account => workspaceModelScopes(account).map(scope => [scope.id, account.index] as const)));
+			const capabilityEligible = (key: string): boolean => {
+				const index = scopeAccounts.get(key);
+				const account = index === undefined ? null : accountManager.getAccountByIndex(index);
+				return !!account && typeof account.access === "string" && workspaceModelScopes(account).some(scope => scope.id === key && scope.routable) && failures.supports(
+					capabilityFailureKey(key, {accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires}), requestedModel, effort, requestedTier);
+			};
+			catalogScopeEligible = key => capabilityEligible(key) && modelCatalog.supportsForRouting(key, requestedModel, effort, requestedTier);
 			await modelCatalog.prepareRouting(
 				eligible.flatMap(workspaceModelScopes).filter(scope => scope.routable).map(scope => scope.id),
-				requestedModel, effort, requestedTier, key => failures.supports(key, requestedModel, effort, requestedTier),
+				requestedModel, effort, requestedTier, capabilityEligible,
 			);
 			if (res.destroyed || res.writableEnded) return;
 			let supported = 0;
@@ -4253,6 +4264,8 @@ async function handleRequestInner(
 			}
 
 			const binding = captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, accountId);
+			const capabilityScopeId = requestScope?.id ?? workspaceModelScopes(refreshed.account).find(scope => scope.accountId === accountId)?.id ?? catalogAccountKey(refreshed.account);
+			const submittedCapabilityKey = capabilityFailureKey(capabilityScopeId, binding);
 			const validate = () => validateAccountDispatch(state, context, binding, circuitAdmission, admittedCooldown, async () => apiKeyClient || await nativeOAuth());
 			const scopeEligible = () => !requestScope || (catalogScopeEligible?.(requestScope.id) === true && workspaceModelScopes(refreshed.account).some(scope => scope.id === requestScope.id && scope.routable));
 			let finalAdmissionSkip: string | null = null;
@@ -4476,7 +4489,7 @@ async function handleRequestInner(
      const body=parseRequestBody(context.body);
      const effort=isRecord(body?.reasoning)&&typeof body.reasoning.effort==="string"?body.reasoning.effort:undefined;
      const tier=typeof body?.service_tier==="string"?body.service_tier:undefined;
-     (state.capabilityFailures??=new RuntimeCapabilityFailures(state.now)).record(requestScope?.id ?? catalogAccountKey(refreshed.account),context.model,failure,effort,tier);
+     (state.capabilityFailures??=new RuntimeCapabilityFailures(state.now)).record(submittedCapabilityKey,context.model,failure,effort,tier);
      rejectedWorkspaces.add(accountId);capabilityRejectionIsLatest=true;
      if(pendingScopes && pendingScopes.length>1){
       pendingScopes.shift();attemptedIndexes.delete(refreshed.account.index);state.status.retries++;continue;
@@ -4891,8 +4904,7 @@ async function handleRequestInner(
 					const body = parseRequestBody(context.body);
 					const effort = isRecord(body?.reasoning) && typeof body.reasoning.effort === "string" ? body.reasoning.effort : undefined;
 					const tier = typeof body?.service_tier === "string" ? body.service_tier : undefined;
-					const scope = workspaceModelScopes(refreshed.account).find(item => item.accountId === accountId);
-					(state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now)).record(scope?.id ?? catalogAccountKey(refreshed.account), context.model, rejection, effort, tier);
+					(state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now)).record(submittedCapabilityKey, context.model, rejection, effort, tier);
 				}
 			}
 			// A stream that broke mid-flight still bills for whatever the upstream

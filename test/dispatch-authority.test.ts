@@ -646,6 +646,33 @@ it.each(["http", "custom", "native"])("records terminal usage even if restrictio
 	expect(sends).toBe(1);
 });
 
+it.each(["http", "sse"].flatMap(mode => [false, true].map(replace => ({mode, replace}))))("scopes late capability denial to its submitted credentials (%j)", async ({mode, replace}) => {
+	const f = await fixture(true, false, undefined, true), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const account = f.manager.getAccountByIndex(0)!;
+	account.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	let sends = 0;
+	f.setPostResponse(async () => {
+		if (++sends > 1) return new Response('data: {"type":"response.completed","response":{"id":"B","status":"completed","output":[]}}\n\n', {headers: {"content-type": "text/event-stream"}});
+		entered.resolve(); await release.promise;
+		const error = {code: "model_not_supported", message: "Model unavailable for credential A"};
+		return mode === "http" ? Response.json({error}, {status: 400}) : new Response(`data: ${JSON.stringify({type: "response.failed", response: {id: "A", status: "failed", error}})}\n\n`, {headers: {"content-type": "text/event-stream"}});
+	});
+	const a = f.post().then(async response => ({status: response.status, body: await response.text()}));
+	void a.catch(() => undefined); await entered.promise;
+	if (replace) {
+		f.manager.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: account.expires!});
+		await f.manager.saveToDisk();
+	}
+	release.resolve(); await a;
+	const b = await f.post(); const body = await b.text();
+	expect(b.status, body).toBe(replace ? 200 : 403);
+	expect(body).toContain(replace ? '"response.completed"' : '"model_not_available_in_account_catalog"');
+	expect(f.fetched).toEqual(replace ? ["Bearer A", "Bearer B"] : ["Bearer A"]);
+	expect(sends).toBe(replace ? 2 : 1);
+});
+
 it("does not dispatch discovery for a deleted or foreign manager member", async () => {
 	const f = await fixture(true), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
