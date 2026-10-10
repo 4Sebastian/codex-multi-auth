@@ -75,6 +75,36 @@ describe("native record generation matching", () => {
 });
 
 describe("native account credential reload", () => {
+	it.each(["auth-failure", "network-error", "rate-limit"] as const)("reconciles a newly persisted same-credential cooldown (%s)", reason => {
+		const storage = fixture(); delete storage.accounts[0]!.coolingDownUntil; delete storage.accounts[0]!.cooldownReason;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {coolingDownUntil: Date.now() + 60000, cooldownReason: reason});
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({coolingDownUntil: disk.accounts[0]!.coolingDownUntil, cooldownReason: reason});
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(false);
+	});
+	it("adopts durable quota observations and explicit clears without erasing concurrent local limits", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		account.rateLimitResetTimes = {...account.rateLimitResetTimes, "codex:local": 300000};
+		disk.accounts[0]!.rateLimitResetTimes = {codex: 200000, "codex:external": 400000};
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(account.rateLimitResetTimes).toEqual({codex: 200000, "codex:external": 400000, "codex:local": 300000});
+		disk.accounts[0]!.rateLimitResetTimes = {};
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.rateLimitResetTimes).toEqual({"codex:local": 300000});
+	});
+	it("honors a durable cooldown clear but retains a newer local cooldown", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		Object.assign(account, {coolingDownUntil: 200000, cooldownReason: "network-error"});
+		delete disk.accounts[0]!.coolingDownUntil; delete disk.accounts[0]!.cooldownReason;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account).toMatchObject({coolingDownUntil: 200000, cooldownReason: "network-error"});
+		const clean = new AccountManager(undefined, storage);
+		syncNativeAccountCredentials(clean, disk);
+		expect(clean.getAccountByIndex(0)?.coolingDownUntil).toBeUndefined();
+	});
 	it("adopts external workspace inventory and disablement without changing credentials", () => {
 		const storage=fixture();
 		storage.accounts[0]!.workspaces=[{id:"personal",enabled:true},{id:"business",enabled:true},{id:"removed",enabled:true}];

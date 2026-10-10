@@ -1,4 +1,4 @@
-import { mergeAccountCooldown, mergeAccountSnapshot, mergeAccountRuntimeObservations } from "./storage/snapshot-merge.js";
+import { mergeAccountCooldown, mergeAccountRateLimits, mergeAccountSnapshot, mergeAccountRuntimeObservations } from "./storage/snapshot-merge.js";
 import type { Auth } from "@codex-ai/sdk";
 import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-identity.js";
 export { resolveAccountRecordId } from "./storage/record-identity.js";
@@ -1579,8 +1579,30 @@ export class AccountManager {
 		return before !== account.authInvalidatedAt || wasEnabled !== (account.enabled !== false);
 	}
 
+	private readonly nativeRuntimeSnapshots = new WeakMap<ManagedAccount, Pick<AccountStorageV3["accounts"][number], "accessToken" | "refreshToken" | "coolingDownUntil" | "cooldownReason" | "rateLimitResetTimes">>();
+
+	private rememberRuntimeRestrictions(account: ManagedAccount, disk: Pick<AccountStorageV3["accounts"][number], "accessToken" | "refreshToken" | "coolingDownUntil" | "cooldownReason" | "rateLimitResetTimes">): void {
+		this.nativeRuntimeSnapshots.set(account, {accessToken: disk.accessToken, refreshToken: disk.refreshToken, coolingDownUntil: disk.coolingDownUntil, cooldownReason: disk.cooldownReason, rateLimitResetTimes: structuredClone(disk.rateLimitResetTimes)});
+	}
+
+	syncRuntimeRestrictionsFromSnapshot(account: ManagedAccount, disk: AccountStorageV3["accounts"][number], adoptCredentials: boolean): boolean {
+		const before = JSON.stringify([account.coolingDownUntil, account.cooldownReason, account.rateLimitResetTimes]);
+		const base = this.nativeRuntimeSnapshots.get(account) ?? {...account, accessToken: account.access};
+		const replaced = adoptCredentials && (disk.accessToken !== account.access || disk.refreshToken !== account.refreshToken);
+		const cooldown = mergeAccountCooldown(base,
+			replaced && disk.cooldownReason === "auth-failure" && (disk.coolingDownUntil ?? 0) <= Date.now() ? {...disk, coolingDownUntil: undefined, cooldownReason: undefined} : disk,
+			{...account, accessToken: adoptCredentials ? disk.accessToken : account.access, refreshToken: adoptCredentials ? disk.refreshToken : account.refreshToken,
+				coolingDownUntil: replaced && account.cooldownReason === "auth-failure" ? undefined : account.coolingDownUntil,
+				cooldownReason: replaced && account.cooldownReason === "auth-failure" ? undefined : account.cooldownReason});
+		Object.assign(account, cooldown);
+		account.rateLimitResetTimes = mergeAccountRateLimits(base, disk, account);
+		this.rememberRuntimeRestrictions(account, disk);
+		return before !== JSON.stringify([account.coolingDownUntil, account.cooldownReason, account.rateLimitResetTimes]);
+	}
+
 	acceptNativeCredentials(account: ManagedAccount, disk: AccountStorageV3["accounts"][number]): boolean {
 		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
+		if (!this.nativeRuntimeSnapshots.has(account) && baseline) this.rememberRuntimeRestrictions(account, baseline);
 		if (baseline && disk.accessToken === baseline.accessToken && disk.refreshToken === baseline.refreshToken &&
 			(account.access !== baseline.accessToken || account.refreshToken !== baseline.refreshToken ||
 				(disk.expiresAt === baseline.expiresAt && account.expires !== baseline.expiresAt))) return false;
@@ -2385,6 +2407,7 @@ export class AccountManager {
      account.workspaces = saved.workspaces ? structuredClone(saved.workspaces) : undefined;
      account.currentWorkspaceIndex = saved.currentWorkspaceIndex;
     }
+    this.rememberRuntimeRestrictions(account, saved);
     const observation = this.nativeAuthSnapshots.get(account);
     this.nativeAuthSnapshots.set(account, {
      authInvalidatedAt: authUnchanged ? account.authInvalidatedAt : observation?.authInvalidatedAt,

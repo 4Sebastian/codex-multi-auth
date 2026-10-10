@@ -116,7 +116,7 @@ it.each(["disable", "delete", "remove", "corrupt"])("rejects durable custom rest
 	expect(f.creates).toHaveLength(1);
 });
 
-it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", "usage", "metadata", "churn"].map(mutation => ({transport, mutation}))))
+it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", "usage", "metadata", "churn", "cooldown", "quota"].map(mutation => ({transport, mutation}))))
 ("rechecks changed authority during the final journal wait (%j)", async ({transport, mutation}) => {
 	const native = transport === "native";
 	const f = await fixture(native), entered = deferred(), release = deferred();
@@ -144,6 +144,10 @@ it.each(["custom", "native", "http"].flatMap(transport => ["primary", "policy", 
 	if (mutation === "primary") {
 		const other = new AccountManager(undefined, f.pool);
 		other.setAccountEnabled(0, false); await other.saveToDisk();
+	} else if (mutation === "cooldown" || mutation === "quota") {
+		if (mutation === "cooldown") Object.assign(f.pool.accounts[0]!, {coolingDownUntil: Date.now() + 60000, cooldownReason: "auth-failure"});
+		else f.pool.accounts[0]!.rateLimitResetTimes = {[`${getModelFamily("shared")}:shared`]: Date.now() + 60000};
+		await fs.writeFile(f.path, JSON.stringify(f.pool));
 	} else if (mutation === "metadata" || mutation === "churn") {
 		f.pool.accounts[0]!.accountLabel = "Fixture label change";
 		await fs.writeFile(f.path, JSON.stringify(f.pool));
@@ -470,6 +474,25 @@ it.each(["credential", "workspace"].flatMap(mutation => [false, true].map(contin
 		expect(f.creates[1]).toMatchObject(mutation === "credential" ? {token: "Bearer B"} : {workspace: "W2"});
 		expect(f.connections()).toBe(2);
 	}
+});
+
+it("honors a durable runtime clear after this manager persisted its own restrictions", async () => {
+	const f = await fixture(true);
+	await (await f.post()).text();
+	const account = f.manager.getAccountByIndex(0)!;
+	f.manager.markAccountCoolingDown(account, 60000, "auth-failure");
+	account.rateLimitResetTimes[`${getModelFamily("shared")}:shared`] = Date.now() + 60000;
+	await f.manager.saveToDisk();
+	const disk = await loadAccounts();
+	if (!disk) throw Error("Missing fixture primary");
+	const other = new AccountManager(undefined, disk), current = other.getAccountByIndex(0)!;
+	other.clearAccountCooldown(current); current.rateLimitResetTimes = {};
+	await other.saveToDisk();
+	const response = await f.post(); const body = await response.text();
+	expect(response.status, body).toBe(200);
+	expect(account.coolingDownUntil).toBeUndefined();
+	expect(account.rateLimitResetTimes).toEqual({});
+	expect(f.fetched).toEqual(["Bearer A", "Bearer A"]);
 });
 
 it("rejects same-record durable credential replacement before HTTP dispatch", async () => {

@@ -210,6 +210,7 @@ export async function applyPendingAuth(
 		const entry = account.refreshToken ? entries.find((item) => item.prior === hash(account.refreshToken)) : undefined;
 		if (!entry) continue;
 		account.recordId ??= entry.recordId;
+		const replacesCredential = account.accessToken !== entry.accessToken || account.refreshToken !== entry.refreshToken;
 		const authorization = options.source === "historical-recovery" && entry.committed
 			? mergeAuthorization(entry.accessToken, [entry])
 			: mergeAuthorization(entry.accessToken, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
@@ -220,7 +221,8 @@ export async function applyPendingAuth(
 		account.authInvalidationErrorCode = authorization.authInvalidationErrorCode;
 		if (options.source === "historical-recovery" && entry.committed) account.enabled = authorization.enabled;
 		else if (authorization.enabled === false) account.enabled = false;
-		if (!account.authInvalidatedAt && account.cooldownReason === "auth-failure") {
+		if (!account.authInvalidatedAt && account.cooldownReason === "auth-failure" &&
+			(replacesCredential || (options.source === "historical-recovery" && entry.committed))) {
 			delete account.coolingDownUntil;
 			delete account.cooldownReason;
 		}

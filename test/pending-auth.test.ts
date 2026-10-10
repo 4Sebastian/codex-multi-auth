@@ -38,6 +38,19 @@ function failReads(code: string, times: number, skip = 0) {
 	}) as typeof fs.readFile);
 }
 
+it.each([false, true])("preserves current-primary cooldown under a same-credential journal mapping (committed:%s)", async committed => {
+	const {saveAccounts, loadAccounts, setStoragePathDirect} = await import("../lib/storage.js");
+	setStoragePathDirect(storagePath);
+	const initial: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", refreshToken: "b", accessToken: "access-b", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+	await saveAccounts(initial);
+	await recordPendingAuth(storagePath, {...rotation("b", "b"), expiresAt: initial.accounts[0]!.expiresAt!, recordId: "R1"});
+	if (committed) {await fs.writeFile(`${storagePath}.bak.2`, "fixture retention gap"); await saveAccounts((await loadAccounts())!);}
+	const cooldown = Date.now() + 60000;
+	Object.assign(initial.accounts[0]!, {coolingDownUntil: cooldown, cooldownReason: "auth-failure"});
+	await fs.writeFile(storagePath, JSON.stringify(initial));
+	for (let i = 0; i < 2; i++) expect((await loadAccounts())?.accounts[0]).toMatchObject({coolingDownUntil: cooldown, cooldownReason: "auth-failure"});
+});
+
 it("retries a transient lock and keeps other accounts' pending tokens", async () => {
 	await recordPendingAuth(storagePath, rotation("spent-a", "new-a"));
 	failReads("EBUSY", 2);

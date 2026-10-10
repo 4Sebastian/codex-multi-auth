@@ -82,8 +82,7 @@ export function mergeAccountCooldown(base: CooldownRow, disk: CooldownRow, local
     const cooldown = (disk.coolingDownUntil ?? 0) >= (local.coolingDownUntil ?? 0) ? disk : local;
     return { coolingDownUntil: cleared ? undefined : cooldown.coolingDownUntil, cooldownReason: cleared ? undefined : cooldown.cooldownReason };
 }
-/** Runtime observations commute; user-owned edits retain conflict detection. */
-function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, local: AccountMetadataV3): AccountMetadataV3 {
+export function mergeAccountRateLimits(base: Pick<AccountMetadataV3, "rateLimitResetTimes">, disk: Pick<AccountMetadataV3, "rateLimitResetTimes">, local: Pick<AccountMetadataV3, "rateLimitResetTimes">): Record<string, number> {
     const limits: Record<string, number> = {};
     for (const key of new Set([...Object.keys(disk.rateLimitResetTimes ?? {}), ...Object.keys(local.rateLimitResetTimes ?? {})])) {
         const before = base.rateLimitResetTimes?.[key], a = disk.rateLimitResetTimes?.[key], b = local.rateLimitResetTimes?.[key];
@@ -92,6 +91,11 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
         const value = clear ? undefined : Math.max(a ?? 0, b ?? 0);
         if (value !== undefined) limits[key] = value;
     }
+    return limits;
+}
+/** Runtime observations commute; user-owned edits retain conflict detection. */
+function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, local: AccountMetadataV3): AccountMetadataV3 {
+    const limits = mergeAccountRateLimits(base, disk, local);
     const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
     const refreshToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
     const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && row.refreshToken === refreshToken ? row.authInvalidatedAt : undefined;

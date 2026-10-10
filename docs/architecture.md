@@ -157,6 +157,8 @@ Delayed refusals and authentication cooldowns may restrict only their submitted 
 
 Capability probe revocation affects only evidence attributable to the failing credential. Invalidated evidence carries the loss observation timestamp through export and persisted merges. An explicit forced check starts a fresh probe generation without reusing denied in-flight results or reviving late successes from that generation. Independent imported credentials and documented capabilities remain intact.
 
+Durable cooldowns and quota reset times reconcile even when credentials and expiry are unchanged. The runtime compares each observed primary snapshot with local observations, preserving concurrent restrictions while honoring explicit clears. Replaying a journal self-mapping does not clear a later current-primary authentication cooldown; credential replacement or verified historical recovery may clear an obsolete one.
+
 Each credential rotation advances every retained predecessor to the newest credential. Pruning retains predecessors that backups or the WAL can restore. Only verified primary saves establish committed recovery authorization. Unchanged aliases preserve that authorization, while current primary disablement and revocation remain authoritative.
 
 The active selection is mirrored into the official `~/.codex/auth.json` / `accounts.json` so plain forwarded Codex commands keep the intended account.
