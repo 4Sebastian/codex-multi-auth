@@ -83,7 +83,7 @@ Details worth knowing:
 
 Per request the proxy tries, in order: a soft pin left by `codex-multi-auth switch`, policy priority tiers (lower `account priority` numbers first), a hard pin from `--account`/`CODEX_MULTI_AUTH_FORCE_ACCOUNT`, the sequential stick-until-exhausted cursor, session affinity (20-minute sticky sessions), a hybrid score (`health*2 + tokens*5 + hoursSinceUsed*2 + capability boost`), and finally a linear scan. An account is skipped when it is disabled, workspace-disabled, token-invalid, rate-limited, cooling down, or has an open circuit breaker.
 
-HTTP and WebSocket requests retain their circuit admission receipt through completion. A success or failure from an older circuit epoch cannot settle a newer half-open probe. Successful completion also checks the submitted account credential binding before healing account health. Terminal usage remains attributed to the submitted account even when its circuit receipt is no longer current.
+HTTP and WebSocket requests retain their circuit admission receipt through completion. A success or failure from an older circuit epoch cannot settle a newer half-open probe. Successful completion also checks the submitted account credential binding before healing account health. Terminal usage remains attributed to the submitted account even when its circuit receipt is no longer current. A failed terminal restriction write still records the original terminal usage before propagating the persistence error. The custom socket closes on that error rather than draining queued work, and subsequent admission continues to reject unreadable journal authority.
 
 ---
 

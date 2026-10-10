@@ -2678,13 +2678,15 @@ function bridgeWebSocketConnection(
 							);
 						}
 						settlingTurn = true;
-						void restriction.then(() => settled.request.usageRecorder.record({
-							...terminal.record,
-							account: settled.account,
-						})).then(() => {
-							settlingTurn = false;
+						void (async () => {
+							try {
+								await restriction;
+							} finally {
+								await settled.request.usageRecorder.record({...terminal.record, account: settled.account});
+								settlingTurn = false;
+							}
 							drainPending();
-						}).catch(rejectConnection);
+						})().catch(rejectConnection);
 					}
 				}
 				if (terminal?.record.outcome === "failure" && terminal.tokenInvalidated) {
@@ -4874,11 +4876,12 @@ async function handleRequestInner(
 				{...(budgetAdvisory.level === "soft" ? buildContextBudgetHeaders(budgetAdvisory) : {}),...(state.catalogEtag ? {"x-models-etag":state.catalogEtag} : {})},
 				() => {usageScanner.result();return responseOutcome.finish();},
 			);
-			await responseRestriction;
+			let restrictionFailure: {error: unknown} | undefined;
+			try {await responseRestriction;} catch (error) {restrictionFailure = {error};}
 			// The client went away mid-stream: no upstream error, and the response was
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
-			if (forwarded && upstream.ok) {
+			if (forwarded && upstream.ok && !restrictionFailure) {
 				if (isDispatchBindingCurrent(state, binding)) accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
 				recordRuntimeAccountRecovery(refreshed.account.index);
 			} else if (!clientDisconnected) {
@@ -4921,6 +4924,7 @@ async function handleRequestInner(
 				account: refreshed.account,
 				...(usageTokens ?? {}),
 			});
+			if (restrictionFailure) throw restrictionFailure.error;
 			return;
 		}
 

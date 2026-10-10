@@ -616,6 +616,36 @@ it.each(["http", "custom", "native"])("keeps an already-sent completion out of a
 	expect(sends).toBe(2);
 });
 
+it.each(["http", "custom", "native"])("records terminal usage even if restriction persistence cannot observe the journal (%s)", async transport => {
+	const f = await fixture(transport === "native"), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const terminal = {type: "response.failed", response: {id: "invalid-A", status: "failed", error: {code: "token_invalidated", message: "OAuth token invalidated"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+	let sends = 0;
+	if (transport === "http") f.setPostResponse(async () => {
+		sends++; entered.resolve();
+		return new Response(new ReadableStream({start(controller) {
+			void release.promise.then(() => {controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(terminal)}\n\n`)); controller.close();});
+		}}), {headers: {"content-type": "text/event-stream"}});
+	});
+	else f.setReply(ws => {sends++; entered.resolve(); void release.promise.then(() => ws.send(JSON.stringify(terminal)));});
+	const priorRows = await readUsageLedgerRows(), before = priorRows.length;
+	const priorIds = new Set(priorRows.map(row => row.id));
+	const result = transport === "http" ? f.post().then(response => response.text()) : turn(await f.connect());
+	void result.catch(() => undefined);
+	await entered.promise;
+	await fs.writeFile(getPendingAuthPath(f.path), "invalid terminal fixture journal");
+	release.resolve(); await result;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).length).toBe(before + 1));
+	const newRows = (await readUsageLedgerRows()).filter(row => !priorIds.has(row.id));
+	expect(newRows).toHaveLength(1);
+	const row = newRows[0]!;
+	expect(row).toMatchObject({outcome: "failure", errorCode: transport === "custom" ? "token_invalidated" : "upstream_response_failed", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(row.account?.accountHash).toBeTruthy();
+	const blocked = await f.post();
+	expect(blocked.status).not.toBe(200); await blocked.text();
+	expect(sends).toBe(1);
+});
+
 it("does not dispatch discovery for a deleted or foreign manager member", async () => {
 	const f = await fixture(true), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
