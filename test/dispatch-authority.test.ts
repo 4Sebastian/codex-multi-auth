@@ -7,6 +7,7 @@ import {join} from "node:path";
 import WebSocket, {WebSocketServer} from "ws";
 import {afterEach, expect, it, vi} from "vitest";
 import {AccountManager} from "../lib/accounts.js";
+import {ContextBudgetGuard} from "../lib/context-budget-guard.js";
 import {CircuitBreaker, getCircuitBreaker, clearCircuitBreakers, type CircuitAdmissionReceipt} from "../lib/circuit-breaker.js";
 import {PreemptiveQuotaScheduler} from "../lib/preemptive-quota-scheduler.js";
 import {getModelFamily} from "../lib/prompts/codex.js";
@@ -30,6 +31,7 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 	vi.useRealTimers();
 	for (const close of cleanups.splice(0).reverse()) await close();
+	vi.unstubAllEnvs();
 	setStoragePathDirect(null);
 	clearCircuitBreakers();
 });
@@ -45,7 +47,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("Missing fixture address");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number = false) {
+async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number = false, quotaRemainingPercentThreshold?: number) {
 	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-authority-"));
 	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
 	const path = join(root, "accounts.json");
@@ -94,7 +96,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		if (quotaFailure) return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}});
 		return new Response('data: {"type":"response.completed","response":{"id":"http-result","status":"completed","output":[]}}\n\n', {headers: {"content-type": "text/event-stream"}});
 	};
-	const proxy = await startRuntimeRotationProxy({readApiRoutes, nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
+	const proxy = await startRuntimeRotationProxy({readApiRoutes, quotaRemainingPercentThreshold, nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
 	cleanups.push(async () => {await proxy.close(); await manager.flushPendingSave();});
 	const connect = async () => {
 		const ws = new WebSocket(`${proxy.baseUrl.replace("http:", "ws:")}/responses`, {headers: {authorization: "Bearer fixture-client"}});
@@ -102,7 +104,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		await once(ws, "open");
 		return ws;
 	};
-	const post = (model = "shared") => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: []})});
+	const post = (model = "shared", sessionKey?: string) => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: [], ...(sessionKey ? {prompt_cache_key: sessionKey} : {})})});
 	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
 }
 it.each(["disable", "delete", "remove", "corrupt", "reset"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
@@ -725,6 +727,328 @@ it.each(["http", "custom", "native"])("records terminal usage even if restrictio
 	const blocked = await f.post();
 	expect(blocked.status).not.toBe(200); await blocked.text();
 	expect(sends).toBe(1);
+});
+
+it.each([false, true].flatMap(sawEvent => ["success", "reject", "stale"].flatMap(restriction => ["client", "cancel", "shutdown", "reject"].map(ending => ({sawEvent, restriction, ending})))))
+("retains sent custom accounting through an interrupted close wait (%j)", async ({sawEvent, restriction, ending}) => {
+	const f = await fixture(false), entered = deferred(), release = deferred(), finished = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		entered.resolve(); await release.promise;
+		try {if (restriction === "reject") throw Error("fixture restriction failure"); return await actual(...args);}
+		finally {finished.resolve();}
+	});
+	f.setReply(ws => {if (sawEvent) ws.send(JSON.stringify({type: "response.created", response: {id: "active-A"}})); ws.close();});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const ws = await f.connect();
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	if (restriction === "stale") {
+		const other = new AccountManager(undefined, (await loadAccounts())!);
+		other.updateFromAuth(other.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+		await other.saveToDisk();
+	}
+	if (ending === "client") {const closed = once(ws, "close"); ws.close(); await closed;}
+	if (ending === "cancel") ws.send(JSON.stringify({type: "response.cancel"}));
+	if (ending === "shutdown") await f.proxy.close();
+	if (ending === "reject") {const closed = once(ws, "close"); for (let i = 0; i < 32; i++) ws.send("{}"); await closed;}
+	try {
+		await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+		const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
+		expect(row).toMatchObject({outcome: ending === "reject" ? "failure" : "cancelled", account: {index: 0}});
+		expect(row?.account?.accountHash).toBeTruthy();
+	} finally {release.resolve(); await finished.promise;}
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1);
+	expect(f.creates).toHaveLength(1);
+	expect(f.connections()).toBe(1);
+	if (restriction === "stale") expect((await loadAccounts())?.accounts[0]).toMatchObject({accessToken: "B", refreshToken: "refresh-B"});
+});
+
+it("retains original cancellation accounting during a synchronous send failure", async () => {
+	const f = await fixture(false), entered = deferred(), release = deferred(), finished = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		entered.resolve(); await release.promise;
+		try {return await restrict(...args);} finally {finished.resolve();}
+	});
+	const send = WebSocket.prototype.send;
+	vi.spyOn(WebSocket.prototype, "send").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
+		if (this.url?.startsWith(f.upstreamBaseUrl.replace("http:", "ws:"))) throw Error("fixture synchronous upstream send failure");
+		return send.apply(this, args);
+	});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const ws = await f.connect();
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	const closed = once(ws, "close"); ws.close(); await closed;
+	try {
+		await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+		expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "cancelled", account: {index: 0}});
+	} finally {release.resolve(); await finished.promise;}
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1);
+	expect(f.creates).toHaveLength(0);
+});
+
+it.each([401, 429, 503])("retains handshake accounting while its failed restriction waits (%s)", async status => {
+	const f = await fixture(false, false, undefined, status), entered = deferred(), release = deferred(), finished = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		entered.resolve(); await release.promise;
+		try {return await restrict(...args);} finally {finished.resolve();}
+	});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const ws = await f.connect();
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	const closed = once(ws, "close"); ws.close(); await closed;
+	try {
+		await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+		expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "cancelled", account: {index: 0}});
+	} finally {release.resolve(); await finished.promise;}
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1);
+	expect(f.creates).toHaveLength(0);
+});
+
+it("retains the submitted account while an authorized custom retry prepares", async () => {
+	vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const ws = await f.connect(), before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const journal = f.manager.isAccountJournalEligible.bind(f.manager);
+	let recovery = false;
+	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async (...args) => {
+		if (recovery) {entered.resolve(); await release.promise;}
+		return journal(...args);
+	});
+	const restriction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {const result = await restriction(...args); recovery = true; return result;});
+	f.setReply(socket => {socket.close();});
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	const closed = once(ws, "close"); ws.close(); await closed;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "cancelled", account: {index: 0}});
+	release.resolve();
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect(f.creates).toHaveLength(1);
+	expect(f.connections()).toBe(1);
+	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1);
+});
+
+it.each(["retry", "continuation", "stale"])("retains authorized open custom recovery and continuation controls (%s)", async mode => {
+	vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const ws = await f.connect();
+	const initialRows = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const first = mode === "continuation" ? await turn(ws) : undefined;
+	if (first) await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !initialRows.has(row.id))).toHaveLength(1));
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return actual(...args);});
+	f.setReply(socket => {socket.close();});
+	const pending = turn(ws, first ? {previous_response_id: first.response.id} : {});
+	await entered.promise;
+	f.setReply(undefined);
+	if (mode === "stale") {
+		const other = new AccountManager(undefined, (await loadAccounts())!);
+		other.updateFromAuth(other.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+		await other.saveToDisk();
+	}
+	release.resolve();
+	const result = await pending;
+	expect(result.type).toBe(mode === "retry" ? "response.completed" : "error");
+	if (mode === "continuation") expect(result.error.code).toBe("previous_response_not_found");
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
+	expect(row).toMatchObject({outcome: mode === "retry" ? "success" : "failure", account: {index: 0}});
+	expect(f.creates).toHaveLength(mode === "stale" ? 1 : 2);
+});
+
+it.each(["header", "near", "event"].flatMap(boundary => ["journal", "persist"].flatMap(failure => [false, true].map(native => ({boundary, failure, native})))))
+("consumes original quota response usage despite durability failure (%j)", async ({boundary, failure, native}) => {
+	const f = await fixture(native, false, undefined, false, 5);
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const heals = vi.spyOn(f.manager, "recordSuccess"), contextUpdates = vi.spyOn(ContextBudgetGuard.prototype, "update");
+	let healsAtSend = 0, consumed = false, restrictions = 0;
+	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
+	const rename = fs.rename.bind(fs);
+	const fail = async () => {
+		if (failure === "journal") await fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt quota journal");
+		else vi.spyOn(fs, "rename").mockImplementation(async (...args: Parameters<typeof fs.rename>) => {
+			if (String(args[1]) === f.path) throw Object.assign(Error("fixture quota persistence failed"), {code: "EIO"});
+			return rename(...args);
+		});
+	};
+	if (boundary === "near") vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		restrictions++;
+		if (restrictions === 1) {const result = await actual(...args); await fail(); return result;}
+		return actual(...args);
+	});
+	const terminal = {type: "response.completed", response: {id: "quota-A", status: "completed", output: [], service_tier: "priority", usage: {input_tokens: 17, output_tokens: 6, total_tokens: 23, input_tokens_details: {cached_tokens: 3}, output_tokens_details: {reasoning_tokens: 2}}}};
+	const quota = {type: "codex.rate_limits", rate_limits: {primary: {used_percent: 99, reset_at: Math.floor(Date.now() / 1000) + 60}}};
+	f.setPostResponse(async () => {
+		healsAtSend = heals.mock.calls.length;
+		if (boundary !== "near") await fail();
+		let sent = false;
+		return new Response(new ReadableStream({pull(controller) {
+			if (!sent) {sent = true; controller.enqueue(new TextEncoder().encode(`${boundary === "event" ? `data: ${JSON.stringify(quota)}\n\n` : ""}data: ${JSON.stringify(terminal)}\n\n`));}
+			else {consumed = true; controller.close();}
+		}}), {headers: {"content-type": "text/event-stream", ...(boundary !== "event" ? {"x-codex-primary-used-percent": "99", "x-codex-primary-reset-after-seconds": "60"} : {})}});
+	});
+	const response = await f.post("shared", "fixture-quota-session"), body = await response.text();
+	expect(response.status, body).toBe(200);
+	expect(body).toContain('"response.completed"');
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
+	expect(row).toMatchObject({outcome: "success", statusCode: 200, account: {index: 0}, tokens: {serviceTier: "priority", inputTokens: 17, outputTokens: 4, cachedInputTokens: 3, reasoningTokens: 2, totalTokens: 23}});
+	expect(consumed).toBe(true);
+	expect(heals).toHaveBeenCalledTimes(healsAtSend);
+	expect(contextUpdates).toHaveBeenCalledWith("fixture-quota-session", expect.objectContaining({model: "shared", contextTokens: 21}));
+	const sends = f.fetched.length;
+	const blocked = await f.post(); await blocked.text();
+	expect(blocked.status).not.toBe(200);
+	expect(f.fetched).toHaveLength(sends);
+});
+
+it.each([200, 400, 401, 402, 403, 429, 503])("consumes non-SSE quota response accounting before reporting durability failure (%s)", async status => {
+	const f = await fixture(false);
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let consumed = false;
+	f.setPostResponse(async () => {
+		await fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt non-SSE quota journal");
+		let sent = false;
+		return new Response(new ReadableStream({pull(controller) {
+			if (!sent) {sent = true; controller.enqueue(new TextEncoder().encode(JSON.stringify({object: "response", status: status === 200 ? "completed" : "failed", error: status === 200 ? undefined : {code: "fixture_error"}, service_tier: "priority", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}})));}
+			else {consumed = true; controller.close();}
+		}}), {status, headers: {"content-type": "application/json", "x-codex-primary-used-percent": "99", "x-codex-primary-reset-after-seconds": "60"}});
+	});
+	const response = await f.post(); await response.text();
+	expect(response.status).toBe(status);
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: status === 200 ? "success" : "failure", statusCode: status, account: {index: 0}, tokens: {serviceTier: "priority", inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(consumed).toBe(true);
+	expect(f.fetched).toEqual(["Bearer A"]);
+});
+
+it.each([401, 403, 429, 503])("consumes error usage when its own restriction fails without quota headers (%s)", async status => {
+	const f = await fixture(false), before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let consumed = false;
+	f.setPostResponse(async () => {
+		await fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt error restriction journal");
+		let sent = false;
+		return new Response(new ReadableStream({pull(controller) {
+			if (!sent) {sent = true; controller.enqueue(new TextEncoder().encode(JSON.stringify({error: {code: status === 403 ? "workspace_disabled" : "fixture_error"}, service_tier: "priority", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}})));}
+			else {consumed = true; controller.close();}
+		}}), {status, headers: {"content-type": "application/json"}});
+	});
+	const response = await f.post(); await response.text();
+	expect(response.status).toBe(status);
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "failure", statusCode: status, account: {index: 0}, tokens: {serviceTier: "priority", inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(consumed).toBe(true);
+	expect(f.fetched).toEqual(["Bearer A"]);
+});
+
+it.each([403, 404, 503].flatMap(status => ["get", "set"].map(operation => ({status, operation}))))
+("consumes original error usage before thread goal fallback with failed quota (%j)", async ({status, operation}) => {
+	const f = await fixture(false), before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let consumed = false;
+	f.setPostResponse(async () => {
+		await fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt goal quota journal");
+		let sent = false;
+		return new Response(new ReadableStream({pull(controller) {
+			if (!sent) {sent = true; controller.enqueue(new TextEncoder().encode(JSON.stringify({error: {code: "fixture_goal_error"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}})));}
+			else {consumed = true; controller.close();}
+		}}), {status, headers: {"content-type": "application/json", "x-codex-primary-used-percent": "99"}});
+	});
+	const response = await fetch(`${f.proxy.baseUrl}/thread/goal/${operation}`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({thread_id: "fixture-thread", goal: "fixture-goal"})});
+	const body = await response.json();
+	expect(response.status).toBe(operation === "get" || status === 403 ? 200 : status);
+	if (operation === "get") expect(body).toEqual({goal: null});
+	if (operation === "set" && status === 403) expect(body).toEqual({ok: true, goal: "fixture-goal"});
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "failure", statusCode: status, account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(consumed).toBe(true);
+	expect(f.fetched).toEqual(["Bearer A"]);
+});
+
+it("consumes native gateway quota usage without ambiguous replay or health healing", async () => {
+	const f = await fixture(true), heals = vi.spyOn(f.manager, "recordSuccess");
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let healsAtSend = 0;
+	f.setReply(socket => {
+		healsAtSend = heals.mock.calls.length;
+		void fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt native gateway journal").then(() => {
+			socket.send(JSON.stringify({type: "codex.rate_limits", rate_limits: {primary: {used_percent: 99}}}));
+			socket.send(JSON.stringify({type: "response.completed", response: {id: "native-A", status: "completed", output: [], service_tier: "priority", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
+		});
+	});
+	const ws = await f.connect();
+	const terminal = new Promise<Record<string, unknown>>(resolve => {ws.on("message", data => {
+		const event = JSON.parse(String(data));
+		if (event.type === "response.completed" || event.type === "error") resolve(event);
+	});});
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	expect((await terminal).type).toBe("response.completed");
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", account: {index: 0}, tokens: {serviceTier: "priority", inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(heals).toHaveBeenCalledTimes(healsAtSend);
+	expect(await turn(ws)).toMatchObject({type: "error"});
+	expect(f.creates).toHaveLength(1);
+	expect(f.connections()).toBe(1);
+	expect(f.fetched).toHaveLength(0);
+});
+
+it("coalesces held quota observations while preserving original terminal accounting", async () => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const restriction = vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async () => {
+		entered.resolve(); await release.promise; throw Error("fixture first coalesced quota failure");
+	});
+	f.setPostResponse(async () => new Response(
+		Array.from({length: 128}, (_, i) => `data: ${JSON.stringify({type: "codex.rate_limits", rate_limits: {primary: {used_percent: 90 + i % 10}}})}\n\n`).join("") +
+		'data: {"type":"response.completed","response":{"id":"coalesced-A","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n',
+		{headers: {"content-type": "text/event-stream"}},
+	));
+	const body = f.post().then(response => response.text());
+	await entered.promise;
+	expect(await body).toContain('"response.completed"');
+	expect(restriction).toHaveBeenCalledTimes(1);
+	release.resolve();
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(f.proxy.getStatus().lastError).toBe("fixture first coalesced quota failure");
+	expect(restriction).toHaveBeenCalledTimes(1);
+});
+
+it("retains quota-failed partial usage when the client cancels the HTTP body", async () => {
+	const f = await fixture(false);
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let cancelled = false;
+	f.setPostResponse(async () => {
+		await fs.writeFile(getPendingAuthPath(f.path), "fixture corrupt cancelled quota journal");
+		return new Response(new ReadableStream({start(controller) {
+			controller.enqueue(new TextEncoder().encode('data: {"type":"response.in_progress","response":{"id":"partial-A","usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7}}}\n\n'));
+		}, cancel() {cancelled = true;}}), {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "99"}});
+	});
+	const response = await f.post(), reader = response.body!.getReader();
+	expect(response.status).toBe(200);
+	expect((await reader.read()).done).toBe(false);
+	await reader.cancel();
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "cancelled", statusCode: 200, account: {index: 0}, tokens: {inputTokens: 7, outputTokens: 0, totalTokens: 7}});
+	expect(cancelled).toBe(true);
+	const denied = await f.post(); await denied.text();
+	expect(denied.status).not.toBe(200);
+	expect(f.fetched).toHaveLength(1);
 });
 
 it("does not drain a closing channel before its terminal restriction settles", async () => {
