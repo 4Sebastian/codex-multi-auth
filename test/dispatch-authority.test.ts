@@ -10,6 +10,7 @@ import {AccountManager} from "../lib/accounts.js";
 import {ContextBudgetGuard} from "../lib/context-budget-guard.js";
 import {CircuitBreaker, getCircuitBreaker, clearCircuitBreakers, type CircuitAdmissionReceipt} from "../lib/circuit-breaker.js";
 import {PreemptiveQuotaScheduler} from "../lib/preemptive-quota-scheduler.js";
+import * as quotaOrdering from "../lib/runtime/subscription-quota-order.js";
 import {getModelFamily} from "../lib/prompts/codex.js";
 import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import * as refreshRuntime from "../lib/runtime/rotation-token-refresh.js";
@@ -1160,4 +1161,180 @@ it.each(["open", "reset", "window", "other-breaker"])("invalidates a circuit rec
 		}
 	}
 	expect(breaker.isAdmissionCurrent(receipt)).toBe(false);
+});
+
+it.each(["primary", "secondary"])("checkpoint preserves pending independent %s quota exhaustion before the next native create", async exhausted => {
+	const f = await fixture(true), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const account = f.manager.getAccountByIndex(0)!;
+	account.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let held = false;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return original(...args);
+	});
+	let upstream: WebSocket | undefined;
+	f.setReply(ws => {upstream = ws; ws.send(JSON.stringify({type: "codex.rate_limits", rate_limits: {[exhausted === "primary" ? "secondary" : "primary"]: {used_percent: 10, reset_at: Math.floor(Date.now() / 1000) + 600}}}));});
+	const rowsBefore = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const ws = await f.connect();
+	const terminal = new Promise<Record<string, unknown>>(resolve => ws.on("message", data => {const event = JSON.parse(String(data)); if (event.type === "response.completed" || event.type === "error") resolve(event);}));
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	if (!upstream) throw Error("Fixture upstream missing");
+	upstream.send(JSON.stringify({type: "codex.rate_limits", plan_type: "pro", rate_limits: {[exhausted]: {used_percent: 100, reset_at: Math.floor(Date.now() / 1000) + 600}}}));
+	upstream.send(JSON.stringify({type: "codex.rate_limits", rate_limits: {[exhausted === "primary" ? "secondary" : "primary"]: {used_percent: 20, reset_at: Math.floor(Date.now() / 1000) + 600}}}));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(3));
+	upstream.send(JSON.stringify({type: "response.completed", response: {id: "quota-A", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
+	release.resolve();
+	expect((await terminal).type).toBe("response.completed");
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !rowsBefore.has(row.id))).toHaveLength(1));
+	const row = (await readUsageLedgerRows()).find(row => !rowsBefore.has(row.id))!;
+	expect(row).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	f.setReply(ws => ws.send(JSON.stringify({type: "response.completed", response: {id: "unexpected-next", status: "completed", output: []}})));
+	expect(await turn(ws)).toMatchObject({type: "error"});
+	expect(f.creates).toHaveLength(1);
+});
+
+
+
+it.each(["primary", "secondary"].flatMap(exhausted =>
+	["native", "http-native", "http-custom"].flatMap(transport =>
+		["pending", "consumed", "header", "replacement"]
+			.filter(sequence => transport !== "native" || (sequence !== "pending" && sequence !== "header"))
+			.map(sequence => ({exhausted, transport, sequence})))))
+("retains response-local independent quota fields across partial observations (%j)", async ({exhausted, transport, sequence}) => {
+	const f = await fixture(transport !== "http-custom"), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const account = f.manager.getAccountByIndex(0)!;
+	account.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	const resetAt = Math.floor(Date.now() / 1000) + 600;
+	const other = exhausted === "primary" ? "secondary" : "primary";
+	const quota = (window: string, used: number, reset = true) => ({
+		type: "codex.rate_limits",
+		rate_limits: {[window]: {used_percent: used, ...(reset ? {reset_at: resetAt} : {})}},
+	});
+	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let started = 0, completed = 0;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (++started === (sequence === "header" ? 2 : 1)) {entered.resolve(); await release.promise;}
+		const result = await original(...args);
+		completed++;
+		return result;
+	});
+	const scheduler = vi.spyOn(PreemptiveQuotaScheduler.prototype, "update");
+	let send: (event: Record<string, unknown>) => void = () => {throw Error("Fixture upstream missing");};
+	const firstEvent = quota(sequence === "pending" ? other : exhausted, sequence === "pending" ? 10 : 100);
+	let socket: WebSocket | undefined;
+	let result: Promise<unknown>;
+	const rowsBefore = new Set((await readUsageLedgerRows()).map(row => row.id));
+	if (transport === "native") {
+		f.setReply(ws => {send = event => ws.send(JSON.stringify(event)); send(firstEvent);});
+		socket = await f.connect();
+		result = new Promise(resolve => socket!.on("message", data => {
+			const event = JSON.parse(String(data));
+			if (event.type === "response.completed" || event.type === "error") resolve(event);
+		}));
+		socket.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	} else {
+		f.setPostResponse(async () => new Response(new ReadableStream({
+			start(controller) {
+				send = event => {
+					controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+					if (event.type === "response.completed") controller.close();
+				};
+				send(firstEvent);
+			},
+		}), {headers: {"content-type": "text/event-stream", ...(sequence === "header" ? {
+			[`x-codex-${other}-used-percent`]: "10",
+			[`x-codex-${other}-reset-after-seconds`]: "600",
+		} : {})}}));
+		result = f.post().then(async response => {
+			expect(response.status).toBe(200);
+			expect(await response.text()).toContain('"response.completed"');
+		});
+	}
+	await entered.promise;
+	if (sequence === "consumed") {
+		release.resolve();
+		await vi.waitFor(() => expect(completed).toBe(1));
+	}
+	if (sequence === "pending") send(quota(exhausted, 100));
+	if (sequence === "replacement") send(quota(exhausted, 0, false));
+	send({...quota(other, 20), rate_limits: {
+		[other]: {used_percent: 20, reset_at: resetAt},
+		...(sequence !== "replacement" ? {[exhausted]: {used_percent: "invalid", reset_at: resetAt}} : {}),
+	}});
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(sequence === "pending" || sequence === "replacement" ? 3 : 2));
+	send({type: "response.completed", response: {id: "independent-quota-A", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	release.resolve();
+	const response = await result;
+	if (transport === "native") expect(response).toMatchObject({type: "response.completed"});
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !rowsBefore.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !rowsBefore.has(row.id))).toMatchObject({
+		outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21},
+	});
+	const snapshot = scheduler.mock.calls.at(-1)?.[1];
+	expect(snapshot?.[exhausted]).toEqual(sequence === "replacement" ? {usedPercent: 0} : {usedPercent: 100, resetAtMs: resetAt * 1000});
+	expect(snapshot?.[other]).toEqual({usedPercent: 20, resetAtMs: resetAt * 1000});
+	expect(snapshot).toMatchObject({status: 200, updatedAt: expect.any(Number)});
+	f.setReply(undefined);
+	f.setPostResponse(undefined);
+	if (socket) expect(await turn(socket)).toMatchObject({type: sequence === "replacement" ? "response.completed" : "error"});
+	else {
+		const next = await f.post(); await next.text();
+		expect(next.status === 200).toBe(sequence === "replacement");
+	}
+	expect(transport === "native" ? f.creates.length : f.fetched.length).toBe(sequence === "replacement" ? 2 : 1);
+});
+
+it.each(["free", "pro"].flatMap(planType => [false, true].map(replace => ({planType, replace}))))
+("retains the latest supplied plan through coalesced native quota windows (%j)", async ({planType, replace}) => {
+	const f = await fixture(true), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.manager.getAccountByIndex(0)!.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	const preference = vi.spyOn(quotaOrdering, "subscriptionQuotaPreference");
+	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let held = false;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return original(...args);
+	});
+	let upstream: WebSocket | undefined;
+	f.setReply(ws => {
+		upstream = ws;
+		ws.send(JSON.stringify({type: "codex.rate_limits", rate_limits: {primary: {used_percent: 10}}}));
+	});
+	const ws = await f.connect();
+	const terminal = new Promise(resolve => ws.on("message", data => {
+		const event = JSON.parse(String(data));
+		if (event.type === "response.completed" || event.type === "error") resolve(event);
+	}));
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await entered.promise;
+	if (!upstream) throw Error("Fixture upstream missing");
+	upstream.send(JSON.stringify({type: "codex.rate_limits", plan_type: planType, rate_limits: {secondary: {used_percent: 20}}}));
+	const expectedPlan = replace ? (planType === "free" ? "pro" : "free") : planType;
+	upstream.send(JSON.stringify({type: "codex.rate_limits", ...(replace ? {plan_type: expectedPlan} : {}), rate_limits: {primary: {used_percent: 0}}}));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(3));
+	upstream.send(JSON.stringify({type: "response.completed", response: {id: "plan-A", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
+	release.resolve();
+	expect(await terminal).toMatchObject({type: "response.completed"});
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({
+		outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21},
+	});
+	const callsBeforeNext = preference.mock.calls.length;
+	f.setReply(undefined);
+	expect(await turn(ws)).toMatchObject({type: "response.completed"});
+	const observed = preference.mock.calls.slice(callsBeforeNext).filter(([entry]) => entry?.planType === expectedPlan);
+	expect(observed.length).toBeGreaterThan(0);
+	expect(observed[0]?.[0]).toMatchObject({planType: expectedPlan, primary: {usedPercent: 0}, secondary: {usedPercent: 20}});
+	const hints = preference.mock.results.slice(callsBeforeNext).filter(result => result.type === "return").map(result => result.value);
+	expect(hints).toContainEqual(expect.objectContaining({plan: expectedPlan === "free" ? "free" : "subscription", remainingPercent: 80}));
+	expect(f.creates).toHaveLength(2);
 });

@@ -4507,30 +4507,33 @@ async function handleRequestInner(
 				res.off("close", onClientClose);
 			}
 			reconcileManualSelection();
-			let pendingQuota: {snapshot: QuotaSchedulerSnapshot; planType?: string} | undefined;
+			let latestQuota: (QuotaSchedulerSnapshot & {planType?: string}) | undefined;
+			let pendingQuota: typeof latestQuota;
 			let quotaUpdate: Promise<void> | undefined;
 			let restrictionFailure: {error: unknown} | undefined;
 			const captureRestrictionFailure = (error: unknown): void => {restrictionFailure ??= {error};};
+			const mergeQuota = (snapshot: QuotaSchedulerSnapshot, planType: string | undefined, previous: (Pick<QuotaSchedulerSnapshot, "primary" | "secondary"> & {planType?: string}) | null | undefined) => ({
+				...snapshot,
+				primary: snapshot.primary.usedPercent === undefined && snapshot.primary.resetAtMs === undefined ? previous?.primary ?? snapshot.primary : snapshot.primary,
+				secondary: snapshot.secondary.usedPercent === undefined && snapshot.secondary.resetAtMs === undefined ? previous?.secondary ?? snapshot.secondary : snapshot.secondary,
+				planType: planType ?? previous?.planType,
+			});
 			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
-				pendingQuota = {snapshot, planType};
+				latestQuota = pendingQuota = mergeQuota(snapshot, planType, latestQuota);
 				quotaUpdate ??= (async () => {
 					try {
 						while (pendingQuota) {
-							const {snapshot, planType} = pendingQuota;
+							const snapshot = pendingQuota;
 							pendingQuota = undefined;
 							await applyDispatchRestriction(state, binding, () => {
 								const previous = requestScope ? quotaForScope(refreshed.account, requestScope) : undefined;
-								const merged = {
-									...snapshot,
-									primary: snapshot.primary.usedPercent === undefined ? previous?.primary ?? snapshot.primary : snapshot.primary,
-									secondary: snapshot.secondary.usedPercent === undefined ? previous?.secondary ?? snapshot.secondary : snapshot.secondary,
-								};
+								const merged = mergeQuota(snapshot, snapshot.planType, previous);
 								state.preemptiveQuotaScheduler.update(quotaScheduleKey, merged);
 								if (state.nativeOpenai && requestScope && isResponsesRequest) {
 									const observations = state.subscriptionQuotaObservations ??= new Map();
 									const key = JSON.stringify([requestScope.id, context.model]);
 									if (observations.size >= 1000 && !observations.has(key)) observations.delete(observations.keys().next().value ?? "");
-									observations.set(key, { ...merged, model: context.model ?? "unknown", planType: planType ?? previous?.planType });
+									observations.set(key, { ...merged, model: context.model ?? "unknown" });
 								}
 							});
 						}
