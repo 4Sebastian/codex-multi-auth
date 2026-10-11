@@ -421,3 +421,59 @@ it('clears only the recovered model quota without clearing sibling models',()=>{
  expect(scheduler.getDeferral('account:model',now).defer).toBe(false);
  expect(scheduler.getDeferral('account:model-other',now).defer).toBe(true);
 });
+
+it.each(["primary", "secondary"] as const)("merges committed %s quota without carrying consumed fields", exhausted => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1_000_000;
+	const other = exhausted === "primary" ? "secondary" : "primary";
+	const partial = (window: "primary" | "secondary", usedPercent: number, planType?: string) => ({
+		status: 200, updatedAt: now, primary: {}, secondary: {},
+		[window]: {usedPercent, resetAtMs: now + 60000}, planType,
+	});
+	scheduler.observe("account:model", partial(exhausted, 100, "free"));
+	const merged = scheduler.observe("account:model", partial(other, 20));
+	expect(merged[exhausted].usedPercent).toBe(100);
+	expect(merged[other].usedPercent).toBe(20);
+	expect(merged.planType).toBe("free");
+	expect(scheduler.getDeferral("account:model", now).defer).toBe(true);
+	scheduler.observe("account:model", partial(exhausted, 0, "pro"));
+	const healthy = scheduler.observe("account:model", {...partial(other, 20), planType: " "});
+	expect(healthy[exhausted].usedPercent).toBe(0);
+	expect(healthy.planType).toBe("pro");
+	expect(scheduler.getDeferral("account:model", now).defer).toBe(false);
+});
+
+it("honors current scoped quota rather than another scheduler baseline", () => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1_000_000;
+	scheduler.update("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100}, secondary: {}, planType: "free"});
+	const scoped = scheduler.observe("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {usedPercent: 20}}, {
+		primary: {usedPercent: 0}, secondary: {}, planType: "pro",
+	});
+	expect(scoped).toMatchObject({primary: {usedPercent: 0}, secondary: {usedPercent: 20}, planType: "pro"});
+	expect(scheduler.getDeferral("account:model", now).defer).toBe(false);
+	scheduler.update("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {usedPercent: 100}});
+	const absent = scheduler.observe("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 20}, secondary: {}}, null);
+	expect(absent.secondary).toEqual({});
+	expect(scheduler.getDeferral("account:model", now).defer).toBe(false);
+});
+
+it.each(["clear", "clearAll", "clearByPrefix", "full-replacement", "prune"])("does not revive consumed quota after %s", action => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1_000_000;
+	scheduler.observe("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {usedPercent: 100, resetAtMs: now + 1000}, planType: "free"});
+	if (action === "clear") scheduler.clear("account:model");
+	if (action === "clearAll") scheduler.clearAll();
+	if (action === "clearByPrefix") scheduler.clearByPrefix("account:");
+	if (action === "full-replacement") scheduler.update("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {}});
+	const later = action === "prune" ? now + 60001 : now;
+	const merged = scheduler.observe("account:model", {status: 200, updatedAt: later, primary: {usedPercent: 20}, secondary: {}});
+	expect(merged.secondary).toEqual({});
+	expect(merged.planType).toBeUndefined();
+	expect(scheduler.getDeferral("account:model", later).defer).toBe(false);
+});
+
+it("retains a rate-limit window during unrelated partial observations", () => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1_000_000;
+	scheduler.markRateLimited("account:model", 60000, now);
+	const merged = scheduler.observe("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {usedPercent: 20}});
+	expect(merged.primary).toEqual({usedPercent: 100, resetAtMs: now + 60000});
+	expect(scheduler.getDeferral("account:model", now).defer).toBe(true);
+});

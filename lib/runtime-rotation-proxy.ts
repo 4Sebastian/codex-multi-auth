@@ -99,6 +99,7 @@ import {
 } from "./request/fetch-helpers.js";
 import {
 	PreemptiveQuotaScheduler,
+	mergeQuotaObservations,
 	readQuotaSchedulerSnapshot,
 	type QuotaSchedulerSnapshot,
 } from "./preemptive-quota-scheduler.js";
@@ -4507,33 +4508,27 @@ async function handleRequestInner(
 				res.off("close", onClientClose);
 			}
 			reconcileManualSelection();
-			let latestQuota: (QuotaSchedulerSnapshot & {planType?: string}) | undefined;
-			let pendingQuota: typeof latestQuota;
+			let pendingQuota: QuotaSchedulerSnapshot | undefined;
 			let quotaUpdate: Promise<void> | undefined;
 			let restrictionFailure: {error: unknown} | undefined;
 			const captureRestrictionFailure = (error: unknown): void => {restrictionFailure ??= {error};};
-			const mergeQuota = (snapshot: QuotaSchedulerSnapshot, planType: string | undefined, previous: (Pick<QuotaSchedulerSnapshot, "primary" | "secondary"> & {planType?: string}) | null | undefined) => ({
-				...snapshot,
-				primary: snapshot.primary.usedPercent === undefined && snapshot.primary.resetAtMs === undefined ? previous?.primary ?? snapshot.primary : snapshot.primary,
-				secondary: snapshot.secondary.usedPercent === undefined && snapshot.secondary.resetAtMs === undefined ? previous?.secondary ?? snapshot.secondary : snapshot.secondary,
-				planType: planType ?? previous?.planType,
-			});
 			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
-				latestQuota = pendingQuota = mergeQuota(snapshot, planType, latestQuota);
+				pendingQuota = mergeQuotaObservations({...snapshot, planType}, pendingQuota);
 				quotaUpdate ??= (async () => {
 					try {
 						while (pendingQuota) {
 							const snapshot = pendingQuota;
 							pendingQuota = undefined;
 							await applyDispatchRestriction(state, binding, () => {
-								const previous = requestScope ? quotaForScope(refreshed.account, requestScope) : undefined;
-								const merged = mergeQuota(snapshot, snapshot.planType, previous);
-								state.preemptiveQuotaScheduler.update(quotaScheduleKey, merged);
 								if (state.nativeOpenai && requestScope && isResponsesRequest) {
 									const observations = state.subscriptionQuotaObservations ??= new Map();
 									const key = JSON.stringify([requestScope.id, context.model]);
+									const previous = observations.get(key) ?? quotaForScope(refreshed.account, requestScope) ?? null;
+									const merged = state.preemptiveQuotaScheduler.observe(quotaScheduleKey, snapshot, previous);
 									if (observations.size >= 1000 && !observations.has(key)) observations.delete(observations.keys().next().value ?? "");
 									observations.set(key, { ...merged, model: context.model ?? "unknown" });
+								} else {
+									state.preemptiveQuotaScheduler.observe(quotaScheduleKey, snapshot);
 								}
 							});
 						}

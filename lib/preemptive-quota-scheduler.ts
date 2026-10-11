@@ -7,10 +7,20 @@ export interface QuotaSchedulerWindow {
 }
 
 export interface QuotaSchedulerSnapshot {
+	planType?: string;
 	status: number;
 	primary: QuotaSchedulerWindow;
 	secondary: QuotaSchedulerWindow;
 	updatedAt: number;
+}
+
+export function mergeQuotaObservations(snapshot: QuotaSchedulerSnapshot, previous?: Pick<QuotaSchedulerSnapshot, "primary" | "secondary" | "planType"> | null): QuotaSchedulerSnapshot {
+	return {
+		...snapshot,
+		primary: snapshot.primary.usedPercent === undefined && snapshot.primary.resetAtMs === undefined ? previous?.primary ?? snapshot.primary : snapshot.primary,
+		secondary: snapshot.secondary.usedPercent === undefined && snapshot.secondary.resetAtMs === undefined ? previous?.secondary ?? snapshot.secondary : snapshot.secondary,
+		planType: snapshot.planType?.trim() ? snapshot.planType : previous?.planType,
+	};
 }
 
 export interface QuotaDeferralDecision {
@@ -240,6 +250,13 @@ export class PreemptiveQuotaScheduler {
 		if (!key) return;
 		this.maybePrune(snapshot.updatedAt || Date.now());
 		this.snapshots.set(key, snapshot);
+	}
+
+	observe(key: string, snapshot: QuotaSchedulerSnapshot, baseline?: Pick<QuotaSchedulerSnapshot, "primary" | "secondary" | "planType"> | null): QuotaSchedulerSnapshot {
+		this.maybePrune(snapshot.updatedAt || Date.now());
+		const merged = mergeQuotaObservations(snapshot, baseline === undefined ? this.snapshots.get(key) : baseline);
+		this.update(key, merged);
+		return merged;
 	}
 
 	markRateLimited(key: string, retryAfterMs: number, now = Date.now()): void {

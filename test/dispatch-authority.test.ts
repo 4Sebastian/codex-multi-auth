@@ -4,7 +4,7 @@ import {createServer, type Server} from "node:http";
 import type {Socket} from "node:net";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import WebSocket, {WebSocketServer} from "ws";
+import WebSocket, {WebSocketServer, type RawData} from "ws";
 import {afterEach, expect, it, vi} from "vitest";
 import {AccountManager} from "../lib/accounts.js";
 import {ContextBudgetGuard} from "../lib/context-budget-guard.js";
@@ -1337,4 +1337,141 @@ it.each(["free", "pro"].flatMap(planType => [false, true].map(replace => ({planT
 	const hints = preference.mock.results.slice(callsBeforeNext).filter(result => result.type === "return").map(result => result.value);
 	expect(hints).toContainEqual(expect.objectContaining({plan: expectedPlan === "free" ? "free" : "subscription", remainingPercent: 80}));
 	expect(f.creates).toHaveLength(2);
+});
+
+it.each(["primary", "secondary"].flatMap(exhausted => ["event", "header"].map(input => ({exhausted, input}))))
+("merges concurrent HTTP quota deltas against committed shared windows (%j)", async ({exhausted, input}) => {
+	const now = Date.now();
+	vi.spyOn(Date, "now").mockReturnValue(now);
+	const f = await fixture(false);
+	const bothDispatched = deferred(), headers = deferred();
+	cleanups.push(async () => {headers.resolve();});
+	const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+	const other = exhausted === "primary" ? "secondary" : "primary";
+	const resetAt = Math.floor(now / 1000) + 600;
+	let calls = 0;
+	f.setPostResponse(async () => {
+		const index = calls++;
+		if (index === 1) {
+			bothDispatched.resolve();
+			if (input === "header") await headers.promise;
+		}
+		return new Response(new ReadableStream({start(controller) {
+			controllers[index] = controller;
+			controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({type: "response.created", response: {id: `concurrent-${index}`}})}\n\n`));
+		}}), {headers: {"content-type": "text/event-stream", ...(index === 1 && input === "header" ? {
+			[`x-codex-${other}-used-percent`]: "20",
+			[`x-codex-${other}-reset-after-seconds`]: "600",
+		} : {})}});
+	});
+	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let commit = deferred();
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		const notification = commit;
+		const applied = await actual(...args);
+		expect(applied).toBe(true);
+		notification.resolve();
+		return applied;
+	});
+	const send = (index: number, event: Record<string, unknown>) => controllers[index]!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const aPending = f.post(), bPending = f.post();
+	await bothDispatched.promise;
+	const a = await aPending, aBody = a.text();
+	let b = input === "event" ? await bPending : undefined;
+	let bBody = b?.text();
+	send(0, {type: "codex.rate_limits", rate_limits: {[exhausted]: {used_percent: 100, reset_at: resetAt}}});
+	await commit.promise;
+	commit = deferred();
+	if (input === "header") {
+		headers.resolve();
+		b = await bPending; bBody = b.text();
+	} else {
+		send(1, {type: "codex.rate_limits", rate_limits: {[other]: {used_percent: 20, reset_at: resetAt}}});
+	}
+	await commit.promise;
+	expect(a.status).toBe(200); expect(b?.status).toBe(200);
+	for (let index = 0; index < 2; index++) {
+		send(index, {type: "response.completed", response: {id: `concurrent-${index}`, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+		controllers[index]!.close();
+	}
+	for (const body of await Promise.all([aBody, bBody])) expect(body).toContain('"response.completed"');
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+	for (const row of rows) expect(row).toMatchObject({outcome: "success", statusCode: 200, account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(new Set(rows.map(row => row.requestId)).size).toBe(2);
+	f.setPostResponse(undefined);
+	const next = await f.post(); await next.text();
+	expect(next.status).not.toBe(200);
+	expect(f.fetched).toHaveLength(2);
+});
+
+it.each(["primary", "secondary"].flatMap(exhausted => [false, true].map(held => ({exhausted, held}))))
+("does not replay consumed native quota fields over a concurrent replacement (%j)", async ({exhausted, held}) => {
+	const now = Date.now();
+	vi.spyOn(Date, "now").mockReturnValue(now);
+	const f = await fixture(true), bothSent = deferred(), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.manager.getAccountByIndex(0)!.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	const preference = vi.spyOn(quotaOrdering, "subscriptionQuotaPreference");
+	const upstream: WebSocket[] = [];
+	f.setReply(ws => {
+		upstream.push(ws);
+		ws.send(JSON.stringify({type: "response.created", response: {id: `native-concurrent-${upstream.length}`}}));
+		if (upstream.length === 2) bothSent.resolve();
+	});
+	const clients = [await f.connect(), await f.connect()];
+	const terminals = clients.map(client => new Promise<Record<string, unknown>>(resolve => {
+		const onMessage = (data: RawData) => {
+			const event = JSON.parse(String(data));
+			if (event.type === "response.completed" || event.type === "error") {client.off("message", onMessage); resolve(event);}
+		};
+		client.on("message", onMessage);
+	}));
+	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let started = 0, commit = deferred();
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		const notification = commit;
+		if (++started === 2 && held) {entered.resolve(); await release.promise;}
+		const applied = await actual(...args);
+		expect(applied).toBe(true);
+		notification.resolve();
+		return applied;
+	});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	for (const client of clients) client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await bothSent.promise;
+	const resetAt = Math.floor(now / 1000) + 600;
+	const other = exhausted === "primary" ? "secondary" : "primary";
+	upstream[0]!.send(JSON.stringify({type: "codex.rate_limits", plan_type: "free", rate_limits: {[exhausted]: {used_percent: 100, reset_at: resetAt}}}));
+	await commit.promise;
+	commit = deferred();
+	const partial = {type: "codex.rate_limits", ...(held ? {plan_type: " "} : {}), rate_limits: {[other]: {used_percent: 20, reset_at: resetAt}}};
+	let heldCommit: ReturnType<typeof deferred> | undefined;
+	if (held) {
+		heldCommit = commit;
+		upstream[0]!.send(JSON.stringify(partial));
+		await entered.promise;
+		commit = deferred();
+	}
+	upstream[1]!.send(JSON.stringify({type: "codex.rate_limits", plan_type: "pro", rate_limits: {[exhausted]: {used_percent: 0}}}));
+	await commit.promise;
+	if (held) {release.resolve(); await heldCommit!.promise;}
+	else {commit = deferred(); upstream[0]!.send(JSON.stringify(partial)); await commit.promise;}
+	for (let index = 0; index < 2; index++) upstream[index]!.send(JSON.stringify({type: "response.completed", response: {id: `native-concurrent-${index}`, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
+	for (const terminal of await Promise.all(terminals)) expect(terminal.type).toBe("response.completed");
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+	for (const row of rows) expect(row).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(new Set(rows.map(row => row.requestId)).size).toBe(2);
+	const callsBeforeNext = preference.mock.calls.length;
+	f.setReply(undefined);
+	expect(await turn(clients[0]!)).toMatchObject({type: "response.completed"});
+	expect(preference.mock.calls.slice(callsBeforeNext).map(([entry]) => entry)).toContainEqual(expect.objectContaining({
+		planType: "pro", [exhausted]: {usedPercent: 0}, [other]: {usedPercent: 20, resetAtMs: resetAt * 1000},
+	}));
+	expect(f.creates).toHaveLength(3);
+	expect(f.connections()).toBe(2);
+	expect(f.fetched).toHaveLength(0);
 });
