@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { isRecord } from "../lib/utils.js";
 import {
 	ApiModelCapabilities,
 	parseApiReasoningDocumentation,
@@ -613,7 +614,7 @@ it("retains independent imported credential evidence after an attributed loss", 
 	const imported = new ApiModelCapabilities(fetcher, () => now);
 	imported.importProbes(first.exportProbes());
 	revoked = true; now = 3000;
-	await imported.enrich([{slug: "X"}, {slug: "Y"}], false, route);
+	await imported.enrich([{slug: "Y"}], false, route);
 	const before = posts;
 	const [independent] = await imported.enrich([{slug: "X"}], false, other);
 	expect(posts).toBe(before);
@@ -622,6 +623,39 @@ it("retains independent imported credential evidence after an attributed loss", 
 	const changed = imported.exportProbes().filter(([, result]) => !Object.values(result.status).includes("verified"));
 	expect(changed).toHaveLength(2);
 	for (const [, result] of changed) expect(result.at).toBe(3000);
+});
+
+it.each([false, true])("retires held and queued probes without letting old results harm the fresh owner (denied=%s)", async denied => {
+	let entered: () => void = () => undefined, release: () => void = () => undefined, posts = 0, oldPosts = 0, fresh = false;
+	const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+	const reader = new ApiModelCapabilities(async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		const body = JSON.parse(String(init.body));
+		const old = body.model !== "new"; posts++;
+		if (old) oldPosts++;
+		if (old && posts === 1) {entered(); await gate;}
+		if (old && fresh && !denied || !old && denied) return Response.json({error: {code: "invalid_api_key"}}, {status: 401});
+		return Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default", output: [{type: "function_call", name: "capability_probe"}]});
+	}, () => fresh ? 2000 : 1000);
+	const pending = reader.enrich([{slug: "old"}, {slug: "queued"}], false, route);
+	await ready;
+	try {
+		const alreadySent = oldPosts;
+		fresh = true;
+		const [current] = await reader.enrich([{slug: "new"}], false, route, true);
+		expect(oldPosts).toBe(alreadySent);
+		expect(current?.capability_probe_status).toMatchObject({responses: denied ? "unverified" : "verified"});
+		const exported = reader.exportProbes(), before = posts;
+		release();
+		const old = await pending;
+		expect(posts).toBe(before);
+		for (const model of old) {
+			expect(model.service_tiers).toEqual([]);
+			expect(isRecord(model.capability_probe_status)).toBe(true);
+			if (isRecord(model.capability_probe_status)) expect(Object.values(model.capability_probe_status)).not.toContain("verified");
+		}
+		expect(reader.exportProbes()).toEqual(exported);
+	} finally {release(); await pending;}
 });
 
 it("forces a fresh healthy batch instead of sharing an earlier in-flight probe", async () => {

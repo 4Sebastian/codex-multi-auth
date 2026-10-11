@@ -1,13 +1,20 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { promises as fs } from "node:fs";
+import * as filesystem from "node:fs";
+import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
+import { clearAccountStorageArtifacts } from "../lib/storage/account-clear.js";
 import {recordPendingAuth, getPendingAuthPath} from "../lib/storage/pending-auth.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
 import * as parser from "../lib/storage/storage-parser.js";
+vi.mock("node:fs", async importOriginal => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {...actual, statSync: vi.fn(actual.statSync)};
+});
 const roots: string[] = [];
-afterEach(async () => { vi.restoreAllMocks(); for (const root of roots.splice(0))
+afterEach(async () => { vi.restoreAllMocks(); vi.mocked(filesystem.statSync).mockRestore(); for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true }); });
 it.each(["EACCES","corrupt"])("never verifies unrestricted primary after journal observation fails (%s)",async failure=>{
  const root=await mkdtemp(join(tmpdir(),"native-journal-"));roots.push(root);const path=join(root,"accounts.json");
@@ -21,6 +28,37 @@ it.each(["EACCES","corrupt"])("never verifies unrestricted primary after journal
  blocked.mockRestore();await rm(getPendingAuthPath(path));
  expect((await read()).verified).toBe(true);
 });
+it.each(["surviving-primary", "busy-primary", "unreadable-marker", "during-journal"])("denies reset authority without cache or grace override (%s)", async mode => {
+	const root = await mkdtemp(join(tmpdir(), "native-reset-")); roots.push(root);
+	const path = join(root, "accounts.json"), marker = getIntentionalResetMarkerPath(path);
+	await writeFile(path, JSON.stringify({version: 3, activeIndex: 0, accounts: [{recordId: "R1", refreshToken: "refresh-A", accessToken: "A", addedAt: 1, lastUsed: 1}]}));
+	const read = createNativeAccountStorageReader(undefined, path);
+	expect((await read()).verified).toBe(true);
+	if (mode === "surviving-primary") {
+		vi.spyOn(fs, "unlink").mockRejectedValueOnce(Object.assign(Error("fixture unlink failed"), {code: "EIO"}));
+		await expect(clearAccountStorageArtifacts({path, resetMarkerPath: marker, walPath: path + ".wal", backupPaths: [], logError: () => undefined})).rejects.toThrow("fixture unlink failed");
+	} else if (mode === "unreadable-marker") {
+		const original = vi.mocked(filesystem.statSync).getMockImplementation();
+		if (!original) throw Error("Missing fixture filesystem implementation");
+		vi.mocked(filesystem.statSync).mockImplementation((...args: Parameters<typeof filesystem.statSync>) => {
+			if (String(args[0]) === marker) throw Object.assign(Error("fixture marker unavailable"), {code: "EACCES"});
+			return original(...args);
+		});
+	} else if (mode === "during-journal") {
+		const original = fs.readFile.bind(fs);
+		vi.spyOn(fs, "readFile").mockImplementation(async (...args: Parameters<typeof fs.readFile>) => {
+			if (String(args[0]) === getPendingAuthPath(path)) await writeFile(marker, "{}");
+			return original(...args);
+		});
+	} else {
+		vi.spyOn(parser, "loadAccountsFromPath").mockRejectedValueOnce(Object.assign(Error("fixture primary locked"), {code: "EBUSY"}));
+		await writeFile(marker, "{}");
+	}
+	expect(await read()).toMatchObject({storage: null, verified: false, routingAvailable: false});
+	vi.restoreAllMocks(); vi.mocked(filesystem.statSync).mockRestore(); await rm(marker, {force: true});
+	expect((await read()).verified).toBe(true);
+});
+
 it("rejects a primary revision changed during journal observation", async () => {
 	const root = await mkdtemp(join(tmpdir(), "native-revision-")); roots.push(root);
 	const path = join(root, "accounts.json");

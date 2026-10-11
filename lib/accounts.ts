@@ -8,6 +8,7 @@ import { applyPendingAuth, getPendingAuthPath } from "./storage/pending-auth.js"
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
 import { createNativeAccountStorageReader, type NativeAccountSnapshot } from "./runtime/native-account-storage.js";
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
 import { createLogger } from "./logger.js";
 import {
 	getStoragePath,
@@ -2490,10 +2491,9 @@ export class AccountManager {
 		mutate: () => boolean | void,
 	): Promise<boolean> {
 		return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
+			if (!captureAuthorityRevision([], [getIntentionalResetMarkerPath(this.resolveSelectionStoragePath())])()) return false;
 			const primaryExists = existsSync(this.resolveSelectionStoragePath());
 			if (this.hadPersistedStorage && !primaryExists) return false;
-			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
-				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken) return false;
 			if (current && primaryExists) {
 				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
 				const row = matches.length === 1 ? matches[0] : undefined;
@@ -2503,6 +2503,8 @@ export class AccountManager {
 						: (row.accountId?.trim() || extractAccountId(row.accessToken)?.trim()) !== submitted.accountId))) return false;
 			}
 			if (!await this.isAccountJournalEligible(account)) return false;
+			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
+				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken) return false;
 			if (mutate() === false) return false;
 			this.reconcileSelectionFromDisk();
 			this.syncWorkspaceSelections(current);

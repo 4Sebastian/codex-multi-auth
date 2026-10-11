@@ -40,7 +40,7 @@ it.each(["invalidated", "cooldown", "quota"])("does not submit initially restric
 	expect(inventory.entries[0]).toMatchObject({error: true, models: [], visibleModels: []});
 });
 
-it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journal"])("rechecks OAuth discovery authority after refresh (%s)", async mutation => {
+it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journal", "reset"])("rechecks OAuth discovery authority after refresh (%s)", async mutation => {
 	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, workspaces: [{id: "W1", enabled: true}]}]};
 	const path = isolationJoin(multiAuthDir, "accounts.json");
 	setStoragePathDirect(path); await isolationFs.writeFile(path, JSON.stringify(storage));
@@ -58,6 +58,7 @@ it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journ
 		if (mutation === "invalidated") storage.accounts[0]!.authInvalidatedAt = Date.now();
 		if (mutation === "credential") Object.assign(storage.accounts[0]!, {accessToken: "fixture-B", refreshToken: "fixture-refresh-B"});
 		if (mutation === "workspace") storage.accounts[0]!.workspaces![0]!.enabled = false;
+		if (mutation === "reset") await isolationFs.writeFile(`${path}.reset-intent`, "{}");
 		if (mutation === "journal") await isolationFs.writeFile(getPendingAuthPath(path), "fixture corrupt journal");
 		else await isolationFs.writeFile(path, JSON.stringify(storage));
 		release();
@@ -435,7 +436,7 @@ it("persists attributed loss timestamps over a concurrent older positive and pre
 	const gate = new Promise<void>(resolve => {release = resolve;});
 	const ready = new Promise<void>(resolve => {entered = resolve;});
 	const denying: typeof fetch = async (url, init) => {
-		if (String(url).endsWith("/models")) return Response.json({data: [{id: "X"}, {id: "Y"}]});
+		if (String(url).endsWith("/models")) return Response.json({data: [{id: "Y"}]});
 		if (init?.method !== "POST") return new Response("missing", {status: 404});
 		entered(); await gate;
 		return Response.json({error: {code: "invalid_api_key"}}, {status: 401});

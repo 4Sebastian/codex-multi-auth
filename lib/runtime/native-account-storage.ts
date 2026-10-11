@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
 import { captureAuthorityRevision } from "../storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
 import { getStoragePath, normalizeAccountStorage, type AccountStorageV3 } from "../storage.js";
 import { loadAccountsFromPath } from "../storage/storage-parser.js";
 import { applyPendingAuth, capturePendingAuth, getPendingAuthPath } from "../storage/pending-auth.js";
@@ -21,8 +22,14 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
     return () => {
         if (pending) return pending;
         const capturedAt = performance.now();
-        const authorityCurrent = captureAuthorityRevision([path, getPendingAuthPath(path)]);
+        const authorityCurrent = captureAuthorityRevision([path, getPendingAuthPath(path)], [getIntentionalResetMarkerPath(path)]);
         pending = (async (): Promise<NativeAccountSnapshot> => {
+            if (!authorityCurrent()) {
+                cached = null;
+                signature = undefined;
+                lastSuccess = undefined;
+                return {storage: null, verified: false, capturedAt, routingAvailable: false};
+            }
             let storage: AccountStorageV3 | null;
             let nextSignature: string | undefined;
             let verified = true;

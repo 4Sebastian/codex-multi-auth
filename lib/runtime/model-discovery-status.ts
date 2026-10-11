@@ -12,6 +12,7 @@ import { modelScopeId, workspaceModelScopes } from "./workspace-model-scopes.js"
 import { AccountManager } from "../accounts.js";
 import { type AccountStorageV3, loadAccounts, getStoragePath } from "../storage.js";
 import {captureAuthorityRevision} from "../storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
 import {getPendingAuthPath} from "../storage/pending-auth.js";
 import {syncNativeAccountCredentials} from "./native-account-sync.js";
 import {
@@ -66,7 +67,7 @@ const probeCacheSchema = z.object({
 	version: z.literal(1),
 	entries: z.array(z.tuple([
 		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
+		z.object({ credentialOwner: z.string().regex(/^[0-9a-f]{64}$/).optional(), documented: z.array(printable).max(100).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
 	])).max(1000),
 });
 function probeCachePath(): string {
@@ -127,7 +128,7 @@ export async function discoverModelInventory(
 		if (version && /^[0-9A-Za-z.+_-]{1,80}$/.test(version))
 			url.searchParams.set("client_version", version);
 		const binding = {recordId: account.recordId, refreshToken: account.refreshToken, expires: account.expires};
-		const authorityCurrent = captureAuthorityRevision([getStoragePath(), getPendingAuthPath(getStoragePath())]);
+		const authorityCurrent = captureAuthorityRevision([getStoragePath(), getPendingAuthPath(getStoragePath())], [getIntentionalResetMarkerPath(getStoragePath())]);
 		const snapshot = await manager.readDispatchAccountStorage();
 		if (snapshot) {
 			if (!snapshot.verified || !snapshot.storage) throw Error("Account authority unavailable");

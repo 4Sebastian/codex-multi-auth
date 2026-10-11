@@ -45,7 +45,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("Missing fixture address");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse = false) {
+async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number = false) {
 	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-authority-"));
 	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
 	const path = join(root, "accounts.json");
@@ -65,7 +65,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		entered.resolve();
 		void (delayed ? release.promise : Promise.resolve()).then(() => {
 			if (socket.destroyed) return;
-			if (refuse) {socket.end("HTTP/1.1 404 Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); return;}
+			if (refuse) {socket.end(`HTTP/1.1 ${typeof refuse === "number" ? refuse : 404} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`); return;}
 			wss.handleUpgrade(req, socket, head, ws => {
 				connections++;
 				ws.on("message", data => {
@@ -105,13 +105,14 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 	const post = (model = "shared") => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: []})});
 	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
 }
-it.each(["disable", "delete", "remove", "corrupt"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
+it.each(["disable", "delete", "remove", "corrupt", "reset"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
 	const f = await fixture(false), ws = await f.connect();
 	const first = await turn(ws);
 	expect(first).toMatchObject({type: "response.completed"});
 	const other = new AccountManager(undefined, f.pool);
 	if (mutation === "disable") {other.setAccountEnabled(0, false); await other.saveToDisk();}
 	if (mutation === "delete") {other.removeAccountByIndex(0); await other.saveToDisk();}
+	if (mutation === "reset") await fs.writeFile(`${f.path}.reset-intent`, "{}");
 	if (mutation === "remove") await fs.unlink(f.path);
 	if (mutation === "corrupt") await fs.writeFile(f.path, "invalid fixture");
 	const result = await turn(ws, {previous_response_id: first.response.id});
@@ -414,6 +415,85 @@ it.each(["api", "zdr"] as const)("rejects known %s denial on a cached HTTP-only 
 	expect(f.fetched).toEqual(["Bearer fixture-key"]);
 });
 
+it.each(["credential", "expiry"])("rechecks submitted credentials after final journal observation without treating expiry as identity (%s)", async mutation => {
+	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
+	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, accountId: "W1"};
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const journal = f.manager.isAccountJournalEligible.bind(f.manager);
+	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async candidate => {const eligible = await journal(candidate); entered.resolve(); await release.promise; return eligible;});
+	const restrict = vi.fn(() => {f.manager.markAccountCoolingDown(account, 60000, "server-error");});
+	const pending = f.manager.withCurrentAccountCredential(account, submitted, restrict);
+	await entered.promise;
+	if (mutation === "credential") f.manager.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+	else account.expires = Date.now() + 7200000;
+	release.resolve();
+	expect(await pending).toBe(mutation === "expiry");
+	expect(restrict).toHaveBeenCalledTimes(mutation === "expiry" ? 1 : 0);
+	await f.manager.saveToDisk();
+	expect((await loadAccounts())?.accounts[0]?.cooldownReason).toBe(mutation === "expiry" ? "server-error" : undefined);
+});
+
+it.each(["http-server", "http-network", "http-stream", "http-quota", "custom-server", "custom-quota", "custom-close", "custom-handshake"].flatMap(mode =>
+	["same", "local", "durable"].flatMap(recovery => (mode.startsWith("http") ? [false, true] : [false]).map(native => ({mode, recovery, native})))))
+("attributes delayed server, quota and transport restrictions to the submitted generation (%j)", async ({mode, recovery, native}) => {
+	const handshake = mode === "custom-handshake";
+	const f = await fixture(native, handshake, undefined, handshake ? 503 : false);
+	const entered = handshake ? f.entered : deferred(), release = handshake ? f.release : deferred();
+	cleanups.push(async () => {release.resolve();});
+	const quota = mode.endsWith("quota"), server = mode.endsWith("server") || handshake;
+	const status = quota ? 429 : 503;
+	if (mode.startsWith("http")) f.setPostResponse(async () => {
+		entered.resolve();
+		if (mode === "http-stream") return new Response(new ReadableStream({start(controller) {
+			controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"A"}}\n\n'));
+			void release.promise.then(() => controller.error(Error("fixture stream failure")));
+		}}), {headers: {"content-type": "text/event-stream"}});
+		await release.promise;
+		if (mode === "http-network") throw Error("fixture network failure");
+		return Response.json({error: {code: quota ? "usage_limit_reached" : "server_error"}}, {status, headers: quota ? {"retry-after": "60"} : {}});
+	});
+	else if (!handshake) f.setReply(ws => {
+		entered.resolve();
+		if (mode === "custom-close") ws.send(JSON.stringify({type: "response.created", response: {id: "A"}}));
+		void release.promise.then(() => {
+			if (mode === "custom-close") ws.close();
+			else ws.send(JSON.stringify({type: "response.failed", response: {id: "A", status: "failed", error: {code: quota ? "usage_limit_reached" : "server_error"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}, status}));
+		});
+	});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const pending = mode.startsWith("http") ? f.post().then(response => response.text()).catch(() => undefined) : turn(await f.connect());
+	await entered.promise;
+	if (recovery !== "same") {
+		const manager = recovery === "local" ? f.manager : new AccountManager(undefined, (await loadAccounts())!);
+		manager.updateFromAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
+		await manager.saveToDisk();
+		f.setPostResponse(undefined);
+	}
+	release.resolve(); await pending;
+	await vi.waitFor(async () => {
+		const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+		expect(rows).toHaveLength(1);
+	});
+	await f.manager.flushPendingSave();
+	const account = (await loadAccounts())?.accounts[0];
+	const expected = quota ? undefined : server ? "server-error" : "network-error";
+	if (recovery === "same") {
+		if (quota) expect(Object.values(account?.rateLimitResetTimes ?? {}).some(at => at > Date.now())).toBe(true);
+		else expect(account?.cooldownReason).toBe(expected);
+	} else {
+		expect(account).toMatchObject({accessToken: "B", refreshToken: "refresh-B"});
+		expect(account?.cooldownReason).toBeUndefined();
+		expect(Object.values(account?.rateLimitResetTimes ?? {}).some(at => at > Date.now())).toBe(false);
+		const current = new AccountManager(undefined, (await loadAccounts())!);
+		expect(current.getAccountRuntimeSkipReason(0, getModelFamily("shared"), "shared")).toBeNull();
+	}
+	if (mode === "custom-server" || mode === "custom-quota") {
+		const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
+		expect(row).toMatchObject({outcome: "failure", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	}
+});
+
 function turn(ws: WebSocket, extra: Record<string, unknown> = {}) {
 	const listeners = new AbortController();
 	const received = Promise.race([
@@ -424,7 +504,7 @@ function turn(ws: WebSocket, extra: Record<string, unknown> = {}) {
 	return received;
 }
 
-it.each(["quota", "scheduler", "circuit", "revoked", "journal"])("rechecks native %s authority after a delayed real handshake", async mutation => {
+it.each(["quota", "scheduler", "circuit", "revoked", "journal", "reset"])("rechecks native %s authority after a delayed real handshake", async mutation => {
 	const f = await fixture(true, true);
 	const ws = await f.connect();
 	const result = turn(ws);
@@ -439,6 +519,7 @@ it.each(["quota", "scheduler", "circuit", "revoked", "journal"])("rechecks nativ
 	if (mutation === "scheduler") vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral").mockReturnValue({defer: true, waitMs: 60000});
 	if (mutation === "circuit") for (let i = 0; i < 3; i++) f.manager.recordFailure(account, "codex", "shared");
 	if (mutation === "revoked") await recordPendingAuth(f.path, {recordId: "R1", priorRefreshToken: "refresh-A", refreshToken: "refresh-A", accessToken: "A", expiresAt: account.expires!, enabled: false, authInvalidatedAt: 5000, at: 1});
+	if (mutation === "reset") await fs.writeFile(`${f.path}.reset-intent`, "{}");
 	if (mutation === "journal") await fs.writeFile(getPendingAuthPath(f.path), "invalid journal");
 	f.release.resolve();
 	expect(await result).toMatchObject({type: "error", status: 503});
@@ -644,6 +725,45 @@ it.each(["http", "custom", "native"])("records terminal usage even if restrictio
 	const blocked = await f.post();
 	expect(blocked.status).not.toBe(200); await blocked.text();
 	expect(sends).toBe(1);
+});
+
+it("does not drain a closing channel before its terminal restriction settles", async () => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return restrict(...args);});
+	f.setReply(ws => {ws.send(JSON.stringify({type: "response.failed", status: 503, response: {id: "A", status: "failed", error: {code: "server_error"}}})); ws.close();});
+	const ws = await f.connect(), first = turn(ws);
+	await entered.promise; await first;
+	const queued = turn(ws);
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect(f.connections()).toBe(1);
+	release.resolve();
+	expect(await queued).toMatchObject({type: "error"});
+	expect(f.creates).toHaveLength(1);
+});
+
+it.each(["terminal", "close-before-event", "close-after-event"])("settles custom transport failure despite a restriction transaction error (%s)", async mode => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const terminal = {type: "response.failed", status: 503, response: {id: "failed-A", status: "failed", error: {code: "server_error"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+	f.setReply(ws => {
+		entered.resolve();
+		if (mode === "close-after-event") ws.send(JSON.stringify({type: "response.created", response: {id: "A"}}));
+		void release.promise.then(() => {if (mode === "terminal") ws.send(JSON.stringify(terminal)); else ws.close();});
+	});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const ws = await f.connect(), pending = turn(ws);
+	await entered.promise;
+	await fs.writeFile(getPendingAuthPath(f.path), "fixture unreadable journal");
+	release.resolve(); await pending;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
+	expect(row).toMatchObject({outcome: "failure", account: {index: 0}});
+	if (mode === "terminal") expect(row?.tokens).toMatchObject({inputTokens: 17, outputTokens: 4, totalTokens: 21});
+	const blocked = await f.post(); await blocked.text();
+	expect(blocked.status).not.toBe(200);
+	expect(f.creates).toHaveLength(1);
 });
 
 it.each(["http", "sse"].flatMap(mode => [false, true].map(replace => ({mode, replace}))))("scopes late capability denial to its submitted credentials (%j)", async ({mode, replace}) => {

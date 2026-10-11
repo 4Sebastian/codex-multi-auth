@@ -46,14 +46,16 @@ export function parseApiReasoningDocumentation(
 	return [...new Set(values)];
 }
 export type ProbeResult = {
+	credentialOwner?: string;
+	documented?: string[];
 	at: number;
 	levels: string[];
 	tiers: string[];
 	status: Record<string, string>;
 };
 type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
-type CredentialProbeGroup = { lostAt?: number };
-type ProbeCacheEntry = ProbeResult & { group?: CredentialProbeGroup; documented?: string[] };
+type CredentialProbeGroup = { owner: string; lostAt?: number; retiredAt?: number };
+type ProbeCacheEntry = ProbeResult & { group?: CredentialProbeGroup };
 
 /** Only the exact model's input declaration can enable native image attachments. */
 function parseInputModalities(id: string, text: string): string[] | undefined {
@@ -119,12 +121,13 @@ export class ApiModelCapabilities {
 			const oldest = this.credentialGroups.keys().next().value;
 			if (oldest !== undefined) {
 				const retired = this.credentialGroups.get(oldest);
-				if (retired) retired.lostAt ??= this.now();
+				if (retired) retired.retiredAt ??= this.now();
 				for (const [modelKey, entry] of this.probes) if (entry.group === retired) this.probes.delete(modelKey);
 				this.credentialGroups.delete(oldest);
 			}
 		}
-		const group: CredentialProbeGroup = {};
+		if (current) current.retiredAt ??= this.now();
+		const group: CredentialProbeGroup = {owner: key};
 		this.credentialGroups.set(key, group);
 		return group;
 	}
@@ -139,8 +142,9 @@ export class ApiModelCapabilities {
 
 	private revokeGroup(group: CredentialProbeGroup): void {
 		group.lostAt ??= this.now();
+		if (this.credentialGroups.get(group.owner) !== group) return;
 		for (const result of this.probes.values()) {
-			if (result.group === group) this.clearVerified(result, result.documented ?? [], group.lostAt);
+			if (result.credentialOwner === group.owner) this.clearVerified(result, result.documented ?? [], group.lostAt);
 		}
 	}
 	private readonly cache = new Map<string, DocumentedCapabilities & { at: number }>();
@@ -150,13 +154,13 @@ export class ApiModelCapabilities {
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
-		return [...this.probes].map(([key, {at, levels, tiers, status}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}}]);
+		return [...this.probes].map(([key, {at, levels, tiers, status, credentialOwner, documented}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}, credentialOwner, documented: documented ? [...documented] : undefined}]);
 	}
 	importProbes(entries: Array<[string, ProbeResult]>): void {
 		for (const [key, value] of entries.slice(-1000)) {
 			if (this.probes.has(key) || value.at > this.now()) continue;
 			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
-			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}});
+			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}, credentialOwner: value.credentialOwner, documented: value.documented ? [...value.documented] : undefined});
 		}
 	}
 	async reasoning(id: string, refresh = false): Promise<string[]> {
@@ -221,7 +225,7 @@ export class ApiModelCapabilities {
 		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
 		if (this.credentialGroups.get(owner) !== group) return {at: group.lostAt ?? this.now(), levels: [...documented], tiers: [], status: {responses: "unverified", retry: "transient"}} satisfies ProbeResult;
 		const old = this.probes.get(key);
-		if (old) {old.group = group; old.documented = [...documented];}
+		if (old) {old.group = group; old.credentialOwner = owner; old.documented = [...documented];}
 		if (group.lostAt !== undefined && old) this.clearVerified(old, documented, group.lostAt);
 		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
 		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
@@ -242,6 +246,8 @@ export class ApiModelCapabilities {
 		group: CredentialProbeGroup,
 	): Promise<ProbeResult> {
 		const result = {
+			credentialOwner: group.owner,
+			documented: [...documented],
 			at: this.now(),
 			levels: [...documented],
 			tiers: [] as string[],
@@ -274,7 +280,7 @@ export class ApiModelCapabilities {
 				return "unverified";
 			};
 			return this.withProbeSlot(async () => {
-				if (credentialUnavailable || modelDenied || group.lostAt !== undefined) return "unverified";
+				if (credentialUnavailable || modelDenied || group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group) return "unverified";
 				try {
 					const response = await this.fetchImpl(
 						"https://api.openai.com/v1/responses",
@@ -440,8 +446,9 @@ export class ApiModelCapabilities {
 		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
 		if (this.credentialGroups.get(owner) === group) {
 			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
-			this.probes.set(key, {...result, group, documented: [...documented]});
+			this.probes.set(key, {...result, levels: [...result.levels], tiers: [...result.tiers], status: {...result.status}, group, documented: [...documented]});
 		}
+		if (this.credentialGroups.get(owner) !== group) this.clearVerified(result, documented, group.lostAt ?? group.retiredAt ?? this.now());
 		return result;
 	}
 	async enrich(
@@ -466,7 +473,8 @@ export class ApiModelCapabilities {
 						let levels = documented.levels;
 						let extra: Record<string, unknown> = {};
 						if (probed) {
-							if (group?.lostAt !== undefined) this.clearVerified(probed, documented.levels, group.lostAt);
+							probed = {...probed, levels: [...probed.levels], tiers: [...probed.tiers], status: {...probed.status}};
+							if (group && (group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group)) this.clearVerified(probed, documented.levels, group.lostAt ?? group.retiredAt ?? this.now());
 							levels = probed.levels;
 							extra = {
 								service_tiers: probed.tiers.map((id) => ({
