@@ -48,7 +48,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("Missing fixture address");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number = false, quotaRemainingPercentThreshold?: number) {
+async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number | {status: number; error: {code: string; param?: string; message?: string}; workspace?: string} = false, quotaRemainingPercentThreshold?: number) {
 	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-authority-"));
 	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
 	const path = join(root, "accounts.json");
@@ -68,7 +68,12 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		entered.resolve();
 		void (delayed ? release.promise : Promise.resolve()).then(() => {
 			if (socket.destroyed) return;
-			if (refuse) {socket.end(`HTTP/1.1 ${typeof refuse === "number" ? refuse : 404} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`); return;}
+			if (refuse && (typeof refuse !== "object" || !refuse.workspace || refuse.workspace === req.headers["chatgpt-account-id"])) {
+				const status = typeof refuse === "object" ? refuse.status : typeof refuse === "number" ? refuse : 404;
+				const body = typeof refuse === "object" ? JSON.stringify({error: refuse.error}) : "";
+				socket.end(`HTTP/1.1 ${status} Rejected\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+				return;
+			}
 			wss.handleUpgrade(req, socket, head, ws => {
 				connections++;
 				ws.on("message", data => {
@@ -91,7 +96,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 	let quotaFailure = false;
 	let postResponse: (() => Promise<Response>) | undefined;
 	const fetchImpl: typeof fetch = async (_url, init) => {
-		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});}
+		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared", ...(typeof refuse === "object" ? {supported_reasoning_levels: [{effort: "high"}], service_tiers: [{id: "priority", name: "Priority", description: "Fixture"}]} : {})}], data: [{id: "shared"}]});}
 		fetched.push(new Headers(init.headers).get("authorization") ?? "");
 		httpWorkspaces.push(new Headers(init.headers).get("chatgpt-account-id") ?? "");
 		if (postResponse) return postResponse();
@@ -992,6 +997,25 @@ it.each([403, 404, 503].flatMap(status => ["get", "set"].map(operation => ({stat
 	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "failure", statusCode: status, account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 	expect(consumed).toBe(true);
 	expect(f.fetched).toEqual(["Bearer A"]);
+});
+
+it.each([
+	{status: 403, code: "workspace_disabled"},
+	{status: 402, code: "deactivated_workspace"},
+	{status: 404, code: "model_not_found"},
+	{status: 400, code: "unsupported_value", param: "reasoning.effort"},
+	{status: 400, code: "unsupported_parameter", param: "service_tier"},
+])("retains native handshake decisions and recovers only through an eligible sibling (%j)", async ({status, code, ...setting}) => {
+	const f = await fixture(true, false, undefined, {status, error: {code, ...setting, message: "fixture credential-secret diagnosis"}, workspace: "W1"});
+	const ws = await f.connect();
+	const result = await turn(ws, {reasoning: {effort: "high"}, service_tier: "priority"});
+	expect(result, JSON.stringify(result)).toMatchObject({type: "response.completed"});
+	expect(f.creates.map(create => create.workspace)).toEqual(["W2"]);
+	expect(f.fetched).toEqual([]);
+	await vi.waitFor(async () => expect((await loadAccounts())?.accounts[0]?.workspaces?.find(workspace => workspace.id === "W1")?.enabled).toBe([402, 403].includes(status) ? false : true));
+	expect(await turn(ws, {reasoning: {effort: "high"}, service_tier: "priority"})).toMatchObject({type: "response.completed"});
+	expect(f.creates.map(create => create.workspace)).toEqual(["W2", "W2"]);
+	expect(f.fetched).toEqual([]);
 });
 
 it("consumes native gateway quota usage without ambiguous replay or health healing", async () => {

@@ -10,6 +10,8 @@ import { Agent, fetch as undiciFetch } from "undici";
 import { parseModelRoute } from "../model-route-policy.js";
 import { isRecord } from "../utils.js";
 import { ResponseOutputHistory, hasOrphanToolResult } from "./response-output-history.js";
+import { classifyCapabilityFailure } from "./runtime-capability-failures.js";
+import { isWorkspaceDisabledError } from "../request/error-classification.js";
 
 const CONTEXT_HEADER = "x-local-responses-transport";
 const terminal = new Set([
@@ -239,10 +241,18 @@ class SocketSession {
 							response.off("data", onData);
 							init.signal?.removeEventListener("abort", cancel);
 							context.signal.removeEventListener("abort", cancel);
-							const revoked = isTokenInvalidationError(Buffer.concat(chunks).toString("utf8"));
+							const body = Buffer.concat(chunks).toString("utf8");
+							const revoked = isTokenInvalidationError(body);
 							const status = response.statusCode ?? 502;
+							let parsed: unknown;
+							try {parsed = JSON.parse(body);} catch {parsed = null;}
+							const decision = isRecord(parsed) && isRecord(parsed.error) ? parsed.error : undefined;
+							const capability = classifyCapabilityFailure(status, parsed);
+							const code = revoked ? "token_invalidated" : capability ? String(decision?.code) :
+								isWorkspaceDisabledError(status, decision?.code, body) ? status === 402 ? "deactivated_workspace" : "workspace_disabled" : "websocket_handshake_rejected";
 							resolve(Response.json({error: {
-								code: revoked ? "token_invalidated" : "websocket_handshake_rejected",
+								code,
+								...(capability && capability !== "model" ? {param: decision?.param} : {}),
 								message: revoked ? "OAuth token has been invalidated. Please re-login." : "Upstream rejected the WebSocket handshake.",
 							}}, {status: revoked ? 401 : status >= 400 && status <= 599 ? status : 502, headers: upstreamHeaders(response.headers)}));
 							response.destroy();

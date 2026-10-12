@@ -515,6 +515,39 @@ it("keeps Retry-After and quota headers from a rejected upstream handshake", asy
 	expect(g.responses[0]?.headers.get("x-codex-primary-used-percent")).toBe("100");
 });
 
+it.each([
+	{status: 403, code: "workspace_disabled"},
+	{status: 402, code: "deactivated_workspace"},
+	{status: 404, code: "model_not_found"},
+	{status: 400, code: "unsupported_value", param: "reasoning.effort"},
+	{status: 400, code: "unsupported_parameter", param: "service_tier"},
+])("retains only safe structured native handshake decisions (%j)", async ({status, code, ...setting}) => {
+	let httpCalls = 0;
+	const upstream = createServer((_req, res) => {httpCalls++; res.end();});
+	upstream.on("upgrade", (_req, socket) => {
+		const body = JSON.stringify({error: {code, ...setting, message: "credential-secret upstream diagnostic", debug: "fixture-secret"}});
+		socket.end(`HTTP/1.1 ${status} Rejected\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+	});
+	const g = await customGateway({upstream, outboundHeaders: {"chatgpt-account-id": "acc_fixture"}});
+	const ws = await g.connect(), events = await turn(ws, {model: "shared", input: []});
+	expect(events.at(-1)).toMatchObject({type: "error", status, error: {code, ...setting}});
+	expect(JSON.stringify(events)).not.toContain("credential-secret");
+	expect(JSON.stringify(events)).not.toContain("fixture-secret");
+	expect(httpCalls).toBe(0);
+	expect(g.stats.upstreamRequests).toBe(0);
+});
+
+it.each(["{malformed credential-secret", JSON.stringify({error: {code: "credential-secret", param: "fixture-secret", message: "diagnostic"}})])
+("does not expose malformed or unknown handshake diagnostics (%s)", async body => {
+	const upstream = createServer();
+	upstream.on("upgrade", (_req, socket) => socket.end(`HTTP/1.1 403 Rejected\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`));
+	const g = await customGateway({upstream, outboundHeaders: {"chatgpt-account-id": "acc_fixture"}});
+	const events = await turn(await g.connect(), {model: "shared", input: []});
+	expect(events.at(-1)).toMatchObject({type: "error", status: 403, error: {code: "websocket_handshake_rejected"}});
+	expect(JSON.stringify(events)).not.toContain("credential-secret");
+	expect(JSON.stringify(events)).not.toContain("fixture-secret");
+});
+
 it.each(["oversized", "stalled"])("bounds %s native handshake bodies and retains safe revocation metadata", async mode => {
 	const upstream = createServer();
 	let closed = false;
