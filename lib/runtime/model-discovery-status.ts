@@ -67,7 +67,7 @@ const probeCacheSchema = z.object({
 	version: z.literal(1),
 	entries: z.array(z.tuple([
 		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ credentialOwner: z.string().regex(/^[0-9a-f]{64}$/).optional(), documented: z.array(printable).max(100).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
+		z.object({ credentialOwner: z.string().regex(/^[0-9a-f]{64}$/).optional(), generationAt: z.number().finite().nonnegative().optional(), observedLossAt: z.number().finite().nonnegative().optional(), lostAt: z.number().finite().nonnegative().optional(), documented: z.array(printable).max(100).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
 	])).max(1000),
 });
 function probeCachePath(): string {
@@ -177,17 +177,40 @@ export async function discoverModelInventory(
 	await api.catalogs(routes, true, options.forceProbes === true);
 	if (options.persistProbes) {
 		const path = probeCachePath();
-		await withFileTransactionLock(path, async () => {
+		const persisted = await withFileTransactionLock(path, async () => {
 			// Merge with the latest file: a concurrent check may have probed other
 			// credentials since this one loaded. The newer result wins per key.
 			const merged = new Map(await loadProbeCache());
-			for (const [key, value] of capabilities.exportProbes()) {
+			const updates = capabilities.exportProbes(), losses = new Map<string, number>();
+			for (const [, value] of [...merged, ...updates]) {
+				if (value.credentialOwner && value.lostAt !== undefined) losses.set(value.credentialOwner, Math.max(losses.get(value.credentialOwner) ?? 0, value.lostAt));
+			}
+			for (const [key, value] of updates) {
+				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
+				if (loss !== undefined && (value.observedLossAt ?? -Infinity) < loss && value.at > loss) continue;
 				const disk = merged.get(key);
 				if (!disk || disk.at <= value.at) merged.set(key, value);
 			}
+			for (const value of merged.values()) {
+				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
+				if (loss === undefined) continue;
+				value.lostAt = loss;
+				if ((value.observedLossAt ?? -Infinity) >= loss) continue;
+				value.at = loss;
+				value.levels = [...value.documented ?? []];
+				value.tiers = [];
+				for (const name of Object.keys(value.status)) if (value.status[name] === "verified") value.status[name] = "unverified";
+				value.status.retry = "transient";
+			}
 			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
 			await writeFileAtomic(path, JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n");
+			return entries;
 		}).catch(() => undefined);
+		if (persisted) for (const catalog of api.cachedCatalogs()) {
+			const route = routes.find(route => route.id === catalog.id && route.kind === catalog.kind);
+			if (!route?.probeCapabilities) continue;
+			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted));
+		}
 	}
 	entries.push(
 		...api.statuses(routes).map((s, i) => ({

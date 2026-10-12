@@ -477,6 +477,50 @@ it("asks a running proxy to force paid probes only for an explicit capability ch
  expect(urls).toEqual(["http://127.0.0.1:12345/models?refresh_capabilities=1", "http://127.0.0.1:12345/models?refresh_capabilities=1&force_probes=1"]);
 });
 
+it.each(["transport", "server"].flatMap(mode => [2000, 3000, 4000].map(startedAt => ({mode, startedAt}))))
+("does not let a late probe resurrect another process's persisted credential loss (%j)", async ({mode, startedAt}) => {
+	const route: ApiRouteCredential = {id: "late-writer", kind: "api", label: "Late writer", apiKey: "fixture-late-secret", enabled: true, priority: 0, visibleModels: ["X", "Y"], probeCapabilities: true};
+	const independent = {...route, id: "independent", label: "Independent", apiKey: "fixture-independent-secret"};
+	const positive: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/models")) return Response.json({data: [{id: "X"}]});
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const updateApiDiscovery = async (credential: ApiRouteCredential) => credential;
+	await discoverModelInventory(null, [route, independent], {fetchImpl: positive, now: () => 1000, updateApiDiscovery, persistProbes: true});
+	let entered: () => void = () => undefined, release: () => void = () => undefined, clock = startedAt;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const delayed: typeof fetch = async (url, init) => {
+		if (init?.method !== "POST") return positive(url, init);
+		entered(); await gate;
+		if (mode === "transport") throw Error("fixture transport unavailable");
+		return Response.json({error: {code: "server_error"}}, {status: 500});
+	};
+	const pending = discoverModelInventory(null, [route], {fetchImpl: delayed, now: () => clock, updateApiDiscovery, persistProbes: true, forceProbes: true});
+	try {
+		await ready;
+		await discoverModelInventory(null, [route], {fetchImpl: async (url, init) => init?.method === "POST" ? Response.json({error: {code: "invalid_api_key"}}, {status: 401}) : String(url).endsWith("/models") ? Response.json({data: [{id: "Y"}]}) : new Response("missing", {status: 404}), now: () => 3000, updateApiDiscovery, persistProbes: true});
+	} finally {clock = 4000; release();}
+	const late = await pending;
+	expect(late.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("unverified");
+	expect(late.entries[0]?.entitlements?.[0]?.serviceTiers).toEqual([]);
+	let posts = 0;
+	const cached = await discoverModelInventory(null, [route, independent], {fetchImpl: async (url, init) => {if (init?.method === "POST") posts++; return positive(url, init);}, now: () => 5000, updateApiDiscovery, persistProbes: true});
+	expect(posts).toBe(0);
+	const denied = cached.entries.find(entry => entry.label === route.label)?.entitlements?.[0];
+	const retained = cached.entries.find(entry => entry.label === independent.label)?.entitlements?.[0];
+	expect(denied?.probes?.responses).toBe("unverified");
+	expect(denied?.serviceTiers).toEqual([]);
+	expect(retained?.probes?.responses).toBe("verified");
+	const recovered = await discoverModelInventory(null, [route], {fetchImpl: positive, now: () => 6000, updateApiDiscovery, persistProbes: true, forceProbes: true});
+	expect(recovered.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+	const serialized = await isolationFs.readFile(isolationJoin(multiAuthDir, "api-capability-probes.json"), "utf8");
+	expect(serialized).not.toContain("fixture-late-secret");
+	expect(serialized).not.toContain("fixture-independent-secret");
+});
+
 it("merges concurrent checks' probe results instead of replacing the shared cache", async () => {
  const { promises: fs } = await import("node:fs");
  const { tmpdir } = await import("node:os");

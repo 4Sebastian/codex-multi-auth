@@ -47,6 +47,9 @@ export function parseApiReasoningDocumentation(
 }
 export type ProbeResult = {
 	credentialOwner?: string;
+	generationAt?: number;
+	observedLossAt?: number;
+	lostAt?: number;
 	documented?: string[];
 	at: number;
 	levels: string[];
@@ -54,7 +57,7 @@ export type ProbeResult = {
 	status: Record<string, string>;
 };
 type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
-type CredentialProbeGroup = { owner: string; lostAt?: number; retiredAt?: number };
+type CredentialProbeGroup = { owner: string; startedAt: number; priorLossAt?: number; lostAt?: number; retiredAt?: number };
 type ProbeCacheEntry = ProbeResult & { group?: CredentialProbeGroup };
 
 /** Only the exact model's input declaration can enable native image attachments. */
@@ -127,13 +130,14 @@ export class ApiModelCapabilities {
 			}
 		}
 		if (current) current.retiredAt ??= this.now();
-		const group: CredentialProbeGroup = {owner: key};
+		const group: CredentialProbeGroup = {owner: key, startedAt: this.now(), priorLossAt: current?.lostAt ?? current?.priorLossAt};
 		this.credentialGroups.set(key, group);
 		return group;
 	}
 
 	private clearVerified(result: ProbeResult, documented: string[], lostAt: number): void {
 		result.at = lostAt;
+		result.lostAt = Math.max(result.lostAt ?? 0, lostAt);
 		result.levels = [...documented];
 		result.tiers = [];
 		for (const name of Object.keys(result.status)) if (result.status[name] === "verified") result.status[name] = "unverified";
@@ -154,13 +158,25 @@ export class ApiModelCapabilities {
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
-		return [...this.probes].map(([key, {at, levels, tiers, status, credentialOwner, documented}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}, credentialOwner, documented: documented ? [...documented] : undefined}]);
+		return [...this.probes].map(([key, {at, levels, tiers, status, credentialOwner, generationAt, observedLossAt, lostAt, documented}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}, credentialOwner, generationAt, observedLossAt, lostAt, documented: documented ? [...documented] : undefined}]);
 	}
 	importProbes(entries: Array<[string, ProbeResult]>): void {
+		const owners = new Map<string, {startedAt: number; lostAt: number; observedLossAt: number}>();
+		for (const [, value] of entries.slice(-1000)) {
+			if (!value.credentialOwner || value.lostAt === undefined || value.at > this.now()) continue;
+			const previous = owners.get(value.credentialOwner);
+			owners.set(value.credentialOwner, {startedAt: Math.max(previous?.startedAt ?? 0, value.generationAt ?? 0), lostAt: Math.max(previous?.lostAt ?? 0, value.lostAt), observedLossAt: Math.max(previous?.observedLossAt ?? -Infinity, value.observedLossAt ?? -Infinity)});
+		}
+		for (const [owner, evidence] of owners) {
+			if (!this.credentialGroups.has(owner)) {
+				if (this.credentialGroups.size >= 1000) this.credentialGroups.delete(this.credentialGroups.keys().next().value ?? "");
+				this.credentialGroups.set(owner, {owner, startedAt: evidence.startedAt, priorLossAt: evidence.lostAt, ...(evidence.observedLossAt < evidence.lostAt ? {lostAt: evidence.lostAt} : {})});
+			}
+		}
 		for (const [key, value] of entries.slice(-1000)) {
 			if (this.probes.has(key) || value.at > this.now()) continue;
 			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
-			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}, credentialOwner: value.credentialOwner, documented: value.documented ? [...value.documented] : undefined});
+			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}, credentialOwner: value.credentialOwner, generationAt: value.generationAt, observedLossAt: value.observedLossAt, lostAt: value.lostAt, documented: value.documented ? [...value.documented] : undefined});
 		}
 	}
 	async reasoning(id: string, refresh = false): Promise<string[]> {
@@ -247,6 +263,9 @@ export class ApiModelCapabilities {
 	): Promise<ProbeResult> {
 		const result = {
 			credentialOwner: group.owner,
+			generationAt: group.startedAt,
+			observedLossAt: group.priorLossAt,
+			lostAt: group.priorLossAt,
 			documented: [...documented],
 			at: this.now(),
 			levels: [...documented],
@@ -469,51 +488,56 @@ export class ApiModelCapabilities {
 			const probed = route && group ? await this.probe(route, model.slug, documented.levels, group, forceProbes) : undefined;
 			return {model, documented, probed};
 		});
-		return enriched.map(({model, documented, probed}) => {
-						let levels = documented.levels;
-						let extra: Record<string, unknown> = {};
-						if (probed) {
-							probed = {...probed, levels: [...probed.levels], tiers: [...probed.tiers], status: {...probed.status}};
-							if (group && (group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group)) this.clearVerified(probed, documented.levels, group.lostAt ?? group.retiredAt ?? this.now());
-							levels = probed.levels;
-							extra = {
-								service_tiers: probed.tiers.map((id) => ({
-									id: id === "fast" ? "priority" : id,
-									name: id === "fast" ? "Fast" : "Ultrafast",
-									description:
-										"Verified by an API probe; runtime capacity can still downgrade processing.",
-								})),
-								default_service_tier: "default",
-								additional_speed_tiers: probed.tiers,
-								capability_probe_status: probed.status,
-								capability_checked_at: probed.at,
-							};
-						}
-						// Ultra is a native orchestration mode. Codex resolves it to this
-						// supported wire effort; it is not an API entitlement named "ultra".
-						const multiAgentEffort =
-							["max", "xhigh", "high"].find((level) =>
-								levels.includes(level),
-							) ?? null;
-						const nativeLevels = multiAgentEffort
-							? [...levels, "ultra"]
-							: levels;
-						return {
-							...model,
-							...extra,
-							...(documented.inputModalities ? { input_modalities: documented.inputModalities } : {}),
-							multi_agent_reasoning_effort: multiAgentEffort,
-							supported_reasoning_levels: nativeLevels.map((effort) => ({
-								effort,
-								description:
-									effort === "ultra"
-										? "Proactive multi-agent mode using a supported API reasoning effort"
-										: `${effort} reasoning effort`,
-							})),
-							default_reasoning_level: levels.includes("medium")
-								? "medium"
-								: (levels[0] ?? null),
-						};
-		});
+		return enriched.map(({model, documented, probed}) => this.renderModel(model, documented, probed, group));
+	}
+	applyPersistedProbes(models: RouteModel[], route: ApiRouteCredential, entries: Array<[string, ProbeResult]>): RouteModel[] {
+		const persisted = new Map(entries);
+		return models.map(model => this.renderModel(model, this.cache.get(model.slug) ?? {levels: []}, persisted.get(this.probeKey(route, model.slug))));
+	}
+	private renderModel(model: RouteModel, documented: DocumentedCapabilities, probed?: ProbeResult, group?: CredentialProbeGroup): RouteModel {
+		let levels = documented.levels;
+		let extra: Record<string, unknown> = {};
+		if (probed) {
+			probed = {...probed, levels: [...probed.levels], tiers: [...probed.tiers], status: {...probed.status}};
+			if (group && (group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group)) this.clearVerified(probed, documented.levels, group.lostAt ?? group.retiredAt ?? this.now());
+			levels = probed.levels;
+			extra = {
+				service_tiers: probed.tiers.map((id) => ({
+					id: id === "fast" ? "priority" : id,
+					name: id === "fast" ? "Fast" : "Ultrafast",
+					description:
+						"Verified by an API probe; runtime capacity can still downgrade processing.",
+				})),
+				default_service_tier: "default",
+				additional_speed_tiers: probed.tiers,
+				capability_probe_status: probed.status,
+				capability_checked_at: probed.at,
+			};
+		}
+		// Ultra is a native orchestration mode. Codex resolves it to this
+		// supported wire effort; it is not an API entitlement named "ultra".
+		const multiAgentEffort =
+			["max", "xhigh", "high"].find((level) =>
+				levels.includes(level),
+			) ?? null;
+		const nativeLevels = multiAgentEffort
+			? [...levels, "ultra"]
+			: levels;
+		return {
+			...model,
+			...extra,
+			...(documented.inputModalities ? { input_modalities: documented.inputModalities } : {}),
+			multi_agent_reasoning_effort: multiAgentEffort,
+			supported_reasoning_levels: nativeLevels.map((effort) => ({
+				effort,
+				description:
+					effort === "ultra"
+						? "Proactive multi-agent mode using a supported API reasoning effort"
+						: `${effort} reasoning effort`,
+			})),
+			default_reasoning_level: levels.includes("medium")
+				? "medium"
+				: (levels[0] ?? null),
+		};
 	}
 }
