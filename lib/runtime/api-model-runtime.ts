@@ -5,6 +5,9 @@ import {
 	classifyCapabilityFailure,
 } from "./runtime-capability-failures.js";
 import { readErrorBody } from "../request/stream-failover-runtime.js";
+import { parseRetryAfterBodyMs, parseRetryAfterHeaderMs } from "../request/rate-limit-decision.js";
+import { isModelAtCapacityError } from "../request/error-classification.js";
+import { MAX_RATE_LIMIT_DELAY_MS } from "../constants.js";
 import { createHash } from "node:crypto";
 import type { ApiRouteCredential } from "../api-route-store.js";
 import {
@@ -130,6 +133,8 @@ export class ApiModelRuntime {
 	) {}
 	private key(route: ApiRouteCredential): string {
 		return createHash("sha256")
+			.update(route.kind)
+			.update("\0")
 			.update(route.id)
 			.update("\0")
 			.update(route.apiKey)
@@ -295,7 +300,7 @@ export class ApiModelRuntime {
 		body: Record<string, unknown>,
 		routes: ApiRouteCredential[],
 		signal?: AbortSignal,
-		onAttempt?: (credentialIndex: number) => void,
+		onAttempt?: (credentialIndex: number, credential: ApiRouteCredential) => void,
 	): Promise<Response> {
 		let route;
 		try {
@@ -333,8 +338,10 @@ export class ApiModelRuntime {
 		let lastStatus = 503;
 		let lastRejection: Response | undefined;
 		for (const candidate of route.candidates) {
-			const credential = routes.find((r) => r.id === candidate.id);
-			if (!credential) continue;
+			const credentialIndex = routes.findIndex(r => r.id === candidate.id && r.kind === candidate.kind);
+			const configured = routes[credentialIndex];
+			if (!configured) continue;
+			const credential = {...configured};
 			const effort =
 				isRecord(body.reasoning) && typeof body.reasoning.effort === "string"
 					? body.reasoning.effort
@@ -349,7 +356,7 @@ export class ApiModelRuntime {
 			signal?.addEventListener("abort", abort, { once: true });
 			const timer = setTimeout(abort, 60000);
 			try {
-				onAttempt?.(routes.indexOf(credential));
+				onAttempt?.(credentialIndex, credential);
 				const response = await this.fetchImpl(
 					"https://api.openai.com/v1/responses",
 					{
@@ -388,6 +395,7 @@ export class ApiModelRuntime {
 				} catch {
 					data = null;
 				}
+				this.recordStreamFailure(credential, alias, body, data, {status: response.status, headers: response.headers});
 				const rejection = classifyCapabilityFailure(response.status, data);
 				const source = isRecord(data) && isRecord(data.error) ? data.error : {};
                 const sanitized: Record<string,string> = {message:"Upstream rejected the API request.",code:"api_request_rejected"};
@@ -397,13 +405,6 @@ export class ApiModelRuntime {
                 }
                 if (rejection) {
                     lastRejection = Response.json({error:sanitized},{status:response.status});
-					this.failures.record(
-						this.key(credential),
-						route.upstreamModel,
-						rejection,
-						effort,
-						route.serviceTier,
-					);
 					continue;
 				}
 				if (![401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
@@ -424,10 +425,18 @@ export class ApiModelRuntime {
 		// client must not read an exhausted credential pool as a bad login.
 		return this.failure(lastStatus === 401 || lastStatus === 403 ? 503 : lastStatus, "model_route_pool_unavailable");
 	}
-	recordStreamFailure(credential: ApiRouteCredential, alias: string, body: Record<string, unknown>, error: unknown): void {
+	recordStreamFailure(credential: ApiRouteCredential, alias: string, body: Record<string, unknown>, error: unknown, response?: {status: number; headers?: Headers | null; retryAfterMs?: number | null}): void {
 		const route = parseModelRoute(alias);
 		if (route.kind !== credential.kind) return;
-		const rejection = classifyCapabilityFailure(400, error);
+		const status = response?.status ?? 400;
+		const errorBody = JSON.stringify(error ?? {});
+		if (status === 401 || status === 429 && !isModelAtCapacityError(status, errorBody)) {
+			const now = this.now();
+			const hint = (response?.headers ? parseRetryAfterHeaderMs(response.headers, now) : null) ?? response?.retryAfterMs ?? parseRetryAfterBodyMs(errorBody, now);
+			const delay = Math.min(MAX_RATE_LIMIT_DELAY_MS, typeof hint === "number" && Number.isFinite(hint) && hint > 0 ? hint : 60_000);
+			this.failures.deferCredential(this.key(credential), now + delay);
+		}
+		const rejection = classifyCapabilityFailure(status, error);
 		if (!rejection) return;
 		const effort = isRecord(body.reasoning) && typeof body.reasoning.effort === "string" ? body.reasoning.effort : undefined;
 		const tier = route.serviceTier ?? (typeof body.service_tier === "string" ? body.service_tier : undefined);

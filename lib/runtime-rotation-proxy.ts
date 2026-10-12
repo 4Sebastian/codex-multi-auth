@@ -20,7 +20,7 @@ import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway, type DispatchAuthorization } from "./runtime/responses-websocket.js";
 import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
 import { saveModelInventory } from "./runtime/model-discovery-status.js";
-import { loadApiRoutes, updateApiModelDiscovery, getApiRoutesPath } from "./api-route-store.js";
+import { loadApiRoutes, updateApiModelDiscovery, getApiRoutesPath, type ApiRouteCredential } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
 import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, isRouteModelEligible, type RouteModel } from "./model-route-policy.js";
 import { isSameNativeAccount, syncNativeAccountCredentials } from "./runtime/native-account-sync.js";
@@ -3476,19 +3476,19 @@ async function handleRequestInner(
 			res.on("close", abort);
 			try {
 				const apiRoutes = (await state.readApiRoutes?.()) ?? [];
-				let attemptedCredentialIndex: number | undefined;
+				const attempt: {credential?: ApiRouteCredential} = {};
 				const authorize: DispatchAuthorization = async (input, init) => {
 					if (init.method !== "POST" || !new URL(String(input)).pathname.endsWith("/responses")) return;
 					const policyCurrent = captureRuntimePolicyRevision();
 					const routesCurrent = captureAuthorityRevision([getApiRoutesPath()]);
 					const policy = await currentDispatchPolicy(state, context, state.activeAccountManager);
-					const credential = attemptedCredentialIndex === undefined ? undefined : apiRoutes[attemptedCredentialIndex];
-					const current = (await state.readApiRoutes?.())?.find(route => route.id === credential?.id);
+					const credential = attempt.credential;
+					const current = (await state.readApiRoutes?.())?.find(route => route.id === credential?.id && route.kind === credential?.kind);
 					const sent = parseRequestBody(Buffer.from(typeof init.body === "string" ? init.body : ""));
 					const model = sent?.model;
 					const effort = isRecord(sent?.reasoning) && typeof sent.reasoning.effort === "string" ? sent.reasoning.effort : undefined;
 					const tier = typeof sent?.service_tier === "string" ? sent.service_tier : undefined;
-					const catalog = apiRuntime.cachedCatalogs().find(item => item.id === credential?.id);
+					const catalog = apiRuntime.cachedCatalogs().find(item => item.id === credential?.id && item.kind === credential?.kind);
 					const advertised = catalog?.models.find(item => item.slug === model);
 					if (!credential || !current?.enabled || current.apiKey !== credential.apiKey || current.kind !== credential.kind ||
 						new Headers(init.headers).get("authorization") !== `Bearer ${current.apiKey}` || typeof model !== "string" ||
@@ -3504,10 +3504,9 @@ async function handleRequestInner(
 					body,
 					apiRoutes,
 					controller.signal,
-					(credentialIndex) => {
-						attemptedCredentialIndex = credentialIndex;
-      const credential = apiRoutes[credentialIndex];
-      if (credential) recordRuntimeInferenceRequest(`sha256:${modelScopeId(credential.kind, credential.id)}`, state.now());
+					(credentialIndex, credential) => {
+						attempt.credential = credential;
+						recordRuntimeInferenceRequest(`sha256:${modelScopeId(credential.kind, credential.id)}`, state.now());
 						const label = `${context.model?.startsWith("zdr/") ? "ZDR" : "API"} credential ${credentialIndex + 1}`;
 						state.status.upstreamRequests++;
 						state.status.lastAccountIndex = null;
@@ -3532,7 +3531,15 @@ async function handleRequestInner(
 					contentType: upstream.headers.get("content-type"),
 					onEvent: event => {
 						responseOutcome.observe(event);
-						if (nativeSent) nativeTerminal.event ??= websocketTerminalUsage(Buffer.from(JSON.stringify(event)));
+						if (nativeSent) {
+							nativeTerminal.event ??= websocketTerminalUsage(Buffer.from(JSON.stringify(event)));
+							const terminal = nativeTerminal.event;
+							if (terminal?.record.outcome === "failure" && typeof terminal.record.statusCode === "number" && attempt.credential) {
+								apiRuntime.recordStreamFailure(attempt.credential, context.model, body, JSON.parse(terminal.rawBody), {
+									status: terminal.record.statusCode, headers: terminal.retryHeaders ?? upstream.headers, retryAfterMs: terminal.retryAfterMs,
+								});
+							}
+						}
 					},
 				});
 				const forwarded = await forwardStreamingResponse(
@@ -3545,9 +3552,8 @@ async function handleRequestInner(
  state.catalogEtag ? {"x-models-etag":state.catalogEtag} : undefined,
 					() => {scanner.result();return responseOutcome.finish();},
 				);
-				const attemptedCredential = attemptedCredentialIndex === undefined ? undefined : apiRoutes[attemptedCredentialIndex];
 				const clientDisconnected = res.destroyed && !res.writableEnded;
-				if (!forwarded && !clientDisconnected && attemptedCredential) apiRuntime.recordStreamFailure(attemptedCredential, context.model, body, responseOutcome.rejection);
+				if (!forwarded && !clientDisconnected && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, context.model, body, responseOutcome.rejection);
 				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
 				const usageTokens = scanner.result();
 				if (usageTokens && context.stableSessionKey && context.model) {

@@ -43,7 +43,7 @@ export class RuntimeCapabilityFailures {
 	private key(
 		credential: string,
 		model: string,
-		kind: CapabilityFailure,
+		kind: CapabilityFailure | "credential",
 		value = "",
 	) {
 		return JSON.stringify([credential, model, kind, value]);
@@ -63,9 +63,15 @@ export class RuntimeCapabilityFailures {
 						effort ?? null,
 						canonicalServiceTier(tier ?? "default"),
 					]);
-		const key = this.key(credential, model, kind, value);
+		this.remember(this.key(credential, model, kind, value), this.now() + this.ttlMs);
+	}
+	deferCredential(credential: string, until: number): void {
+		const key = this.key(credential, "", "credential");
+		this.remember(key, Math.max(this.denied.get(key) ?? 0, until));
+	}
+	private remember(key: string, until: number): void {
 		this.denied.delete(key);
-		this.denied.set(key, this.now() + this.ttlMs);
+		this.denied.set(key, until);
 		while (this.denied.size > 4096) {
 			const first = this.denied.keys().next().value;
 			if (first) this.denied.delete(first);
@@ -82,6 +88,7 @@ export class RuntimeCapabilityFailures {
 			canonicalServiceTier(tier ?? "default"),
 		]);
 		const keys = [
+			this.key(credential, "", "credential"),
 			this.key(credential, model, "model"),
 			this.key(credential, model, "effort", combination),
 			this.key(credential, model, "tier", combination),

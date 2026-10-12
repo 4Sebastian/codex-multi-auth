@@ -228,6 +228,28 @@ it.each(["api", "zdr"] as const)("rejects a known %s model denial acquired durin
 	expect(f.fetched).toEqual([]);
 });
 
+it.each((["api", "zdr"] as const).flatMap(kind => [401, 429].map(status => ({kind, status}))))
+("rejects a prepared API create after credential deferral during final route observation (%j)", async ({kind, status}) => {
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const routes: ApiRouteCredential[] = [{id: "prepared", kind, label: "Fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}];
+	let reads = 0;
+	const f = await fixture(true, false, async () => {if (++reads === 2) {entered.resolve(); await release.promise;} return routes;});
+	let runtime: ApiModelRuntime | undefined;
+	const request = ApiModelRuntime.prototype.request;
+	vi.spyOn(ApiModelRuntime.prototype, "request").mockImplementation(function(...args) {runtime = this; return request.apply(this, args);});
+	const pending = f.post(`${kind}/shared`);
+	await entered.promise;
+	if (!runtime) throw Error("Missing runtime");
+	runtime.recordStreamFailure(routes[0]!, `${kind}/shared`, {}, {error: {code: status === 401 ? "invalid_api_key" : "quota_exceeded"}}, {status, headers: new Headers({"retry-after": "60"})});
+	release.resolve();
+	const denied = await pending;
+	await denied.text();
+	expect(denied.status).toBe(502);
+	expect(f.fetched).toEqual([]);
+	expect(f.creates).toEqual([]);
+});
+
 it.each(["http", "custom", "native", "http-stream", "native-stream"].flatMap(transport =>
 	["workspace", "auth", "cooldown"].filter(kind => !transport.endsWith("stream") || kind === "auth").flatMap(kind =>
 		[false, true].map(lossFirst => ({transport, kind, lossFirst})))))

@@ -186,6 +186,77 @@ it("never emits credential-bearing upstream headers", async () => {
 	expect(response.headers.get("content-type")).toBe("text/event-stream");
 });
 
+it.each(["api", "zdr"] as const)("keeps credential deferrals distinct from %s model evidence and catalog refresh", async kind => {
+	let clock = 1000;
+	const runtime = new ApiModelRuntime(async () => Response.json({data: [{id: "exclusive"}, {id: "other"}]}), () => clock);
+	const route = credential("same-owner", kind);
+	await runtime.catalogs([route]);
+	runtime.recordStreamFailure(route, `${kind}/exclusive`, {}, {error: {code: "model_not_found"}});
+	runtime.recordStreamFailure(route, `${kind}/other`, {}, {error: {code: "invalid_api_key"}}, {status: 401, headers: new Headers({"retry-after": "60"})});
+	expect(runtime.supportsDispatch(route, "other")).toBe(false);
+	expect(runtime.supportsDispatch({...route, kind: kind === "api" ? "zdr" : "api"}, "other")).toBe(true);
+	expect(runtime.supportsDispatch({...route, apiKey: "replacement"}, "other")).toBe(true);
+	clock = 2000;
+	runtime.recordStreamFailure(route, `${kind}/other`, {}, {error: {code: "quota_exceeded"}}, {status: 429, headers: new Headers({"retry-after": "1"})});
+	await runtime.catalogs([route], true);
+	clock = 60_999;
+	expect(runtime.supportsDispatch(route, "other")).toBe(false);
+	clock = 61_000;
+	expect(runtime.supportsDispatch(route, "other")).toBe(true);
+	expect(runtime.supportsDispatch(route, "exclusive")).toBe(false);
+});
+
+it.each([
+	{header: "retry-after", value: "invalid", delay: 60_000},
+	{header: "retry-after", value: "-2", delay: 60_000},
+	{header: "retry-after-ms", value: "2500", delay: 2500},
+	{header: "retry-after", value: "99999999999999999999999", delay: 7 * 24 * 60 * 60 * 1000},
+])("bounds credential retry-after and permits dispatch at expiry (%j)", async ({header, value, delay}) => {
+	let clock = 1_700_000_000_000;
+	const start = clock;
+	const route = credential("bounded", "api");
+	const runtime = new ApiModelRuntime(async () => Response.json({data: [{id: "exclusive"}]}), () => clock);
+	await runtime.catalogs([route]);
+	runtime.recordStreamFailure(route, "api/exclusive", {}, {error: {code: "quota_exceeded"}}, {status: 429, headers: new Headers({[header]: value})});
+	clock = start + delay - 1;
+	expect(runtime.supportsDispatch(route, "exclusive")).toBe(false);
+	clock++;
+	expect(runtime.supportsDispatch(route, "exclusive")).toBe(true);
+});
+
+it.each(["api", "zdr"] as const)("does not defer recovered %s credentials after a delayed old-key failure", async kind => {
+	let entered: () => void = () => undefined, release: () => void = () => undefined;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const primary = credential("mutable", kind);
+	const submitted = {...primary};
+	const posts: string[] = [];
+	const attempts: ApiRouteCredential[] = [];
+	const runtime = new ApiModelRuntime(async (_url, init) => {
+		if (init?.method !== "POST") return Response.json({data: [{id: "exclusive"}]});
+		const authorization = new Headers(init.headers).get("authorization")!;
+		posts.push(authorization);
+		if (authorization === `Bearer ${submitted.apiKey}`) {
+			entered(); await gate;
+			return Response.json({error: {code: "invalid_api_key"}}, {status: 401, headers: {"retry-after": "60"}});
+		}
+		return new Response("replacement success");
+	});
+	const request = () => runtime.request(`${kind}/exclusive`, {}, [primary], undefined, (_index, credential) => {attempts.push(credential);});
+	const old = request();
+	try {
+		await ready;
+		primary.apiKey = "recovered-key";
+		expect(await (await request()).text()).toBe("replacement success");
+	} finally {release();}
+	expect((await old).status).toBe(503);
+	expect(attempts[0]?.apiKey).toBe(submitted.apiKey);
+	expect(runtime.supportsDispatch(submitted, "exclusive")).toBe(false);
+	expect(runtime.supportsDispatch(primary, "exclusive")).toBe(true);
+	expect(await (await request()).text()).toBe("replacement success");
+	expect(posts).toEqual([`Bearer ${submitted.apiKey}`, "Bearer recovered-key", "Bearer recovered-key"]);
+});
+
 it("includes the instruction template required by native ModelsResponse deserialization", async () => {
 	const { apiPickerModel } = await import(
 		"../lib/runtime/api-model-runtime.js"
