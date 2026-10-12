@@ -477,3 +477,66 @@ it("retains a rate-limit window during unrelated partial observations", () => {
 	expect(merged.primary).toEqual({usedPercent: 100, resetAtMs: now + 60000});
 	expect(scheduler.getDeferral("account:model", now).defer).toBe(true);
 });
+
+it.each(["primary", "secondary"] as const)("rejects older %s receipts while retaining independent fields", window => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	const other = window === "primary" ? "secondary" : "primary";
+	const older = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {}, [window]: {usedPercent: 20}, [other]: {usedPercent: 10}, planType: "free"}, "A");
+	const newer = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {}, [window]: {usedPercent: 100, resetAtMs: now + 60000}, planType: "pro"}, "A");
+	scheduler.observeReceipt("account:model", newer); scheduler.settleReceipt("account:model", newer, true);
+	const merged = scheduler.observeReceipt("account:model", older);
+	scheduler.settleReceipt("account:model", older, true);
+	expect(merged?.[window]).toEqual({usedPercent: 100, resetAtMs: now + 60000});
+	expect(merged?.[other]).toEqual({usedPercent: 10});
+	expect(merged?.planType).toBe("pro");
+	expect(scheduler.getDeferral("account:model", now, "A").defer).toBe(true);
+});
+
+it("keeps failed exhaustion credential-scoped until a valid replacement settles", () => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	const failed = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100, resetAtMs: now + 60000}, secondary: {}}, "A");
+	scheduler.settleReceipt("account:model", failed, false);
+	expect(scheduler.getDeferral("account:model", now, "A").defer).toBe(true);
+	expect(scheduler.getDeferral("account:model", now, "B").defer).toBe(false);
+	const healthy = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 0}, secondary: {}}, "A");
+	expect(scheduler.getDeferral("account:model", now, "A").defer).toBe(true);
+	scheduler.observeReceipt("account:model", healthy); scheduler.settleReceipt("account:model", healthy, true);
+	scheduler.settleReceipt("account:model", failed, false);
+	expect(scheduler.getDeferral("account:model", now, "A").defer).toBe(false);
+	const other = scheduler.receive("other:model", failed.snapshot, "A");
+	scheduler.settleReceipt("other:model", other, false);
+	expect(scheduler.getDeferral("other:model", now, "A").defer).toBe(true);
+});
+
+it("does not attribute retired receipts or failures to a recovered owner", () => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	const a = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100}, secondary: {}}, "A");
+	const b = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 0}, secondary: {}, planType: "pro"}, "B");
+	expect(scheduler.observeReceipt("account:model", a)).toBeUndefined();
+	scheduler.settleReceipt("account:model", a, false);
+	scheduler.observeReceipt("account:model", b); scheduler.settleReceipt("account:model", b, true);
+	expect(scheduler.getDeferral("account:model", now, "B").defer).toBe(false);
+});
+
+it("retains failed exhaustion when the earlier healthy snapshot expires", () => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	scheduler.update("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 20, resetAtMs: now + 1000}, secondary: {}});
+	const failed = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100, resetAtMs: now + 60000}, secondary: {}}, "A");
+	scheduler.settleReceipt("account:model", failed, false);
+	expect(scheduler.prune(now + 2000)).toBe(0);
+	expect(scheduler.getDeferral("account:model", now + 2000, "A").defer).toBe(true);
+	expect(scheduler.prune(now + 60001)).toBe(1);
+	expect(scheduler.getDeferral("account:model", now + 60001, "A").defer).toBe(false);
+});
+
+it.each(["clear", "full-replacement", "rate-limit", "prune"])("retires queued receipts on %s", action => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	scheduler.update("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {usedPercent: 20, resetAtMs: now + 1000}});
+	const old = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100}, secondary: {}}, "A");
+	if (action === "clear") scheduler.clear("account:model");
+	if (action === "full-replacement") scheduler.update("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 0}, secondary: {}});
+	if (action === "rate-limit") scheduler.markRateLimited("account:model", 60000, now);
+	if (action === "prune") scheduler.prune(now + 2000);
+	expect(scheduler.observeReceipt("account:model", old)).toBeUndefined();
+	expect(scheduler.getDeferral("account:model", now, "A").defer).toBe(action === "rate-limit");
+});

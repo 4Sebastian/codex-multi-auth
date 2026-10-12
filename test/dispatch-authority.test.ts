@@ -1027,7 +1027,7 @@ it("coalesces held quota observations while preserving original terminal account
 	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
 	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 	expect(f.proxy.getStatus().lastError).toBe("fixture first coalesced quota failure");
-	expect(restriction).toHaveBeenCalledTimes(1);
+	expect(restriction).toHaveBeenCalledTimes(2);
 });
 
 it("retains quota-failed partial usage when the client cancels the HTTP body", async () => {
@@ -1474,4 +1474,248 @@ it.each(["primary", "secondary"].flatMap(exhausted => [false, true].map(held => 
 	expect(f.creates).toHaveLength(3);
 	expect(f.connections()).toBe(2);
 	expect(f.fetched).toHaveLength(0);
+});
+
+it.each(["primary", "secondary"])("receipt-order regression retains newer %s exhaustion despite an older pending delta", async window => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
+	const encoder = new TextEncoder();
+	const emit = (controller: ReadableStreamDefaultController<Uint8Array>, event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+	f.setPostResponse(async () => new Response(new ReadableStream<Uint8Array>({start(controller) {
+		streams.push(controller); emit(controller, {type: "response.in_progress", response: {id: `held-${streams.length}`}});
+	}}), {headers: {"content-type": "text/event-stream"}}));
+	const responses = await Promise.all([f.post(), f.post()]);
+	const bodies = responses.map(response => response.text());
+	const [a, b] = streams;
+	if (!a || !b) throw Error("Missing concurrent fixture streams");
+	const eligibility = f.manager.isAccountJournalEligible.bind(f.manager);
+	let held = false;
+	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async (...args) => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return eligibility(...args);
+	});
+	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let committed = 0;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {const value = await transaction(...args); committed++; return value;});
+	const other = window === "primary" ? "secondary" : "primary";
+	const quota = (field: string, used: number) => ({type: "codex.rate_limits", rate_limits: {[field]: {used_percent: used, reset_at: Math.floor(Date.now() / 1000) + 600}}});
+	emit(a, quota(other, 10)); await entered.promise;
+	emit(a, quota(window, 20));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(2));
+	emit(b, quota(window, 100));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(3));
+	release.resolve();
+	await vi.waitFor(() => expect(committed).toBe(3));
+	for (const [index, controller] of streams.entries()) {
+		emit(controller, {type: "response.completed", response: {id: `terminal-${index}`, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+		controller.close();
+	}
+	await Promise.all(bodies);
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	for (const row of (await readUsageLedgerRows()).filter(row => !before.has(row.id))) expect(row).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	f.setPostResponse(undefined);
+	const next = await f.post(); const body = await next.text();
+	expect(next.status, body).not.toBe(200);
+	expect(f.fetched).toHaveLength(2);
+});
+
+it("failed-worker regression retains pending exhaustion after the first transaction rejects", async () => {
+	const f = await fixture(false), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+	const encoder = new TextEncoder();
+	const emit = (event: unknown) => {if (!stream) throw Error("Missing quota fixture stream"); stream.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));};
+	f.setPostResponse(async () => new Response(new ReadableStream<Uint8Array>({start(controller) {
+		stream = controller; emit({type: "response.in_progress", response: {id: "held-quota"}});
+	}}), {headers: {"content-type": "text/event-stream"}}));
+	const response = await f.post(), body = response.text();
+	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let held = false;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		const value = await transaction(...args);
+		if (!held) {held = true; entered.resolve(); await release.promise; throw Error("fixture quota transaction completion failure");}
+		return value;
+	});
+	const quota = (used: number) => ({type: "codex.rate_limits", rate_limits: {primary: {used_percent: used, reset_at: Math.floor(Date.now() / 1000) + 600}}});
+	emit(quota(20)); await entered.promise;
+	emit(quota(100));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(2));
+	release.resolve();
+	emit({type: "response.completed", response: {id: "quota-terminal", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	if (!stream) throw Error("Missing quota fixture stream"); stream.close();
+	expect(await body).toContain('"response.completed"');
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(f.proxy.getStatus().lastError).toBe("fixture quota transaction completion failure");
+	f.setPostResponse(undefined);
+	const next = await f.post(); const result = await next.text();
+	expect(next.status, result).not.toBe(200);
+	expect(f.fetched).toHaveLength(1);
+});
+
+it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native =>
+	[false, true].map(healthy => ({window, native, healthy})))))
+("orders queued quota fields by receipt rather than completion (%j)", async ({window, native, healthy}) => {
+	const now = Date.now();
+	vi.spyOn(Date, "now").mockReturnValue(now);
+	const f = await fixture(native), entered = deferred(), release = deferred(), ready = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.manager.getAccountByIndex(0)!.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	const preference = vi.spyOn(quotaOrdering, "subscriptionQuotaPreference");
+	const streams: Array<(event: unknown) => void> = [], controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+	let clients: WebSocket[] = [], bodies: Promise<unknown>[];
+	if (native) {
+		f.setReply(ws => {
+			streams.push(event => ws.send(JSON.stringify(event)));
+			ws.send(JSON.stringify({type: "response.created", response: {id: `receipt-${streams.length}`}}));
+			if (streams.length === 2) ready.resolve();
+		});
+		clients = [await f.connect(), await f.connect()];
+		bodies = clients.map(client => new Promise(resolve => {
+			const onMessage = (data: RawData) => {
+				const event = JSON.parse(String(data));
+				if (event.type === "response.completed" || event.type === "error") {client.off("message", onMessage); resolve(event);}
+			};
+			client.on("message", onMessage);
+		}));
+		for (const client of clients) client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+		await ready.promise;
+	} else {
+		f.setPostResponse(async () => new Response(new ReadableStream({start(controller) {
+			controllers.push(controller);
+			streams.push(event => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)));
+			streams.at(-1)!({type: "response.created", response: {id: `receipt-${streams.length}`}});
+		}}), {headers: {"content-type": "text/event-stream"}}));
+		const responses = await Promise.all([f.post(), f.post()]);
+		for (const response of responses) expect(response.status).toBe(200);
+		bodies = responses.map(response => response.text());
+	}
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const eligibility = f.manager.isAccountJournalEligible.bind(f.manager);
+	let held = false, committed = 0;
+	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async (...args) => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return eligibility(...args);
+	});
+	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		const result = await transaction(...args); committed++; return result;
+	});
+	const other = window === "primary" ? "secondary" : "primary";
+	const quota = (field: string, used: number, plan_type?: string) => ({
+		type: "codex.rate_limits", plan_type, rate_limits: {[field]: {used_percent: used, reset_at: Math.floor(now / 1000) + 600}},
+	});
+	streams[0]!(quota(other, 10)); await entered.promise;
+	streams[0]!(quota(window, healthy ? 100 : 20, "free"));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(2));
+	streams[1]!(quota(window, healthy ? 0 : 100, "pro"));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(3));
+	release.resolve();
+	await vi.waitFor(() => expect(committed).toBe(3));
+	for (let index = 0; index < 2; index++) {
+		streams[index]!({type: "response.completed", response: {id: `receipt-${index}`, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+		controllers[index]?.close();
+	}
+	for (const result of await Promise.all(bodies)) {
+		if (native) expect(result).toMatchObject({type: "response.completed"});
+		else expect(result).toContain('"response.completed"');
+	}
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	for (const row of (await readUsageLedgerRows()).filter(row => !before.has(row.id))) expect(row).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	const callsBeforeNext = preference.mock.calls.length;
+	f.setPostResponse(undefined); f.setReply(undefined);
+	if (native) {
+		expect(await turn(clients[0]!)).toMatchObject({type: healthy ? "response.completed" : "error"});
+		expect(preference.mock.calls.slice(callsBeforeNext).map(([entry]) => entry)).toContainEqual(expect.objectContaining({planType: "pro", [window]: {usedPercent: healthy ? 0 : 100, resetAtMs: (Math.floor(now / 1000) + 600) * 1000}}));
+		expect(f.creates).toHaveLength(healthy ? 3 : 2);
+	} else {
+		const next = await f.post(); await next.text();
+		expect(next.status === 200).toBe(healthy);
+		expect(f.fetched).toHaveLength(healthy ? 3 : 2);
+	}
+});
+
+it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native =>
+	["completion", "persist", "journal"].map(failure => ({window, native, failure})))))
+("settles known pending quota after worker failure without another event (%j)", async ({window, native, failure}) => {
+	const f = await fixture(native), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	f.manager.getAccountByIndex(0)!.workspaces!.splice(1);
+	await f.manager.saveToDisk();
+	let emit: (event: unknown) => void = () => {throw Error("Missing failed quota stream");};
+	let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+	let body: Promise<unknown>;
+	if (native) {
+		f.setReply(ws => {
+			emit = event => ws.send(JSON.stringify(event));
+			emit({type: "response.created", response: {id: "failed-worker"}});
+		});
+		const client = await f.connect();
+		body = new Promise(resolve => {
+			const onMessage = (data: RawData) => {
+				const event = JSON.parse(String(data));
+				if (event.type === "response.completed" || event.type === "error") {client.off("message", onMessage); resolve(event);}
+			};
+			client.on("message", onMessage);
+		});
+		client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+		await vi.waitFor(() => expect(f.creates).toHaveLength(1));
+	} else {
+		f.setPostResponse(async () => new Response(new ReadableStream({start(value) {
+			controller = value;
+			emit = event => value.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+			emit({type: "response.created", response: {id: "failed-worker"}});
+		}}), {headers: {"content-type": "text/event-stream"}}));
+		const response = await f.post(); expect(response.status).toBe(200);
+		body = response.text();
+	}
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let failed = false;
+	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	if (failure === "completion") vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		const result = await transaction(...args);
+		if (!failed) {failed = true; entered.resolve(); await release.promise; throw Error("fixture first quota completion failure");}
+		return result;
+	});
+	if (failure === "persist") {
+		const rename = fs.rename.bind(fs);
+		vi.spyOn(fs, "rename").mockImplementation(async (...args: Parameters<typeof fs.rename>) => {
+			if (String(args[1]) === f.path && !failed) {
+				failed = true; entered.resolve(); await release.promise;
+				throw Object.assign(Error("fixture first quota persist failure"), {code: "EIO"});
+			}
+			return rename(...args);
+		});
+	}
+	if (failure === "journal") {
+		const eligibility = f.manager.isAccountJournalEligible.bind(f.manager);
+		vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async (...args) => {
+			if (!failed) {failed = true; entered.resolve(); await release.promise;}
+			return eligibility(...args);
+		});
+	}
+	const quota = (used: number) => ({type: "codex.rate_limits", rate_limits: {[window]: {used_percent: used, reset_at: Math.floor(Date.now() / 1000) + 600}}});
+	emit(quota(20)); await entered.promise;
+	emit(quota(100));
+	await vi.waitFor(() => expect(f.proxy.getStatus().streamQuotaUpdates).toBe(2));
+	if (failure === "journal") await fs.writeFile(getPendingAuthPath(f.path), "fixture unreadable pending quota journal");
+	emit({type: "response.completed", response: {id: "failed-worker", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	controller?.close();
+	release.resolve();
+	const result = await body;
+	if (native) expect(result).toMatchObject({type: "response.completed"});
+	else expect(result).toContain('"response.completed"');
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	await vi.waitFor(() => expect(f.proxy.getStatus().lastError).not.toBeNull());
+	if (failure !== "journal") expect(f.proxy.getStatus().lastError).toBe(`${failure === "persist" ? "Failed to save accounts: " : ""}fixture first quota ${failure} failure`);
+	if (failure === "journal") await fs.unlink(getPendingAuthPath(f.path));
+	f.setPostResponse(undefined); f.setReply(undefined);
+	const next = await f.post(); const text = await next.text();
+	expect(next.status, text).not.toBe(200);
+	expect(native ? f.creates.length : f.fetched.length).toBe(1);
 });

@@ -99,8 +99,9 @@ import {
 } from "./request/fetch-helpers.js";
 import {
 	PreemptiveQuotaScheduler,
-	mergeQuotaObservations,
+	mergeQuotaReceipts,
 	readQuotaSchedulerSnapshot,
+	type QuotaObservationReceipt,
 	type QuotaSchedulerSnapshot,
 } from "./preemptive-quota-scheduler.js";
 import { ContextBudgetGuard } from "./context-budget-guard.js";
@@ -1141,6 +1142,10 @@ function captureDispatchBinding(accountManager: AccountManager, account: Managed
 	return {accountManager, account, recordId: account.recordId, refreshToken: account.refreshToken, accessToken, expiresAt: account.expires, accountId};
 }
 
+function quotaReceiptOwner(account: Pick<ManagedAccount, "recordId" | "access" | "refreshToken">, accountId: string): string {
+	return modelScopeId(account.recordId ?? "", account.access ?? "", account.refreshToken, accountId);
+}
+
 function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDispatchBinding): boolean {
 	const {accountManager, account} = binding;
 	return state.activeAccountManager === accountManager && accountManager.getAccountByIndex(account.index) === account &&
@@ -1421,7 +1426,8 @@ function dispatchRuntimeSkipReason(
 	account: ManagedAccount,
 	context: { family: ModelFamily; model: string | null },
 	admission: CircuitAdmissionReceipt | undefined,
-	admittedCooldown?: Pick<ManagedAccount, "coolingDownUntil" | "cooldownReason">,
+	admittedCooldown: Pick<ManagedAccount, "coolingDownUntil" | "cooldownReason"> | undefined,
+	accountId: string,
 ): string | null {
 	if (accountManager.getAccountByIndex(account.index) !== account ||
 		(state.nativeOpenai && state.activeAccountManager !== accountManager)) return "missing";
@@ -1435,8 +1441,10 @@ function dispatchRuntimeSkipReason(
 		if (!breaker?.isAdmissionCurrent(admission)) return reason ?? "circuit-open";
 		if (reason === "circuit-open" && admission.halfOpen) reason = null;
 	}
+	const scope = state.nativeOpenai ? workspaceModelScopes(account).find(scope => scope.accountId === accountId) : undefined;
+	const baseline = state.nativeOpenai ? (scope ? state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id, context.model])) : undefined) ?? null : undefined;
 	const deferral = state.preemptiveQuotaScheduler.getDeferral(
-		buildQuotaScheduleKey(account, context.family, context.model), state.now(),
+		buildQuotaScheduleKey(account, context.family, context.model), state.now(), quotaReceiptOwner(account, accountId), baseline,
 	);
 	return reason ?? (deferral.defer ? "rate-limited" : null);
 }
@@ -1493,7 +1501,7 @@ async function validateAccountDispatch(
 	if (state.contextBudgetGuard.getAdvisory(context.stableSessionKey ?? "", state.now(), context.model).level === "hard") {
 		throw createRuntimeProxyHttpError("Context budget paused dispatch.", 503, "context_budget_guard_paused");
 	}
-	return dispatchRuntimeSkipReason(state, accountManager, account, context, admission, admittedCooldown);
+	return dispatchRuntimeSkipReason(state, accountManager, account, context, admission, admittedCooldown, binding.accountId);
 }
 
 async function withDispatchAuthorization(state: RotationProxyState, authorize: DispatchAuthorization, operation: () => Promise<Response>): Promise<Response> {
@@ -4508,30 +4516,45 @@ async function handleRequestInner(
 				res.off("close", onClientClose);
 			}
 			reconcileManualSelection();
-			let pendingQuota: QuotaSchedulerSnapshot | undefined;
+			let pendingQuota: QuotaObservationReceipt | undefined;
 			let quotaUpdate: Promise<void> | undefined;
 			let restrictionFailure: {error: unknown} | undefined;
 			const captureRestrictionFailure = (error: unknown): void => {restrictionFailure ??= {error};};
+			const quotaScopeKey = state.nativeOpenai && requestScope && isResponsesRequest ? JSON.stringify([requestScope.id, context.model]) : undefined;
+			const currentQuotaScope = () => quotaScopeKey ? state.subscriptionQuotaObservations?.get(quotaScopeKey) : undefined;
 			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
-				pendingQuota = mergeQuotaObservations({...snapshot, planType}, pendingQuota);
+				if (state.activeAccountManager !== accountManager || accountManager.getAccountByIndex(refreshed.account.index) !== refreshed.account ||
+					refreshed.account.recordId !== binding.recordId || refreshed.account.access !== binding.accessToken || refreshed.account.refreshToken !== binding.refreshToken) return Promise.resolve();
+				if (quotaScopeKey && requestScope && !currentQuotaScope()) {
+					const observations = state.subscriptionQuotaObservations ??= new Map();
+					if (observations.size >= 1000) observations.delete(observations.keys().next().value ?? "");
+					observations.set(quotaScopeKey, quotaForScope(refreshed.account, requestScope) ?? {model: context.model ?? "unknown", status: 200, updatedAt: 0, primary: {}, secondary: {}});
+				}
+				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, quotaReceiptOwner(refreshed.account, binding.accountId), currentQuotaScope());
+				pendingQuota = mergeQuotaReceipts(receipt, pendingQuota);
 				quotaUpdate ??= (async () => {
+					let failure: {error: unknown} | undefined;
 					try {
 						while (pendingQuota) {
-							const snapshot = pendingQuota;
+							const receipt = pendingQuota;
 							pendingQuota = undefined;
-							await applyDispatchRestriction(state, binding, () => {
-								if (state.nativeOpenai && requestScope && isResponsesRequest) {
-									const observations = state.subscriptionQuotaObservations ??= new Map();
-									const key = JSON.stringify([requestScope.id, context.model]);
-									const previous = observations.get(key) ?? quotaForScope(refreshed.account, requestScope) ?? null;
-									const merged = state.preemptiveQuotaScheduler.observe(quotaScheduleKey, snapshot, previous);
-									if (observations.size >= 1000 && !observations.has(key)) observations.delete(observations.keys().next().value ?? "");
-									observations.set(key, { ...merged, model: context.model ?? "unknown" });
-								} else {
-									state.preemptiveQuotaScheduler.observe(quotaScheduleKey, snapshot);
-								}
-							});
+							try {
+								const applied = await applyDispatchRestriction(state, binding, () => {
+									const merged = state.preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt, currentQuotaScope());
+									if (merged && quotaScopeKey) {
+										const observations = state.subscriptionQuotaObservations ??= new Map();
+										if (observations.size >= 1000 && !observations.has(quotaScopeKey)) observations.delete(observations.keys().next().value ?? "");
+										observations.set(quotaScopeKey, Object.assign(merged, {model: context.model ?? "unknown"}));
+									}
+								});
+								if (applied) state.preemptiveQuotaScheduler.settleReceipt(quotaScheduleKey, receipt, true, currentQuotaScope());
+							} catch (error) {
+								failure ??= {error};
+								captureRestrictionFailure(error);
+								state.preemptiveQuotaScheduler.settleReceipt(quotaScheduleKey, receipt, false, currentQuotaScope());
+							}
 						}
+						if (failure) throw failure.error;
 					} finally {quotaUpdate = undefined;}
 				})();
 				return quotaUpdate;
