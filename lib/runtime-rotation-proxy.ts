@@ -3526,9 +3526,14 @@ async function handleRequestInner(
 					},
 				));
 				const responseOutcome = new ResponseOutcome(upstream.headers.get("content-type")?.includes("text/event-stream") === true);
+				const nativeSent = state.webSocketRequestSent?.() === true;
+				const nativeTerminal: {event: WebSocketTerminalEvent | null} = {event: null};
 				const scanner = createUsageStreamScanner({
 					contentType: upstream.headers.get("content-type"),
-					onEvent: event => responseOutcome.observe(event),
+					onEvent: event => {
+						responseOutcome.observe(event);
+						if (nativeSent) nativeTerminal.event ??= websocketTerminalUsage(Buffer.from(JSON.stringify(event)));
+					},
 				});
 				const forwarded = await forwardStreamingResponse(
 					upstream,
@@ -3554,8 +3559,8 @@ async function handleRequestInner(
 				}
 				await usageRecorder.record({
 					outcome: forwarded && upstream.ok ? "success" : clientDisconnected ? "cancelled" : "failure",
-					statusCode: upstream.status,
-					errorCode: clientDisconnected ? "client_disconnected" : responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
+					statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
+					errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
 					...(usageTokens ?? {}),
 				});
             } catch (error) {
@@ -4943,11 +4948,50 @@ async function handleRequestInner(
 			// unlimited spend, with only --requests actually enforced.
 			const responseOutcome = new ResponseOutcome(isResponsesRequest && upstream.headers.get("content-type")?.includes("text/event-stream") === true);
 			let responseRestriction: Promise<boolean> | undefined;
+			const nativeSent = state.webSocketRequestSent?.() === true;
+			const nativeTerminal: {event: WebSocketTerminalEvent | null} = {event: null};
 			const usageScanner = createUsageStreamScanner({
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (isResponsesTokenInvalidationEvent(event)) {
+					if (nativeSent) {
+						nativeTerminal.event ??= websocketTerminalUsage(Buffer.from(JSON.stringify(event)));
+						const terminal = nativeTerminal.event;
+						if (terminal?.record.outcome === "failure") {
+							responseRestriction ??= (async () => {
+								const status = terminal.record.statusCode;
+								if (typeof status !== "number" || isModelAtCapacityError(status, terminal.rawBody)) return false;
+								if (status === 429) {
+									const retryAfterMs = (terminal.retryHeaders ? parseRetryAfterHeaderMs(terminal.retryHeaders, state.now()) : null) ?? terminal.retryAfterMs ?? parseRetryAfterBodyMs(terminal.rawBody, state.now()) ?? 60_000;
+									if (quotaScopeKey) await observeQuota({status: 429, updatedAt: state.now(), primary: {usedPercent: 100, resetAtMs: state.now() + retryAfterMs}, secondary: {}});
+									return applyDispatchRestriction(state, binding, () => {
+										accountManager.recordRateLimit(refreshed.account, context.family, context.model);
+										if (!quotaScopeKey || !refreshed.account.workspaces?.length) {
+											state.preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, retryAfterMs, state.now());
+											accountManager.markRateLimitedWithReason(refreshed.account, retryAfterMs, context.family, "quota", context.model);
+										}
+									});
+								}
+								return applyDispatchRestriction(state, binding, () => {
+									if (status === 401) {
+										accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
+										if (terminal.tokenInvalidated) accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, binding.accessToken);
+										applyMonotonicAuthCooldown(accountManager, refreshed.account, terminal.tokenInvalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, binding.accessToken);
+									} else if ((status === 402 || status === 403) && isWorkspaceDisabledError(status, terminal.record.errorCode, terminal.errorMessage ?? "")) {
+										if (requestScope && refreshed.account.workspaces?.length) accountManager.disableWorkspace(refreshed.account, requestScope.accountId);
+										else {
+											accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
+											accountManager.setAccountEnabled(refreshed.account.index, false);
+										}
+									} else if (status >= 500) {
+										accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
+										accountManager.markAccountCoolingDown(refreshed.account, state.serverErrorCooldownMs, "server-error");
+									}
+								});
+							})();
+							void responseRestriction.catch(captureRestrictionFailure);
+						}
+					} else if (isResponsesTokenInvalidationEvent(event)) {
 						responseRestriction ??= applyDispatchRestriction(state, binding, () => {
 							accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, binding.accessToken);
 							accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
@@ -5029,8 +5073,8 @@ async function handleRequestInner(
 			}
 			await usageRecorder.record({
 				outcome: forwarded && upstream.ok ? "success" : clientDisconnected ? "cancelled" : "failure",
-				statusCode: upstream.status,
-				errorCode: clientDisconnected ? "client_disconnected" : responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
+				statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
+				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
 				account: refreshed.account,
 				...(usageTokens ?? {}),
 			});

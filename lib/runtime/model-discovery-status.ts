@@ -75,9 +75,19 @@ function probeCachePath(): string {
 }
 async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
 	try {
-		return probeCacheSchema.parse(JSON.parse(await fs.readFile(probeCachePath(), "utf8"))).entries;
-	} catch {
-		return [];
+		const file = await fs.open(probeCachePath(), "r");
+		try {
+			if (!(await file.stat()).isFile()) throw Error("Invalid capability cache file");
+			const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
+			return probeCacheSchema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"))).entries;
+		} finally {
+			await file.close();
+		}
+	} catch (error) {
+		if (isRecord(error) && error.code === "ENOENT") return [];
+		throw error;
 	}
 }
 export async function discoverModelInventory(
@@ -96,6 +106,8 @@ export async function discoverModelInventory(
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
 		now = options.now ?? Date.now;
+	const capabilities = new ApiModelCapabilities(fetcher, now);
+	if (options.persistProbes) capabilities.importProbes(await loadProbeCache());
 	const manager = new AccountManager(
 		undefined,
 		storage ?? {
@@ -163,8 +175,6 @@ export async function discoverModelInventory(
 	} finally {
 		await manager.flushPendingSave();
 	}
-	const capabilities = new ApiModelCapabilities(fetcher, now);
-	if (options.persistProbes) capabilities.importProbes(await loadProbeCache());
 	const api = new ApiModelRuntime(
 		fetcher,
 		now,
@@ -203,10 +213,12 @@ export async function discoverModelInventory(
 				value.status.retry = "transient";
 			}
 			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
-			await writeFileAtomic(path, JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n");
+			const serialized = JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n";
+			if (Buffer.byteLength(serialized) > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
+			await writeFileAtomic(path, serialized);
 			return entries;
-		}).catch(() => undefined);
-		if (persisted) for (const catalog of api.cachedCatalogs()) {
+		});
+		for (const catalog of api.cachedCatalogs()) {
 			const route = routes.find(route => route.id === catalog.id && route.kind === catalog.kind);
 			if (!route?.probeCapabilities) continue;
 			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted));

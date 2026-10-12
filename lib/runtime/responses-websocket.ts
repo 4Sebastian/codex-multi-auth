@@ -360,25 +360,13 @@ class SocketSession {
 						text = JSON.stringify(event);
 					}
 					if (!isRecord(event) || typeof event.type !== "string") throw Error("Invalid response event");
-					if (event.type === "error" && !accepted && !extractResponsesUsage(event)) {
-						finished = true;
-						cleanup();
-						const status =
-							typeof event.status === "number" &&
-							event.status >= 400 &&
-							event.status <= 599
-								? event.status
-								: 400;
-						resolve(Response.json(event, { status, headers: upstreamHeaders(event.headers) }));
-						return;
-					}
 					if (!accepted) {
 						accepted = true;
 						// Handshake headers describe the account only at connect time,
 						// so they ride on the first response of a fresh socket.
 						resolve(
 							new Response(stream, {
-								headers: { ...handshakeHeaders, "content-type": "text/event-stream" },
+								headers: { ...handshakeHeaders, ...(event.type === "error" ? upstreamHeaders(event.headers) : {}), "content-type": "text/event-stream" },
 							}),
 						);
 					}

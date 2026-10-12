@@ -235,6 +235,12 @@ it.each(["http", "custom", "native", "http-stream", "native-stream"].flatMap(tra
 	if (kind === "cooldown" && lossFirst && transport !== "custom") vi.useFakeTimers({toFake: ["Date"]});
 	const native = transport.startsWith("native"), stream = transport.endsWith("stream");
 	const f = await fixture(native), entered = deferred(), release = deferred();
+	if (native && kind === "cooldown" && lossFirst) {
+		const account = f.manager.getAccountByIndex(0)!;
+		f.manager.recordFailure(account, getModelFamily("shared"), "shared");
+		f.manager.recordFailure(account, getModelFamily("shared"), "shared");
+		expect(getCircuitBreaker(account.circuitKeyId!).getFailureCount()).toBe(2);
+	}
 	cleanups.push(async () => {release.resolve();});
 	const status = kind === "workspace" ? 402 : 401;
 	const error = {code: kind === "workspace" ? "deactivated_workspace" : kind === "auth" ? "token_invalidated" : "unauthorized"};
@@ -266,6 +272,7 @@ it.each(["http", "custom", "native", "http-stream", "native-stream"].flatMap(tra
 		});
 		await recover();
 	} else {await recover(); release.resolve(); await pending;}
+	if (native) expect(f.creates).toHaveLength(1);
 	f.setPostResponse(undefined); f.setReply(undefined);
 	await f.manager.flushPendingSave();
 	const reloaded = await loadAccounts();
@@ -738,7 +745,7 @@ it.each(["http", "custom", "native"])("records terminal usage even if restrictio
 	const newRows = (await readUsageLedgerRows()).filter(row => !priorIds.has(row.id));
 	expect(newRows).toHaveLength(1);
 	const row = newRows[0]!;
-	expect(row).toMatchObject({outcome: "failure", errorCode: transport === "custom" ? "token_invalidated" : "upstream_response_failed", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(row).toMatchObject({outcome: "failure", errorCode: transport === "http" ? "upstream_response_failed" : "token_invalidated", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 	expect(row.account?.accountHash).toBeTruthy();
 	const blocked = await f.post();
 	expect(blocked.status).not.toBe(200); await blocked.text();

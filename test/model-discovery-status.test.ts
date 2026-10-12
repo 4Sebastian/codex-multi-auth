@@ -521,6 +521,77 @@ it.each(["transport", "server"].flatMap(mode => [2000, 3000, 4000].map(startedAt
 	expect(serialized).not.toContain("fixture-independent-secret");
 });
 
+it.each(["malformed", "schema", "oversized", "directory", "unreadable"])("rejects %s capability authority before API discovery", async mode => {
+	const path = isolationJoin(multiAuthDir, "api-capability-probes.json");
+	if (mode === "directory") await isolationFs.mkdir(path);
+	else if (mode === "unreadable") {
+		const open = isolationFs.open.bind(isolationFs);
+		vi.spyOn(isolationFs, "open").mockImplementation(async (...args) => {
+			if (String(args[0]) === path) throw Object.assign(Error("fixture authority unavailable"), {code: "EACCES"});
+			return open(...args);
+		});
+	} else await isolationFs.writeFile(path, mode === "malformed" ? "{" : mode === "schema" ? JSON.stringify({version: 2, entries: []}) : " ".repeat(4 * 1024 * 1024 + 1));
+	const fetchImpl = vi.fn(async () => Response.json({data: [{id: "X"}]}));
+	const route: ApiRouteCredential = {id: "authority", kind: "api", label: "Authority", apiKey: "fixture-secret", enabled: true, priority: 0, visibleModels: ["X"], probeCapabilities: true};
+	await expect(discoverModelInventory(null, [route], {fetchImpl, updateApiDiscovery: async credential => credential, persistProbes: true})).rejects.toThrow();
+	expect(fetchImpl).not.toHaveBeenCalled();
+});
+
+it.each(["rename", "write", "lock", "reread", "malformed-reread"])("rejects a late writer when %s prevents capability reconciliation", async mode => {
+	const path = isolationJoin(multiAuthDir, "api-capability-probes.json");
+	const route: ApiRouteCredential = {id: "late-failure", kind: "api", label: "Late failure", apiKey: "fixture-secret", enabled: true, priority: 0, visibleModels: ["X", "Y"], probeCapabilities: true};
+	const positive: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/models")) return Response.json({data: [{id: "X"}]});
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const options = {updateApiDiscovery: async (credential: ApiRouteCredential) => credential, persistProbes: true};
+	const initial = await discoverModelInventory(null, [route], {...options, fetchImpl: positive, now: () => 1000});
+	expect(initial.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+	let entered: () => void = () => undefined, release: () => void = () => undefined;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const pending = discoverModelInventory(null, [route], {...options, now: () => 4000, forceProbes: true, fetchImpl: async (url, init) => {
+		if (init?.method !== "POST") return positive(url, init);
+		entered(); await gate;
+		return Response.json({error: {code: "server_error"}}, {status: 500});
+	}});
+	const rejected = expect(pending).rejects.toThrow();
+	try {
+		await ready;
+		await discoverModelInventory(null, [route], {...options, now: () => 3000, fetchImpl: async (url, init) => init?.method === "POST" ? Response.json({error: {code: "invalid_api_key"}}, {status: 401}) : String(url).endsWith("/models") ? Response.json({data: [{id: "Y"}]}) : new Response("missing", {status: 404})});
+		if (mode === "reread") {
+			const open = isolationFs.open.bind(isolationFs);
+			vi.spyOn(isolationFs, "open").mockImplementation(async (...args) => {
+				if (String(args[0]) === path) throw Object.assign(Error("fixture reread denied"), {code: "EACCES"});
+				return open(...args);
+			});
+		} else if (mode === "malformed-reread") await isolationFs.writeFile(path, "{");
+		else if (mode === "write") {
+			const write = isolationFs.writeFile.bind(isolationFs);
+			vi.spyOn(isolationFs, "writeFile").mockImplementation(async (...args) => {
+				if (String(args[0]).startsWith(path + ".") && !String(args[0]).includes("write-lock")) throw Object.assign(Error("fixture full disk"), {code: "ENOSPC"});
+				return write(...args);
+			});
+		} else {
+			const rename = isolationFs.rename.bind(isolationFs);
+			vi.spyOn(isolationFs, "rename").mockImplementation(async (...args) => {
+				if (String(args[1]) === (mode === "lock" ? path + ".write-lock" : path)) throw Object.assign(Error("fixture commit denied"), {code: "ENOSPC"});
+				return rename(...args);
+			});
+		}
+	} finally {release();}
+	await rejected;
+	vi.restoreAllMocks();
+	if (mode !== "malformed-reread") {
+		let posts = 0;
+		const cached = await discoverModelInventory(null, [route], {...options, now: () => 5000, fetchImpl: async (url, init) => {if (init?.method === "POST") posts++; return positive(url, init);}});
+		expect(posts).toBe(0);
+		expect(cached.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("unverified");
+	}
+});
+
 it("merges concurrent checks' probe results instead of replacing the shared cache", async () => {
  const { promises: fs } = await import("node:fs");
  const { tmpdir } = await import("node:os");
