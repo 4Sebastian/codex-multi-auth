@@ -1178,7 +1178,6 @@ interface ActiveWebSocketRequest extends AccountDispatchBinding {
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
 	frame: PendingWebSocketFrame;
-	sawUpstreamEvent: boolean;
 }
 
 interface WebSocketTerminalEvent {
@@ -2541,7 +2540,7 @@ function bridgeWebSocketConnection(
 		}
 		if (!admission) throw createRuntimeProxyHttpError("Circuit admission is unavailable.", 503, "routing_configuration_changed");
 		frame.submittedAccount = forwardingAccount;
-		activeRequests.push({...binding, circuitAdmission: admission, request, frame, sawUpstreamEvent: false});
+		activeRequests.push({...binding, circuitAdmission: admission, request, frame});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2682,8 +2681,6 @@ function bridgeWebSocketConnection(
 			state.status.streamsStarted += 1;
 			connectedUpstream.on("message", (data, isBinary) => {
 				if (closed || upstream !== connectedUpstream) return;
-				const active = activeRequests[0];
-				if (active) active.sawUpstreamEvent = true;
 				const terminal = websocketTerminalUsage(data);
 				if (terminal) {
 					const settled = activeRequests.shift();
@@ -2727,7 +2724,7 @@ function bridgeWebSocketConnection(
 				}
 				if (client.readyState === WebSocket.OPEN) sendBuffered(client, data, isBinary);
 			});
-			connectedUpstream.on("close", (code, reason) => {
+			connectedUpstream.on("close", () => {
 				void (async () => {
 					if (closed || upstream !== connectedUpstream) return;
 					upstream = null;
@@ -2738,58 +2735,13 @@ function bridgeWebSocketConnection(
 					settlingTurn = true;
 					await settlePendingHandshake("failure", "upstream_websocket_closed", true);
 					if (activeRequests.length === 0) {settlingTurn = false; drainPending(); return;}
-					if (
-						activeRequests.length === 1 &&
-						activeRequests[0]?.sawUpstreamEvent === false
-					) {
-						const interrupted = activeRequests[0];
-						if (interrupted) {
-							settlingTurn = true;
-							let applied: boolean;
-							try {applied = await applyWebSocketTransportAccountFailure(state, interrupted);}
-							catch (error) {
-								const index = activeRequests.indexOf(interrupted);
-								if (index >= 0) activeRequests.splice(index, 1);
-								await interrupted.request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "upstream_websocket_closed", account: interrupted.account});
-								throw error;
-							}
-							settlingTurn = false;
-							const index = activeRequests.indexOf(interrupted);
-							if (index < 0 || interrupted.request.usageRecorder.hasRecorded()) {drainPending(); return;}
-							activeRequests.splice(index, 1);
-							if (closed || client.readyState !== WebSocket.OPEN) {
-								await interrupted.request.usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_websocket_closed", account: interrupted.account});
-								return;
-							}
-							if (!applied || !isDispatchBindingCurrent(state, interrupted)) {
-								await interrupted.request.usageRecorder.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "upstream_websocket_closed", account: interrupted.account});
-								throw createRuntimeProxyHttpError("Account routing changed before WebSocket recovery.", HTTP_STATUS.SERVICE_UNAVAILABLE, "websocket_dispatch_stale");
-							}
-							if (hasConnectionScopedContinuation(interrupted.frame)) {
-								void interrupted.request.usageRecorder.record({
-									outcome: "failure",
-									statusCode: HTTP_STATUS.BAD_GATEWAY,
-									errorCode: "websocket_continuation_lost",
-									account: interrupted.account,
-								});
-								reportConnectionScopedContinuationLoss();
-								drainPending();
-								return;
-							}
-							const frame = interrupted.frame;
-							frame.recoveryAttempts ??= 0;
-							frame.request = interrupted.request;
-							queuedFrames.add(frame);
-							queuedBytes += rawDataToBuffer(frame.data).byteLength;
-							pending.unshift(frame);
-							void initialize();
-							return;
-						}
-					}
-					await settleAll("failure", "upstream_websocket_closed", true);
-					settlePending("failure", "upstream_websocket_closed");
-					closed = true;
-					mirrorWebSocketClose(client, code, reason);
+					const continuationLost = activeRequests.some(active => hasConnectionScopedContinuation(active.frame));
+					await settleAll("failure", continuationLost ? "websocket_continuation_lost" : "upstream_websocket_closed", true);
+					if (closed || client.readyState !== WebSocket.OPEN) return;
+					if (continuationLost) reportConnectionScopedContinuationLoss();
+					else sendBuffered(client, JSON.stringify({type: "error", status: HTTP_STATUS.BAD_GATEWAY, error: {code: "upstream_websocket_closed", message: "Upstream closed after request dispatch. The submitted turn was not replayed."}}));
+					settlingTurn = false;
+					drainPending();
 				})().catch(rejectConnection);
 			});
 			connectedUpstream.on("error", (error) => {

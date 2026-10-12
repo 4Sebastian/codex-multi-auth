@@ -1978,7 +1978,9 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("mirrors client termination and abnormal closes after upstream events", async () => {
+	it("mirrors client termination and settles abnormal upstream closes after events", async () => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		let secondClient: WebSocket | undefined;
 		let connectionCount = 0;
 		let resolveFirstUpstreamClose: ((code: number) => void) | null = null;
 		const firstUpstreamClose = new Promise<number>((resolve) => {
@@ -2017,74 +2019,144 @@ describe("runtime rotation proxy", () => {
 			firstClient.terminate();
 			expect(await firstUpstreamClose).toBe(1006);
 
-			const secondClient = await connectWebSocket(
+			secondClient = await connectWebSocket(
 				proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
 			);
-			const secondClosed = nextWebSocketClose(secondClient);
+			const created = nextWebSocketMessage(secondClient);
+			const failed = new Promise<string>(resolve => secondClient!.on("message", raw => {if (JSON.parse(raw.toString()).type === "error") resolve(raw.toString());}));
 			secondClient.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
-			expect(await secondClosed).toMatchObject({ code: 1006 });
+			expect(JSON.parse(await created).type).toBe("response.created");
+			expect(JSON.parse(await failed)).toMatchObject({type: "error", error: {code: "upstream_websocket_closed"}});
+			expect(secondClient.readyState).toBe(WebSocket.OPEN);
+			expect(connectionCount).toBe(2);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			expect(append.mock.calls.map(([row]) => row.outcome)).toEqual(["success", "failure"]);
+			expect(append.mock.calls[1]?.[0]).toMatchObject({accountIndex: 0, errorCode: "upstream_websocket_closed"});
 		} finally {
 			firstClient.terminate();
+			secondClient?.terminate();
 			await upstream.close();
+			append.mockRestore();
 		}
 	});
 
-	it("recovers an interrupted request on another upstream WebSocket before emitting events", async () => {
+	it.each([false, true])("never replays a received custom create after upstream disconnect (created=%s)", async created => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
 		const authorizationAttempts: Array<string | undefined> = [];
-		let connectionCount = 0;
+		const received: string[] = [];
+		let replayed!: () => void;
+		const replayDetected = new Promise<"replayed">(resolve => {replayed = () => resolve("replayed");});
 		const upstream = await startTestWebSocketUpstream({
 			onConnection: (socket, request) => {
-				connectionCount += 1;
 				authorizationAttempts.push(request.headers.authorization);
-				socket.once("message", () => {
-					if (connectionCount === 1) {
-						socket.terminate();
-						return;
-					}
-					socket.send(JSON.stringify({
-						type: "response.completed",
-						response: { id: "recovered-response" },
-					}));
+				socket.on("message", raw => {
+					const body = JSON.parse(raw.toString());
+					if (body.type !== "response.create") return;
+					received.push(body.input[0]);
+					if (received.filter(id => id === "A").length > 1) replayed();
+					if (body.input[0] === "A") {
+						if (created) socket.send(JSON.stringify({type: "response.created", response: {id: "A"}}));
+						socket.close(1011, "fixture ambiguous dispatch");
+					} else socket.send(JSON.stringify({type: "response.completed", response: {id: "D", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
 				});
 			},
 		});
 		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
-		const { fetchImpl } = createRecordingFetch(() => textEventStream());
-		const proxy = await startProxy({
-			accountManager,
-			fetchImpl,
-			options: { upstreamBaseUrl: upstream.baseUrl },
-		});
-		const socket = await connectWebSocket(
-			proxy.baseUrl.replace(/^http:/, "ws:") + "/codex/responses",
-		);
+		const proxy = await startProxy({accountManager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const socket = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
-			const response = nextWebSocketMessage(socket);
-			socket.send(JSON.stringify({
-				type: "response.create",
-				model: "gpt-5.6-sol",
-				prompt_cache_key: "recover-before-events",
-				input: [],
-			}));
-			expect(JSON.parse(await response)).toMatchObject({
-				type: "response.completed",
-				response: { id: "recovered-response" },
-			});
+			const failed = new Promise<string>(resolve => socket.on("message", raw => {const event = JSON.parse(raw.toString()); if (event.type === "error") resolve(raw.toString());}));
+			const closed = new Promise<"closed">(resolve => socket.once("close", () => resolve("closed")));
+			socket.send(JSON.stringify({type: "response.create", model: "gpt-5.6-sol", prompt_cache_key: "recover-before-events", input: ["A"]}));
+			const outcome = await Promise.race([failed, replayDetected, closed]);
+			expect(outcome).not.toBe("replayed");
+			expect(outcome).not.toBe("closed");
+			expect(JSON.parse(outcome)).toMatchObject({type: "error", status: 502, error: {code: "upstream_websocket_closed"}});
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: "failure", accountIndex: 0, statusCode: 502, errorCode: "upstream_websocket_closed"});
+			expect(received).toEqual(["A"]);
+			expect(authorizationAttempts).toEqual(["Bearer access-1"]);
 			expect(socket.readyState).toBe(WebSocket.OPEN);
-			expect(authorizationAttempts).toEqual([
-				"Bearer access-1",
-				"Bearer access-2",
-			]);
-			expect(proxy.getStatus()).toMatchObject({
-				upstreamRequests: 2,
-				streamsStarted: 2,
-				retries: 1,
-				rotations: 1,
-			});
-		} finally {
-			socket.terminate();
-			await upstream.close();
-		}
+			const later = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({type: "response.create", model: "gpt-5.6-sol", input: ["D"]}));
+			expect(JSON.parse(await later)).toMatchObject({type: "response.completed", response: {id: "D"}});
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			expect(append.mock.calls[1]?.[0]).toMatchObject({outcome: "success", accountIndex: 1, inputTokens: 17, outputTokens: 4, totalTokens: 21});
+			expect(received).toEqual(["A", "D"]);
+			expect(authorizationAttempts).toEqual(["Bearer access-1", "Bearer access-2"]);
+			expect(proxy.getStatus()).toMatchObject({upstreamRequests: 2, streamsStarted: 2, retries: 1, rotations: 1});
+		} finally {socket.terminate(); await upstream.close(); append.mockRestore();}
+	});
+
+	it("never requeues an ambiguous synchronous custom send failure", async () => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		const received: string[] = [];
+		let connections = 0, attempts = 0;
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => {connections++; ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type === "response.create") received.push(body.input[0]);});}});
+		const send = WebSocket.prototype.send;
+		const sending = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
+			if (this.url?.startsWith(upstream.baseUrl.replace("http:", "ws:")) && JSON.parse(String(args[0])).type === "response.create") {
+				attempts++;
+				send.apply(this, args);
+				throw Error("fixture ambiguous send");
+			}
+			return send.apply(this, args);
+		});
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const closed = nextWebSocketClose(client);
+			client.send(JSON.stringify({type: "response.create", model: "shared", input: ["A"]}));
+			expect(await closed).toMatchObject({code: 1013});
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: "failure", errorCode: "websocket_send_failed", accountIndex: 0});
+			expect(attempts).toBe(1);
+			expect(connections).toBe(1);
+			expect(received).toEqual(["A"]);
+			expect(proxy.getStatus().lastError).toBe("fixture ambiguous send");
+		} finally {client.terminate(); await upstream.close(); sending.mockRestore(); append.mockRestore();}
+	});
+
+	it.each(["queued", "cancelled", "expiry-replacement"])("keeps ambiguous custom sends settled during restriction waits (%s)", async mode => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {entered = resolve;});
+		const restriction = manager.withCurrentAccountCredential.bind(manager);
+		const held = vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered(); await gate; return restriction(...args);});
+		const sent: string[] = [], completed: string[] = [];
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", raw => {
+			const body = JSON.parse(raw.toString());
+			if (body.type !== "response.create") return;
+			const id = body.input[0];
+			sent.push(id);
+			if (id === "A") ws.terminate();
+			else ws.send(JSON.stringify({type: "response.completed", response: {id, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}}));
+		})});
+		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		client.on("message", raw => {const event = JSON.parse(raw.toString()); if (event.type === "response.completed") completed.push(event.response.id);});
+		try {
+			client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
+			await ready;
+			client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]}));
+			if (mode === "cancelled") {
+				client.send(JSON.stringify({type: "response.cancel"}));
+				await vi.waitFor(() => expect(append.mock.calls.filter(([row]) => row.model === "A-model").map(([row]) => row.outcome)).toEqual(["cancelled"]));
+			}
+			if (mode === "expiry-replacement") manager.getAccountByIndex(0)!.expires! += 1000;
+			client.send(JSON.stringify({type: "response.create", model: "D-model", input: ["D"]}));
+			release();
+			await vi.waitFor(() => expect(completed).toEqual(mode === "cancelled" ? ["D"] : ["B", "D"]));
+			expect(sent).toEqual(mode === "cancelled" ? ["A", "D"] : ["A", "B", "D"]);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(3));
+			expect(append.mock.calls.filter(([row]) => row.model === "A-model")).toHaveLength(1);
+			expect(append.mock.calls.find(([row]) => row.model === "A-model")?.[0]).toMatchObject({accountIndex: 0, outcome: mode === "cancelled" ? "cancelled" : "failure"});
+			expect(append.mock.calls.find(([row]) => row.model === "D-model")?.[0]).toMatchObject({outcome: "success", inputTokens: 17, outputTokens: 4, totalTokens: 21});
+			if (mode === "expiry-replacement") expect(manager.getAccountByIndex(0)?.cooldownReason).toBeUndefined();
+		} finally {release(); client.terminate(); await upstream.close(); held.mockRestore(); append.mockRestore();}
 	});
 
 	it("reconnects upstream between requests without closing the client WebSocket", async () => {
@@ -2477,15 +2549,16 @@ describe("runtime rotation proxy", () => {
 				prompt_cache_key: "replayed-budget-session",
 				input: [],
 			}));
-			expect(JSON.parse(await response)).toMatchObject({ type: "response.completed" });
+			expect(JSON.parse(await response)).toMatchObject({type: "error", error: {code: "upstream_websocket_closed"}});
+			expect(connectionCount).toBe(1);
 			expect(usageRecorder).toHaveBeenCalledTimes(1);
 			expect(usageRecords).toEqual([
 				expect.objectContaining({
-					outcome: "success",
-					account: expect.objectContaining({ index: 1 }),
+					outcome: "failure",
+					account: expect.objectContaining({ index: 0 }),
 				}),
 			]);
-			expect(guardUpdate).toHaveBeenCalledTimes(1);
+			expect(guardUpdate).not.toHaveBeenCalled();
 		} finally {
 			socket.terminate();
 			await upstream.close();
@@ -2494,7 +2567,7 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("preserves a prepared request across a pre-event disconnect", async () => {
+	it("settles each submitted request across disconnects and admits a later independent turn", async () => {
 		const usageRecords: Array<Record<string, unknown>> = [];
 		const usageRecorder = vi
 			.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
@@ -2546,17 +2619,18 @@ describe("runtime rotation proxy", () => {
 			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
 			expect(JSON.parse(await firstResponse)).toMatchObject({ type: "response.failed" });
 
+			const interruptedResponse = nextWebSocketMessage(socket);
+			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
+			expect(JSON.parse(await interruptedResponse)).toMatchObject({type: "error", error: {code: "upstream_websocket_closed"}});
+			expect(connectionCount).toBe(2);
+			expect(usageRecords).toHaveLength(2);
+			expect(usageRecords[1]).toMatchObject({outcome: "failure", account: expect.objectContaining({index: 1})});
 			const recoveredResponse = nextWebSocketMessage(socket);
 			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
-			expect(JSON.parse(await recoveredResponse)).toMatchObject({
-				type: "response.completed",
-			});
-			expect(usageRecorder).toHaveBeenCalledTimes(2);
-			expect(usageRecords).toHaveLength(2);
-			expect(usageRecords[1]).toMatchObject({
-				outcome: "success",
-				account: expect.objectContaining({ index: 2 }),
-			});
+			expect(JSON.parse(await recoveredResponse)).toMatchObject({type: "response.completed"});
+			expect(usageRecorder).toHaveBeenCalledTimes(3);
+			expect(usageRecords).toHaveLength(3);
+			expect(usageRecords[2]).toMatchObject({outcome: "success", account: expect.objectContaining({index: 2})});
 		} finally {
 			socket.terminate();
 			await upstream.close();

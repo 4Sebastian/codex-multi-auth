@@ -956,19 +956,13 @@ it.each([401, 429, 503])("retains handshake accounting while its failed restrict
 	expect(f.creates).toHaveLength(0);
 });
 
-it("retains the submitted account while an authorized custom retry prepares", async () => {
+it("retains the submitted account while a dispatched custom disconnect settles", async () => {
 	vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
 	const f = await fixture(false), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	const ws = await f.connect(), before = new Set((await readUsageLedgerRows()).map(row => row.id));
-	const journal = f.manager.isAccountJournalEligible.bind(f.manager);
-	let recovery = false;
-	vi.spyOn(f.manager, "isAccountJournalEligible").mockImplementation(async (...args) => {
-		if (recovery) {entered.resolve(); await release.promise;}
-		return journal(...args);
-	});
 	const restriction = f.manager.withCurrentAccountCredential.bind(f.manager);
-	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {const result = await restriction(...args); recovery = true; return result;});
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return restriction(...args);});
 	f.setReply(socket => {socket.close();});
 	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
 	await entered.promise;
@@ -982,7 +976,7 @@ it("retains the submitted account while an authorized custom retry prepares", as
 	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1);
 });
 
-it.each(["retry", "continuation", "stale"])("retains authorized open custom recovery and continuation controls (%s)", async mode => {
+it.each(["independent", "continuation", "stale"])("retains submitted custom accounting and independent continuation controls (%s)", async mode => {
 	vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
 	const f = await fixture(false), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
@@ -1004,12 +998,20 @@ it.each(["retry", "continuation", "stale"])("retains authorized open custom reco
 	}
 	release.resolve();
 	const result = await pending;
-	expect(result.type).toBe(mode === "retry" ? "response.completed" : "error");
+	expect(result.type).toBe("error");
+	if (mode === "independent") expect(result.error.code).toBe("upstream_websocket_closed");
 	if (mode === "continuation") expect(result.error.code).toBe("previous_response_not_found");
 	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
 	const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
-	expect(row).toMatchObject({outcome: mode === "retry" ? "success" : "failure", account: {index: 0}});
-	expect(f.creates).toHaveLength(mode === "stale" ? 1 : 2);
+	expect(row).toMatchObject({outcome: "failure", account: {index: 0}});
+	expect(f.creates).toHaveLength(mode === "continuation" ? 2 : 1);
+	if (mode === "independent") {
+		const later = await turn(ws);
+		expect(later.type).toBe("response.completed");
+		await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+		expect(f.creates).toHaveLength(2);
+		expect((await readUsageLedgerRows()).filter(row => !before.has(row.id)).map(record => record.outcome)).toEqual(["failure", "success"]);
+	}
 });
 
 it.each(["header", "near", "event"].flatMap(boundary => ["journal", "persist"].flatMap(failure => [false, true].map(native => ({boundary, failure, native})))))

@@ -234,17 +234,17 @@ export async function writeJsonStoreFileAtomicWithRetry(
 ): Promise<void> {
 	const tempPath = tempPathFor(filePath);
 	await fs.mkdir(dirname(filePath), { recursive: true });
-	const handle = await fs.open(tempPath, "w", options?.mode);
-	try {
-		await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
-		if (options?.fsync) {
-			await handle.sync();
-		}
-	} finally {
-		await handle.close();
-	}
 	let renamed = false;
 	try {
+		const handle = await fs.open(tempPath, "w", options?.mode);
+		try {
+			await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
+			if (options?.fsync) await handle.sync();
+		} catch (error) {
+			await handle.close().catch(() => undefined);
+			throw error;
+		}
+		await handle.close();
 		if (options && "expectedMtimeMs" in options) {
 			await assertJsonStoreFileMtimeUnchanged(
 				filePath,
