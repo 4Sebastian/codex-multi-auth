@@ -398,10 +398,10 @@ export class PreemptiveQuotaScheduler {
 			return { defer: false, waitMs: 0 };
 		}
 
-		let snapshot = this.snapshots.get(key);
-		const current = baseline === undefined ? snapshot : baseline;
-		const state = current ? this.receipts.get(current) : undefined;
-		if (owner !== undefined && state?.owner === owner && state.epoch === (snapshot ? this.receipts.get(snapshot)?.epoch : undefined)) {
+		const shared = this.snapshots.get(key);
+		let snapshot = baseline === undefined ? shared : baseline;
+		const state = snapshot ? this.receipts.get(snapshot) : undefined;
+		if (owner !== undefined && state?.owner === owner && state.epoch === (shared ? this.receipts.get(shared)?.epoch : undefined)) {
 			const primary = state.primary?.failed, secondary = state.secondary?.failed;
 			if (primary || secondary) snapshot = mergeQuotaObservations({
 				status: primary?.status ?? secondary?.status ?? 200,

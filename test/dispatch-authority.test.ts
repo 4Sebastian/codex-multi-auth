@@ -87,12 +87,13 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		await new Promise<void>(done => wss.close(() => done()));
 		await new Promise<void>(done => upstream.close(() => done()));
 	});
-	const fetched: string[] = [], discoveries: string[] = [];
+	const fetched: string[] = [], discoveries: string[] = [], httpWorkspaces: string[] = [];
 	let quotaFailure = false;
 	let postResponse: (() => Promise<Response>) | undefined;
 	const fetchImpl: typeof fetch = async (_url, init) => {
 		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});}
 		fetched.push(new Headers(init.headers).get("authorization") ?? "");
+		httpWorkspaces.push(new Headers(init.headers).get("chatgpt-account-id") ?? "");
 		if (postResponse) return postResponse();
 		if (quotaFailure) return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}});
 		return new Response('data: {"type":"response.completed","response":{"id":"http-result","status":"completed","output":[]}}\n\n', {headers: {"content-type": "text/event-stream"}});
@@ -106,7 +107,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		return ws;
 	};
 	const post = (model = "shared", sessionKey?: string) => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: [], ...(sessionKey ? {prompt_cache_key: sessionKey} : {})})});
-	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
+	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, httpWorkspaces, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
 }
 it.each(["disable", "delete", "remove", "corrupt", "reset"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
 	const f = await fixture(false), ws = await f.connect();
@@ -482,7 +483,12 @@ it.each(["http-server", "http-network", "http-stream", "http-quota", "custom-ser
 	const account = (await loadAccounts())?.accounts[0];
 	const expected = quota ? undefined : server ? "server-error" : "network-error";
 	if (recovery === "same") {
-		if (quota) expect(Object.values(account?.rateLimitResetTimes ?? {}).some(at => at > Date.now())).toBe(true);
+		if (quota && native) {
+			const denied = await f.post(); await denied.text();
+			expect(denied.status).toBe(503);
+			expect(f.httpWorkspaces).toEqual(["W1", "W2"]);
+			expect(account?.rateLimitResetTimes ?? {}).toEqual({});
+		} else if (quota) expect(Object.values(account?.rateLimitResetTimes ?? {}).some(at => at > Date.now())).toBe(true);
 		else expect(account?.cooldownReason).toBe(expected);
 	} else {
 		expect(account).toMatchObject({accessToken: "B", refreshToken: "refresh-B"});
@@ -509,6 +515,10 @@ function turn(ws: WebSocket, extra: Record<string, unknown> = {}) {
 
 it.each(["quota", "scheduler", "circuit", "revoked", "journal", "reset"])("rechecks native %s authority after a delayed real handshake", async mutation => {
 	const f = await fixture(true, true);
+	if (mutation === "quota") {
+		f.manager.disableWorkspace(f.manager.getAccountByIndex(0)!, "W2");
+		await f.manager.saveToDisk();
+	}
 	const ws = await f.connect();
 	const result = turn(ws);
 	await f.entered.promise;
@@ -517,7 +527,7 @@ it.each(["quota", "scheduler", "circuit", "revoked", "journal", "reset"])("reche
 		f.rejectQuota();
 		const concurrent = await f.post(); await concurrent.text();
 		expect(concurrent.status).toBe(503);
-		expect(f.manager.getAccountRuntimeSkipReason(0, getModelFamily("shared"), "shared")).toBe("rate-limited");
+		expect(f.httpWorkspaces).toEqual(["W1"]);
 	}
 	if (mutation === "scheduler") vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral").mockReturnValue({defer: true, waitMs: 60000});
 	if (mutation === "circuit") for (let i = 0; i < 3; i++) f.manager.recordFailure(account, "codex", "shared");
@@ -875,6 +885,10 @@ it.each(["retry", "continuation", "stale"])("retains authorized open custom reco
 it.each(["header", "near", "event"].flatMap(boundary => ["journal", "persist"].flatMap(failure => [false, true].map(native => ({boundary, failure, native})))))
 ("consumes original quota response usage despite durability failure (%j)", async ({boundary, failure, native}) => {
 	const f = await fixture(native, false, undefined, false, 5);
+	if (native) {
+		f.manager.disableWorkspace(f.manager.getAccountByIndex(0)!, "W2");
+		await f.manager.saveToDisk();
+	}
 	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
 	const heals = vi.spyOn(f.manager, "recordSuccess"), contextUpdates = vi.spyOn(ContextBudgetGuard.prototype, "update");
 	let healsAtSend = 0, consumed = false, restrictions = 0;
@@ -1005,6 +1019,53 @@ it("consumes native gateway quota usage without ambiguous replay or health heali
 	expect(f.creates).toHaveLength(1);
 	expect(f.connections()).toBe(1);
 	expect(f.fetched).toHaveLength(0);
+});
+
+it.each(["primary", "secondary"].flatMap(window => ["http", "websocket"].map(transport => ({window, transport}))))
+("keeps native workspace exhaustion isolated from its healthy sibling (%j)", async ({window, transport}) => {
+	const f = await fixture(true), before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const quota = {type: "codex.rate_limits", rate_limits: {[window]: {used_percent: 100, reset_at: Math.floor(Date.now() / 1000) + 600}}};
+	let count = 0;
+	const completed = () => ({type: "response.completed", response: {id: `scope-${++count}`, status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	f.setReply(ws => {if (!count) ws.send(JSON.stringify(quota)); ws.send(JSON.stringify(completed()));});
+	f.setPostResponse(async () => new Response((!count ? `data: ${JSON.stringify(quota)}\n\n` : "") + `data: ${JSON.stringify(completed())}\n\n`, {headers: {"content-type": "text/event-stream"}}));
+	const ws = transport === "websocket" ? await f.connect() : undefined;
+	const dispatch = async () => {
+		if (ws) {
+			const result = new Promise<Record<string, unknown>>(resolve => {
+				const receive = (data: RawData) => {
+					const event = JSON.parse(String(data));
+					if (event.type === "response.completed" || event.type === "error") {ws.off("message", receive); resolve(event);}
+				};
+				ws.on("message", receive);
+			});
+			ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+			return result;
+		}
+		const response = await f.post(), body = await response.text();
+		return {type: response.ok && body.includes('"response.completed"') ? "response.completed" : "error"};
+	};
+	expect(await dispatch()).toMatchObject({type: "response.completed"});
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect(await dispatch()).toMatchObject({type: "response.completed"});
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	expect(ws ? f.creates.map(create => create.workspace) : f.httpWorkspaces).toEqual(["W1", "W2"]);
+	for (const row of (await readUsageLedgerRows()).filter(row => !before.has(row.id))) expect(row).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect((await loadAccounts())?.accounts[0]?.rateLimitResetTimes ?? {}).toEqual({});
+});
+
+it("tries the healthy native workspace after a workspace-local HTTP quota rejection", async () => {
+	const f = await fixture(true), before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	let count = 0;
+	f.setPostResponse(async () => ++count === 1 ? Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}}) : new Response('data: {"type":"response.completed","response":{"id":"healthy-sibling","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n', {headers: {"content-type": "text/event-stream"}}));
+	const response = await f.post(), body = await response.text();
+	expect(response.status, body).toBe(200);
+	expect(body).toContain('"response.completed"');
+	expect(f.httpWorkspaces).toEqual(["W1", "W2"]);
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	expect((await readUsageLedgerRows()).find(row => !before.has(row.id))).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	expect((await loadAccounts())?.accounts[0]?.rateLimitResetTimes ?? {}).toEqual({});
 });
 
 it("coalesces held quota observations while preserving original terminal accounting", async () => {

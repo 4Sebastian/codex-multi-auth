@@ -4177,9 +4177,12 @@ async function handleRequestInner(
 				context.family,
 				context.model,
 			);
+			const selectedScope = state.nativeOpenai ? workspaceCandidates.get(selected.index)?.[0] : undefined;
 			const preemptiveDeferral = state.preemptiveQuotaScheduler.getDeferral(
 				quotaScheduleKey,
 				state.now(),
+				selectedScope ? quotaReceiptOwner(selected, selectedScope.accountId) : undefined,
+				state.nativeOpenai ? (selectedScope ? quotaForScope(selected, selectedScope) : null) ?? null : undefined,
 			);
 			if (preemptiveDeferral.defer && preemptiveDeferral.waitMs > 0) {
 				accountSkipReasons.set(
@@ -4188,15 +4191,14 @@ async function handleRequestInner(
 				);
 				exhaustionReason = "rate-limit";
 				capabilityRejectionIsLatest = false;
-				accountManager.markRateLimitedWithReason(
-					selected,
-					preemptiveDeferral.waitMs,
-					context.family,
-					"quota",
-					context.model,
-				);
-				accountManager.recordRateLimit(selected, context.family, context.model);
-				accountManager.saveToDiskDebounced();
+				if (state.nativeOpenai && selectedScope) {
+					workspaceCandidates.get(selected.index)?.shift();
+					if (workspaceCandidates.get(selected.index)?.length) attemptedIndexes.delete(selected.index);
+				} else {
+					accountManager.markRateLimitedWithReason(selected, preemptiveDeferral.waitMs, context.family, "quota", context.model);
+					accountManager.recordRateLimit(selected, context.family, context.model);
+					accountManager.saveToDiskDebounced();
+				}
 				noteRotation();
 				continue;
 			}
@@ -4622,22 +4624,14 @@ async function handleRequestInner(
 					}
 					if (outcome === "retry") continue;
 				}
+				if (quotaScopeKey) await observeQuota({status: 429, updatedAt: state.now(), primary: {usedPercent: 100, resetAtMs: state.now() + retryAfterMs}, secondary: {}});
 				await applyDispatchRestriction(state, binding, () => {
-					state.preemptiveQuotaScheduler.markRateLimited(
-						quotaScheduleKey,
-						retryAfterMs,
-						state.now(),
-					);
-					// A 429 is the upstream quota signal for the attempted account, so
-					// keep the consumed runtime token drained.
+					// Preserve the consumed token; scoped native quota does not bench siblings.
 					accountManager.recordRateLimit(refreshed.account, context.family, context.model);
-					accountManager.markRateLimitedWithReason(
-						refreshed.account,
-						retryAfterMs,
-						context.family,
-						"quota",
-						context.model,
-					);
+					if (!quotaScopeKey || !refreshed.account.workspaces?.length) {
+						state.preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, retryAfterMs, state.now());
+						accountManager.markRateLimitedWithReason(refreshed.account, retryAfterMs, context.family, "quota", context.model);
+					}
 				});
 				exhaustionReason = "rate-limit";
 				capabilityRejectionIsLatest = false;
@@ -4905,13 +4899,15 @@ async function handleRequestInner(
 			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
 				quotaScheduleKey,
 				state.now(),
+				quotaReceiptOwner(refreshed.account, binding.accountId),
+				state.nativeOpenai ? currentQuotaScope() ?? null : undefined,
 			);
 			const nearExhaustionWaitMs = quotaDeferral.defer
 				? quotaDeferral.waitMs
 				: 0;
 			if (!restrictionFailure && nearExhaustionWaitMs > 0) {
 				await applyDispatchRestriction(state, binding, () => {
-					accountManager.markRateLimitedWithReason(
+					if (!quotaScopeKey) accountManager.markRateLimitedWithReason(
 						refreshed.account,
 						nearExhaustionWaitMs,
 						context.family,

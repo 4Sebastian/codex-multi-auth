@@ -508,6 +508,20 @@ it("keeps failed exhaustion credential-scoped until a valid replacement settles"
 	expect(scheduler.getDeferral("other:model", now, "A").defer).toBe(true);
 });
 
+it.each(["primary", "secondary"] as const)("evaluates each workspace's %s baseline and failed receipts independently", window => {
+	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
+	const a = {status: 200, updatedAt: now, primary: {}, secondary: {}};
+	const b = {status: 200, updatedAt: now, primary: {}, secondary: {}};
+	const failure = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {}, secondary: {}, [window]: {usedPercent: 100, resetAtMs: now + 60000}}, "A", a);
+	scheduler.settleReceipt("account:model", failure, false, a);
+	const healthy = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 0}, secondary: {usedPercent: 0}}, "B", b);
+	const committedB = scheduler.observeReceipt("account:model", healthy, b)!;
+	scheduler.settleReceipt("account:model", healthy, true, committedB);
+	expect(scheduler.getDeferral("account:model", now, "A", a).defer).toBe(true);
+	expect(scheduler.getDeferral("account:model", now, "B", committedB).defer).toBe(false);
+	expect(scheduler.getDeferral("account:model", now, "unknown", null).defer).toBe(false);
+});
+
 it("does not attribute retired receipts or failures to a recovered owner", () => {
 	const scheduler = new PreemptiveQuotaScheduler(), now = 1000000;
 	const a = scheduler.receive("account:model", {status: 200, updatedAt: now, primary: {usedPercent: 100}, secondary: {}}, "A");
