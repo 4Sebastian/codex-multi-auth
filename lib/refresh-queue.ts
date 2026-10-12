@@ -14,6 +14,8 @@ import type { TokenResult } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
+import { assertPendingAuthRefreshCapacity } from "./storage/pending-auth.js";
+import { getStoragePath } from "./storage.js";
 
 const log = createLogger("refresh-queue");
 
@@ -118,7 +120,7 @@ export class RefreshQueue {
    * @param refreshToken - The refresh token to use
    * @returns Token result (success with new tokens, or failure)
    */
-  async refresh(refreshToken: string): Promise<TokenResult> {
+  async refresh(refreshToken: string, storagePath = getStoragePath()): Promise<TokenResult> {
     this.cleanup();
 
     // Check for existing in-flight refresh (direct match)
@@ -183,7 +185,7 @@ export class RefreshQueue {
           return supersedingPromise;
         }
         markStage("refresh");
-        return this.executeRefreshWithRotationTracking(refreshToken);
+        return this.executeRefreshWithRotationTracking(refreshToken, storagePath);
       }
       if (lease.role === "follower" && lease.result) {
         log.info("Using refresh result from cross-process lease", {
@@ -198,7 +200,7 @@ export class RefreshQueue {
           return supersedingPromise;
         }
         markStage("refresh");
-        const result = await this.executeRefreshWithRotationTracking(refreshToken);
+        const result = await this.executeRefreshWithRotationTracking(refreshToken, storagePath);
         try {
           await lease.release(result);
         } catch (error) {
@@ -255,8 +257,8 @@ export class RefreshQueue {
     }
   }
 
-  private async executeRefreshWithRotationTracking(refreshToken: string): Promise<TokenResult> {
-    const result = await this.executeRefresh(refreshToken);
+  private async executeRefreshWithRotationTracking(refreshToken: string, storagePath: string): Promise<TokenResult> {
+    const result = await this.executeRefresh(refreshToken, storagePath);
     
     if (result.type === "success" && result.refresh !== refreshToken) {
       this.tokenRotationMap.set(refreshToken, result.refresh);
@@ -272,7 +274,7 @@ export class RefreshQueue {
   /**
    * Execute the actual refresh and log results.
    */
-  private async executeRefresh(refreshToken: string): Promise<TokenResult> {
+  private async executeRefresh(refreshToken: string, storagePath: string): Promise<TokenResult> {
     const startTime = Date.now();
     log.info("Starting token refresh", { tokenSuffix: tokenFingerprint(refreshToken) });
     const timeoutMs = Math.max(1_000, this.maxEntryAgeMs);
@@ -280,6 +282,8 @@ export class RefreshQueue {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
     try {
+      const capacity = assertPendingAuthRefreshCapacity(storagePath, refreshToken);
+      if (capacity) await capacity;
       const timeoutErrorMessage = `Refresh timeout after ${timeoutMs}ms`;
       const timeoutPromise = new Promise<TokenResult>((_resolve, reject) => {
         timeoutId = setTimeout(() => {
@@ -449,6 +453,6 @@ export function resetRefreshQueue(): void {
  * @param refreshToken - The refresh token to use
  * @returns Token result
  */
-export async function queuedRefresh(refreshToken: string): Promise<TokenResult> {
-  return getRefreshQueue().refresh(refreshToken);
+export async function queuedRefresh(refreshToken: string, storagePath = getStoragePath()): Promise<TokenResult> {
+  return getRefreshQueue().refresh(refreshToken, storagePath);
 }

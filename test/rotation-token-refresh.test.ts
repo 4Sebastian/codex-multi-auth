@@ -142,7 +142,7 @@ describe("ensureFreshAccessToken", () => {
 
 		const result = await ensureFreshAccessToken(refreshParams(accountManager));
 
-		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1");
+		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1", accountManager.resolveSelectionStoragePath());
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.accessToken).toBe("access-new");

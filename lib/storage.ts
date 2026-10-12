@@ -1,5 +1,5 @@
 import { existsSync, promises as fs, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { ACCOUNT_LIMITS } from "./constants.js";
 import { parseIntegerEnv } from "./env-parsing.js";
 import { StorageError } from "./errors.js";
@@ -37,15 +37,13 @@ import {
 	type RestoreAssessment,
 	buildMetadataSection,
 } from "./storage/backup-metadata.js";
-import { isCacheLikeBackupArtifactName } from "./storage/cache-artifacts.js";
+import { collectRestorableCredentials, getAccountsBackupRecoveryCandidatesWithDiscovery } from "./storage/recovery-credentials.js";
 import {
 	ACCOUNTS_BACKUP_SUFFIX,
-	ACCOUNTS_WAL_SUFFIX,
 	getAccountsBackupPath,
 	getAccountsBackupRecoveryCandidates,
 	getAccountsWalPath,
 	getIntentionalResetMarkerPath,
-	RESET_MARKER_SUFFIX,
 } from "./storage/backup-paths.js";
 import { restoreAccountsFromBackupPath } from "./storage/backup-restore.js";
 import { looksLikeSyntheticFixtureStorage } from "./storage/fixture-guards.js";
@@ -149,7 +147,7 @@ import {
 } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
 import { mergeAccountSnapshot } from "./storage/snapshot-merge.js";
-import { applyPendingAuth, capturePendingAuth, clearPendingAuth, getPendingAuthPath, PendingAuthObservationError, prunePendingAuth, recordPendingAuth, type PendingAuthRecoveryCredential } from "./storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, clearPendingAuth, PendingAuthObservationError, prunePendingAuth, recordPendingAuth } from "./storage/pending-auth.js";
 export { recordPendingAuth };
 const loadedAccountSnapshots = new WeakMap<AccountStorageV3, AccountStorageV3>();
 
@@ -303,49 +301,6 @@ export function setStorageBackupEnabled(enabled: boolean): void {
 	storageBackupEnabled = enabled;
 }
 
-async function getAccountsBackupRecoveryCandidatesWithDiscovery(
-	path: string,
-): Promise<string[]> {
-	const knownCandidates = getAccountsBackupRecoveryCandidates(
-		path,
-		ACCOUNTS_BACKUP_HISTORY_DEPTH,
-	);
-	const discoveredCandidates = new Set<string>();
-	const candidatePrefix = `${basename(path)}.`;
-	const knownCandidateSet = new Set(knownCandidates);
-	const directoryPath = dirname(path);
-
-	try {
-		const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-		for (const entry of entries) {
-			if (!entry.isFile()) continue;
-			if (!entry.name.startsWith(candidatePrefix)) continue;
-			if (isCacheLikeBackupArtifactName(entry.name)) continue;
-			if (entry.name.endsWith(RESET_MARKER_SUFFIX)) continue;
-			if (entry.name.endsWith(".tmp")) continue;
-			if (entry.name.includes(".rotate.")) continue;
-			if (entry.name.endsWith(ACCOUNTS_WAL_SUFFIX)) continue;
-			const candidatePath = join(directoryPath, entry.name);
-			if (candidatePath === getPendingAuthPath(path)) continue;
-			if (knownCandidateSet.has(candidatePath)) continue;
-			discoveredCandidates.add(candidatePath);
-		}
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "ENOENT") {
-			log.warn("Failed to discover account backup candidates", {
-				path,
-				error: String(error),
-			});
-		}
-	}
-
-	const discoveredOrdered = Array.from(discoveredCandidates).sort((a, b) =>
-		a.localeCompare(b, undefined, { sensitivity: "base" }),
-	);
-	return [...knownCandidates, ...discoveredOrdered];
-}
-
 async function copyFileWithRetry(
 	sourcePath: string,
 	destinationPath: string,
@@ -495,62 +450,6 @@ async function readOnDiskCredentialSignature(
 		// Missing or unparsable primary: fall through to the null sentinel.
 	}
 	return null;
-}
-
-/**
- * Refresh tokens still present in a recovery source: rotating and discovered
- * `.bak*` snapshots plus any WAL journal payload. Pending rotated credentials
- * whose spent token a restore could still resurface must survive pruning, so
- * recovering a throttle-stale backup self-heals to the newest credential via
- * `applyPendingAuth` instead of reviving a token that was spent upstream.
- */
-async function collectRestorableCredentials(path: string): Promise<PendingAuthRecoveryCredential[]> {
-	const tokens: PendingAuthRecoveryCredential[] = [];
-	const collectContent = (raw: string): void => {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(raw);
-		} catch {
-			throw new Error("Unparseable account recovery source");
-		}
-		if (!isRecord(parsed) || !Array.isArray(parsed.accounts)) throw new Error("Invalid account recovery source");
-		for (const account of parsed.accounts) {
-			if (
-				isRecord(account) &&
-				typeof account.refreshToken === "string" &&
-				account.refreshToken.length > 0
-			) {
-				tokens.push({
-					refreshToken: account.refreshToken,
-					accessToken: typeof account.accessToken === "string" ? account.accessToken : undefined,
-					expiresAt: typeof account.expiresAt === "number" ? account.expiresAt : undefined,
-					authInvalidatedAt: typeof account.authInvalidatedAt === "number" ? account.authInvalidatedAt : undefined,
-					authInvalidationErrorCode: typeof account.authInvalidationErrorCode === "string" ? account.authInvalidationErrorCode : undefined,
-					enabled: account.enabled === false ? false : undefined,
-					cooldownReason: account.cooldownReason === "auth-failure" ? "auth-failure" : undefined,
-				});
-			}
-		}
-	};
-	for (const candidate of await getAccountsBackupRecoveryCandidatesWithDiscovery(
-		path,
-	)) {
-		try {
-			collectContent(await fs.readFile(candidate, "utf-8"));
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-	}
-	try {
-		const walEntry: unknown = JSON.parse(
-			await fs.readFile(getAccountsWalPath(path), "utf-8"),
-		);
-		if (!isRecord(walEntry) || typeof walEntry.content !== "string") throw new Error("Invalid account recovery journal");
-		collectContent(walEntry.content);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-	return tokens;
 }
 
 /**
@@ -2977,13 +2876,14 @@ export async function clearAccounts(): Promise<void> {
 		walPath: getAccountsWalPath(path),
 		getBackupPaths: () =>
 			getAccountsBackupRecoveryCandidatesWithDiscovery(path),
-		clearAccountStorageArtifacts,
+		clearAccountStorageArtifacts: async (args) => {
+			await clearAccountStorageArtifacts(args);
+			await clearPendingAuth(path);
+		},
 		logError: (message: string, details: Record<string, unknown>) => {
 			log.error(message, details);
 		},
 	});
-	// Pending rotated credentials belong to the cleared pool.
-	await clearPendingAuth(path);
 }
 
 export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {

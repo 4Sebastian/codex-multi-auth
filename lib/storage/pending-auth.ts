@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { decodeJWT } from "../auth/auth.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
 import { withRetry } from "../fs-retry.js";
@@ -9,6 +9,8 @@ import { tempPathFor } from "../temp-path.js";
 import { withFileTransactionLock } from "./file-lock.js";
 import { getIntentionalResetMarkerPath } from "./backup-paths.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
+import { collectRestorableCredentials, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
+export { getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 
 /**
  * Rotated OAuth credentials that could not be written to the account pool
@@ -36,14 +38,8 @@ const entrySchema = z.object({
 const MAX_ENTRIES = 1000;
 const fileSchema = z.object({ version: z.literal(1), entries: z.array(entrySchema) });
 type PendingAuth = z.infer<typeof entrySchema>;
-export type PendingAuthRecoveryCredential = Pick<AccountMetadataV3,
-	"refreshToken" | "accessToken" | "expiresAt" | "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled" | "cooldownReason">;
 const retry = { maxAttempts: 6, backoffMs: 25 };
 const log = createLogger("pending-auth");
-
-export function getPendingAuthPath(storagePath: string): string {
-	return `${storagePath}.pending-auth.json`;
-}
 
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
 
@@ -118,6 +114,45 @@ export async function capturePendingAuth(storagePath: string, accounts: readonly
 	return {entries, accounts: structuredClone(accounts ?? [])};
 }
 
+export class PendingAuthCapacityError extends Error {
+	readonly code = "EPENDINGAUTHCAPACITY";
+	constructor(options?: ErrorOptions) {
+		super("Cannot safely retain rotated credentials within the journal capacity", options);
+		this.name = "PendingAuthCapacityError";
+	}
+}
+
+async function trimToCapacity(storagePath: string, entries: PendingAuth[], protectedPrior: string, reserve = 0): Promise<PendingAuth[]> {
+	const excess = entries.length + reserve - MAX_ENTRIES;
+	if (excess <= 0) return entries;
+	let roots: PendingAuthRecoveryCredential[];
+	try {
+		roots = await collectRestorableCredentials(storagePath, true);
+	} catch (cause) {
+		throw new PendingAuthCapacityError({cause});
+	}
+	const required = new Set(roots.map(root => hash(root.refreshToken)));
+	required.add(protectedPrior);
+	const removable = entries.filter(entry => !required.has(entry.prior));
+	if (removable.length < excess) throw new PendingAuthCapacityError();
+	const dropped = new Set(removable.slice(0, excess));
+	return entries.filter(entry => !dropped.has(entry));
+}
+
+export function assertPendingAuthRefreshCapacity(storagePath: string, refreshToken: string): Promise<void> | undefined {
+	const path = getPendingAuthPath(storagePath);
+	try { statSync(path); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	return withFileTransactionLock(path, async () => {
+		const entries = await read(path);
+		const prior = hash(refreshToken);
+		await trimToCapacity(storagePath, entries, prior, entries.some(entry => entry.prior === prior) ? 0 : 1);
+	});
+}
+
 /** Record a rotated credential beside the account pool. */
 export async function recordPendingAuth(
 	storagePath: string,
@@ -175,15 +210,7 @@ export async function recordPendingAuth(
 		}
 		const current: PendingAuth = {prior, ...replacement};
 		entries.push(current);
-		const excess = entries.length - MAX_ENTRIES;
-		if (excess > 0) {
-			// Drop the oldest other entries, never the credential being recorded now.
-			const dropped = new Set(entries.filter((entry) => entry !== current).sort((a, b) => a.at - b.at).slice(0, excess));
-			log.warn("Pending rotated credentials exceeded the journal cap; dropped the oldest entries", { dropped: dropped.size });
-			await write(path, entries.filter((entry) => !dropped.has(entry)));
-			return replacement;
-		}
-		await write(path, entries);
+		await write(path, await trimToCapacity(storagePath, entries, prior));
 		return replacement;
 	});
 }

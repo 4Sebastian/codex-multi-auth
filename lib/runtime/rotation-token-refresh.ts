@@ -98,7 +98,7 @@ export async function ensureFreshAccessToken(params: {
 
 	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
 	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
-	const refreshResult = await queuedRefresh(submittedRefreshToken);
+	const refreshResult = await queuedRefresh(submittedRefreshToken, accountManager.resolveSelectionStoragePath());
 	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
 		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
 		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)

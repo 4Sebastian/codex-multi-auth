@@ -4,7 +4,7 @@ import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-
 export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
-import { applyPendingAuth, getPendingAuthPath } from "./storage/pending-auth.js";
+import { applyPendingAuth, getPendingAuthPath, PendingAuthCapacityError } from "./storage/pending-auth.js";
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
 import { createNativeAccountStorageReader, type NativeAccountSnapshot } from "./runtime/native-account-storage.js";
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
@@ -2072,6 +2072,10 @@ export class AccountManager {
 					});
 					}
 				} catch (journalError) {
+					if (journalError instanceof PendingAuthCapacityError) {
+						this.saveToDiskDebounced();
+						throw new CodexAuthError(journalError.message, {retryable: false, cause: error});
+					}
 					log.error("Account storage could not be read or written and the rotated credential could not be journaled; it is only in memory. Keep this process running until the accounts file is readable, or the account will need a re-login.", {
 						sourceIndex: source.index,
 						code: typeof (journalError as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((journalError as NodeJS.ErrnoException).code ?? "") ? (journalError as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
