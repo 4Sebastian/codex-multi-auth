@@ -8,7 +8,7 @@ import { buildSync } from "esbuild";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import { clearAccounts, loadAccounts, saveAccounts, setStoragePathDirect } from "../lib/storage.js";
-import { assertPendingAuthRefreshCapacity, getPendingAuthPath, recordPendingAuth } from "../lib/storage/pending-auth.js";
+import { applyPendingAuth, assertPendingAuthRefreshCapacity, capturePendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth } from "../lib/storage/pending-auth.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
 import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
 import { withRetry } from "../lib/fs-retry.js";
@@ -126,6 +126,69 @@ it("denies upstream refresh at required-root capacity and retains an already-spe
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
 	expect((await queuedRefresh("newest")).type).toBe("failed");
 	expect(upstream).not.toHaveBeenCalled();
+});
+
+it.each([1000, 1001])("bounds provenance-changing prune with a failed recovery scan (%s)", async count => {
+	const roots = Array.from({length: count}, (_, i) => `old-${i}`);
+	const original = pool(roots);
+	const entries = roots.map((token, i) => ({prior: sha(token), recordId: `record-${i}`, refreshToken: `new-${i}`, accessToken: `access-new-${i}`, expiresAt: 1, at: 1}));
+	const journalPath = getPendingAuthPath(path);
+	await fs.writeFile(path, JSON.stringify(original));
+	await fs.writeFile(journalPath, JSON.stringify({version: 1, entries}));
+	const observedPool = (await applyPendingAuth(path, structuredClone(original)))!;
+	const observed = await capturePendingAuth(path, observedPool.accounts);
+	const saved = structuredClone(observedPool);
+	Object.assign(saved.accounts[0]!, {accessToken: "renewed", expiresAt: 2});
+	const before = await fs.readFile(journalPath, "utf8");
+	const pruning = prunePendingAuth(path, saved, async () => {throw Error("fixture unreadable recovery");}, observed);
+	if (count > 1000) {
+		await expect(pruning).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+		expect(await fs.readFile(journalPath, "utf8")).toBe(before);
+		const fresh = (await applyPendingAuth(path, structuredClone(original)))!;
+		expect(fresh.accounts.map(row => row.refreshToken)).toEqual(entries.map(entry => entry.refreshToken));
+		expect(fresh.accounts[0]?.accessToken).toBe("access-new-0");
+		expect((await capturePendingAuth(path, [])).entries.some(entry => entry.committed)).toBe(false);
+	} else {
+		await pruning;
+		const persisted = (await capturePendingAuth(path, [])).entries;
+		expect(persisted).toHaveLength(1000);
+		expect(persisted[0]).toMatchObject({committed: true, accessToken: "renewed", expiresAt: 2});
+	}
+});
+
+it("strict recovery scanning can prune a legacy over-cap journal to proven required roots", async () => {
+	const {collectRestorableCredentials} = await import("../lib/storage/recovery-credentials.js");
+	await seedFull();
+	const journalPath = getPendingAuthPath(path);
+	const data = JSON.parse(await fs.readFile(journalPath, "utf8"));
+	data.entries.push({prior: sha("extra"), ...rotation("extra", "new-extra")});
+	await fs.writeFile(journalPath, JSON.stringify(data));
+	await fs.writeFile(`${path}.bak.2`, JSON.stringify(pool(["old-0"])));
+	const saved = (await applyPendingAuth(path, pool(["old-0"])))!;
+	const observed = await capturePendingAuth(path, saved.accounts);
+	await prunePendingAuth(path, saved, () => collectRestorableCredentials(path), observed);
+	const entries = (await capturePendingAuth(path, [])).entries;
+	expect(entries).toHaveLength(1);
+	expect(entries[0]).toMatchObject({prior: sha("old-0"), refreshToken: "new-0", committed: true});
+	expect((await applyPendingAuth(path, pool(["old-0"])))?.accounts[0]?.refreshToken).toBe("new-0");
+});
+
+it("propagates the first over-cap reconciliation failure after primary save without claiming journal proof", async () => {
+	await saveAccounts(pool(["old-0"]));
+	await seedFull();
+	const journalPath = getPendingAuthPath(path);
+	const data = JSON.parse(await fs.readFile(journalPath, "utf8"));
+	data.entries.push({prior: sha("extra"), ...rotation("extra", "new-extra")});
+	await fs.writeFile(journalPath, JSON.stringify(data));
+	await fs.writeFile(`${path}.snapshot-old`, "{");
+	const saved = (await loadAccounts())!;
+	Object.assign(saved.accounts[0]!, {accessToken: "renewed", expiresAt: 2});
+	const before = await fs.readFile(journalPath, "utf8");
+	await expect(saveAccounts(saved)).rejects.toMatchObject({message: "Failed to reconcile pending account recovery", cause: {code: "EPENDINGAUTHCAPACITY"}});
+	expect(JSON.parse(await fs.readFile(path, "utf8")).accounts[0].accessToken).toBe("renewed");
+	expect(await fs.readFile(journalPath, "utf8")).toBe(before);
+	expect((await capturePendingAuth(path, [])).entries.some(entry => entry.committed)).toBe(false);
+	expect((await applyPendingAuth(path, pool(["old-0"])))?.accounts[0]?.refreshToken).toBe("new-0");
 });
 
 it("holds the pool lock through contended journal reset before a new process saves and rotates", async () => {

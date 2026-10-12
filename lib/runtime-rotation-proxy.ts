@@ -3554,7 +3554,8 @@ async function handleRequestInner(
 					() => {scanner.result();return responseOutcome.finish();},
 				);
 				const clientDisconnected = res.destroyed && !res.writableEnded;
-				if (!forwarded && !clientDisconnected && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, responseOutcome.rejection);
+				const completion = responseOutcome.finish();
+				if (!forwarded && !clientDisconnected && completion.outcome !== "cancelled" && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, responseOutcome.rejection);
 				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
 				const usageTokens = scanner.result();
 				if (usageTokens && context.stableSessionKey && context.model) {
@@ -3565,9 +3566,9 @@ async function handleRequestInner(
 					});
 				}
 				await usageRecorder.record({
-					outcome: forwarded && upstream.ok ? "success" : clientDisconnected ? "cancelled" : "failure",
+					outcome: forwarded && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
 					statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
-					errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
+					errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
 					...(usageTokens ?? {}),
 				});
             } catch (error) {
@@ -5043,6 +5044,7 @@ async function handleRequestInner(
 			// The client went away mid-stream: no upstream error, and the response was
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
+			const completion = responseOutcome.finish();
 			if (forwarded && upstream.ok && !restrictionFailure) {
 				if (isDispatchBindingCurrent(state, binding)) accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
 				recordRuntimeAccountRecovery(refreshed.account.index);
@@ -5079,9 +5081,9 @@ async function handleRequestInner(
 				});
 			}
 			await usageRecorder.record({
-				outcome: forwarded && upstream.ok ? "success" : clientDisconnected ? "cancelled" : "failure",
+				outcome: forwarded && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
 				statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
-				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? responseOutcome.finish().errorCode ?? (forwarded ? null : "stream_forward_failed"),
+				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
 				account: refreshed.account,
 				...(usageTokens ?? {}),
 			});

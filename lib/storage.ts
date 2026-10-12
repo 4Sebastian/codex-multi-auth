@@ -2499,7 +2499,7 @@ async function saveAccountsUnlocked(
 		collectRestorableCredentials(path), observed,
 	).catch((error) => {
 		log.warn("Failed to prune pending rotated credentials", { code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH" });
-		throw new Error("Failed to reconcile pending account recovery");
+		throw new Error("Failed to reconcile pending account recovery", {cause: error});
 	});
 }
 

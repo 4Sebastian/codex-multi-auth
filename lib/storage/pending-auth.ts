@@ -82,6 +82,7 @@ async function read(path: string): Promise<PendingAuth[]> {
 }
 
 async function write(path: string, entries: PendingAuth[]): Promise<void> {
+	if (entries.length > MAX_ENTRIES) throw new PendingAuthCapacityError();
 	if (!entries.length) {
 		await withRetry(() => fs.rm(path, { force: true }), retry);
 		return;

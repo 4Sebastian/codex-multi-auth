@@ -13,10 +13,11 @@ it("accepts a completed empty prewarm and cannot turn a failed event into succes
 it.each([true,false])("treats an incomplete response as delivered and keeps its terminal type as an annotation (stream=%s)",stream=>{
  const outcome=new ResponseOutcome(stream);
  outcome.observe(stream?{type:"response.incomplete",response:{incomplete_details:{reason:"max_output_tokens"}}}:{object:"response",status:"incomplete"});
- expect(outcome.finish()).toEqual({success:true,missingTerminal:false,errorCode:"upstream_response_incomplete"});
+ expect(outcome.finish()).toEqual({outcome:"success",success:true,missingTerminal:false,errorCode:"upstream_response_incomplete"});
 });
 it.each([["completed",true],["incomplete",true],["failed",false],["cancelled",false]] as const)("reads the nested status of response.done (%s)",(status,success)=>{
  const outcome=new ResponseOutcome(true);outcome.observe({type:"response.done",response:{status}});
  const result=outcome.finish();
  expect(result.success).toBe(success);expect(result.missingTerminal).toBe(false);
+ expect(result.outcome).toBe(status === "cancelled" ? "cancelled" : success ? "success" : "failure");
 });

@@ -1,6 +1,7 @@
 import { isRecord } from "../utils.js";
 
 export interface StreamCompletion {
+	outcome: "success" | "failure" | "cancelled";
 	success: boolean;
 	errorCode: string | null;
 	missingTerminal: boolean;
@@ -45,6 +46,7 @@ export class ResponseOutcome {
 		const missingTerminal = this.requireTerminal && !this.terminal;
 		const success = !missingTerminal && (!this.terminal || this.terminal === "completed" || this.terminal === "incomplete");
 		return {
+			outcome: success ? "success" : this.terminal === "cancelled" ? "cancelled" : "failure",
 			success,
 			missingTerminal,
 			errorCode: missingTerminal ? "upstream_missing_terminal" : this.terminal && this.terminal !== "completed" ? `upstream_response_${this.terminal}` : null,

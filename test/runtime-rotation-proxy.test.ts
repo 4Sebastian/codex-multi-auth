@@ -6814,7 +6814,7 @@ describe("committed authorization and receive-order regressions", () => {
 				client.send(JSON.stringify({type: "response.create", ...body})); await first;
 			} else {const response = await postResponses(proxy, body); expect(response.status).toBe(200); await response.text();}
 			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
-			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: status === "completed" ? "success" : "failure", inputTokens: 110, outputTokens: 2, reasoningTokens: 10, cachedInputTokens: 20, serviceTier: "priority"});
+			expect(append.mock.calls[0]?.[0]).toMatchObject({outcome: status === "completed" ? "success" : status === "cancelled" ? "cancelled" : "failure", inputTokens: 110, outputTokens: 2, reasoningTokens: 10, cachedInputTokens: 20, serviceTier: "priority"});
 			if (client) {const pause = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", ...body})); expect(JSON.parse(await pause).type).toBe("response.created");}
 			else {const response = await postResponses(proxy, body); expect(response.headers.get("x-codex-plugin-error-type")).toBe("context_budget_pause"); await response.text();}
 			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
@@ -7230,6 +7230,81 @@ describe("review transport boundary regressions", () => {
 			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeDefined();
 			expect(creates).toBe(1);
 		} finally {client.terminate(); await upstream.close(); append.mockRestore();}
+	});
+
+	it.each(["oauth", "api", "zdr"].flatMap(kind => (kind === "oauth" ? ["http", "native", "custom", "legacy-http"] : ["http", "native"]).flatMap(mode => ["response.cancelled", "response.done"].map(type => ({kind, mode, type})))))("preserves one delivered cancellation ledger without healing or replay %j", async ({kind, mode, type}) => {
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const success = vi.spyOn(manager, "recordSuccess");
+		const failure = vi.spyOn(manager, "recordFailure");
+		let creates = 0, httpResponses = 0, successesAtSend = 0;
+		const terminal = () => ({type: creates === 1 ? type : "response.completed", response: {id: creates === 1 ? "cancel-A" : "later-D", status: creates === 1 ? "cancelled" : "completed", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", () => {
+			creates++;
+			successesAtSend = success.mock.calls.length;
+			ws.send(JSON.stringify(terminal()));
+		})});
+		const {fetchImpl} = createRecordingFetch(call => {
+			if (call.url.endsWith("/models")) return Response.json({data: [{id: "shared"}], models: [{slug: "shared"}]});
+			httpResponses++;
+			creates++;
+			successesAtSend = success.mock.calls.length;
+			return new Response(`data: ${JSON.stringify(terminal())}\n\n`, {headers: {"content-type": "text/event-stream"}});
+		});
+		const NativeGateway = websocketTransport.ResponsesWebSocketGateway;
+		const transport = vi.spyOn(websocketTransport, "ResponsesWebSocketGateway").mockImplementation(function(...args) {
+			const gateway = new NativeGateway(...args);
+			const original = gateway.fetch;
+			const fixtureFetch: typeof fetch = (input, init) => original(String(input) === "https://api.openai.com/v1/responses" ? `${upstream.baseUrl}/responses` : input, init);
+			Object.defineProperty(gateway, "fetch", {value: fixtureFetch});
+			return gateway;
+		});
+		const model = kind === "oauth" ? "shared" : `${kind}/shared`;
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+			nativeOpenai: mode !== "custom" && mode !== "legacy-http",
+			forcedAccountIndex: 0,
+			upstreamBaseUrl: upstream.baseUrl,
+			readApiRoutes: async () => [{id: "cancel-fixture", label: "Fixture", kind: kind === "zdr" ? "zdr" : "api", apiKey: "fixture-api-key", enabled: true, priority: 0, visibleModels: ["shared"]}],
+		}});
+		let client: WebSocket | undefined;
+		const body = {model, input: [], stream: true};
+		const send = async () => {
+			if (client) {
+				const received = new Promise<string>(resolve => {
+					const listener = (raw: WebSocket.RawData) => {
+						const event = JSON.parse(raw.toString());
+						if (event.response?.id === "cancel-A" || event.response?.id === "later-D") {
+							client!.off("message", listener);
+							resolve(raw.toString());
+						}
+					};
+					client!.on("message", listener);
+				});
+				client.send(JSON.stringify({type: "response.create", ...body}));
+				return received;
+			}
+			const response = await postResponses(proxy, body);
+			expect(response.status).toBe(200);
+			return response.text();
+		};
+		try {
+			if (mode === "native" || mode === "custom") client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+			const first = await send();
+			expect(first).toContain('"id":"cancel-A"');
+			expect(first).toContain('"status":"cancelled"');
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+			expect(append.mock.calls[0]?.[0]).toMatchObject({model, outcome: "cancelled", inputTokens: 17, outputTokens: 4, totalTokens: 21, statusCode: mode === "custom" ? null : 200});
+			expect(append.mock.calls[0]?.[0].accountIndex).toBe(kind === "oauth" ? 0 : undefined);
+			expect(creates).toBe(1);
+			expect(success).toHaveBeenCalledTimes(successesAtSend);
+			expect(failure).not.toHaveBeenCalled();
+			const later = await send();
+			expect(later).toContain('"id":"later-D"');
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			expect(append.mock.calls.map(([row]) => row.outcome)).toEqual(["cancelled", "success"]);
+			expect(creates).toBe(2);
+			expect(httpResponses).toBe(mode === "native" || mode === "custom" ? 0 : 2);
+		} finally {client?.terminate(); await upstream.close(); append.mockRestore(); success.mockRestore(); failure.mockRestore(); transport.mockRestore();}
 	});
 
 	it.each(["failed", "cancelled", "completed", "incomplete"])("classifies custom response.done status=%s", async status => {

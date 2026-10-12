@@ -366,7 +366,7 @@ describe("forwardStreamingResponse", () => {
 			1_000,
 			() => { res.ended = true; },
 			undefined,
-			() => ({ success: false, missingTerminal: true, errorCode: "upstream_missing_terminal" }),
+			() => ({ outcome: "failure", success: false, missingTerminal: true, errorCode: "upstream_missing_terminal" }),
 		);
 		expect(result).toBe(false);
 		expect(Buffer.concat(res.chunks).toString("utf8")).not.toContain("upstream_missing_terminal");
