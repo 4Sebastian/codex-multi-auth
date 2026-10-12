@@ -3854,9 +3854,6 @@ function resolveRuntimeRotationProxyOriginalCodexHome(baseEnv) {
 	return override || resolveCodexHomeDir(baseEnv);
 }
 
-// Markerless dirs are pre-sweeper leftovers (or crashed-before-mark runs);
-// 24h is generous next to any real session so a live shadow is never reaped.
-const STALE_SHADOW_HOME_AGE_MS = 24 * 60 * 60 * 1000;
 // A recorded PID is an identity, not just a liveness token: the owning process
 // necessarily started before its marker was written, so a process now holding
 // the PID that started meaningfully later is a different process — the PID was
@@ -3872,7 +3869,7 @@ function writeShadowHomeOwnerMarker(shadowDir) {
 			{ mode: 0o600 },
 		);
 	} catch {
-		// Best-effort only; a missing marker just defers reaping to the age rule.
+		return;
 	}
 }
 
@@ -3885,7 +3882,7 @@ function recordShadowHomeChildPid(shadowDir, childPid) {
 	if (typeof shadowDir !== "string" || shadowDir.trim().length === 0) {
 		return;
 	}
-	if (typeof childPid !== "number" || !Number.isFinite(childPid)) {
+	if (!Number.isSafeInteger(childPid) || childPid <= 0) {
 		return;
 	}
 	try {
@@ -3907,60 +3904,33 @@ function recordShadowHomeChildPid(shadowDir, childPid) {
 			{ mode: 0o600 },
 		);
 	} catch {
-		// Best-effort only; a missing child record just shortens retention.
+		return;
 	}
 }
 
 function isShadowHomeStale(shadowDir, probeStartTime) {
-	const ownerPath = join(shadowDir, SHADOW_HOME_OWNER_FILE);
-	if (existsSync(ownerPath)) {
-		try {
-			const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
-			if (typeof owner?.pid === "number" && Number.isFinite(owner.pid)) {
-				const recordedProcessAlive = (pid, recordedAt) => {
-					if (typeof pid !== "number" || !Number.isFinite(pid)) {
-						return false;
-					}
-					if (!isProcessAlive(pid)) {
-						return false;
-					}
-					if (
-						typeof recordedAt !== "number" ||
-						!Number.isFinite(recordedAt)
-					) {
-						// No marker timestamp to check identity against — bare liveness.
-						return true;
-					}
-					const actualStartTimeMs = probeStartTime(pid);
-					if (actualStartTimeMs === null || actualStartTimeMs === undefined) {
-						// Identity unknowable (Windows, no ps, probe budget spent) —
-						// retaining a maybe-live home beats reaping a live one.
-						return true;
-					}
-					return actualStartTimeMs <= recordedAt + SHADOW_HOME_OWNER_SKEW_MS;
-				};
-				if (recordedProcessAlive(owner.pid, owner.createdAt)) {
-					return false;
-				}
-				// The wrapper that owned this home is gone, but a killed wrapper
-				// can leave its forwarded child running against the shadow home;
-				// the home is only orphaned once the child is gone too.
-				if (
-					recordedProcessAlive(
-						owner.childPid,
-						owner.childRecordedAt ?? owner.createdAt,
-					)
-				) {
-					return false;
-				}
-				return true;
-			}
-		} catch {
-			// Corrupt marker — fall through to the age rule.
-		}
-	}
 	try {
-		return Date.now() - statSync(shadowDir).mtimeMs > STALE_SHADOW_HOME_AGE_MS;
+		const owner = JSON.parse(readFileSync(join(shadowDir, SHADOW_HOME_OWNER_FILE), "utf8"));
+		if (
+			!Number.isSafeInteger(owner?.pid) || owner.pid <= 0 ||
+			!Number.isFinite(owner.createdAt) || owner.createdAt <= 0 ||
+			(owner.childPid !== undefined && (!Number.isSafeInteger(owner.childPid) || owner.childPid <= 0)) ||
+			(owner.childRecordedAt !== undefined && (owner.childPid === undefined || !Number.isFinite(owner.childRecordedAt) || owner.childRecordedAt <= 0))
+		) {
+			return false;
+		}
+		const recordedProcessGone = (pid, recordedAt) => {
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				return error && typeof error === "object" && error.code === "ESRCH";
+			}
+			const actualStartTimeMs = probeStartTime(pid);
+			return typeof actualStartTimeMs === "number" && Number.isFinite(actualStartTimeMs) &&
+				actualStartTimeMs > recordedAt + SHADOW_HOME_OWNER_SKEW_MS;
+		};
+		return recordedProcessGone(owner.pid, owner.createdAt) &&
+			(owner.childPid === undefined || recordedProcessGone(owner.childPid, owner.childRecordedAt ?? owner.createdAt));
 	} catch {
 		return false;
 	}

@@ -1,4 +1,5 @@
 import { type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
 	chmodSync,
 	copyFileSync,
@@ -9548,29 +9549,60 @@ describe("forwarded signal relay", () => {
 });
 
 describe("stale shadow-home sweep", () => {
-	it("removes dead-owner and aged markerless shadow homes, keeps live ones", async () => {
+	it.each(["runtime", "compatibility"].flatMap(root => ["missing", "corrupt", "unreadable"].map(marker => ({root, marker}))))(
+		"retains aged live legacy state (%j)",
+		async ({root, marker}) => {
+			const fixtureRoot = createWrapperFixture();
+			const codexHome = join(fixtureRoot, "codexhome");
+			const isolatedTmp = join(fixtureRoot, "tmp");
+			const shadowRoot = root === "runtime" ? join(codexHome, "multi-auth", "runtime-shadow-homes") : isolatedTmp;
+			mkdirSync(shadowRoot, {recursive: true});
+			mkdirSync(isolatedTmp, {recursive: true});
+			const shadow = mkdtempSync(join(shadowRoot, root === "runtime" ? "codex-multi-auth-runtime-home-" : "codex-multi-auth-home-"));
+			const state = join(shadow, "session-state.json");
+			writeFileSync(state, "before update");
+			if (marker === "corrupt") writeFileSync(join(shadow, ".codex-multi-auth-owner.json"), "{");
+			if (marker === "unreadable") mkdirSync(join(shadow, ".codex-multi-auth-owner.json"));
+			const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+			utimesSync(shadow, old, old);
+			const oldMtime = statSync(shadow).mtimeMs;
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			let childReady: Promise<unknown> = Promise.resolve();
+			await withLivePid(async pid => {
+				await childReady;
+				expect(isProcessAlive(pid)).toBe(true);
+				expect(readFileSync(state, "utf8")).toBe("unsynced legacy state");
+				expect(statSync(shadow).mtimeMs).toBe(oldMtime);
+				const result = runWrapper(fixtureRoot, ["exec", "do"], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin, CODEX_HOME: codexHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0", TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp,
+				});
+				expect(result.status).toBe(0);
+				expect(isProcessAlive(pid)).toBe(true);
+				expect(readFileSync(state, "utf8")).toBe("unsynced legacy state");
+				expect(statSync(shadow).mtimeMs).toBe(oldMtime);
+			}, {spawnChild: () => {
+				const child = spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1], 'unsynced legacy state'); process.stdout.write('ready'); process.stdin.resume();", state], {stdio: ["pipe", "pipe", "pipe"]});
+				if (!child.stdout) throw Error("Missing fixture output");
+				childReady = once(child.stdout, "data");
+				return child;
+			}});
+		}, SHUTDOWN_TEST_TIMEOUT_MS,
+	);
+	it.each(["runtime", "compatibility"])("removes dead-owner %s shadow homes and retains unknown or live owners", async root => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codexhome");
-		const shadowRoot = join(
-			codexHome,
-			"multi-auth",
-			"runtime-shadow-homes",
-		);
+		const isolatedTmp = join(fixtureRoot, "tmp");
+		mkdirSync(isolatedTmp, {recursive: true});
+		const shadowRoot = root === "runtime" ? join(codexHome, "multi-auth", "runtime-shadow-homes") : isolatedTmp;
+		const prefix = root === "runtime" ? "codex-multi-auth-runtime-home-" : "codex-multi-auth-home-";
 		mkdirSync(shadowRoot, { recursive: true });
 		const OWNER_FILE = ".codex-multi-auth-owner.json";
 
-		const deadOwnerDir = mkdtempSync(
-			join(shadowRoot, "codex-multi-auth-runtime-home-"),
-		);
-		const liveOwnerDir = mkdtempSync(
-			join(shadowRoot, "codex-multi-auth-runtime-home-"),
-		);
-		const markerlessOldDir = mkdtempSync(
-			join(shadowRoot, "codex-multi-auth-runtime-home-"),
-		);
-		const markerlessFreshDir = mkdtempSync(
-			join(shadowRoot, "codex-multi-auth-runtime-home-"),
-		);
+		const deadOwnerDir = mkdtempSync(join(shadowRoot, prefix));
+		const liveOwnerDir = mkdtempSync(join(shadowRoot, prefix));
+		const markerlessOldDir = mkdtempSync(join(shadowRoot, prefix));
+		const markerlessFreshDir = mkdtempSync(join(shadowRoot, prefix));
 
 		writeFileSync(
 			join(liveOwnerDir, OWNER_FILE),
@@ -9590,15 +9622,78 @@ describe("stale shadow-home sweep", () => {
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: codexHome,
 				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp,
 			});
 			expect(result.status).toBe(0);
 
 			expect(existsSync(deadOwnerDir)).toBe(false);
-			expect(existsSync(markerlessOldDir)).toBe(false);
+			expect(existsSync(markerlessOldDir)).toBe(true);
 			expect(existsSync(liveOwnerDir)).toBe(true);
 			expect(existsSync(markerlessFreshDir)).toBe(true);
 		});
 	}, SHUTDOWN_TEST_TIMEOUT_MS);
+
+	it.each(["runtime", "compatibility"])("retains malformed %s ownership regardless of age", async root => {
+		const fixtureRoot = createWrapperFixture();
+		const codexHome = join(fixtureRoot, "codexhome"), isolatedTmp = join(fixtureRoot, "tmp");
+		mkdirSync(isolatedTmp, {recursive: true});
+		const shadowRoot = root === "runtime" ? join(codexHome, "multi-auth", "runtime-shadow-homes") : isolatedTmp;
+		mkdirSync(shadowRoot, {recursive: true});
+		const prefix = root === "runtime" ? "codex-multi-auth-runtime-home-" : "codex-multi-auth-home-";
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		await withDeadPid(async deadPid => {
+			const valid = {pid: deadPid, createdAt: Date.now() - 60_000};
+			const owners = [null, {}, {pid: deadPid}, ...[0, -1, 1.5, "123", Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1].map(pid => ({...valid, pid})),
+				...[null, 0, -1, "123"].map(createdAt => ({...valid, createdAt})),
+				...[null, 0, -1, 1.5, "123"].map(childPid => ({...valid, childPid})),
+				{...valid, childRecordedAt: Date.now()}, {...valid, childPid: deadPid, childRecordedAt: "invalid"}];
+			const homes = owners.map(owner => {
+				const home = mkdtempSync(join(shadowRoot, prefix));
+				writeFileSync(join(home, ".codex-multi-auth-owner.json"), JSON.stringify(owner));
+				writeFileSync(join(home, "unsynced.json"), "retained state");
+				const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+				utimesSync(home, old, old);
+				return home;
+			});
+			const result = runWrapper(fixtureRoot, ["exec", "do"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin, CODEX_HOME: codexHome, CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp,
+			});
+			expect(result.status).toBe(0);
+			for (const home of homes) expect(readFileSync(join(home, "unsynced.json"), "utf8")).toBe("retained state");
+		});
+	}, SHUTDOWN_TEST_TIMEOUT_MS);
+
+	it.each(["runtime", "compatibility"].flatMap(root => ["identity", "liveness"].map(probe => ({root, probe}))))(
+		"retains unknown process evidence (%j)", async ({root, probe}) => {
+			const fixtureRoot = createWrapperFixture();
+			const codexHome = join(fixtureRoot, "codexhome"), isolatedTmp = join(fixtureRoot, "tmp");
+			mkdirSync(isolatedTmp, {recursive: true});
+			const shadowRoot = root === "runtime" ? join(codexHome, "multi-auth", "runtime-shadow-homes") : isolatedTmp;
+			mkdirSync(shadowRoot, {recursive: true});
+			const prefix = root === "runtime" ? "codex-multi-auth-runtime-home-" : "codex-multi-auth-home-";
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			await withLivePid(async pid => {
+				const home = mkdtempSync(join(shadowRoot, prefix));
+				const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+				writeFileSync(join(home, ".codex-multi-auth-owner.json"), JSON.stringify({pid, createdAt: old.getTime()}));
+				writeFileSync(join(home, "unsynced.json"), "retained state");
+				utimesSync(home, old, old);
+				const preload = join(fixtureRoot, "unknown-probe.mjs");
+				writeFileSync(preload, `import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
+					const kill = process.kill.bind(process); process.kill = (pid, signal) => {if (pid === ${pid} && ${JSON.stringify(probe)} === 'liveness') throw Object.assign(Error('fixture probe failed'), {code: 'EINVAL'}); return kill(pid, signal);};
+					const exec = cp.execFileSync; cp.execFileSync = (file, args, ...rest) => {if (file === 'ps' && args?.includes('${pid}')) throw Error('fixture identity unavailable'); return exec(file, args, ...rest);}; syncBuiltinESMExports();`);
+				const result = runWrapper(fixtureRoot, ["exec", "do"], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin, CODEX_HOME: codexHome, CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+					TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp,
+					NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}`,
+				});
+				expect(result.status).toBe(0);
+				expect(isProcessAlive(pid)).toBe(true);
+				expect(readFileSync(join(home, "unsynced.json"), "utf8")).toBe("retained state");
+			});
+		}, SHUTDOWN_TEST_TIMEOUT_MS,
+	);
 
 	it("keeps a shadow home whose owner died while its forwarded child still runs", async () => {
 		const fixtureRoot = createWrapperFixture();
