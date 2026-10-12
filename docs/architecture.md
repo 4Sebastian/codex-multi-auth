@@ -87,7 +87,7 @@ HTTP and WebSocket requests retain their circuit admission receipt through compl
 
 Quota headers and stream events may supply primary, secondary and plan fields independently. Shared quota observations preserve the latest supplied field in receipt order, including equal-clock events and transactions that finish out of order. A response carries only unconsumed deltas, so unrelated partial updates cannot erase exhaustion or replay an older blocker. The credential-scoped worker consumes pending deltas even after an earlier write fails. Failed exhaustion remains scoped to the submitted credentials through its reset window; a settled newer healthy observation can replace it. Terminal accounting retains the original persistence error without losing the upstream outcome or billed usage.
 
-Terminal usage remains attributed to the submitted account even when its circuit receipt is no longer current. A failed terminal restriction write still records the original terminal usage before propagating the persistence error. The custom socket closes on that error rather than draining queued work, and subsequent admission continues to reject unreadable journal authority.
+Terminal usage remains attributed to the submitted account even when its circuit receipt is no longer current. After an upstream stream error, the forwarding boundary awaits the credential-scoped failure restriction before exposing the broken body to the client. Restriction-write failure still closes the body and records the original terminal usage before propagating the persistence error. The custom socket closes on that error rather than draining queued work, and subsequent admission continues to reject unreadable journal authority.
 
 ---
 

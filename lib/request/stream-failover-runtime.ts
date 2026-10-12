@@ -146,7 +146,7 @@ export async function forwardStreamingResponse(
 	upstream: Response,
 	res: ServerResponse,
 	status: RuntimeRotationProxyStatus,
-	onStreamError: () => void,
+	onStreamError: () => void | Promise<void>,
 	streamStallTimeoutMs: number,
 	/**
 	 * Observe each forwarded chunk. Used to recover the upstream `usage` totals
@@ -219,9 +219,12 @@ export async function forwardStreamingResponse(
             return false;
         }
 		status.lastError = error instanceof Error ? error.message : String(error);
-		onStreamError();
-		if (!res.destroyed) {
-			res.destroy(error instanceof Error ? error : undefined);
+		try {
+			await onStreamError();
+		} finally {
+			if (!res.destroyed) {
+				res.destroy(error instanceof Error ? error : undefined);
+			}
 		}
 		return false;
 	}

@@ -4985,7 +4985,7 @@ async function handleRequestInner(
 						accountManager.markAccountCoolingDown(refreshed.account, state.networkErrorCooldownMs, "network-error");
 						state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					}));
-					void responseRestriction.catch(captureRestrictionFailure);
+					return responseRestriction.then(() => undefined, captureRestrictionFailure);
 				},
 				state.streamStallTimeoutMs,
 				usageScanner.push,
