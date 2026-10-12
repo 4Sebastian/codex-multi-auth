@@ -2,7 +2,7 @@ import { withFileTransactionLock } from "../storage/file-lock.js";
 import { styleReportText as paint } from "../ui/format.js";
 import { withCheckProgress } from "../ui/check-progress.js";
 import { mapWithConcurrency } from "../concurrency.js";
-import { ApiModelCapabilities, type ProbeResult } from "./api-model-capabilities.js";
+import { ApiModelCapabilities } from "./api-model-capabilities.js";
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
 import { promises as fs } from "node:fs";
@@ -65,6 +65,7 @@ const schema = z.object({
 export type ModelInventory = z.infer<typeof schema>;
 const probeCacheSchema = z.object({
 	version: z.literal(1),
+	ownerLosses: z.array(z.tuple([z.string().regex(/^[0-9a-f]{64}$/), z.number().finite().nonnegative()])).max(1000).optional(),
 	entries: z.array(z.tuple([
 		z.string().regex(/^[0-9a-f]{64}$/),
 		z.object({ credentialOwner: z.string().regex(/^[0-9a-f]{64}$/).optional(), generationAt: z.number().finite().nonnegative().optional(), observedLossAt: z.number().finite().nonnegative().optional(), lostAt: z.number().finite().nonnegative().optional(), documented: z.array(printable).max(100).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
@@ -73,7 +74,7 @@ const probeCacheSchema = z.object({
 function probeCachePath(): string {
 	return join(getCodexMultiAuthDir(), "api-capability-probes.json");
 }
-async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
+async function loadProbeCache(): Promise<z.infer<typeof probeCacheSchema>> {
 	try {
 		const file = await fs.open(probeCachePath(), "r");
 		try {
@@ -81,12 +82,12 @@ async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
 			const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
 			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
 			if (bytesRead > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
-			return probeCacheSchema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"))).entries;
+			return probeCacheSchema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
 		} finally {
 			await file.close();
 		}
 	} catch (error) {
-		if (isRecord(error) && error.code === "ENOENT") return [];
+		if (isRecord(error) && error.code === "ENOENT") return {version: 1, entries: []};
 		throw error;
 	}
 }
@@ -107,7 +108,10 @@ export async function discoverModelInventory(
 	const fetcher = options.fetchImpl ?? fetch,
 		now = options.now ?? Date.now;
 	const capabilities = new ApiModelCapabilities(fetcher, now);
-	if (options.persistProbes) capabilities.importProbes(await loadProbeCache());
+	if (options.persistProbes) {
+		const cached = await loadProbeCache();
+		capabilities.importProbes(cached.entries, cached.ownerLosses);
+	}
 	const manager = new AccountManager(
 		undefined,
 		storage ?? {
@@ -190,11 +194,14 @@ export async function discoverModelInventory(
 		const persisted = await withFileTransactionLock(path, async () => {
 			// Merge with the latest file: a concurrent check may have probed other
 			// credentials since this one loaded. The newer result wins per key.
-			const merged = new Map(await loadProbeCache());
+			const latest = await loadProbeCache();
+			const merged = new Map(latest.entries);
 			const updates = capabilities.exportProbes(), losses = new Map<string, number>();
+			for (const [owner, at] of [...(latest.ownerLosses ?? []), ...capabilities.exportOwnerLosses()]) losses.set(owner, Math.max(losses.get(owner) ?? 0, at));
 			for (const [, value] of [...merged, ...updates]) {
 				if (value.credentialOwner && value.lostAt !== undefined) losses.set(value.credentialOwner, Math.max(losses.get(value.credentialOwner) ?? 0, value.lostAt));
 			}
+			if (losses.size > 1000) throw Error("Capability loss authority exceeds capacity");
 			for (const [key, value] of updates) {
 				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
 				if (loss !== undefined && (value.observedLossAt ?? -Infinity) < loss && value.at > loss) continue;
@@ -213,15 +220,15 @@ export async function discoverModelInventory(
 				value.status.retry = "transient";
 			}
 			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
-			const serialized = JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n";
+			const serialized = JSON.stringify(probeCacheSchema.parse({ version: 1, entries, ownerLosses: [...losses] })) + "\n";
 			if (Buffer.byteLength(serialized) > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
 			await writeFileAtomic(path, serialized);
-			return entries;
+			return {entries, ownerLosses: [...losses]};
 		});
 		for (const catalog of api.cachedCatalogs()) {
 			const route = routes.find(route => route.id === catalog.id && route.kind === catalog.kind);
 			if (!route?.probeCapabilities) continue;
-			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted));
+			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted.entries, persisted.ownerLosses));
 		}
 	}
 	entries.push(

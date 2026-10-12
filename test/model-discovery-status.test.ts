@@ -592,6 +592,66 @@ it.each(["rename", "write", "lock", "reread", "malformed-reread"])("rejects a la
 	}
 });
 
+it("retains credential loss after 1000 newer model results evict its entries", async () => {
+	const route: ApiRouteCredential = {id: "evicted", kind: "api", label: "Evicted", apiKey: "fixture-evicted-secret", enabled: true, priority: 0, visibleModels: ["X", "Y"], probeCapabilities: true};
+	const independent = {...route, id: "independent", label: "Independent", apiKey: "fixture-independent-secret", visibleModels: ["stable"]};
+	const churn = {...route, id: "churn", label: "Churn", apiKey: "fixture-churn-secret", visibleModels: Array.from({length: 1000}, (_, index) => `M${index}`)};
+	const positive: typeof fetch = async (url, init) => {
+		if (String(url).endsWith("/models")) {
+			const key = new Headers(init?.headers).get("authorization");
+			return Response.json({data: (key === `Bearer ${independent.apiKey}` ? independent.visibleModels : key === `Bearer ${churn.apiKey}` ? churn.visibleModels : ["X"]).map(id => ({id}))});
+		}
+		if (init?.method !== "POST") return String(url).endsWith("/X.md") ? new Response("Model ID: `X`\nReasoning.effort supports: low.") : new Response("missing", {status: 404});
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const options = {persistProbes: true, updateApiDiscovery: async (credential: ApiRouteCredential) => credential};
+	await discoverModelInventory(null, [route, independent], {...options, fetchImpl: positive, now: () => 1000});
+	let entered: () => void = () => undefined, release: () => void = () => undefined;
+	const ready = new Promise<void>(resolve => {entered = resolve;});
+	const gate = new Promise<void>(resolve => {release = resolve;});
+	const late = discoverModelInventory(null, [route], {...options, now: () => 5000, forceProbes: true, fetchImpl: async (url, init) => {
+		if (init?.method !== "POST") return positive(url, init);
+		entered(); await gate; return new Response("inconclusive", {status: 500});
+	}});
+	const path = isolationJoin(multiAuthDir, "api-capability-probes.json");
+	try {
+		await ready;
+		await discoverModelInventory(null, [route], {...options, now: () => 3000, fetchImpl: async (url, init) => init?.method === "POST" ? Response.json({error: {code: "invalid_api_key"}}, {status: 401}) : String(url).endsWith("/models") ? Response.json({data: [{id: "Y"}]}) : positive(url, init)});
+		const lossSnapshot = JSON.parse(await isolationFs.readFile(path, "utf8"));
+		const losses: Array<[string, number]> = lossSnapshot.ownerLosses ?? lossSnapshot.entries.flatMap(([, result]: [string, {credentialOwner?: string; lostAt?: number}]) => result.credentialOwner && result.lostAt !== undefined ? [[result.credentialOwner, result.lostAt]] : []);
+		await discoverModelInventory(null, [churn], {...options, now: () => 4000, fetchImpl: positive});
+		const evicted = JSON.parse(await isolationFs.readFile(path, "utf8"));
+		expect(evicted.entries).toHaveLength(1000);
+		expect(evicted.entries.every((entry: [string, {credentialOwner: string}]) => !losses.some(([owner]: [string, number]) => owner === entry[1].credentialOwner))).toBe(true);
+		await discoverModelInventory(null, [independent], {...options, now: () => 4500, forceProbes: true, fetchImpl: positive});
+	} finally {release();}
+	const published = await late;
+	expect(published.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("unverified");
+	expect(published.entries[0]?.entitlements?.[0]?.serviceTiers).toEqual([]);
+	expect(JSON.parse(await isolationFs.readFile(path, "utf8")).ownerLosses).toHaveLength(1);
+	let posts = 0;
+	const restored = await discoverModelInventory(null, [route, independent], {...options, now: () => 6000, fetchImpl: async (url, init) => {if (init?.method === "POST") posts++; return positive(url, init);}});
+	expect(posts).toBe(0);
+	expect(restored.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("unverified");
+	expect(restored.entries[0]?.entitlements?.[0]?.reasoningLevels).toContain("low");
+	expect(restored.entries[1]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+	const recovered = await discoverModelInventory(null, [route], {...options, now: () => 7000, forceProbes: true, fetchImpl: positive});
+	expect(recovered.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+	const serialized = await isolationFs.readFile(path, "utf8");
+	for (const credential of [route, independent, churn]) expect(serialized).not.toContain(credential.apiKey);
+	expect(Buffer.byteLength(serialized)).toBeLessThan(4 * 1024 * 1024);
+});
+
+it("rejects owner authority overflow without replacing committed cache bytes", async () => {
+	const path = isolationJoin(multiAuthDir, "api-capability-probes.json");
+	const committed = JSON.stringify({version: 1, entries: [], ownerLosses: Array.from({length: 1000}, (_, index) => [index.toString(16).padStart(64, "0"), 0])});
+	await isolationFs.writeFile(path, committed);
+	const route: ApiRouteCredential = {id: "overflow", kind: "api", label: "Overflow", apiKey: "fixture-overflow", enabled: true, priority: 0, visibleModels: ["X"], probeCapabilities: true};
+	await expect(discoverModelInventory(null, [route], {persistProbes: true, now: () => 1000, updateApiDiscovery: async credential => credential, fetchImpl: async (url, init) => init?.method === "POST" ? Response.json({error: {code: "invalid_api_key"}}, {status: 401}) : String(url).endsWith("/models") ? Response.json({data: [{id: "X"}]}) : new Response("missing", {status: 404})})).rejects.toThrow("capacity");
+	expect(await isolationFs.readFile(path, "utf8")).toBe(committed);
+});
+
 it("merges concurrent checks' probe results instead of replacing the shared cache", async () => {
  const { promises: fs } = await import("node:fs");
  const { tmpdir } = await import("node:os");

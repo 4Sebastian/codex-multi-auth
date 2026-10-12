@@ -338,18 +338,21 @@ it("rejects a delayed refresh refusal against another manager's durable recovery
 	expect(durable?.cooldownReason).toBeUndefined();
 });
 
-it("keeps a current refusal authoritative despite a same-credential expiry update", async () => {
+it("does not apply an old refusal after a durable expiry-only update", async () => {
 	const f = await fixture(false), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	f.setPostResponse(async () => {entered.resolve(); await release.promise; return Response.json({error: {code: "token_invalidated"}}, {status: 401});});
 	const pending = f.post(); await entered.promise;
 	const other = new AccountManager(undefined, (await loadAccounts())!);
 	other.getAccountByIndex(0)!.expires += 3600000;
+	const expiresAt = other.getAccountByIndex(0)!.expires;
 	await other.saveToDisk(); release.resolve();
 	await (await pending).text(); await f.manager.flushPendingSave();
 	const durable = (await loadAccounts())?.accounts[0];
-	expect(durable?.authInvalidatedAt).toBeGreaterThan(0);
-	expect(durable?.cooldownReason).toBe("auth-failure");
+	expect(durable).toMatchObject({accessToken: "A", refreshToken: "refresh-A", expiresAt});
+	expect(durable?.authInvalidatedAt).toBeUndefined();
+	expect(durable?.cooldownReason).toBeUndefined();
+	expect(f.manager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
 });
 
 it.each(["deleted", "unreadable"])("does not mutate restrictions against %s primary authority", async mutation => {
@@ -453,9 +456,9 @@ it.each(["api", "zdr"] as const)("rejects known %s denial on a cached HTTP-only 
 	expect(f.fetched).toEqual(["Bearer fixture-key"]);
 });
 
-it.each(["credential", "expiry"])("rechecks submitted credentials after final journal observation without treating expiry as identity (%s)", async mutation => {
+it.each(["credential", "expiry"])("rechecks submitted credential generation after final journal observation (%s)", async mutation => {
 	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
-	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, accountId: "W1"};
+	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: "W1"};
 	const entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	const journal = f.manager.isAccountJournalEligible.bind(f.manager);
@@ -466,10 +469,103 @@ it.each(["credential", "expiry"])("rechecks submitted credentials after final jo
 	if (mutation === "credential") f.manager.updateFromAuth(account, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
 	else account.expires = Date.now() + 7200000;
 	release.resolve();
-	expect(await pending).toBe(mutation === "expiry");
-	expect(restrict).toHaveBeenCalledTimes(mutation === "expiry" ? 1 : 0);
+	expect(await pending).toBe(false);
+	expect(restrict).not.toHaveBeenCalled();
 	await f.manager.saveToDisk();
-	expect((await loadAccounts())?.accounts[0]?.cooldownReason).toBe(mutation === "expiry" ? "server-error" : undefined);
+	expect((await loadAccounts())?.accounts[0]?.cooldownReason).toBeUndefined();
+});
+
+it.each(["http", "custom", "native"].flatMap(transport => ["auth", "workspace", "quota"].map(failure => ({transport, failure}))))
+("isolates delayed restrictions from expiry-only recovery (%j)", async ({transport, failure}) => {
+	const f = await fixture(transport === "native"), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const status = failure === "auth" ? 401 : failure === "workspace" ? 402 : 429;
+	const terminal = {type: "response.failed", status, response: {id: "old-expiry", status: "failed", error: {code: failure === "auth" ? "token_invalidated" : failure === "workspace" ? "deactivated_workspace" : "usage_limit_reached"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+	if (transport === "http") f.setPostResponse(async () => {
+		entered.resolve();
+		return new Response(new ReadableStream({start(controller) {void release.promise.then(() => {controller.enqueue(Buffer.from(`data: ${JSON.stringify(terminal)}\n\n`)); controller.close();});}}), {headers: {"content-type": "text/event-stream"}});
+	});
+	else f.setReply(ws => {entered.resolve(); void release.promise.then(() => ws.send(JSON.stringify(terminal)));});
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const pending = transport === "http" ? f.post().then(response => response.text()) : turn(await f.connect());
+	await entered.promise;
+	const current = (await loadAccounts())!;
+	const replacement = new AccountManager(undefined, current);
+	const expires = f.pool.accounts[0]!.expiresAt! + 3600000;
+	replacement.getAccountByIndex(0)!.expires = expires;
+	await replacement.saveToDisk();
+	f.manager.getAccountByIndex(0)!.expires = expires;
+	release.resolve(); await pending;
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+	await f.manager.flushPendingSave();
+	const saved = (await loadAccounts())!.accounts[0]!;
+	expect(saved).toMatchObject({accessToken: "A", refreshToken: "refresh-A", expiresAt: expires});
+	expect(saved.authInvalidatedAt).toBeUndefined();
+	expect(saved.cooldownReason).toBeUndefined();
+	expect(saved.workspaces?.every(workspace => workspace.enabled !== false)).toBe(true);
+	expect(Object.values(saved.rateLimitResetTimes ?? {}).some(at => at > Date.now())).toBe(false);
+	const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+	expect(rows[0]).toMatchObject({outcome: "failure", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	f.setPostResponse(undefined); f.setReply(undefined);
+	const accepted = await f.post(); const body = await accepted.text();
+	expect(accepted.status, body).toBe(200);
+	expect(f.fetched.at(-1)).toBe("Bearer A");
+});
+
+it.each(["header", "event"])("does not admit pending %s quota against an expiry-only replacement", async input => {
+	const f = await fixture(true), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
+	let held = false;
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (!held) {held = true; entered.resolve(); await release.promise;}
+		return transaction(...args);
+	});
+	const completed = {type: "response.completed", response: {id: "old-quota-expiry", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+	const quota = {type: "codex.rate_limits", rate_limits: {primary: {used_percent: 100, reset_after_seconds: 600}}};
+	f.setPostResponse(async () => new Response(`${input === "event" ? `data: ${JSON.stringify(quota)}\n\n` : ""}data: ${JSON.stringify(completed)}\n\n`, {headers: {"content-type": "text/event-stream", ...(input === "header" ? {"x-codex-primary-used-percent": "100", "x-codex-primary-reset-after-seconds": "600"} : {})}}));
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const pending = f.post().then(response => response.text());
+	await entered.promise;
+	const replacement = new AccountManager(undefined, (await loadAccounts())!);
+	const expires = f.pool.accounts[0]!.expiresAt! + 3600000;
+	replacement.getAccountByIndex(0)!.expires = expires;
+	await replacement.saveToDisk();
+	f.manager.getAccountByIndex(0)!.expires = expires;
+	f.setPostResponse(undefined);
+	const accepted = await f.post(); const body = await accepted.text();
+	expect(accepted.status, body).toBe(200);
+	expect(f.httpWorkspaces).toEqual(["W1", "W1"]);
+	release.resolve(); expect(await pending).toContain('"response.completed"');
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
+	await f.manager.flushPendingSave();
+	const saved = (await loadAccounts())!.accounts[0]!;
+	expect(saved).toMatchObject({accessToken: "A", refreshToken: "refresh-A", expiresAt: expires});
+	const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+	expect(new Set(rows.map(row => row.requestId)).size).toBe(2);
+	expect(rows.find(row => row.tokens?.totalTokens === 21)).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	const next = await f.post(); await next.text();
+	expect(next.status).toBe(200);
+	expect(f.httpWorkspaces).toEqual(["W1", "W1", "W1"]);
+});
+
+it("does not apply a delayed refresh refusal to an expiry-only replacement", async () => {
+	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
+	account.expires = 0;
+	f.pool.accounts[0]!.expiresAt = 0;
+	await fs.writeFile(f.path, JSON.stringify(f.pool));
+	const entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	vi.spyOn(refreshQueue, "queuedRefresh").mockImplementation(async () => {entered.resolve(); await release.promise; return {type: "failed", reason: "http_error", statusCode: 401, message: "OAuth token has been invalidated"};});
+	const pending = refreshRuntime.ensureFreshAccessToken({accountManager: f.manager, account, family: getModelFamily("shared"), model: "shared", now: Date.now(), tokenRefreshSkewMs: 30000, tokenInvalidationCooldownMs: 60000});
+	await entered.promise;
+	const replacement = new AccountManager(undefined, (await loadAccounts())!);
+	replacement.getAccountByIndex(0)!.expires = Date.now() + 7200000;
+	await replacement.saveToDisk();
+	release.resolve();
+	expect(await pending).toMatchObject({ok: false, retryable: true, invalidated: false});
+	expect(account.cooldownReason).toBeUndefined();
+	expect((await loadAccounts())!.accounts[0]!.authInvalidatedAt).toBeUndefined();
 });
 
 it.each(["http-server", "http-network", "http-stream", "http-quota", "custom-server", "custom-quota", "custom-close", "custom-handshake"].flatMap(mode =>

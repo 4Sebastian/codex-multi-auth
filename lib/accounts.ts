@@ -277,6 +277,8 @@ export const MAX_DEBOUNCED_SAVE_RETRIES = 5;
 /** Ceiling for the debounced-save retry backoff. */
 export const MAX_SAVE_RETRY_DELAY_MS = 8_000;
 
+export type CurrentAccountCredential = {recordId?: string; accessToken: string | undefined; refreshToken: string; expiresAt: number | undefined; accountId?: string};
+
 export interface ManagedAccount {
 	index: number;
 	recordId?: string;
@@ -2487,24 +2489,24 @@ export class AccountManager {
 
 	async withCurrentAccountCredential(
 		account: ManagedAccount,
-		submitted: {recordId?: string; accessToken: string | undefined; refreshToken: string; accountId?: string},
+		submitted: CurrentAccountCredential,
 		mutate: () => boolean | void,
 	): Promise<boolean> {
 		return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
 			if (!captureAuthorityRevision([], [getIntentionalResetMarkerPath(this.resolveSelectionStoragePath())])()) return false;
 			const primaryExists = existsSync(this.resolveSelectionStoragePath());
 			if (this.hadPersistedStorage && !primaryExists) return false;
+			if (!await this.isAccountJournalEligible(account)) return false;
 			if (current && primaryExists) {
 				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
 				const row = matches.length === 1 ? matches[0] : undefined;
-				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.enabled === false ||
+				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.expiresAt !== submitted.expiresAt || row.enabled === false ||
 					(submitted.accountId && (row.workspaces?.length
 						? !row.workspaces.some(workspace => workspace.id === submitted.accountId && workspace.enabled !== false)
 						: (row.accountId?.trim() || extractAccountId(row.accessToken)?.trim()) !== submitted.accountId))) return false;
 			}
-			if (!await this.isAccountJournalEligible(account)) return false;
 			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
-				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken) return false;
+				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return false;
 			if (mutate() === false) return false;
 			this.reconcileSelectionFromDisk();
 			this.syncWorkspaceSelections(current);

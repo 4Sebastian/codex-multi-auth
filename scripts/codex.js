@@ -3914,8 +3914,8 @@ function isShadowHomeStale(shadowDir, probeStartTime) {
 		if (
 			!Number.isSafeInteger(owner?.pid) || owner.pid <= 0 ||
 			!Number.isFinite(owner.createdAt) || owner.createdAt <= 0 ||
-			(owner.childPid !== undefined && (!Number.isSafeInteger(owner.childPid) || owner.childPid <= 0)) ||
-			(owner.childRecordedAt !== undefined && (owner.childPid === undefined || !Number.isFinite(owner.childRecordedAt) || owner.childRecordedAt <= 0))
+			!Number.isSafeInteger(owner.childPid) || owner.childPid <= 0 ||
+			(owner.childRecordedAt !== undefined && (!Number.isFinite(owner.childRecordedAt) || owner.childRecordedAt <= 0))
 		) {
 			return false;
 		}
@@ -3930,7 +3930,7 @@ function isShadowHomeStale(shadowDir, probeStartTime) {
 				actualStartTimeMs > recordedAt + SHADOW_HOME_OWNER_SKEW_MS;
 		};
 		return recordedProcessGone(owner.pid, owner.createdAt) &&
-			(owner.childPid === undefined || recordedProcessGone(owner.childPid, owner.childRecordedAt ?? owner.createdAt));
+			recordedProcessGone(owner.childPid, owner.childRecordedAt ?? owner.createdAt);
 	} catch {
 		return false;
 	}

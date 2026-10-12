@@ -115,6 +115,22 @@ export class ApiModelCapabilities {
 	private readonly inFlight = new Map<string, {group: CredentialProbeGroup; promise: Promise<ProbeResult>}>();
 	private readonly probes = new Map<string, ProbeCacheEntry>();
 	private readonly credentialGroups = new Map<string, CredentialProbeGroup>();
+	private readonly ownerLosses = new Map<string, number>();
+
+	exportOwnerLosses(): Array<[string, number]> {
+		return [...this.ownerLosses];
+	}
+	private recordOwnerLoss(owner: string, at: number): void {
+		if (!/^[0-9a-f]{64}$/.test(owner) || !Number.isFinite(at) || at < 0) throw Error("Invalid capability loss authority");
+		if (!this.ownerLosses.has(owner) && this.ownerLosses.size >= 1000) throw Object.assign(Error("Capability loss authority exceeds capacity"), {code: "ECAPACITY"});
+		const loss = Math.max(this.ownerLosses.get(owner) ?? 0, at);
+		this.ownerLosses.set(owner, loss);
+		const group = this.credentialGroups.get(owner);
+		if (group && (group.priorLossAt ?? -Infinity) < loss) group.lostAt = Math.max(group.lostAt ?? 0, loss);
+		for (const result of this.probes.values()) {
+			if (result.credentialOwner === owner && (result.observedLossAt ?? -Infinity) < loss) this.clearVerified(result, result.documented ?? [], loss);
+		}
+	}
 
 	private credentialGroup(route: ApiRouteCredential, force: boolean): CredentialProbeGroup {
 		const key = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
@@ -130,7 +146,7 @@ export class ApiModelCapabilities {
 			}
 		}
 		if (current) current.retiredAt ??= this.now();
-		const group: CredentialProbeGroup = {owner: key, startedAt: this.now(), priorLossAt: current?.lostAt ?? current?.priorLossAt};
+		const group: CredentialProbeGroup = {owner: key, startedAt: this.now(), priorLossAt: this.ownerLosses.get(key) ?? current?.lostAt ?? current?.priorLossAt};
 		this.credentialGroups.set(key, group);
 		return group;
 	}
@@ -145,11 +161,9 @@ export class ApiModelCapabilities {
 	}
 
 	private revokeGroup(group: CredentialProbeGroup): void {
-		group.lostAt ??= this.now();
+		group.lostAt ??= Math.max(this.now(), (this.ownerLosses.get(group.owner) ?? -1) + 1);
 		if (this.credentialGroups.get(group.owner) !== group) return;
-		for (const result of this.probes.values()) {
-			if (result.credentialOwner === group.owner) this.clearVerified(result, result.documented ?? [], group.lostAt);
-		}
+		this.recordOwnerLoss(group.owner, group.lostAt);
 	}
 	private readonly cache = new Map<string, DocumentedCapabilities & { at: number }>();
 	constructor(
@@ -160,23 +174,30 @@ export class ApiModelCapabilities {
 	exportProbes(): Array<[string, ProbeResult]> {
 		return [...this.probes].map(([key, {at, levels, tiers, status, credentialOwner, generationAt, observedLossAt, lostAt, documented}]) => [key, {at, levels: [...levels], tiers: [...tiers], status: {...status}, credentialOwner, generationAt, observedLossAt, lostAt, documented: documented ? [...documented] : undefined}]);
 	}
-	importProbes(entries: Array<[string, ProbeResult]>): void {
+	importProbes(entries: Array<[string, ProbeResult]>, ownerLosses: Array<[string, number]> = []): void {
+		for (const [owner, at] of ownerLosses) this.recordOwnerLoss(owner, at);
+		for (const [, value] of entries) if (value.credentialOwner && value.lostAt !== undefined) this.recordOwnerLoss(value.credentialOwner, value.lostAt);
 		const owners = new Map<string, {startedAt: number; lostAt: number; observedLossAt: number}>();
 		for (const [, value] of entries.slice(-1000)) {
 			if (!value.credentialOwner || value.lostAt === undefined || value.at > this.now()) continue;
 			const previous = owners.get(value.credentialOwner);
 			owners.set(value.credentialOwner, {startedAt: Math.max(previous?.startedAt ?? 0, value.generationAt ?? 0), lostAt: Math.max(previous?.lostAt ?? 0, value.lostAt), observedLossAt: Math.max(previous?.observedLossAt ?? -Infinity, value.observedLossAt ?? -Infinity)});
 		}
+		for (const [owner, lostAt] of this.ownerLosses) if (!owners.has(owner)) owners.set(owner, {startedAt: 0, lostAt, observedLossAt: -Infinity});
 		for (const [owner, evidence] of owners) {
 			if (!this.credentialGroups.has(owner)) {
 				if (this.credentialGroups.size >= 1000) this.credentialGroups.delete(this.credentialGroups.keys().next().value ?? "");
-				this.credentialGroups.set(owner, {owner, startedAt: evidence.startedAt, priorLossAt: evidence.lostAt, ...(evidence.observedLossAt < evidence.lostAt ? {lostAt: evidence.lostAt} : {})});
+				const lostAt = this.ownerLosses.get(owner) ?? evidence.lostAt;
+				this.credentialGroups.set(owner, {owner, startedAt: evidence.startedAt, priorLossAt: lostAt, ...(evidence.observedLossAt < lostAt ? {lostAt} : {})});
 			}
 		}
 		for (const [key, value] of entries.slice(-1000)) {
 			if (this.probes.has(key) || value.at > this.now()) continue;
 			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
-			this.probes.set(key, {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}, credentialOwner: value.credentialOwner, generationAt: value.generationAt, observedLossAt: value.observedLossAt, lostAt: value.lostAt, documented: value.documented ? [...value.documented] : undefined});
+			const result = {at: value.at, levels: [...value.levels], tiers: [...value.tiers], status: {...value.status}, credentialOwner: value.credentialOwner, generationAt: value.generationAt, observedLossAt: value.observedLossAt, lostAt: value.lostAt, documented: value.documented ? [...value.documented] : undefined};
+			const loss = value.credentialOwner ? this.ownerLosses.get(value.credentialOwner) : undefined;
+			if (loss !== undefined && (value.observedLossAt ?? -Infinity) < loss) this.clearVerified(result, result.documented ?? [], loss);
+			this.probes.set(key, result);
 		}
 	}
 	async reasoning(id: string, refresh = false): Promise<string[]> {
@@ -346,7 +367,9 @@ export class ApiModelCapabilities {
 					);
 					if ([401, 429].includes(response.status))
 						credentialUnavailable = true;
-					if (response.status === 401) this.revokeGroup(group);
+					if (response.status === 401) {
+						try {this.revokeGroup(group);} catch (error) {void response.body?.cancel().catch(() => undefined); throw error;}
+					}
 					// Probe bodies are tiny, but an upstream error must not grow local memory unboundedly.
 					const reader = response.body?.getReader();
 					if (!reader) return response.status === 403 ? denied403(null) : "unverified";
@@ -419,7 +442,8 @@ export class ApiModelCapabilities {
 						canonicalServiceTier(setting.tier)
 						? "verified"
 						: "downgraded";
-				} catch {
+				} catch (error) {
+					if (isRecord(error) && error.code === "ECAPACITY") throw error;
 					return "unverified";
 				}
 			});
@@ -462,6 +486,8 @@ export class ApiModelCapabilities {
 		}
 		if (credentialUnavailable && !modelDenied) result.status.retry = "transient";
 		result.at = group.lostAt ?? this.now();
+		const loss = this.ownerLosses.get(group.owner);
+		if (loss !== undefined && (result.observedLossAt ?? -Infinity) < loss) this.clearVerified(result, documented, loss);
 		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
 		if (this.credentialGroups.get(owner) === group) {
 			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
@@ -490,15 +516,22 @@ export class ApiModelCapabilities {
 		});
 		return enriched.map(({model, documented, probed}) => this.renderModel(model, documented, probed, group));
 	}
-	applyPersistedProbes(models: RouteModel[], route: ApiRouteCredential, entries: Array<[string, ProbeResult]>): RouteModel[] {
+	applyPersistedProbes(models: RouteModel[], route: ApiRouteCredential, entries: Array<[string, ProbeResult]>, ownerLosses: Array<[string, number]> = []): RouteModel[] {
+		for (const [owner, at] of ownerLosses) this.recordOwnerLoss(owner, at);
 		const persisted = new Map(entries);
-		return models.map(model => this.renderModel(model, this.cache.get(model.slug) ?? {levels: []}, persisted.get(this.probeKey(route, model.slug))));
+		return models.map(model => {
+			const probed = persisted.get(this.probeKey(route, model.slug));
+			const rendered = this.renderModel(model, this.cache.get(model.slug) ?? {levels: []}, probed);
+			return probed ? rendered : {...rendered, capability_probe_status: {responses: "unverified"}};
+		});
 	}
 	private renderModel(model: RouteModel, documented: DocumentedCapabilities, probed?: ProbeResult, group?: CredentialProbeGroup): RouteModel {
 		let levels = documented.levels;
 		let extra: Record<string, unknown> = {};
 		if (probed) {
 			probed = {...probed, levels: [...probed.levels], tiers: [...probed.tiers], status: {...probed.status}};
+			const loss = probed.credentialOwner ? this.ownerLosses.get(probed.credentialOwner) : undefined;
+			if (loss !== undefined && (probed.observedLossAt ?? -Infinity) < loss) this.clearVerified(probed, documented.levels, loss);
 			if (group && (group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group)) this.clearVerified(probed, documented.levels, group.lostAt ?? group.retiredAt ?? this.now());
 			levels = probed.levels;
 			extra = {
@@ -523,8 +556,10 @@ export class ApiModelCapabilities {
 		const nativeLevels = multiAgentEffort
 			? [...levels, "ultra"]
 			: levels;
+		const clean = {...model};
+		for (const field of ["service_tiers", "default_service_tier", "additional_speed_tiers", "capability_probe_status", "capability_checked_at"]) delete clean[field];
 		return {
-			...model,
+			...clean,
 			...extra,
 			...(documented.inputModalities ? { input_modalities: documented.inputModalities } : {}),
 			multi_agent_reasoning_effort: multiAgentEffort,

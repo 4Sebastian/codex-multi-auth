@@ -67,6 +67,61 @@ const route = {
 	visibleModels: ["fixture"],
 	probeCapabilities: true,
 };
+it("strips inherited probe positives when their persisted model result is missing", async () => {
+	const reader = new ApiModelCapabilities(async (_url, init) => {
+		if (init?.method !== "POST") return new Response("Model ID: `fixture`\nReasoning.effort supports: low.");
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	}, () => 0);
+	const models = await reader.enrich([{slug: "fixture", input_modalities: ["text", "image"]}], false, route);
+	expect(models[0]?.service_tiers).not.toEqual([]);
+	expect(models[0]?.capability_probe_status).toMatchObject({responses: "verified"});
+	const [missing] = reader.applyPersistedProbes(models, route, []);
+	expect(missing?.capability_probe_status).toEqual({responses: "unverified"});
+	expect(missing?.capability_checked_at).toBeUndefined();
+	expect(missing?.service_tiers).toBeUndefined();
+	expect(missing?.default_service_tier).toBeUndefined();
+	expect(missing?.additional_speed_tiers).toBeUndefined();
+	expect(missing?.supported_reasoning_levels).toEqual([{effort: "low", description: "low reasoning effort"}]);
+	expect(missing?.input_modalities).toEqual(["text", "image"]);
+});
+
+it("retains zero-time legacy loss across model and group eviction and another loss", async () => {
+	let denied = false, posts = 0;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", {status: 404});
+		posts++;
+		if (denied) return Response.json({error: {code: "invalid_api_key"}}, {status: 401});
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const reader = new ApiModelCapabilities(fetcher, () => 0);
+	await reader.enrich([{slug: "fixture"}], false, route);
+	denied = true;
+	await reader.enrich([{slug: "fixture"}], true, route, true);
+	const legacy = reader.exportProbes();
+	const owner = legacy[0]![1].credentialOwner!;
+	const restored = new ApiModelCapabilities(fetcher, () => 0);
+	restored.importProbes(legacy);
+	const others: Array<[string, number]> = Array.from({length: 999}, (_, index) => [index.toString(16).padStart(64, "0"), 0]);
+	restored.importProbes(Array.from({length: 1000}, (_, index) => [`model-${index}`, {at: 0, levels: [], tiers: [], status: {responses: "verified"}}]), others);
+	expect(restored.exportProbes().some(([, result]) => result.credentialOwner === owner)).toBe(false);
+	denied = false;
+	await restored.enrich([{slug: "other"}], false, {...route, id: "other", visibleModels: ["other"]});
+	const roundTrip = new ApiModelCapabilities(fetcher, () => 0);
+	roundTrip.importProbes(restored.exportProbes(), restored.exportOwnerLosses());
+	const before = posts;
+	const [hidden] = await roundTrip.enrich([{slug: "fixture"}], false, route);
+	expect(posts).toBe(before);
+	expect(hidden?.capability_probe_status).toMatchObject({responses: "unverified"});
+	const [recovered] = await roundTrip.enrich([{slug: "fixture"}], true, route, true);
+	expect(recovered?.capability_probe_status).toMatchObject({responses: "verified"});
+	denied = true;
+	const [lostAgain] = await roundTrip.enrich([{slug: "fixture"}], true, route, true);
+	expect(lostAgain?.capability_probe_status).toMatchObject({responses: "unverified"});
+	expect(roundTrip.exportOwnerLosses().find(([key]) => key === owner)?.[1]).toBeGreaterThan(0);
+});
+
 it("verifies API effort and equivalent fast tiers per credential and never treats a downgrade as fast", async () => {
 	const calls: RequestInit[] = [];
 	let now = 1;

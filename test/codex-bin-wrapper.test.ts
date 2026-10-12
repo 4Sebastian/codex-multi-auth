@@ -9549,7 +9549,53 @@ describe("forwarded signal relay", () => {
 });
 
 describe("stale shadow-home sweep", () => {
-	it.each(["runtime", "compatibility"].flatMap(root => ["missing", "corrupt", "unreadable"].map(marker => ({root, marker}))))(
+	it.each(["runtime", "compatibility"])("retains a live child after child-marker recording fails and its wrapper exits (%s)", async root => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codexhome"), controlledTmp = join(fixtureRoot, "tmp");
+		mkdirSync(originalHome, {recursive: true}); mkdirSync(controlledTmp, {recursive: true});
+		writeFileSync(join(originalHome, "config.toml"), 'model_reasoning_effort = "ultra"\n');
+		const readyPath = join(fixtureRoot, "child-ready.json"), stopPath = join(fixtureRoot, "stop"), stoppedPath = join(fixtureRoot, "stopped");
+		const preload = join(fixtureRoot, "fail-child-marker.cjs");
+		writeFileSync(preload, [
+			"const fs = require('node:fs'); const write = fs.writeFileSync;",
+			"fs.writeFileSync = function(path, data, ...args) { if (String(path).endsWith('.codex-multi-auth-owner.json') && typeof data === 'string' && JSON.parse(data).childPid) throw Object.assign(Error('fixture child recording failure'), {code: 'EACCES'}); return write.call(this, path, data, ...args); };",
+			"require('node:module').syncBuiltinESMExports();",
+		].join("\n"));
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"const fs = require('node:fs'); const path = require('node:path');",
+			`fs.watch(${JSON.stringify(fixtureRoot)}, (_event, name) => {if (String(name) === 'stop') {fs.writeFileSync(${JSON.stringify(stoppedPath)}, 'stopped'); process.exit(0);}});`,
+			"fs.writeFileSync(path.join(process.env.CODEX_HOME, 'session-state.json'), 'unsynced live child');",
+			`fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({pid: process.pid, home: process.env.CODEX_HOME}));`,
+		]);
+		const env = {CODEX_HOME: originalHome, CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin, CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: root === "runtime" ? "1" : "0", TMPDIR: controlledTmp, TMP: controlledTmp, TEMP: controlledTmp};
+		const wrapper = spawn(process.execPath, [join(fixtureRoot, "scripts", "codex.js"), "exec", "status", "--model", "gpt-6-luna"], {env: buildWrapperEnv({...env, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`}), stdio: ["ignore", "ignore", "ignore"]});
+		const exited = once(wrapper, "exit");
+		let ready = false;
+		try {
+			await waitForPath(readyPath, 15_000); ready = true;
+			const child = JSON.parse(readFileSync(readyPath, "utf8")) as {pid: number; home: string};
+			const marker = JSON.parse(readFileSync(join(child.home, ".codex-multi-auth-owner.json"), "utf8"));
+			expect(marker.pid).toBe(wrapper.pid);
+			expect(marker.childPid).toBeUndefined();
+			expect(child.home).toContain(root === "runtime" ? "runtime-shadow-homes" : "codex-multi-auth-home-");
+			wrapper.kill("SIGKILL"); await exited;
+			expect(isProcessAlive(marker.pid)).toBe(false);
+			expect(isProcessAlive(child.pid)).toBe(true);
+			const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+			utimesSync(child.home, old, old);
+			const mtime = statSync(child.home).mtimeMs;
+			const result = runWrapper(fixtureRoot, ["exec", "do"], {...env, CODEX_MULTI_AUTH_REAL_CODEX_BIN: createFakeCodexBin(fixtureRoot)});
+			expect(result.status).toBe(0);
+			expect(isProcessAlive(child.pid)).toBe(true);
+			expect(readFileSync(join(child.home, "session-state.json"), "utf8")).toBe("unsynced live child");
+			expect(statSync(child.home).mtimeMs).toBe(mtime);
+		} finally {
+			if (wrapper.exitCode === null && wrapper.signalCode === null) {wrapper.kill("SIGKILL"); await exited;}
+			if (ready) {writeFileSync(stopPath, "stop"); await waitForPath(stoppedPath, 5000);}
+		}
+	}, SHUTDOWN_TEST_TIMEOUT_MS);
+	it.each(["runtime", "compatibility"].flatMap(root => ["missing", "corrupt", "unreadable", "wrapper-only"].map(marker => ({root, marker}))))(
 		"retains aged live legacy state (%j)",
 		async ({root, marker}) => {
 			const fixtureRoot = createWrapperFixture();
@@ -9563,6 +9609,9 @@ describe("stale shadow-home sweep", () => {
 			writeFileSync(state, "before update");
 			if (marker === "corrupt") writeFileSync(join(shadow, ".codex-multi-auth-owner.json"), "{");
 			if (marker === "unreadable") mkdirSync(join(shadow, ".codex-multi-auth-owner.json"));
+			if (marker === "wrapper-only") await withDeadPid(async pid => {
+				writeFileSync(join(shadow, ".codex-multi-auth-owner.json"), JSON.stringify({pid, createdAt: Date.now() - 60_000}));
+			});
 			const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
 			utimesSync(shadow, old, old);
 			const oldMtime = statSync(shadow).mtimeMs;
@@ -9612,10 +9661,10 @@ describe("stale shadow-home sweep", () => {
 		utimesSync(markerlessOldDir, old, old);
 
 		const fakeBin = createFakeCodexBin(fixtureRoot);
-		await withDeadPid(async (deadPid) => {
+		await withDeadPids(2, async ([deadPid, deadChildPid]) => {
 			writeFileSync(
 				join(deadOwnerDir, OWNER_FILE),
-				JSON.stringify({ pid: deadPid, createdAt: Date.now() - 60_000 }),
+				JSON.stringify({ pid: deadPid, createdAt: Date.now() - 60_000, childPid: deadChildPid, childRecordedAt: Date.now() - 30_000 }),
 			);
 
 			const result = runWrapper(fixtureRoot, ["exec", "do"], {
@@ -9781,7 +9830,7 @@ describe("stale shadow-home sweep", () => {
 			);
 			const fakeBin = createFakeCodexBin(fixtureRoot);
 
-			await withLivePid(async (livePid) => {
+			await withDeadPid(async deadChildPid => withLivePid(async (livePid) => {
 				// The PID is live, but the marker claims it was written 10 minutes
 				// ago and this process started seconds ago — it cannot be the owner
 				// that wrote the marker, so the PID must have been recycled.
@@ -9790,6 +9839,8 @@ describe("stale shadow-home sweep", () => {
 					JSON.stringify({
 						pid: livePid,
 						createdAt: Date.now() - 10 * 60_000,
+						childPid: deadChildPid,
+						childRecordedAt: Date.now() - 30_000,
 					}),
 				);
 				// Control: the same live PID with a timestamp at-or-after its start
@@ -9808,7 +9859,7 @@ describe("stale shadow-home sweep", () => {
 
 				expect(existsSync(recycledOwnerDir)).toBe(false);
 				expect(existsSync(liveOwnerDir)).toBe(true);
-			});
+			}));
 		},
 		SHUTDOWN_TEST_TIMEOUT_MS,
 	);

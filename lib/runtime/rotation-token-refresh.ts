@@ -96,10 +96,11 @@ export async function ensureFreshAccessToken(params: {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
-	const submittedAccessToken = account.access, submittedRefreshToken = account.refreshToken;
+	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
+	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
 	const refreshResult = await queuedRefresh(submittedRefreshToken);
-	if ((account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
-		!(refreshResult.type === "success" && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
+	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
+		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
 		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
 			? {ok: true, accessToken: account.access ?? "", account}
 			: {ok: false, retryable: true};
@@ -110,7 +111,7 @@ export async function ensureFreshAccessToken(params: {
 		// the long cooldown and signal to the caller to stop rotating rather than
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
-		const applied = await accountManager.withCurrentAccountCredential(account, {recordId: account.recordId, accessToken: submittedAccessToken, refreshToken: submittedRefreshToken}, () => {
+		const applied = await accountManager.withCurrentAccountCredential(account, submitted, () => {
 			accountManager.recordFailure(account, family, model);
 			accountManager.incrementAuthFailures(account);
 			if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
@@ -150,8 +151,8 @@ export async function ensureFreshAccessToken(params: {
 			account: resolvedAccount,
 		};
 	} catch {
-		if (account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
-		await accountManager.withCurrentAccountCredential(account, {recordId: account.recordId, accessToken: submittedAccessToken, refreshToken: submittedRefreshToken}, () => {
+		if (account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
+		await accountManager.withCurrentAccountCredential(account, submitted, () => {
 			accountManager.recordFailure(account, family, model);
 			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submittedAccessToken);
 		});

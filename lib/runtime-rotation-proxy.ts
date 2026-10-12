@@ -38,6 +38,7 @@ import {
 	AUTH_INVALIDATION_MARKER,
 	extractAccountId,
 	type ManagedAccount,
+	type CurrentAccountCredential,
 } from "./accounts.js";
 import { withRoutingMutex } from "./routing-mutex.js";
 import {
@@ -1128,13 +1129,10 @@ function hasConnectionScopedContinuation(frame: PendingWebSocketFrame): boolean 
 	return readStringRecordValue(body ?? {}, "previous_response_id") !== null;
 }
 
-interface AccountDispatchBinding {
+interface AccountDispatchBinding extends CurrentAccountCredential {
 	accountManager: AccountManager;
 	account: ManagedAccount;
-	recordId: string | undefined;
-	refreshToken: string;
 	accessToken: string;
-	expiresAt: number | undefined;
 	accountId: string;
 }
 
@@ -1142,8 +1140,8 @@ function captureDispatchBinding(accountManager: AccountManager, account: Managed
 	return {accountManager, account, recordId: account.recordId, refreshToken: account.refreshToken, accessToken, expiresAt: account.expires, accountId};
 }
 
-function quotaReceiptOwner(account: Pick<ManagedAccount, "recordId" | "access" | "refreshToken">, accountId: string): string {
-	return modelScopeId(account.recordId ?? "", account.access ?? "", account.refreshToken, accountId);
+function quotaReceiptOwner(binding: CurrentAccountCredential): string {
+	return modelScopeId(binding.recordId ?? "", binding.accessToken ?? "", binding.refreshToken, String(binding.expiresAt), binding.accountId ?? "");
 }
 
 function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDispatchBinding): boolean {
@@ -1444,7 +1442,7 @@ function dispatchRuntimeSkipReason(
 	const scope = state.nativeOpenai ? workspaceModelScopes(account).find(scope => scope.accountId === accountId) : undefined;
 	const baseline = state.nativeOpenai ? (scope ? state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id, context.model])) : undefined) ?? null : undefined;
 	const deferral = state.preemptiveQuotaScheduler.getDeferral(
-		buildQuotaScheduleKey(account, context.family, context.model), state.now(), quotaReceiptOwner(account, accountId), baseline,
+		buildQuotaScheduleKey(account, context.family, context.model), state.now(), quotaReceiptOwner(captureDispatchBinding(accountManager, account, account.access ?? "", accountId)), baseline,
 	);
 	return reason ?? (deferral.defer ? "rate-limited" : null);
 }
@@ -2031,9 +2029,12 @@ async function prepareWebSocketAccount(
 			context.family,
 			context.model,
 		);
+		const quotaScopes = workspaceModelScopes(selected).filter(scope => scope.routable);
+		const quotaAccountId = (quotaScopes.find(scope => scope.selected) ?? quotaScopes.find(scope => scope.bound) ?? quotaScopes[0])?.accountId ?? "";
 		const preemptiveDeferral = state.preemptiveQuotaScheduler.getDeferral(
 			quotaScheduleKey,
 			state.now(),
+			quotaReceiptOwner(captureDispatchBinding(accountManager, selected, selected.access ?? "", quotaAccountId)),
 		);
 		if (preemptiveDeferral.defer && preemptiveDeferral.waitMs > 0) {
 			skipReasons.set(
@@ -3535,7 +3536,7 @@ async function handleRequestInner(
 							nativeTerminal.event ??= websocketTerminalUsage(Buffer.from(JSON.stringify(event)));
 							const terminal = nativeTerminal.event;
 							if (terminal?.record.outcome === "failure" && typeof terminal.record.statusCode === "number" && attempt.credential) {
-								apiRuntime.recordStreamFailure(attempt.credential, context.model, body, JSON.parse(terminal.rawBody), {
+								apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, JSON.parse(terminal.rawBody), {
 									status: terminal.record.statusCode, headers: terminal.retryHeaders ?? upstream.headers, retryAfterMs: terminal.retryAfterMs,
 								});
 							}
@@ -3553,7 +3554,7 @@ async function handleRequestInner(
 					() => {scanner.result();return responseOutcome.finish();},
 				);
 				const clientDisconnected = res.destroyed && !res.writableEnded;
-				if (!forwarded && !clientDisconnected && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, context.model, body, responseOutcome.rejection);
+				if (!forwarded && !clientDisconnected && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, responseOutcome.rejection);
 				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
 				const usageTokens = scanner.result();
 				if (usageTokens && context.stableSessionKey && context.model) {
@@ -4192,7 +4193,7 @@ async function handleRequestInner(
 			const preemptiveDeferral = state.preemptiveQuotaScheduler.getDeferral(
 				quotaScheduleKey,
 				state.now(),
-				selectedScope ? quotaReceiptOwner(selected, selectedScope.accountId) : undefined,
+				quotaReceiptOwner(captureDispatchBinding(accountManager, selected, selected.access ?? "", selectedScope?.accountId ?? resolveAccountId(selected, selected.access ?? "") ?? "")),
 				state.nativeOpenai ? (selectedScope ? quotaForScope(selected, selectedScope) : null) ?? null : undefined,
 			);
 			if (preemptiveDeferral.defer && preemptiveDeferral.waitMs > 0) {
@@ -4302,7 +4303,7 @@ async function handleRequestInner(
    const requestScope = pendingScopes?.[0];
    const accountId = requestScope?.accountId ?? resolveAccountId(refreshed.account, refreshed.accessToken);
 			if (!accountId) {
-				await accountManager.withCurrentAccountCredential(refreshed.account, {recordId: refreshed.account.recordId, accessToken: refreshed.accessToken, refreshToken: refreshed.account.refreshToken}, () => {
+				await accountManager.withCurrentAccountCredential(refreshed.account, captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, ""), () => {
 					if (state.activeAccountManager !== accountManager) return false;
 					accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
 					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
@@ -4537,13 +4538,13 @@ async function handleRequestInner(
 			const currentQuotaScope = () => quotaScopeKey ? state.subscriptionQuotaObservations?.get(quotaScopeKey) : undefined;
 			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
 				if (state.activeAccountManager !== accountManager || accountManager.getAccountByIndex(refreshed.account.index) !== refreshed.account ||
-					refreshed.account.recordId !== binding.recordId || refreshed.account.access !== binding.accessToken || refreshed.account.refreshToken !== binding.refreshToken) return Promise.resolve();
+					refreshed.account.recordId !== binding.recordId || refreshed.account.access !== binding.accessToken || refreshed.account.refreshToken !== binding.refreshToken || refreshed.account.expires !== binding.expiresAt) return Promise.resolve();
 				if (quotaScopeKey && requestScope && !currentQuotaScope()) {
 					const observations = state.subscriptionQuotaObservations ??= new Map();
 					if (observations.size >= 1000) observations.delete(observations.keys().next().value ?? "");
 					observations.set(quotaScopeKey, quotaForScope(refreshed.account, requestScope) ?? {model: context.model ?? "unknown", status: 200, updatedAt: 0, primary: {}, secondary: {}});
 				}
-				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, quotaReceiptOwner(refreshed.account, binding.accountId), currentQuotaScope());
+				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, quotaReceiptOwner(binding), currentQuotaScope());
 				pendingQuota = mergeQuotaReceipts(receipt, pendingQuota);
 				quotaUpdate ??= (async () => {
 					let failure: {error: unknown} | undefined;
@@ -4910,7 +4911,7 @@ async function handleRequestInner(
 			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
 				quotaScheduleKey,
 				state.now(),
-				quotaReceiptOwner(refreshed.account, binding.accountId),
+				quotaReceiptOwner(binding),
 				state.nativeOpenai ? currentQuotaScope() ?? null : undefined,
 			);
 			const nearExhaustionWaitMs = quotaDeferral.defer
