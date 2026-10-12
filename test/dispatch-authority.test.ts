@@ -1375,9 +1375,9 @@ it.each(["primary", "secondary"].flatMap(exhausted => ["event", "header"].map(in
 	});
 	const send = (index: number, event: Record<string, unknown>) => controllers[index]!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
 	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
-	const aPending = f.post(), bPending = f.post();
+	const a = await f.post(), aBody = a.text();
+	const bPending = f.post();
 	await bothDispatched.promise;
-	const a = await aPending, aBody = a.text();
 	let b = input === "event" ? await bPending : undefined;
 	let bBody = b?.text();
 	send(0, {type: "codex.rate_limits", rate_limits: {[exhausted]: {used_percent: 100, reset_at: resetAt}}});
