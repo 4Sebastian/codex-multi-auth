@@ -14,7 +14,7 @@ import type { TokenResult } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
-import { MAX_PENDING_AUTH_ENTRIES, PendingAuthCapacityError, PendingAuthSettlementError, withPendingAuthRefresh } from "./storage/pending-auth.js";
+import { MAX_PENDING_AUTH_ENTRIES, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthCapacityError, PendingAuthSettlementError, withPendingAuthRefresh } from "./storage/pending-auth.js";
 import { getStoragePath } from "./storage.js";
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
@@ -214,7 +214,7 @@ export class RefreshQueue {
             throw firstError;
           }
         }
-        return {type: "failed", reason: "network_error", message: error instanceof Error ? error.message : "Refresh admission failed"};
+        throw error instanceof PendingAuthLocalError ? error : new PendingAuthAdmissionError(error);
       } finally {
         try {
           await lease?.release();

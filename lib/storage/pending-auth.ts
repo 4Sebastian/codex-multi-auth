@@ -1,20 +1,21 @@
 import { createHash } from "node:crypto";
 import { decodeJWT } from "../auth/auth.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync, existsSync } from "node:fs";
+import { getStoragePath, getFlaggedAccountsPath, getFlaggedBackupPaths, FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME } from "./file-paths.js";
 import { dirname } from "node:path";
 import { z } from "zod";
 import { withRetry } from "../fs-retry.js";
 import { createLogger } from "../logger.js";
 import { tempPathFor } from "../temp-path.js";
 import type { OAuthAuthDetails, TokenResult, TokenSuccess } from "../types.js";
-import { AnyAccountStorageSchema } from "../schemas.js";
+import { AccountsJournalEntrySchema, AnyAccountStorageSchema, FlaggedAccountStorageV1Schema } from "../schemas.js";
 import { migrateV1ToV3 } from "./migrations.js";
 import { captureAuthorityRevision } from "./authority-revision.js";
 import { withFileTransactionLock } from "./file-lock.js";
-import { getIntentionalResetMarkerPath } from "./backup-paths.js";
+import { getAccountsWalPath, getIntentionalResetMarkerPath } from "./backup-paths.js";
 import type { ManagedAccount } from "../accounts.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
-import { collectRestorableCredentials, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
+import { collectRestorableCredentials, getAccountsBackupRecoveryCandidatesWithDiscoverySync, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 export { getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 
 /**
@@ -60,8 +61,8 @@ function isNewerCredential(candidate: Credential, current: Credential): boolean 
 }
 
 type Authorization = Pick<PendingAuth, "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled">;
-function mergeAuthorization(accessToken: string, sources: Array<Authorization & {accessToken?: string}>): Authorization {
-	const invalidated = sources.filter(source => source.authInvalidatedAt && source.accessToken === accessToken)
+function mergeAuthorization(credential: Credential, sources: Array<Authorization & Partial<Credential>>): Authorization {
+	const invalidated = sources.filter(source => source.authInvalidatedAt && source.accessToken === credential.accessToken && source.refreshToken === credential.refreshToken && source.expiresAt === credential.expiresAt)
 		.sort((a, b) => (b.authInvalidatedAt ?? 0) - (a.authInvalidatedAt ?? 0))[0];
 	return {
 		authInvalidatedAt: invalidated?.authInvalidatedAt,
@@ -102,7 +103,17 @@ async function write(path: string, entries: PendingAuth[]): Promise<void> {
 	}
 }
 
-export class PendingAuthObservationError extends Error {
+export class PendingAuthLocalError extends Error {}
+
+export class PendingAuthAdmissionError extends PendingAuthLocalError {
+	readonly code = "EPENDINGAUTHADMISSION";
+	constructor(cause: unknown) {
+		super("Account refresh admission failed", {cause});
+		this.name = "PendingAuthAdmissionError";
+	}
+}
+
+export class PendingAuthObservationError extends PendingAuthLocalError {
 	readonly code = "EPENDINGAUTHUNREADABLE";
 	readonly statusCode = 503;
 	constructor() {
@@ -120,7 +131,7 @@ export async function capturePendingAuth(storagePath: string, accounts: readonly
 	return {entries, accounts: structuredClone(accounts ?? [])};
 }
 
-export class PendingAuthCapacityError extends Error {
+export class PendingAuthCapacityError extends PendingAuthLocalError {
 	readonly code = "EPENDINGAUTHCAPACITY";
 	constructor(options?: ErrorOptions) {
 		super("Cannot safely retain rotated credentials within the journal capacity", options);
@@ -145,32 +156,149 @@ async function trimToCapacity(storagePath: string, entries: PendingAuth[], prote
 	return entries.filter(entry => !dropped.has(entry));
 }
 
-export class PendingAuthSettlementError extends Error {
+export class PendingAuthSettlementError extends PendingAuthLocalError {
 	readonly code = "EPENDINGAUTHSETTLEMENT";
-	constructor(readonly result: TokenSuccess, cause: unknown, readonly authorityCurrent: () => boolean = () => true, readonly owner?: AccountMetadataV3) {
-		super("Rotated credentials could not be durably retained; they remain only in memory", {cause});
+	constructor(readonly result: TokenSuccess, cause: unknown, readonly authorityCurrent: () => boolean = () => true, readonly owner?: AccountMetadataV3, readonly durability: "memory" | "journal" | "unverified" = "memory") {
+		super(durability === "journal" ? "Journaled credentials could not be published" : durability === "unverified" ? "Rotated credential publication failed; durable retention is unverified" : "Rotated credentials could not be durably retained; they remain only in memory", {cause});
 		this.name = "PendingAuthSettlementError";
 		Object.defineProperties(this, {result: {enumerable: false}, owner: {enumerable: false}, authorityCurrent: {enumerable: false}});
 	}
 }
 
-export async function withRefreshCredentialRetention<T>(
-	account: ManagedAccount | AccountMetadataV3 | OAuthAuthDetails,
+type RefreshOwner = ManagedAccount | AccountMetadataV3 | OAuthAuthDetails;
+
+function refreshBinding(owner: RefreshOwner, result?: TokenSuccess): unknown[] {
+	const replaced = result && !("type" in owner) && (("index" in owner ? owner.access : owner.accessToken) !== result.access || owner.refreshToken !== result.refresh || ("index" in owner ? owner.expires : owner.expiresAt) !== result.expires);
+	return "type" in owner
+		? [owner.type, result?.access ?? owner.access, result?.refresh ?? owner.refresh, result?.expires ?? owner.expires]
+		: [owner.recordId, result?.access ?? ("index" in owner ? owner.access : owner.accessToken), result?.refresh ?? owner.refreshToken,
+			result?.expires ?? ("index" in owner ? owner.expires : owner.expiresAt), owner.accountId, owner.enabled === false,
+			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex];
+}
+
+export function captureRefreshCredentialAuthority(
+	account: RefreshOwner,
+	current: () => boolean = () => true,
+	retainAccount: () => RefreshOwner | null = () => account,
+	storagePath = getStoragePath(),
+): (result?: TokenSuccess) => boolean {
+	const submitted = structuredClone(account);
+	const ambientPath = getStoragePath();
+	const flaggedPaths = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].flatMap(name => {
+		const path = getFlaggedAccountsPath(storagePath, name);
+		return [path, ...getFlaggedBackupPaths(path)];
+	});
+	let accountBackups: string[];
+	try { accountBackups = getAccountsBackupRecoveryCandidatesWithDiscoverySync(storagePath); }
+	catch (error) { throw new PendingAuthAdmissionError(error); }
+	const walPath = getAccountsWalPath(storagePath);
+	const paths = [storagePath, ...flaggedPaths, ...accountBackups, walPath];
+	let revision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
+	let revalidated = false;
+	const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(storagePath)]);
+	const matches = (row: AccountMetadataV3, result?: TokenSuccess) => "type" in submitted ? row.refreshToken === submitted.refresh || row.refreshToken === result?.refresh
+		: submitted.recordId && row.recordId ? row.recordId === submitted.recordId : row.refreshToken === submitted.refreshToken || row.refreshToken === result?.refresh;
+	const sample = (path: string, result?: TokenSuccess): AccountMetadataV3 | undefined => {
+		try {
+			let value: unknown = JSON.parse(readFileSync(path, "utf8"));
+			if (!flaggedPaths.includes(path)) {
+				if (path === walPath) value = JSON.parse(AccountsJournalEntrySchema.pick({version: true, content: true}).parse(value).content);
+				const storage = AnyAccountStorageSchema.parse(value);
+				return (storage.version === 3 ? storage : migrateV1ToV3(storage)).accounts.find(row => matches(row, result));
+			}
+			return FlaggedAccountStorageV1Schema.parse(value).accounts.find(row => matches(row, result));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw new PendingAuthAdmissionError(error);
+		}
+	};
+	const sampledRoots = paths.map(path => ({path, row: sample(path)}));
+	// The primary owns the current generation; older backups remain revision proofs.
+	const roots = sampledRoots.filter(root => root.row).slice(0, 1);
+	if (existsSync(storagePath) && !roots.some(root => root.row)) throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is not in the current pool"), {code: "ESTALE"}));
+	const journalRevision = captureAuthorityRevision([getPendingAuthPath(storagePath)]);
+	const journal = (): PendingAuth[] => {
+		try {return fileSchema.parse(JSON.parse(readFileSync(getPendingAuthPath(storagePath), "utf8"))).entries;}
+		catch (error) {if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw new PendingAuthAdmissionError(error);}
+	};
+	const entries = journal();
+	const credentials = (owner: RefreshOwner) => "type" in owner ? [owner.access, owner.refresh, owner.expires]
+		: ["index" in owner ? owner.access : owner.accessToken, owner.refreshToken, "index" in owner ? owner.expires : owner.expiresAt];
+	for (const {row} of roots) {
+		if (!row) continue;
+		const effective = overlayPendingAuth({version: 3, accounts: [structuredClone(row)], activeIndex: 0}, entries).accounts[0];
+		if (!effective) throw new PendingAuthAdmissionError(Object.assign(Error("Recovery owner is absent"), {code: "ESTALE"}));
+		const rawMatches = credentials(row).every((value, index) => value === credentials(submitted)[index]);
+		const authorization = rawMatches ? row : effective;
+		if (!rawMatches && !credentials(effective).every((value, index) => value === credentials(submitted)[index]) ||
+			!("type" in submitted) && ((row.recordId && row.recordId !== submitted.recordId) || (row.enabled === false) !== (submitted.enabled === false) ||
+				authorization.authInvalidatedAt !== submitted.authInvalidatedAt || authorization.authInvalidationErrorCode !== submitted.authInvalidationErrorCode ||
+				row.accountId !== submitted.accountId || JSON.stringify(row.workspaces) !== JSON.stringify(submitted.workspaces) || row.currentWorkspaceIndex !== submitted.currentWorkspaceIndex)) {
+			throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is no longer current"), {code: "ESTALE"}));
+		}
+	}
+	return result => {
+		const owner = retainAccount();
+		if (!owner || !current() || !resetCurrent() || (ambientPath === storagePath && getStoragePath() !== ambientPath)) return false;
+		try {
+			if (JSON.stringify(getAccountsBackupRecoveryCandidatesWithDiscoverySync(storagePath)) !== JSON.stringify(accountBackups)) return false;
+		} catch (error) { throw new PendingAuthAdmissionError(error); }
+		const live = refreshBinding(owner);
+		const same = (expected: unknown[]) => live.every((value, index) => value === expected[index]);
+		if (!same(refreshBinding(submitted)) && !(result && same(refreshBinding(submitted, result)))) return false;
+		if (!journalRevision()) {
+			const pending = journal();
+			for (const {path, row} of roots) {
+				const disk = sample(path, result);
+				if (!row || !disk) return false;
+				const effective = overlayPendingAuth({version: 3, accounts: [disk], activeIndex: 0}, pending).accounts[0];
+				if (!effective) return false;
+				const actual = refreshBinding(effective);
+				if (!actual.every((value, index) => value === refreshBinding(row)[index]) &&
+					!(result && actual.every((value, index) => value === refreshBinding(row, result)[index]))) return false;
+			}
+		}
+		if (revision()) return true;
+		if (!roots.length || revalidated) return false;
+		const nextRevision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
+		const valid = sampledRoots.every(({path, row}) => {
+			const disk = sample(path, result);
+			if (!row) {
+				if (!disk) return true;
+				const actual = refreshBinding(disk);
+				return actual.every((value, index) => value === refreshBinding(submitted)[index]) ||
+					!!result && actual.every((value, index) => value === refreshBinding(submitted, result)[index]);
+			}
+			if (!disk) return false;
+			const expected = refreshBinding(row), actual = refreshBinding(disk);
+			return actual.every((value, index) => value === expected[index]) || !!result && actual.every((value, index) => value === refreshBinding(row, result)[index]);
+		});
+		if (!valid || !nextRevision()) return false;
+		revision = nextRevision;
+		revalidated = true;
+		return true;
+	};
+}
+
+export async function withRefreshCredentialRetention<T extends TokenResult>(
+	account: RefreshOwner,
 	operation: () => Promise<T>,
 	current: () => boolean = () => true,
 	retainAccount: () => typeof account | null = () => account,
+	storagePath = getStoragePath(),
 ): Promise<T> {
-	const binding = (owner: typeof account) => "type" in owner
-		? [owner.type, owner.access, owner.refresh, owner.expires]
-		: [owner.recordId, "index" in owner ? owner.access : owner.accessToken, owner.refreshToken,
-			"index" in owner ? owner.expires : owner.expiresAt, owner.accountId, owner.enabled, owner.authInvalidatedAt, owner.authInvalidationErrorCode];
-	const submitted = binding(account);
+	const authorityCurrent = captureRefreshCredentialAuthority(account, current, retainAccount, storagePath);
 	try {
-		return await operation();
+		const result = await operation();
+		const tokenResult: TokenResult = result;
+		const credential = tokenResult.type === "success" ? tokenResult : undefined;
+		if (!authorityCurrent(credential)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during refresh"), {code: "ESTALE"}));
+		return result;
 	} catch (error) {
 		const owner = retainAccount();
-		if (owner && error instanceof PendingAuthSettlementError && error.authorityCurrent() && current() &&
-			binding(owner).every((value, index) => value === submitted[index])) {
+		let retain = false;
+		try { retain = error instanceof PendingAuthSettlementError && error.authorityCurrent() && authorityCurrent(error.result); } catch { retain = false; }
+		if (owner && error instanceof PendingAuthSettlementError && retain) {
 			if ("type" in owner) {
 				owner.access = error.result.access;
 				owner.refresh = error.result.refresh;
@@ -235,8 +363,8 @@ export async function withPendingAuthRefresh(
 				accessToken: result.access,
 				expiresAt: result.expires,
 				enabled: owner?.enabled === false ? false : undefined,
-				authInvalidatedAt: owner?.accessToken === result.access ? owner.authInvalidatedAt : undefined,
-				authInvalidationErrorCode: owner?.accessToken === result.access ? owner.authInvalidationErrorCode : undefined,
+				authInvalidatedAt: owner?.accessToken === result.access && owner.refreshToken === result.refresh && owner.expiresAt === result.expires ? owner.authInvalidatedAt : undefined,
+				authInvalidationErrorCode: owner?.accessToken === result.access && owner.refreshToken === result.refresh && owner.expiresAt === result.expires ? owner.authInvalidationErrorCode : undefined,
 				at: Date.now(),
 			}, entries.find(entry => entry.prior === prior));
 			if (journaled.refreshToken === result.refresh && journaled.accessToken === result.access && journaled.expiresAt === result.expires) return result;
@@ -273,7 +401,7 @@ async function recordPendingAuthLocked(
 	const spentObservedCredential = recorded && observed && recorded.refreshToken === auth.priorRefreshToken &&
 		JSON.stringify(recorded) === JSON.stringify(observed);
 	const credential = recorded && !spentObservedCredential && !isNewerCredential(auth, recorded) ? recorded : auth;
-	let retained: Omit<PendingAuth, "prior"> = {...credential, ...mergeAuthorization(credential.accessToken, [auth, ...(recorded ? [recorded] : [])])};
+	let retained: Omit<PendingAuth, "prior"> = {...credential, ...mergeAuthorization(credential, [auth, ...(recorded ? [recorded] : [])])};
 	const followed = new Set<string>();
 	for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
 		if (next.prior === prior && spentObservedCredential) break;
@@ -281,10 +409,10 @@ async function recordPendingAuthLocked(
 		followed.add(next.prior);
 		const sameToken = next.refreshToken === retained.refreshToken;
 		const credential = sameToken && isNewerCredential(retained, next) ? retained : next;
-		retained = {...credential, ...mergeAuthorization(credential.accessToken, [retained, next])};
+		retained = {...credential, ...mergeAuthorization(credential, [retained, next])};
 		if (sameToken) break;
 	}
-	const replacement: Omit<PendingAuth, "prior"> = {recordId: retained.recordId ?? auth.recordId ?? recorded?.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained.accessToken, [retained]), at: retained.at};
+	const replacement: Omit<PendingAuth, "prior"> = {recordId: retained.recordId ?? auth.recordId ?? recorded?.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained, [retained]), at: retained.at};
 	replacement.committed = undefined;
 	const entries = existing.filter(
 		(entry) => entry.prior !== prior && (entry.prior !== hash(replacement.refreshToken) || entry.refreshToken === replacement.refreshToken),
@@ -296,10 +424,10 @@ async function recordPendingAuthLocked(
 	// recovery source can surface — a stale-snapshot restore then self-heals
 	// straight to the newest credential instead of reviving a spent token.
 	const chained = entries.filter(entry => entry.refreshToken === auth.priorRefreshToken);
-	Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...chained]));
+	Object.assign(replacement, mergeAuthorization(replacement, [replacement, ...chained]));
 	for (const entry of chained) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
 	const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
-	Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
+	Object.assign(replacement, mergeAuthorization(replacement, [replacement, ...aliases]));
 	const identities = new Set(aliases.map(entry => entry.recordId).filter(id => id !== undefined));
 	if (identities.size === 1) replacement.recordId ??= identities.values().next().value;
 	const committedFor = (candidate: Omit<PendingAuth, "prior">): PendingAuth["committed"] => authorities.some(authority =>
@@ -335,15 +463,19 @@ export async function applyPendingAuth(
 		});
 		throw new PendingAuthObservationError();
 	}
+	return overlayPendingAuth(storage, entries, options);
+}
+
+function overlayPendingAuth(storage: AccountStorageV3, entries: PendingAuth[], options: {source?: "historical-recovery"} = {}): AccountStorageV3 {
 	if (!entries.length) return storage;
 	for (const account of storage.accounts) {
 		const entry = account.refreshToken ? entries.find((item) => item.prior === hash(account.refreshToken)) : undefined;
 		if (!entry) continue;
 		account.recordId ??= entry.recordId;
-		const replacesCredential = account.accessToken !== entry.accessToken || account.refreshToken !== entry.refreshToken;
+		const replacesCredential = account.accessToken !== entry.accessToken || account.refreshToken !== entry.refreshToken || account.expiresAt !== entry.expiresAt;
 		const authorization = options.source === "historical-recovery" && entry.committed
-			? mergeAuthorization(entry.accessToken, [entry])
-			: mergeAuthorization(entry.accessToken, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
+			? mergeAuthorization(entry, [entry])
+			: mergeAuthorization(entry, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
 		account.refreshToken = entry.refreshToken;
 		account.accessToken = entry.accessToken;
 		account.expiresAt = entry.expiresAt;
@@ -405,7 +537,7 @@ export async function prunePendingAuth(
 		for (const entry of entries) {
 			if (!observed || concurrent.has(entry)) continue;
 			const known = observed.accounts.find(account => {
-				const effective = mergeAuthorization(entry.accessToken, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
+				const effective = mergeAuthorization(entry, [entry, {...account, enabled: account.enabled === false ? false : undefined}]);
 				return account.refreshToken === entry.refreshToken && account.accessToken === entry.accessToken && account.expiresAt === entry.expiresAt &&
 					account.authInvalidatedAt === effective.authInvalidatedAt && account.authInvalidationErrorCode === effective.authInvalidationErrorCode &&
 					(account.enabled === false) === (effective.enabled === false) && (!entry.recordId || entry.recordId === account.recordId);

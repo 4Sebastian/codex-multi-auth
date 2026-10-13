@@ -84,6 +84,8 @@ import {
 	toAccountIdentityRef,
 } from "./storage/identity.js";
 import {
+	ACCOUNTS_FILE_NAME,
+	getStoragePath,
 	FLAGGED_ACCOUNTS_FILE_NAME,
 	LEGACY_FLAGGED_ACCOUNTS_FILE_NAME,
 	getFlaggedAccountsPath as buildFlaggedAccountsPath,
@@ -114,7 +116,6 @@ import {
 } from "./storage/path-state.js";
 import {
 	findProjectRoot,
-	getConfigDir,
 	getProjectConfigDir,
 	getProjectGlobalConfigDir,
 	resolvePath,
@@ -172,7 +173,6 @@ export type {
 };
 
 const log = createLogger("storage");
-const ACCOUNTS_FILE_NAME = "openai-codex-accounts.json";
 const ACCOUNTS_BACKUP_HISTORY_DEPTH = 3;
 const BACKUP_COPY_MAX_ATTEMPTS = 5;
 const BACKUP_COPY_BASE_DELAY_MS = 10;
@@ -841,13 +841,7 @@ export function setStoragePathDirect(path: string | null): void {
  * Returns the file path for the account storage JSON file.
  * @returns Absolute path to the accounts.json file
  */
-export function getStoragePath(): string {
-	const state = getStoragePathState();
-	if (state.currentStoragePath) {
-		return state.currentStoragePath;
-	}
-	return join(getConfigDir(), ACCOUNTS_FILE_NAME);
-}
+export { getStoragePath };
 
 export function buildNamedBackupPath(name: string): string {
 	return resolveNamedBackupPath(name, getStoragePath());

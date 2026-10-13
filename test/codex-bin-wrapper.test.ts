@@ -3168,16 +3168,40 @@ describe("codex bin wrapper", () => {
 		expect(result.stdout).toContain('"ok":true');
 	});
 
-	it("resumes process stdin when cleaning up app-server protocol proxy listeners", () => {
-		const source = readFileSync(
-			join(repoRootDir, "scripts", "codex.js"),
-			"utf8",
-		);
-		const cleanupMatch = source.match(
-			/cleanupProtocolProxy = \(\) => \{[\s\S]*?child\.stderr\?\.removeListener\("data", onChildStderrData\);[\s\S]*?\};/,
-		);
-
-		expect(cleanupMatch?.[0]).toContain("process.stdin.resume();");
+	it("resumes process stdin after a backpressured app-server child exits", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const paused = join(fixtureRoot, "stdin-paused");
+		const observed = join(fixtureRoot, "stdin-cleanup.json");
+		const preload = join(fixtureRoot, "observe-stdin.cjs");
+		writeFileSync(preload, [
+			"const fs = require('node:fs');",
+			"if (process.argv[1]?.endsWith('/scripts/codex.js')) {",
+			`process.stdin.on('pause', () => fs.writeFileSync(${JSON.stringify(paused)}, 'paused'));`,
+			`process.on('exit', () => fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({paused: fs.existsSync(${JSON.stringify(paused)}), flowing: process.stdin.readableFlowing, isPaused: process.stdin.isPaused()})));`,
+			"}",
+		].join("\n"));
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const fs = require('node:fs');",
+			"process.stdout.write('child-ready\\n');",
+			`setInterval(() => { if (fs.existsSync(${JSON.stringify(paused)})) process.exit(0); }, 5);`,
+		]);
+		const wrapper = spawn(process.execPath, [join(fixtureRoot, "scripts", "codex.js"), "app-server", "--listen", "stdio://"], {
+			stdio: ["pipe", "pipe", "pipe"],
+			env: buildWrapperEnv({CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin, CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1", NODE_OPTIONS: `--require=${JSON.stringify(preload)}`}),
+		});
+		let stdout = "";
+		wrapper.stdout.on("data", chunk => {stdout += String(chunk);});
+		wrapper.stderr.resume();
+		wrapper.stdin.on("error", () => undefined);
+		const exited = new Promise<number | null>((resolve, reject) => {wrapper.once("close", resolve); wrapper.once("error", reject);});
+		try {
+			wrapper.stdin.end(" ".repeat(1024 * 1024));
+			expect(await exited).toBe(0);
+			expect(stdout).toContain("child-ready");
+		} finally {if (wrapper.exitCode === null) wrapper.kill("SIGKILL");}
+		expect(JSON.parse(readFileSync(observed, "utf8"))).toEqual({paused: true, flowing: true, isPaused: false});
 	});
 
 	it("suppresses app-server account/read errors with a synthetic multi-auth account", () => {

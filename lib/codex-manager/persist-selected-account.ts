@@ -79,9 +79,6 @@ export async function persistAndSyncSelectedAccount({
 		}
 	}
 	const wasDisabled = account.enabled === false;
-	if (wasDisabled) {
-		account.enabled = true;
-	}
 	const switchNow = Date.now();
 	let syncAccessToken = account.accessToken;
 	let syncRefreshToken = account.refreshToken;
@@ -89,7 +86,7 @@ export async function persistAndSyncSelectedAccount({
 	let syncIdToken = initialSyncIdToken;
 
 	if (!hasUsableAccessToken(account, switchNow)) {
-		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 		if (refreshResult.type === "success") {
 			const tokenAccountId = extractAccountId(refreshResult.access);
 			const nextEmail = sanitizeEmail(
@@ -119,6 +116,7 @@ export async function persistAndSyncSelectedAccount({
 		}
 	}
 
+	if (wasDisabled) account.enabled = true;
 	account.lastUsed = switchNow;
 	account.lastSwitchReason = switchReason;
 	if (setPin) {

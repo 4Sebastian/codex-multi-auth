@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, readdirSync, type Dirent } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createLogger } from "../logger.js";
 import { isRecord } from "../utils.js";
@@ -16,10 +16,7 @@ export function getPendingAuthPath(storagePath: string): string {
 	return `${storagePath}.pending-auth.json`;
 }
 
-export async function getAccountsBackupRecoveryCandidatesWithDiscovery(
-	path: string,
-	strict = false,
-): Promise<string[]> {
+function backupRecoveryCandidates(path: string, entries: readonly Dirent[]): string[] {
 	const knownCandidates = getAccountsBackupRecoveryCandidates(
 		path,
 		3,
@@ -29,9 +26,7 @@ export async function getAccountsBackupRecoveryCandidatesWithDiscovery(
 	const knownCandidateSet = new Set(knownCandidates);
 	const directoryPath = dirname(path);
 
-	try {
-		const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-		for (const entry of entries) {
+	for (const entry of entries) {
 			if (!entry.isFile()) continue;
 			if (!entry.name.startsWith(candidatePrefix)) continue;
 			if (isCacheLikeBackupArtifactName(entry.name)) continue;
@@ -43,22 +38,31 @@ export async function getAccountsBackupRecoveryCandidatesWithDiscovery(
 			if (candidatePath === getPendingAuthPath(path)) continue;
 			if (knownCandidateSet.has(candidatePath)) continue;
 			discoveredCandidates.add(candidatePath);
-		}
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (strict) throw error;
-		if (code !== "ENOENT") {
-			log.warn("Failed to discover account backup candidates", {
-				path,
-				error: String(error),
-			});
-		}
 	}
 
 	const discoveredOrdered = Array.from(discoveredCandidates).sort((a, b) =>
 		a.localeCompare(b, undefined, { sensitivity: "base" }),
 	);
 	return [...knownCandidates, ...discoveredOrdered];
+}
+
+export function getAccountsBackupRecoveryCandidatesWithDiscoverySync(path: string): string[] {
+	try { return backupRecoveryCandidates(path, readdirSync(dirname(path), {withFileTypes: true})); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return backupRecoveryCandidates(path, []);
+		throw error;
+	}
+}
+
+export async function getAccountsBackupRecoveryCandidatesWithDiscovery(path: string, strict = false): Promise<string[]> {
+	try {
+		return backupRecoveryCandidates(path, await fs.readdir(dirname(path), {withFileTypes: true}));
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (strict) throw error;
+		if (code !== "ENOENT") log.warn("Failed to discover account backup candidates", {path, error: String(error)});
+		return backupRecoveryCandidates(path, []);
+	}
 }
 
 export async function collectRestorableCredentials(path: string, includePrimary = false): Promise<PendingAuthRecoveryCredential[]> {

@@ -1,4 +1,6 @@
 import { dirname, join } from "node:path";
+import { getStoragePathState } from "./path-state.js";
+import { getConfigDir } from "./paths.js";
 import {
 	ACCOUNTS_BACKUP_SUFFIX,
 	ACCOUNTS_WAL_SUFFIX,
@@ -9,7 +11,12 @@ import {
 	RESET_MARKER_SUFFIX,
 } from "./backup-paths.js";
 
+export const ACCOUNTS_FILE_NAME = "openai-codex-accounts.json";
 const ACCOUNTS_BACKUP_HISTORY_DEPTH = 3;
+
+export function getStoragePath(): string {
+	return getStoragePathState().currentStoragePath || join(getConfigDir(), ACCOUNTS_FILE_NAME);
+}
 export const FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-flagged-accounts.json";
 export const LEGACY_FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-blocked-accounts.json";
 

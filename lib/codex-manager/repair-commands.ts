@@ -948,7 +948,7 @@ export async function runVerifyFlagged(
 				index: i,
 				flagged,
 				label: formatAccountLabel(flagged, i),
-				result: await withRefreshCredentialRetention(flagged, () => queuedRefresh(flagged.refreshToken)),
+				result: await withRefreshCredentialRetention(flagged, () => queuedRefresh(flagged.refreshToken), () => flaggedStorage.accounts.includes(flagged)),
 			});
 		}
 		return refreshChecks;
@@ -1430,7 +1430,7 @@ export async function runFix(
 			}
 		}
 
-		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 		if (refreshResult.type === "success") {
 			const nextEmail = sanitizeEmail(
 				extractAccountEmail(refreshResult.access, refreshResult.idToken),
@@ -2308,7 +2308,7 @@ export async function runDoctor(
 							message: `Prepared active-account token refresh for account ${activeIndex + 1} (dry-run)`,
 						});
 					} else {
-						const refreshResult = await withRefreshCredentialRetention(activeAccount, () => queuedRefresh(activeAccount.refreshToken));
+						const refreshResult = await withRefreshCredentialRetention(activeAccount, () => queuedRefresh(activeAccount.refreshToken), () => !!storageForChecks?.accounts.includes(activeAccount));
 						if (refreshResult.type === "success") {
 							const refreshedEmail = sanitizeEmail(
 								extractAccountEmail(refreshResult.access, refreshResult.idToken),

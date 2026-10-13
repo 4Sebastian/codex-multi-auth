@@ -93,14 +93,14 @@ vi.mock("../lib/request/fetch-helpers.js", () => ({
 	createCodexHeaders: (_requestInit: any, accountId?: string) =>
 		new Headers(accountId ? { "x-account-id": accountId } : {}),
 	handleErrorResponse: async (response: Response) => {
-		const rawBody = await response.text();
+		const rawBody = await response.clone().text();
 		let errorBody: unknown;
 		try {
 			errorBody = rawBody ? JSON.parse(rawBody) : undefined;
 		} catch {
 			errorBody = undefined;
 		}
-		return { response, rateLimit: false, errorBody };
+		return { response, rateLimit: response.status === 429 ? {retryAfterMs: Number(response.headers.get("retry-after") ?? 60) * 1000} : false, errorBody };
 	},
 	getUnsupportedCodexModelInfo: () => ({
 		isUnsupported: false,
@@ -505,7 +505,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		const {RefreshLeaseCoordinator} = await import("../lib/refresh-lease.js");
 		vi.spyOn(RefreshLeaseCoordinator.prototype, "acquire").mockResolvedValue({role: "leader", release: async () => undefined});
 		await fs.writeFile(path, JSON.stringify({version: 3, activeIndex: 0, accounts: [{
-			recordId: "record-A", refreshToken: account.refreshToken, accessToken: account.access, expiresAt: 1, enabled: true, addedAt: 1, lastUsed: 1,
+			recordId: "record-A", accountId: account.accountId, refreshToken: account.refreshToken, accessToken: account.access, expiresAt: 1, enabled: true, addedAt: 1, lastUsed: 1,
 		}]}));
 		const cause = Object.assign(Error("fixture settlement failed"), {code: "ENOSPC"});
 		const rename = fs.rename.bind(fs);
@@ -666,7 +666,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			const fetchPromise = sdk.fetch("https://example.com", {});
 			await Promise.resolve();
 			const response = await fetchPromise;
-			expect(response.status).toBe(429);
+			expect(response.status).toBe(503);
 			clearPoolExhaustionCooldown();
 		}
 
@@ -704,11 +704,11 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			Promise.resolve(
 				new Response(
 					JSON.stringify({
-						error: { code: "server_error", message: "temporary outage" },
+						error: { code: "rate_limit_exceeded", message: "fixture quota refused" },
 					}),
 					{
-						status: 500,
-						headers: { "content-type": "application/json" },
+						status: 429,
+						headers: { "content-type": "application/json", "retry-after": "120" },
 					},
 				),
 			),
@@ -763,7 +763,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		);
 	});
 
-	it("keeps the total request cap when empty-response retries and server-error rotation combine", async () => {
+	it("does not replay an accepted empty response into another account or server error", async () => {
 		const logger = await import("../lib/logger.js");
 		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
 
@@ -824,37 +824,20 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		const response = await sdk.fetch("https://example.com", {});
 		const payload = await response.json();
 
-		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(
 			fetchMock.mock.calls.map(
 				(call) => (call[1]?.headers as Headers).get("x-account-id"),
 			),
-		).toEqual([
-			"account-1",
-			"account-1",
-			"account-2",
-			"account-3",
-			"account-4",
-			"account-5",
-		]);
-		expect(response.status).toBe(503);
-		expect(payload).toEqual({
-			error: {
-				message:
-					"Request attempt budget exhausted after 6 outbound request(s). Try again after the current retries settle.",
-			},
-		});
-		expect(logWarnSpy).toHaveBeenCalledWith(
+		).toEqual(["account-1"]);
+		expect(response.status).toBe(200);
+		expect(payload).toEqual({});
+		expect(logWarnSpy).not.toHaveBeenCalledWith(
 			"Empty response received (attempt 1/2). Retrying...",
 		);
-		expect(logWarnSpy).toHaveBeenCalledWith(
+		expect(logWarnSpy).not.toHaveBeenCalledWith(
 			"Request attempt budget exhausted.",
-			expect.objectContaining({
-				reason: "primary",
-				accountIndex: 5,
-				budget: 6,
-				consumed: 6,
-			}),
+			expect.anything(),
 		);
 	});
 

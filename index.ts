@@ -62,7 +62,6 @@ import {
 	getAutoResume,
 	getCodexMode,
 	getEmptyResponseMaxRetries,
-	getEmptyResponseRetryDelayMs,
 	getFallbackToGpt52OnUnsupportedGpt53,
 	getFastSession,
 	getFastSessionMaxInputItems,
@@ -181,7 +180,7 @@ import {
 } from "./lib/recovery.js";
 import { RefreshGuardian } from "./lib/refresh-guardian.js";
 import { queuedRefresh } from "./lib/refresh-queue.js";
-import { PendingAuthCapacityError, PendingAuthSettlementError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
 import {
 	parseEnvInt,
 	parseFailoverMode,
@@ -231,7 +230,6 @@ import {
 import { CURRENT_CODEX_MODEL } from "./lib/request/helpers/model-map.js";
 import { applyFastSessionDefaults } from "./lib/request/request-transformer.js";
 import { applyResponseCompaction } from "./lib/request/response-compaction.js";
-import { isEmptyResponse } from "./lib/request/response-handler.js";
 import { CodexAuthError } from "./lib/errors.js";
 import {
 	parseRetryAfterHintMs,
@@ -908,8 +906,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 					const autoResumeEnabled = getAutoResume(pluginConfig);
 					const emptyResponseMaxRetries =
 						getEmptyResponseMaxRetries(pluginConfig);
-					const emptyResponseRetryDelayMs =
-						getEmptyResponseRetryDelayMs(pluginConfig);
 					const pidOffsetEnabled = getPidOffsetEnabled(pluginConfig);
 					const effectiveUserConfig = fastSessionEnabled
 						? applyFastSessionDefaults(userConfig)
@@ -1268,7 +1264,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								};
 
 								let allRateLimitedRetries = 0;
-								let emptyResponseRetries = 0;
 								const attemptedUnsupportedFallbackModels = new Set<string>();
 								if (model) {
 									attemptedUnsupportedFallbackModels.add(model);
@@ -1412,7 +1407,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												);
 											}
 										} catch (err) {
-											if (err instanceof PendingAuthSettlementError || err instanceof PendingAuthCapacityError) throw err;
+											if (err instanceof PendingAuthLocalError) throw err;
 											logDebug(
 												`[${PLUGIN_NAME}] Auth refresh failed for account: ${(err as Error)?.message ?? String(err)}`,
 											);
@@ -1657,7 +1652,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											continue;
 										}
 
-										let sameAccountRetryCount = 0;
 										let shortRateLimitRetryCount = 0;
 										let successAccountForResponse = account;
 										let successEntitlementAccountKey = entitlementAccountKey;
@@ -1760,7 +1754,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												);
 												runtimeMetrics.failedRequests++;
 												runtimeMetrics.networkErrors++;
-												runtimeMetrics.accountRotations++;
 												runtimeMetrics.lastError = errorMsg;
 												const policy = evaluateFailurePolicy(
 													{ kind: "network", failoverMode },
@@ -1784,19 +1777,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														capabilityModelKey,
 													);
 												}
-												if (
-													policy.retrySameAccount &&
-													sameAccountRetryCount < maxSameAccountRetries
-												) {
-													sameAccountRetryCount += 1;
-													runtimeMetrics.sameAccountRetries += 1;
-													const retryDelayMs = Math.max(
-														MIN_BACKOFF_MS,
-														Math.floor(policy.retryDelayMs ?? 250),
-													);
-													await sleep(addJitter(retryDelayMs, 0.2));
-													continue;
-												}
+
 												if (
 													typeof policy.cooldownMs === "number" &&
 													policy.cooldownReason
@@ -1809,7 +1790,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													accountManager.saveToDiskDebounced();
 												}
 												sessionAffinityStore?.forgetSession(sessionAffinityKey);
-												break;
+												throw networkError;
 											} finally {
 												clearTimeout(fetchTimeoutId);
 												if (abortSignal && onUserAbort) {
@@ -2222,14 +2203,13 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													);
 												}
 
-												// Handle 5xx server errors by rotating to another account
+												// Preserve the original 5xx outcome without replaying the authorized request.
 												if (response.status >= 500 && response.status < 600) {
 													logWarn(
-														`Server error ${response.status} for account ${account.index + 1}. Rotating to next account.`,
+														`Server error ${response.status} for account ${account.index + 1}. Request not replayed.`,
 													);
 													runtimeMetrics.failedRequests++;
 													runtimeMetrics.serverErrors++;
-													runtimeMetrics.accountRotations++;
 													runtimeMetrics.lastError = `HTTP ${response.status}`;
 													const serverRetryAfterMs = parseRetryAfterHintMs(
 														response.headers,
@@ -2284,19 +2264,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 															capabilityModelKey,
 														);
 													}
-													if (
-														policy.retrySameAccount &&
-														sameAccountRetryCount < maxSameAccountRetries
-													) {
-														sameAccountRetryCount += 1;
-														runtimeMetrics.sameAccountRetries += 1;
-														const retryDelayMs = Math.max(
-															MIN_BACKOFF_MS,
-															Math.floor(policy.retryDelayMs ?? 500),
-														);
-														await sleep(addJitter(retryDelayMs, 0.2));
-														continue;
-													}
+
 													if (
 														typeof policy.cooldownMs === "number" &&
 														policy.cooldownReason
@@ -2311,7 +2279,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													sessionAffinityStore?.forgetSession(
 														sessionAffinityKey,
 													);
-													break;
+													return errorResponse;
 												}
 
 												if (errorResponse.status === 429 && rateLimit) {
@@ -2524,7 +2492,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	);
 																}
 															} catch (refreshError) {
-																if (refreshError instanceof PendingAuthSettlementError || refreshError instanceof PendingAuthCapacityError) throw refreshError;
+																if (refreshError instanceof PendingAuthLocalError) throw refreshError;
 																logWarn(
 																	`Stream failover refresh failed for account ${fallbackAccount.index + 1}.`,
 																	{
@@ -2752,7 +2720,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																);
 																return fallbackResponse;
 															} catch (streamFailoverError) {
-															if (streamFailoverError instanceof PendingAuthSettlementError || streamFailoverError instanceof PendingAuthCapacityError) throw streamFailoverError;
+															if (streamFailoverError instanceof PendingAuthLocalError) throw streamFailoverError;
 																accountManager.refundToken(
 																	fallbackAccount,
 																	modelFamily,
@@ -2840,104 +2808,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												},
 											);
 
-											if (!isStreaming && emptyResponseMaxRetries > 0) {
-												const clonedResponse = successResponse.clone();
-												try {
-													const bodyText = await clonedResponse.text();
-													const parsedBody = bodyText
-														? (JSON.parse(bodyText) as unknown)
-														: null;
-													if (isEmptyResponse(parsedBody)) {
-														if (
-															emptyResponseRetries < emptyResponseMaxRetries
-														) {
-															emptyResponseRetries++;
-															runtimeMetrics.emptyResponseRetries++;
-															logWarn(
-																`Empty response received (attempt ${emptyResponseRetries}/${emptyResponseMaxRetries}). Retrying...`,
-															);
-															await showRuntimeToast(
-																client,
-																`Empty response. Retrying (${emptyResponseRetries}/${emptyResponseMaxRetries})...`,
-																"warning",
-																{ duration: toastDurationMs },
-															);
-															accountManager.refundToken(
-																account,
-																modelFamily,
-																model,
-															);
-															accountManager.recordFailure(
-																account,
-																modelFamily,
-																model,
-															);
-															capabilityPolicyStore.recordFailure(
-																entitlementAccountKey,
-																capabilityModelKey,
-															);
-															const emptyPolicy = evaluateFailurePolicy({
-																kind: "empty-response",
-																failoverMode,
-															});
-															if (
-																emptyPolicy.retrySameAccount &&
-																sameAccountRetryCount < maxSameAccountRetries
-															) {
-																sameAccountRetryCount += 1;
-																runtimeMetrics.sameAccountRetries += 1;
-																const retryDelayMs = Math.max(
-																	0,
-																	Math.floor(
-																		emptyPolicy.retryDelayMs ??
-																			emptyResponseRetryDelayMs,
-																	),
-																);
-																if (retryDelayMs > 0) {
-																	await sleep(addJitter(retryDelayMs, 0.2));
-																}
-																continue;
-															}
-															sessionAffinityStore?.forgetSession(
-																sessionAffinityKey,
-															);
-															await sleep(
-																addJitter(emptyResponseRetryDelayMs, 0.2),
-															);
-															break;
-														}
-														if (response.status >= 500) {
-															const serverBurstCooldownUntil =
-																recordServerBurstFailure(account.index);
-															if (serverBurstCooldownUntil > 0) {
-																runtimeMetrics.serverBurstFastFails += 1;
-																runtimeMetrics.lastError =
-																	"Repeated upstream server errors across the account pool";
-																syncRuntimeObservability(requestTraceId);
-																return new Response(
-																	JSON.stringify({
-																		error: {
-																			message: `Upstream server failures were observed across multiple accounts. Pausing retries for ${formatWaitTime(serverBurstCooldownUntil - Date.now())}. Check \`codex-multi-auth report --json\` for runtime metrics.`,
-																		},
-																	}),
-																	{
-																		status: 503,
-																		headers: {
-																			"content-type":
-																				"application/json; charset=utf-8",
-																		},
-																	},
-																);
-															}
-														}
-														logWarn(
-															`Empty response after ${emptyResponseMaxRetries} retries. Returning as-is.`,
-														);
-													}
-												} catch {
-													// Intentionally empty: non-JSON response bodies should be returned as-is
-												}
-											}
 
 											if (successAccountForResponse.index !== account.index) {
 												accountManager.markSwitched(
@@ -4432,7 +4302,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 						const label = formatAccountLabel(account, i);
 						try {
-							const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
+							const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 							if (refreshResult.type === "success") {
 								results.push(
 									`  ${getStatusMarker(ui, "ok")} ${label}: Healthy`,
@@ -4445,6 +4315,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								unhealthyCount++;
 							}
 						} catch (error) {
+							if (error instanceof PendingAuthLocalError) throw error;
 							const errorMsg =
 								error instanceof Error ? error.message : String(error);
 							results.push(
@@ -4662,7 +4533,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 									const label = formatAccountLabel(account, i);
 
 									try {
-										const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
+										const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 										if (refreshResult.type === "success") {
 											account.refreshToken = refreshResult.refresh;
 											account.accessToken = refreshResult.access;
@@ -4678,6 +4549,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											failedCount++;
 										}
 									} catch (error) {
+										if (error instanceof PendingAuthLocalError) throw error;
 										const errorMsg =
 											error instanceof Error ? error.message : String(error);
 										results.push(

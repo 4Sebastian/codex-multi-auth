@@ -369,7 +369,7 @@ export async function runReportCommand(
 					);
 					continue;
 				}
-				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 				if (refreshResult.type !== "success") {
 					refreshFailures.set(i, {
 						...refreshResult,

@@ -1720,9 +1720,9 @@ async function applyWebSocketTerminalAccountFailure(
 			accountManager.recordFailure(account, context.family, context.model, active.circuitAdmission);
 			if (terminal.tokenInvalidated) {
 				accountManager.markAuthInvalidated(account, "token_invalidated", undefined, active.accessToken);
-				applyMonotonicAuthCooldown(accountManager, account, state.tokenInvalidationCooldownMs, active.accessToken);
+				applyMonotonicAuthCooldown(accountManager, account, state.tokenInvalidationCooldownMs, active);
 			} else {
-				applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, active.accessToken);
+				applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, active);
 			}
 		});
 		if (applied) forgetAffinity();
@@ -2113,7 +2113,7 @@ async function prepareWebSocketAccount(
 				await accountManager.withCurrentAccountCredential(refreshed.account, prepared, () => {
 					if (state.activeAccountManager !== accountManager) return false;
 					accountManager.recordFailure(refreshed.account, context.family, context.model, prepared.circuitAdmission);
-					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, prepared);
 					return true;
 				});
 			} finally {lifecycle.onReleased(prepared);}
@@ -2230,7 +2230,7 @@ async function connectManagedWebSocket(
 					await applyDispatchRestriction(state, prepared, () => {
 						accountManager.recordFailure(account, context.family, context.model, prepared.circuitAdmission);
 						if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, accessToken);
-						applyMonotonicAuthCooldown(accountManager, account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, accessToken);
+						applyMonotonicAuthCooldown(accountManager, account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, prepared);
 					});
 					if (invalidated) {
 						await request.usageRecorder.record({
@@ -3541,6 +3541,7 @@ async function handleRequestInner(
 		const attemptedIndexes = new Set<number>();
 		// The upstream's own capability 400/403/404, forwarded instead of a
 		// synthetic 503 when no other account can take the request.
+		let transportFailureAccount: ManagedAccount | undefined;
 		let lastCapabilityRejection: { status: number; body: string; headers: Record<string, string>; account: ManagedAccount } | undefined;
 		// True while no other failure has followed the last capability rejection.
 		let capabilityRejectionIsLatest = false;
@@ -4256,7 +4257,7 @@ async function handleRequestInner(
 				await accountManager.withCurrentAccountCredential(refreshed.account, captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, ""), () => {
 					if (state.activeAccountManager !== accountManager) return false;
 					accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
-					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+					applyMonotonicAuthCooldown(accountManager, refreshed.account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, {accessToken: refreshed.accessToken, refreshToken: refreshed.account.refreshToken, expiresAt: refreshed.account.expires});
 					return true;
 				});
 				exhaustionReason = "auth-failure";
@@ -4281,6 +4282,7 @@ async function handleRequestInner(
 
 			const binding = captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, accountId);
 			const requestUsage = usageRecorder;
+			const submittedUsageAccount = structuredClone(refreshed.account);
 			const capabilityScopeId = requestScope?.id ?? workspaceModelScopes(refreshed.account).find(scope => scope.accountId === accountId)?.id ?? catalogAccountKey(refreshed.account);
 			const submittedCapabilityKey = capabilityFailureKey(capabilityScopeId, binding);
 			const validate = () => validateAccountDispatch(state, context, binding, circuitAdmission, admittedCooldown, async () => apiKeyClient || await nativeOAuth());
@@ -4428,8 +4430,9 @@ async function handleRequestInner(
 					return;
 				}
 				if (state.webSocketRequestSent?.()) {
-					writeJson(res, 502, {error: {code: "upstream_websocket_disconnected", message: "Upstream WebSocket request failed; not replayed."}});
-					await usageRecorder.record({outcome: "failure", statusCode: 502, errorCode: "upstream_websocket_disconnected", account: refreshed.account});
+					const errorCode = "upstream_websocket_disconnected";
+					writeJson(res, 502, {error: {code: errorCode, message: "Upstream request failed after dispatch; not replayed."}});
+					await usageRecorder.record({outcome: "failure", statusCode: 502, errorCode, account: refreshed.account});
 					return;
 				}
 				// A timeout may occur after generation; do not retry within this request.
@@ -4473,6 +4476,10 @@ async function handleRequestInner(
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
 				transientExhaustionReason = "network-error";
+				if (dispatchAuthorized) {
+					transportFailureAccount = submittedUsageAccount;
+					break;
+				}
 				state.status.retries += 1;
 				noteRotation();
 				continue;
@@ -4715,7 +4722,7 @@ async function handleRequestInner(
 				const restricted = await applyDispatchRestriction(state, binding, () => {
 					accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
 					if (invalidated) accountManager.markAuthInvalidated(refreshed.account, extractErrorCodeFromBody(bodyText) ?? "token_invalidated", undefined, refreshed.accessToken);
-					applyMonotonicAuthCooldown(accountManager, refreshed.account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, refreshed.accessToken);
+					applyMonotonicAuthCooldown(accountManager, refreshed.account, invalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, binding);
 				});
 				if (!restricted) {
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
@@ -4796,13 +4803,7 @@ async function handleRequestInner(
 						"server-error",
 					);
 				});
-				exhaustionReason = "server-error";
-				capabilityRejectionIsLatest = false;
-				transientAttempts += 1;
-				transientExhaustionReason = "server-error";
-				state.status.retries += 1;
-				noteRotation();
-				continue;
+
 			}
 
 			if (isThreadGoalRequest && upstream.status >= 400) {
@@ -4933,7 +4934,7 @@ async function handleRequestInner(
 									if (status === 401) {
 										accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
 										if (terminal.tokenInvalidated) accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, binding.accessToken);
-										applyMonotonicAuthCooldown(accountManager, refreshed.account, terminal.tokenInvalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, binding.accessToken);
+										applyMonotonicAuthCooldown(accountManager, refreshed.account, terminal.tokenInvalidated ? state.tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, binding);
 									} else if ((status === 402 || status === 403) && isWorkspaceDisabledError(status, terminal.record.errorCode, terminal.errorMessage ?? "")) {
 										if (requestScope && refreshed.account.workspaces?.length) accountManager.disableWorkspace(refreshed.account, requestScope.accountId);
 										else {
@@ -4952,7 +4953,7 @@ async function handleRequestInner(
 						responseRestriction ??= applyDispatchRestriction(state, binding, () => {
 							accountManager.markAuthInvalidated(refreshed.account, "token_invalidated", undefined, binding.accessToken);
 							accountManager.recordFailure(refreshed.account, context.family, context.model, circuitAdmission);
-							applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs, binding.accessToken);
+							applyMonotonicAuthCooldown(accountManager, refreshed.account, state.tokenInvalidationCooldownMs, binding);
 							state.sessionAffinityStore?.forgetSession(context.sessionKey);
 						});
 						void responseRestriction.catch(captureRestrictionFailure);
@@ -4995,8 +4996,10 @@ async function handleRequestInner(
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			const completion = responseOutcome.finish();
 			if (forwarded && upstream.ok && !restrictionFailure) {
-				if (isDispatchBindingCurrent(state, binding)) accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
-				recordRuntimeAccountRecovery(refreshed.account.index);
+				if (isDispatchBindingCurrent(state, binding)) {
+					accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
+					recordRuntimeAccountRecovery(refreshed.account.index);
+				}
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
@@ -5186,6 +5189,7 @@ async function handleRequestInner(
 				outcome: "failure",
 				statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
 				errorCode: "codex_pinned_account_unavailable",
+				account: transportFailureAccount,
 			});
 			writeJson(res, HTTP_STATUS.SERVICE_UNAVAILABLE, { error: errorBody });
 			return;
@@ -5201,6 +5205,7 @@ async function handleRequestInner(
 			outcome: "failure",
 			statusCode: normalizeExhaustionStatus(exhaustionReason),
 			errorCode: isThreadGoalRequest && context.upstreamPath.endsWith("/get") ? "thread_goal_pool_exhausted" : exhaustionReason,
+			account: transportFailureAccount,
 		});
 		if (isThreadGoalRequest && context.upstreamPath.endsWith("/get")) {
 			writeJson(res, HTTP_STATUS.OK, { goal: null });

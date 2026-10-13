@@ -111,7 +111,7 @@ it("denies upstream refresh at required-root capacity and retains an already-spe
 	const auth = await import("../lib/auth/auth.js");
 	const upstream = vi.spyOn(auth, "refreshAccessToken").mockResolvedValue({type: "success", access: "fixture", refresh: "fixture", expires: 1});
 	const {queuedRefresh} = await import("../lib/refresh-queue.js");
-	expect((await queuedRefresh("new-0")).type).toBe("failed");
+	await expect(queuedRefresh("new-0")).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
 	expect(upstream).not.toHaveBeenCalled();
 	const manager = new AccountManager(undefined, await loadAccounts());
 	vi.spyOn(manager, "saveToDiskDebounced").mockImplementation(() => undefined);
@@ -124,7 +124,7 @@ it("denies upstream refresh at required-root capacity and retains an already-spe
 	await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "access-newest", refresh: "newest", expires: 2})).rejects.toMatchObject({cause: {cause: firstError}});
 	expect(manager.getAccountByIndex(0)?.refreshToken).toBe("newest");
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
-	expect((await queuedRefresh("newest")).type).toBe("failed");
+	await expect(queuedRefresh("newest")).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
 	expect(upstream).not.toHaveBeenCalled();
 });
 

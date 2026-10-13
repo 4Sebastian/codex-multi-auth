@@ -21,7 +21,7 @@ import { RefreshLeaseCoordinator } from "../lib/refresh-lease.js";
 import { AccountManager } from "../lib/accounts.js";
 import { ensureFreshAccessToken } from "../lib/runtime/rotation-token-refresh.js";
 import { loadAccounts, loadFlaggedAccounts, getFlaggedAccountsPath, getStoragePath, saveAccounts, setStoragePathDirect } from "../lib/storage.js";
-import { PendingAuthSettlementError, applyPendingAuth, capturePendingAuth, getPendingAuthPath, prunePendingAuth } from "../lib/storage/pending-auth.js";
+import { PendingAuthLocalError, PendingAuthSettlementError, applyPendingAuth, capturePendingAuth, getPendingAuthPath, prunePendingAuth } from "../lib/storage/pending-auth.js";
 import { collectRestorableCredentials } from "../lib/storage/recovery-credentials.js";
 import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
@@ -78,7 +78,7 @@ async function seedNearCapacity() {
 	return roots;
 }
 
-type Message = {event: string; token?: string; result?: TokenResult; tokens?: string[]; enabled?: boolean; error?: string};
+type Message = {event: string; token?: string; result?: TokenResult; tokens?: string[]; enabled?: boolean; error?: string; code?: string};
 async function worker(token: string, options = "") {
 	const workerPath = join(dir, "refresh-worker.mjs");
 	if (!existsSync(workerPath)) buildSync({stdin: {contents: `
@@ -123,7 +123,7 @@ if (token === "read") {
       await manager.commitRefreshedAuth(account, {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires});
     }
     send({event: "done", tokens: (await loadAccounts()).accounts.map(row => row.refreshToken)});
-  } catch (error) {send({event: "error", error: error.message});}
+  } catch (error) {send({event: "error", error: error.message, code: error.code});}
   process.disconnect();
 }
 `, resolveDir: process.cwd()}, bundle: true, format: "esm", platform: "node", outfile: workerPath, logLevel: "silent"});
@@ -136,8 +136,8 @@ if (token === "read") {
 		if (known) {resolve(known); return;}
 		const received = (message: unknown) => {
 			const row = message as Message;
-			if (row.event === "error") {cleanup(); reject(Error(row.error));}
-			else if (events.includes(row.event)) {cleanup(); resolve(row);}
+			if (events.includes(row.event)) {cleanup(); resolve(row);}
+			else if (row.event === "error") {cleanup(); reject(Error(row.error));}
 		};
 		const exited = () => {cleanup(); reject(Error(`Fixture exited before ${events.join("/")}`));};
 		const cleanup = () => {child.off("message", received); child.off("exit", exited);};
@@ -154,11 +154,11 @@ it("protects the final slot across distinct-process OAuth spend and failed manag
 	const b = await worker("B");
 	const boundary = await b.next(["blocked", "spend"]);
 	a.child.send("release");
-	const [aResult, bResult] = await Promise.all([a.next(["settled"]), b.next(["settled"])]);
-	await Promise.all([a.next(["done"]), b.next(["done"])]);
+	const [aResult, bResult] = await Promise.all([a.next(["settled"]), b.next(["error"])]);
+	await a.next(["done"]);
 	expect(boundary.event).toBe("blocked");
 	expect(aResult.result?.type).toBe("success");
-	expect(bResult.result?.type).toBe("failed");
+	expect(bResult).toMatchObject({event: "error", code: "EPENDINGAUTHCAPACITY"});
 	expect([...a.messages, ...b.messages].filter(row => row.event === "spend").map(row => row.token)).toEqual(["A"]);
 	const entries = (await capturePendingAuth(path, [])).entries;
 	expect(entries).toHaveLength(1000);
@@ -181,7 +181,7 @@ it("keeps settled credentials after owner process loss and recovers its abandone
 	a.child.kill("SIGKILL");
 	await exited;
 	const b = await worker("B");
-	expect((await b.next(["settled"])).result?.type).toBe("failed");
+	expect(await b.next(["error"])).toMatchObject({event: "error", code: "EPENDINGAUTHCAPACITY"});
 	expect(b.messages.some(row => row.event === "spend")).toBe(false);
 	const fresh = await worker("read");
 	expect((await fresh.next(["read"])).tokens).toContain("A-next");
@@ -308,10 +308,10 @@ it("rejects a queued cross-process refresh after reset authority changes while a
 	await withFileTransactionLock(path, async () => {
 		contender = await worker("B");
 		await contender.next(["blocked"]);
-		pending = contender.next(["settled"]);
+		pending = contender.next(["error"]);
 		await fs.writeFile(getIntentionalResetMarkerPath(path), "fixture-reset");
 	});
-	expect((await pending).result?.type).toBe("failed");
+	expect(await pending).toMatchObject({event: "error", code: "EPENDINGAUTHADMISSION"});
 	expect(contender.messages.some(row => row.event === "spend")).toBe(false);
 	expect((await capturePendingAuth(path, [])).entries).toHaveLength(0);
 }, 20000);
@@ -427,10 +427,10 @@ it.each(["corrupt-journal", "corrupt-primary", "locked"])("denies admission befo
 		await withFileTransactionLock(path, async () => {
 			const waiting = await worker("B");
 			await waiting.next(["blocked"]);
-			expect((await waiting.next(["settled"])).result?.type).toBe("failed");
+			await expect(waiting.next(["settled"])).rejects.toThrow("admission");
 			expect(waiting.messages.some(row => row.event === "spend")).toBe(false);
 		});
-	} else expect((await queue().refresh("A", path)).type).toBe("failed");
+	} else await expect(queue().refresh("A", path)).rejects.toBeInstanceOf(PendingAuthLocalError);
 	expect(fetch).not.toHaveBeenCalled();
 }, 20000);
 
@@ -454,7 +454,7 @@ it.each([".bak.1", ".bak.2"])("retains older flagged recovery roots through save
 	expect((await capturePendingAuth(path, [])).entries).toHaveLength(999);
 	const fetch = injectRefresh();
 	expect(await queue().refresh("A", path)).toMatchObject({type: "success", refresh: "A-next"});
-	expect(await queue().refresh("B", path)).toMatchObject({type: "failed"});
+	await expect(queue().refresh("B", path)).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
 	expect(fetch).toHaveBeenCalledTimes(1);
 	expect((await capturePendingAuth(path, [])).entries).toHaveLength(1000);
 	expect((await loadFlaggedAccounts()).accounts[0]?.refreshToken).toBe("flagged-next");
@@ -476,7 +476,7 @@ it.each(["openai-codex-flagged-accounts.json", "openai-codex-blocked-accounts.js
 	const fetch = injectRefresh();
 	expect(await queue().refresh("A", path)).toMatchObject({type: "success"});
 	const bytes = await fs.readFile(getPendingAuthPath(path), "utf8");
-	expect(await queue().refresh("B", path)).toMatchObject({type: "failed"});
+	await expect(queue().refresh("B", path)).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
 	await prunePendingAuth(path, pool(["A-next", "B"]), () => collectRestorableCredentials(path));
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(bytes);
 	expect(fetch).toHaveBeenCalledTimes(1);
@@ -530,7 +530,7 @@ it("retains Guardian live credentials without healing or an authentication failu
 	const guardian = new RefreshGuardian(() => manager);
 	await guardian.tick();
 	expect(account).toMatchObject({refreshToken: "A-next", access: "access-A-next", consecutiveAuthFailures: 2});
-	expect(guardian.getStats()).toMatchObject({failed: 1, networkFailed: 1, authFailed: 0, refreshed: 0});
+	expect(guardian.getStats()).toMatchObject({failed: 1, networkFailed: 0, authFailed: 0, refreshed: 0});
 	expect(success).not.toHaveBeenCalled();
 	expect(failure).not.toHaveBeenCalled();
 	await guardian.tick();
@@ -671,8 +671,8 @@ it("does not flag or remove an account on failed settlement during a real accoun
 		clampRuntimeActiveIndices: () => undefined, MODEL_FAMILIES: ["codex"], saveAccounts,
 		invalidateAccountManagerCache: () => undefined, saveFlaggedAccounts: flag, showLine,
 	};
-	await runRuntimeAccountCheck(true, deps);
-	expect(showLine).toHaveBeenCalledWith("Results: 0 ok, 1 error, 0 disabled");
+	await expect(runRuntimeAccountCheck(true, deps)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause});
+	expect(showLine).not.toHaveBeenCalledWith("Results: 0 ok, 1 error, 0 disabled");
 	expect(flag).not.toHaveBeenCalled();
 	expect(probe).not.toHaveBeenCalled();
 	expect((await loadAccounts())?.accounts[0]?.refreshToken).toBe("A");
@@ -695,13 +695,13 @@ it("retains hydrate credentials in their actual live row without claiming a comp
 	const {cause} = denyJournalSettlement();
 	const save = vi.fn();
 	const warn = vi.fn();
-	await hydrateRuntimeEmails(storage, {
+	await expect(hydrateRuntimeEmails(storage, {
 		queuedRefresh, extractAccountId: () => undefined, sanitizeEmail: email => email, extractAccountEmail: () => undefined,
 		shouldUpdateAccountIdFromToken: () => false, saveAccounts: save, logWarn: warn, pluginName: "fixture",
-	});
+	})).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause});
 	expect(storage.accounts[0]).toMatchObject({refreshToken: "A-next", accessToken: "access-A-next"});
 	expect(save).not.toHaveBeenCalled();
-	expect(warn).toHaveBeenCalledTimes(1);
+	expect(warn).not.toHaveBeenCalled();
 	await expect(queue().refresh("A", path)).rejects.toMatchObject({cause});
 	expect(fetch).toHaveBeenCalledTimes(1);
 });
@@ -716,12 +716,13 @@ it("retains flagged credentials without restoring an unsettled sign-in", async (
 	const restore = vi.fn();
 	const save = vi.fn();
 	const showLine = vi.fn();
-	await verifyRuntimeFlaggedAccounts({
+	await expect(verifyRuntimeFlaggedAccounts({
 		loadFlaggedAccounts: async () => flagged, lookupCodexCliTokensByEmail: async () => null, queuedRefresh,
 		resolveTokenSuccessAccount: tokens => tokens, persistAccounts: restore,
 		invalidateAccountManagerCache: () => undefined, saveFlaggedAccounts: save, showLine,
-	});
-	expect(save).toHaveBeenCalledWith({version: 1, accounts: [expect.objectContaining({refreshToken: "flagged-next", accessToken: "access-flagged-next", enabled: false})]});
+	})).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause});
+	expect(flagged.accounts[0]).toMatchObject({refreshToken: "flagged-next", accessToken: "access-flagged-next", enabled: false});
+	expect(save).not.toHaveBeenCalled();
 	expect(restore).not.toHaveBeenCalled();
 	await expect(queue().refresh("flagged", path)).rejects.toMatchObject({cause});
 	expect(fetch).toHaveBeenCalledTimes(1);

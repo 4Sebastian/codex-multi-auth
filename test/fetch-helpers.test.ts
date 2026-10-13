@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as refreshQueueModule from '../lib/refresh-queue.js';
+import { PendingAuthSettlementError } from '../lib/storage/pending-auth.js';
 import {
     shouldRefreshToken,
     refreshAndUpdateToken,
@@ -179,7 +180,7 @@ describe('Fetch Helpers Module', () => {
 			expect(updated.expires).toBe(123);
 		});
 
-		it('throws retryable auth errors when auth persistence fails', async () => {
+		it('retains journaled credentials when auth persistence fails', async () => {
 			const auth: Auth = { type: 'oauth', access: 'old', refresh: 'oldr', expires: 0 };
 			const client = {
 				auth: {
@@ -198,11 +199,12 @@ describe('Fetch Helpers Module', () => {
 			const error = await refreshAndUpdateToken(auth, client).catch(
 				(err) => err as CodexAuthError,
 			);
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(true);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toMatchObject({code: 'EBUSY'});
+			expect(auth).toMatchObject({access: 'new', refresh: 'newr', expires: 123});
 		});
 
-		it('throws terminal auth errors when auth persistence fails permanently', async () => {
+		it('preserves permanent persistence failure without authentication refusal', async () => {
 			const auth: Auth = { type: 'oauth', access: 'old', refresh: 'oldr', expires: 0 };
 			const client = {
 				auth: {
@@ -221,8 +223,9 @@ describe('Fetch Helpers Module', () => {
 			const error = await refreshAndUpdateToken(auth, client).catch(
 				(err) => err as CodexAuthError,
 			);
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(false);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toMatchObject({code: 'EACCES'});
+			expect(auth).toMatchObject({access: 'new', refresh: 'newr', expires: 123});
 		});
 	});
 

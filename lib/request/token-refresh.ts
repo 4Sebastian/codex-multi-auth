@@ -5,7 +5,7 @@
  */
 
 import type { Auth, CodexClient } from "@codex-ai/sdk";
-import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { captureRefreshCredentialAuthority, PendingAuthAdmissionError, PendingAuthSettlementError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { getStoragePath } from "../storage.js";
 import type { AccountManager, ManagedAccount } from "../accounts.js";
 import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
@@ -63,35 +63,6 @@ function isRetryableRefreshFailure(
 	}
 }
 
-function isRetryableAuthSetterError(error: unknown): boolean {
-	if (!error || typeof error !== "object") {
-		return false;
-	}
-
-	const candidate = error as {
-		code?: unknown;
-		status?: unknown;
-		cause?: unknown;
-	};
-	const code =
-		typeof candidate.code === "string"
-			? candidate.code.toUpperCase()
-			: undefined;
-	if (code === "EAGAIN" || code === "EBUSY" || code === "EPERM") {
-		return true;
-	}
-
-	if (candidate.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
-		return true;
-	}
-
-	if (candidate.cause && candidate.cause !== error) {
-		return isRetryableAuthSetterError(candidate.cause);
-	}
-
-	return false;
-}
-
 /**
  * Refreshes the OAuth token and updates stored credentials
  *
@@ -122,42 +93,36 @@ export async function refreshAndUpdateToken(
 
 	const refreshToken = currentAuth.type === "oauth" ? currentAuth.refresh : "";
 	const storagePath = source?.accountManager.resolveSelectionStoragePath() ?? getStoragePath();
-	const refresh = () => queuedRefresh(refreshToken, storagePath);
-	const refreshAuth = () => currentAuth.type === "oauth"
-		? withRefreshCredentialRetention(currentAuth, refresh)
-		: refresh();
+	const sourceCurrent = () => !source || source.accountManager.getAccountByIndex(source.account.index) === source.account &&
+		source.accountManager.resolveSelectionStoragePath() === storagePath;
+	const authCurrent = currentAuth.type === "oauth" ? captureRefreshCredentialAuthority(currentAuth, sourceCurrent, undefined, storagePath) : () => true;
+	const accountCurrent = source ? captureRefreshCredentialAuthority(source.account, sourceCurrent, undefined, storagePath) : () => true;
+	const publish = async () => {
+		const result = await queuedRefresh(refreshToken, storagePath);
+		if (result.type === "failed") {
+			throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
+				retryable: isRetryableRefreshFailure(result),
+				context: {refreshFailureReason: result.reason, statusCode: result.statusCode},
+			});
+		}
+		if (!authCurrent(result) || !accountCurrent(result)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before publication"), {code: "ESTALE"}));
+		try {
+			await authSetter.set({
+				path: {id: "openai"},
+				body: {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires, multiAccount: true},
+			});
+		} catch (error) {
+			throw new PendingAuthSettlementError(result, error, () => authCurrent(result) && accountCurrent(result), undefined, "journal");
+		}
+		if (!authCurrent(result) || !accountCurrent(result)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during publication"), {code: "ESTALE"}));
+		return result;
+	};
+	const retainAuth = () => currentAuth.type === "oauth"
+		? withRefreshCredentialRetention(currentAuth, publish, sourceCurrent, undefined, storagePath)
+		: publish();
 	const refreshResult = source
-		? await withRefreshCredentialRetention(source.account, refreshAuth,
-			() => source.accountManager.getAccountByIndex(source.account.index) === source.account && source.accountManager.resolveSelectionStoragePath() === storagePath)
-		: await refreshAuth();
-
-	if (refreshResult.type === "failed") {
-		throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
-			retryable: isRetryableRefreshFailure(refreshResult),
-			context: {
-				refreshFailureReason: refreshResult.reason,
-				statusCode: refreshResult.statusCode,
-			},
-		});
-	}
-
-	try {
-		await authSetter.set({
-			path: { id: "openai" },
-			body: {
-				type: "oauth",
-				access: refreshResult.access,
-				refresh: refreshResult.refresh,
-				expires: refreshResult.expires,
-				multiAccount: true,
-			},
-		});
-	} catch (error) {
-		throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
-			retryable: isRetryableAuthSetterError(error),
-			cause: error,
-		});
-	}
+		? await withRefreshCredentialRetention(source.account, retainAuth, sourceCurrent, undefined, storagePath)
+		: await retainAuth();
 
 	// Update current auth reference if it's OAuth type
 	if (currentAuth.type === "oauth") {

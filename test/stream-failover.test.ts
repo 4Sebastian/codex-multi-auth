@@ -18,7 +18,7 @@ function makeStallingResponse(): Response {
 	);
 }
 
-function makeIdleResponse(): Response {
+function makeIdleResponse(status = 429): Response {
 	return new Response(
 		new ReadableStream<Uint8Array>({
 			start() {
@@ -26,6 +26,7 @@ function makeIdleResponse(): Response {
 			},
 		}),
 		{
+			status,
 			headers: {
 				"content-type": "text/event-stream",
 			},
@@ -50,6 +51,19 @@ function makeSseResponse(payload: string): Response {
 }
 
 describe("stream failover", () => {
+	it.each(["stall", "error", "eof"])("never replays an accepted zero-output stream (%s)", async failure => {
+		vi.useFakeTimers();
+		const fallback = vi.fn(async () => makeSseResponse("data: duplicate\n\n"));
+		const initial = failure === "stall" ? makeIdleResponse(200) : new Response(new ReadableStream({
+			start(controller) { if (failure === "error") controller.error(Error("accepted stream lost")); else controller.close(); },
+		}));
+		const result = withStreamingFailover(initial, fallback, {stallTimeoutMs: 1000}).text();
+		const assertion = failure === "eof" ? expect(result).resolves.toBe("") : expect(result).rejects.toThrow();
+		await vi.advanceTimersByTimeAsync(1200);
+		await assertion;
+		expect(fallback).not.toHaveBeenCalled();
+	});
+
 	afterEach(() => {
 		vi.useRealTimers();
 	});
@@ -64,7 +78,7 @@ describe("stream failover", () => {
 		await expect(response.text()).resolves.toContain("data: ok");
 	});
 
-	it("switches to fallback stream when primary stalls", async () => {
+	it("switches to fallback after an explicit rejection with a stalled body", async () => {
 		vi.useFakeTimers();
 		const fallback = vi.fn(async () => makeSseResponse("data: second\n\n"));
 		const response = withStreamingFailover(makeIdleResponse(), fallback, {

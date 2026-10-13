@@ -340,8 +340,8 @@ it("preserves authorization carried by another alias of the retained credential"
 
 it.each([false, true])("only clears disk revocation with an authenticated replacement generation, recovered=%s", async recovered => {
 	const token = recovered ? "fixture-new-generation" : "old";
-	await recordPendingAuth(storagePath, {...rotation("a", "b"), accessToken: token});
-	const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "a", accessToken: "old", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated", enabled: false, addedAt: 1, lastUsed: 1}]});
+	await recordPendingAuth(storagePath, {...rotation("a", recovered ? "b" : "a"), accessToken: token});
+	const restored = await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: [{refreshToken: "a", accessToken: "old", expiresAt: 1, authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated", enabled: false, addedAt: 1, lastUsed: 1}]});
 	expect(restored?.accounts[0]?.authInvalidatedAt).toBe(recovered ? undefined : 1500);
 	expect(restored?.accounts[0]?.enabled).toBe(false);
 });

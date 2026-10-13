@@ -125,7 +125,7 @@ export async function proactiveRefreshAccount(
 		snapshot.authRefreshRequests += 1;
 		snapshot.runtimeMetrics.authRefreshRequests += 1;
 	});
-	const result = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken, storagePath), undefined, retainAccount);
+	const result = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken, storagePath), () => true, retainAccount, storagePath);
 
 	if (result.type === "success") {
 		log.info("Proactive refresh succeeded", {

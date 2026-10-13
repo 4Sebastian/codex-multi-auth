@@ -155,7 +155,7 @@ codex-multi-auth rotation status         # runtime proxy state
 
 A single forwarded run can be pinned to one account with `codex-multi-auth-codex --account <selector>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`). The pin is applied per-invocation by that run's own proxy instance, so it never touches the persisted `switch` pin and cannot leak across concurrent sessions. Because the proxy is required for the pin to take effect, `--account` fails hard when the proxy is disabled rather than silently using a rotated account. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation).
 
-For HTTP/SSE traffic, the proxy preserves request bodies and streaming responses, replaces outbound auth headers with the selected managed account, and rotates to another account before response bytes are streamed when it sees rate limits, server errors, network failures, or refresh failures.
+For HTTP/SSE traffic, the proxy preserves request bodies and streaming responses and replaces outbound auth headers with the selected managed account. Rotation is limited to pre-send eligibility failures and explicit safe upstream rejections. A transport failure after authorized dispatch, or an accepted stream that fails before emitting bytes, ends that request without replay; a later independent request may select another account.
 It removes hop-by-hop headers, private account metadata headers, and stale decoded `content-encoding` from HTTP client responses.
 If every account is unavailable, the proxy returns a structured pool-exhaustion error that points to `codex-multi-auth rotation status`.
 

@@ -18,7 +18,7 @@ import {
 	resetTrackers,
 	DEFAULT_TOKEN_BUCKET_CONFIG,
 } from "../lib/rotation.js";
-import { CodexAuthError } from "../lib/errors.js";
+import { PendingAuthSettlementError } from "../lib/storage/pending-auth.js";
 import {
 	clearCircuitBreakers,
 	DEFAULT_CIRCUIT_BREAKER_CONFIG,
@@ -2157,16 +2157,15 @@ describe("AccountManager", () => {
             journal.mockRestore();
 		});
 
-		it("propagates non-transient storage write failure as terminal CodexAuthError", async () => {
+		it("propagates non-transient publication failure without authentication refusal or losing rotated credentials", async () => {
 			const { withAccountStorageTransaction } = await import(
 				"../lib/storage.js"
 			);
 			const mockWithAccountStorageTransaction = vi.mocked(
 				withAccountStorageTransaction,
 			);
-			mockWithAccountStorageTransaction.mockRejectedValueOnce(
-				Object.assign(new Error("EINVAL"), { code: "EINVAL" }),
-			);
+			const cause = Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+			mockWithAccountStorageTransaction.mockRejectedValueOnce(cause);
 
 			const now = Date.now();
 			const stored = {
@@ -2193,11 +2192,16 @@ describe("AccountManager", () => {
 
 			const error = await manager
 				.commitRefreshedAuth(account, refreshedAuth)
-				.catch((err) => err as CodexAuthError);
+				.catch((err: unknown) => err);
 
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(false);
-			expect(account.refreshToken).toBe("old-refresh");
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			if (!(error instanceof PendingAuthSettlementError)) throw new Error("Expected a credential publication error");
+			expect(error.cause).toBe(cause);
+			expect(error.durability).toBe("unverified");
+			expect(error.result.refresh).toBe(refreshedAuth.refresh);
+			expect(account.refreshToken).toBe(refreshedAuth.refresh);
+			expect(account.access).toBe(refreshedAuth.access);
+			expect(account.expires).toBe(refreshedAuth.expires);
 		});
 
 		it("prevents debounced saves from writing stale auth during refresh persistence", async () => {
@@ -5100,10 +5104,10 @@ describe("commit and retryable rescue ordering", () => {
 			else manager.removeAccount(account);
 			release();
 			if (mutation === "remove") {await expect(refreshing).rejects.toThrow(); expect(journal).not.toHaveBeenCalled(); return;}
-			await refreshing;
-			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
-			expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({priorRefreshToken: "fixture-old", refreshToken: account.refreshToken}));
-			if (mutation === "invalidate") {expect(account.authInvalidatedAt).toBeUndefined(); expect(account.cooldownReason).toBeUndefined();}
+			await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, result: {refresh: "fixture-attempted-refresh"}});
+			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-old");
+			expect(journal).not.toHaveBeenCalled();
+			if (mutation === "invalidate") expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
 			if (mutation === "disable") expect(account.enabled).toBe(false);
 		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
 	});
@@ -5120,12 +5124,13 @@ describe("commit and retryable rescue ordering", () => {
 			if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
 			else if (mutation === "disable") manager.setAccountEnabled(0, false);
 			else {manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000}); disk.accounts[0]!.enabled = false;}
-			release(); await refreshing;
-			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
-			expect(restarted.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-attempted-refresh");
-			if (mutation === "invalidate") {expect(restarted.authInvalidatedAt).toBeUndefined(); expect(restarted.cooldownReason).toBeUndefined();}
-			else expect(restarted.enabled).toBe(false);
-		} finally {release(); await refreshing;}
+			release(); await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION", cause: {code: "ESTALE"}});
+			expect(disk.accounts[0]?.refreshToken).toBe("fixture-old");
+			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-old");
+			if (mutation === "invalidate") expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (mutation === "disable") expect(account.enabled).toBe(false);
+			if (mutation === "rotate") expect(disk.accounts[0]?.enabled).toBe(false);
+		} finally {release(); await refreshing.catch(() => undefined);}
 	});
 
 	it.each(["EACCES", "EBUSY", "EPERM", "ELOCKED", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "rotate", "disable"].map(mutation => ({code, mutation}))))("retains live authorization during retryable rescue %j", async ({code, mutation}) => {
@@ -5144,24 +5149,25 @@ describe("commit and retryable rescue ordering", () => {
 			if (mutation === "rotate") manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000});
 			else if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
 			else {manager.setAccountEnabled(0, false); disk.accounts[0]!.enabled = false;}
-			release(); await refreshing;
-			if (mutation === "rotate") {expect(account.access).toBe("fixture-newest"); expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({priorRefreshToken: "fixture-old", refreshToken: "fixture-newest-refresh", accessToken: "fixture-newest"}));}
+			release(); await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, result: {refresh: "fixture-attempted-refresh"}});
+			expect(journal).not.toHaveBeenCalled();
+			if (mutation === "rotate") expect(account.access).toBe("fixture-newest");
 			else {
 				if (mutation === "invalidate") {
 					expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
-					expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({accessToken: "fixture-attempted", authInvalidatedAt: 1500, authInvalidationErrorCode: "token_invalidated"}));
+					expect(account).toMatchObject({access: "fixture-attempted", authInvalidationErrorCode: "token_invalidated"});
 				} else {
 					expect(account.enabled).toBe(false);
-					expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({enabled: false}));
+					expect(account.refreshToken).toBe("fixture-attempted-refresh");
 				}
 			}
 			vi.mocked(storageModule.withAccountStorageTransaction).mockImplementation(async handler => handler(structuredClone(disk), async saved => {disk = structuredClone(saved);}));
-			await manager.flushPendingSave();
+			await manager.saveToDisk(true);
 			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
 			expect(restarted.access).toBe(account.access);
 			expect(restarted.authInvalidatedAt).toBe(account.authInvalidatedAt);
 			expect(restarted.enabled).toBe(account.enabled);
-		} finally {release(); await refreshing; await manager.flushPendingSave(); journal.mockRestore();}
+		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
 	});
 
 	it("orders runtime-conflict commits after snapshots captured while writing", async () => {
@@ -5202,7 +5208,9 @@ describe("committed authorization observations", () => {
 			manager.markAuthInvalidated(account, "token_invalidated", 1500);
 			manager.markAccountCoolingDown(account, 60000, "auth-failure");
 			release();
-			if (failed) await expect(saving).rejects.toThrow(); else await saving;
+			if (failed) await expect(saving).rejects.toThrow();
+			else if (mode === "refresh") await expect(saving).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
+			else await saving;
 			expect(account).toMatchObject({access: "rotated-twice", refreshToken: "rotated-twice-refresh", authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
 			if (!failed) {
 				expect(manager.getAccountByIndex(0)?.enabled).toBe(false);

@@ -245,7 +245,7 @@ export async function runHealthCheck(
 			}
 			continue;
 		}
-		const result = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: refreshing sign-in`, () => withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken)), console.log);
+		const result = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: refreshing sign-in`, () => withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account)), console.log);
 		if (result.type === "success") {
 			const tokenAccountId = extractAccountId(result.access);
 			const nextEmail = sanitizeEmail(

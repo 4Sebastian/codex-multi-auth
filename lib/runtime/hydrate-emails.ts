@@ -1,4 +1,4 @@
-import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import type { AccountStorageV3 } from "../storage.js";
 import type { AccountIdSource, TokenResult } from "../types.js";
 
@@ -37,7 +37,7 @@ export async function hydrateRuntimeEmails(
 	await Promise.all(
 		accountsToHydrate.map(async (account) => {
 			try {
-				const refreshed = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
+				const refreshed = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 				if (refreshed.type !== "success") return;
 				const id = deps.extractAccountId(refreshed.access);
 				const email = deps.sanitizeEmail(
@@ -74,7 +74,8 @@ export async function hydrateRuntimeEmails(
 					account.refreshToken = refreshed.refresh;
 					changed = true;
 				}
-			} catch {
+			} catch (error) {
+				if (error instanceof PendingAuthLocalError) throw error;
 				deps.logWarn(
 					`[${deps.pluginName}] Failed to hydrate email for account`,
 				);

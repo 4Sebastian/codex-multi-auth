@@ -1,5 +1,6 @@
-import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
+import type { TokenResult } from "../types.js";
 import type { FlaggedAccountMetadataV1 } from "../storage.js";
 import type { TokenSuccessWithAccount } from "./account-selection.js";
 import { createFlaggedVerificationState } from "./flagged-verify-types.js";
@@ -27,16 +28,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		| null
 		| undefined
 	>;
-	queuedRefresh: (refreshToken: string) => Promise<
-		| {
-				type: "success";
-				access: string;
-				refresh: string;
-				expires: number;
-				idToken?: string;
-		  }
-		| { type: "failed"; message?: string; reason?: string }
-	>;
+	queuedRefresh: (refreshToken: string) => Promise<TokenResult>;
 	resolveTokenSuccessAccount: (
 		tokens: SuccessfulAccountTokens,
 	) => TokenSuccessWithAccount<SuccessfulAccountTokens>;
@@ -111,7 +103,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 				}
 			}
 
-			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken));
+			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken), () => flaggedStorage.accounts.includes(flagged));
 			if (refreshResult.type !== "success") {
 				deps.showLine(
 					`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: STILL FLAGGED (${refreshResult.message ?? refreshResult.reason ?? "refresh failed"})`,
@@ -133,6 +125,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 				`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: RESTORED`,
 			);
 		} catch (error) {
+			if (error instanceof PendingAuthLocalError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			deps.logError?.(`Failed to verify flagged account ${label}: ${message}`);
 			deps.showLine(

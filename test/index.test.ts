@@ -2280,6 +2280,10 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi.fn(async (requestUrl, init) => {
 			const normalizedUrl =
 				typeof requestUrl === "string" ? requestUrl : String(requestUrl);
@@ -2294,7 +2298,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 
 			const headers = new Headers(init?.headers);
 			if (headers.get("x-test-access-token") === "access-alpha") {
-				throw new Error("Network timeout");
+				return new Response("explicit rate-limit rejection", {status: 429});
 			}
 
 			return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
@@ -2458,7 +2462,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(headers.get("x-test-account-id")).toBe("token-personal");
 	});
 
-	it("preserves stored workspace routing after a first-account network failure", async () => {
+	it("preserves stored workspace routing after an explicit rate-limit rejection", async () => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
 		const manager = buildRoutingManager([
@@ -2492,10 +2496,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2507,9 +2514,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		});
 
 		expect(response.status).toBe(200);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 		const thirdHeaders = new Headers(
-			vi.mocked(globalThis.fetch).mock.calls[2]?.[1]?.headers,
+			vi.mocked(globalThis.fetch).mock.calls[1]?.[1]?.headers,
 		);
 		expect(thirdHeaders.get("x-test-account-id")).toBe("workspace-fallback");
 		expect(thirdHeaders.get("x-test-access-token")).toBe("access-beta");
@@ -2575,10 +2582,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				dispatcher: proxyDispatcher,
 			}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2592,9 +2602,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(response.status).toBe(200);
 		expect(
 			vi.mocked(fetchHelpers.applyProxyCompatibleInit),
-		).toHaveBeenCalledTimes(3);
+		).toHaveBeenCalledTimes(2);
 		const thirdInit = vi.mocked(globalThis.fetch).mock
-			.calls[2]?.[1] as RequestInit;
+			.calls[1]?.[1] as RequestInit;
 		expect(thirdInit.dispatcher).toBe(proxyDispatcher);
 	});
 	it("locks fallback entitlement checks to a stable account snapshot before mutating the shared account", async () => {
@@ -2648,10 +2658,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				}
 				return { blocked: false, waitMs: 0 };
 			});
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2709,10 +2722,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2730,7 +2746,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(fallbackAfterRequest?.email).toBe("beta-fresh@example.com");
 	});
 
-	it("preserves per-request fallback entitlement keys during concurrent fetch failover", async () => {
+	it("preserves per-request fallback entitlement keys after concurrent explicit rejections", async () => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
 		const entitlementModule = await import("../lib/entitlement-cache.js");
@@ -2806,6 +2822,10 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			accountId: string | null;
 			accessToken: string | null;
 		}> = [];
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi.fn().mockImplementation(async (_url, init) => {
 			const headers = new Headers(init?.headers);
 			const accountId = headers.get("x-test-account-id");
@@ -2816,7 +2836,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					releasePrimaryFailures?.();
 				}
 				await primaryBarrier;
-				throw new Error("Network timeout");
+				return new Response("explicit rate-limit rejection", {status: 429});
 			}
 
 			fallbackResponses.push({ accountId, accessToken });
@@ -2886,17 +2906,16 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(syncCodexCliSelectionMock).toHaveBeenCalledWith(1);
 	});
 
-	it("handles network errors and rotates to next account", async () => {
+	it("propagates the original network error without replaying an authorized request", async () => {
 		globalThis.fetch = vi.fn().mockRejectedValue(new Error("Network timeout"));
 
 		const { sdk } = await setupPlugin();
-		const response = await sdk.fetch!("https://api.openai.com/v1/chat", {
+		await expect(sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
 			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
+		})).rejects.toThrow("Network timeout");
 
-		expect(response.status).toBe(503);
-		expect(await response.text()).toContain("server errors or auth issues");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(syncCodexCliSelectionMock).not.toHaveBeenCalled();
 	});
 
@@ -3039,12 +3058,12 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		});
 
 		const { sdk } = await setupPlugin();
-		const response = await sdk.fetch!("https://api.openai.com/v1/chat", {
+		await expect(sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
 			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
+		})).rejects.toMatchObject({name: "AbortError", message: "timeout"});
 
-		expect(response.status).toBe(503);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(recordFailureSpy).toHaveBeenCalled();
 		recordFailureSpy.mockRestore();
 		timeoutSpy.mockRestore();
@@ -3069,7 +3088,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(5000);
 		cooldownSpy.mockRestore();
@@ -3094,7 +3115,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(4500);
 		cooldownSpy.mockRestore();
@@ -3122,7 +3145,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(7000);
 		cooldownSpy.mockRestore();
@@ -3151,7 +3176,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(12000);
 		cooldownSpy.mockRestore();
@@ -3180,7 +3207,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(9000);
 		cooldownSpy.mockRestore();

@@ -499,7 +499,7 @@ it("preserves a bounded non-retryable upstream error code for client recovery",a
  const response=await runtime.request('zdr/exclusive',{},[credential('private')]);
  expect(response.status).toBe(400);expect((await response.json()).error.code).toBe('context_length_exceeded');
 });
-it("fails over a credential transport AbortError while preserving real client cancellation",async()=>{
+it("does not replay an ambiguous credential transport AbortError",async()=>{
  const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
   if(init?.method!=='POST')return Response.json({data:[{id:'exclusive'}]});
   if(new Headers(init.headers).get('authorization')==='Bearer test-first')throw new DOMException('Operation timed out','AbortError');
@@ -507,7 +507,7 @@ it("fails over a credential transport AbortError while preserving real client ca
  });
  const runtime=new ApiModelRuntime(fetcher as typeof fetch);
  const response=await runtime.request('zdr/exclusive',{},[credential('first'),credential('second','zdr',2)]);
- expect(response.status).toBe(200);expect(fetcher.mock.calls.filter(([,init])=>init?.method==='POST')).toHaveLength(2);
+ expect(response.status).toBe(502);expect((await response.json()).error.code).toBe("upstream_transport_error");expect(fetcher.mock.calls.filter(([,init])=>init?.method==='POST')).toHaveLength(1);
 });
 it("enriches capability metadata when a failed cold catalog recovers",async()=>{
  let now=1000,healthy=false;

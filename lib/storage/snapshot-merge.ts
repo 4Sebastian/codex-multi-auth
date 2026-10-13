@@ -60,7 +60,7 @@ function mergeWorkspaces(base: AccountMetadataV3, disk: AccountMetadataV3, local
     const untracked = [base, disk, local].every(row => row.currentWorkspaceIndex === undefined);
     return { workspaces, currentWorkspaceIndex: untracked && index === 0 ? undefined : index };
 }
-type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason" | "refreshToken" | "accessToken">;
+type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason" | "refreshToken" | "accessToken" | "expiresAt">;
 /**
  * Preserve concurrent cooldown observations while allowing an unchanged blocker to clear.
  * An auth-failure cooldown belongs to the credential it was recorded against: once
@@ -71,7 +71,8 @@ type CooldownRow = Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason"
 export function mergeAccountCooldown(base: CooldownRow, disk: CooldownRow, local: CooldownRow): Pick<AccountMetadataV3, "coolingDownUntil" | "cooldownReason"> {
     const keptToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
     const keptAccessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
-    const current = (row: CooldownRow): CooldownRow => row.cooldownReason === "auth-failure" && (row.refreshToken !== keptToken || row.accessToken !== keptAccessToken)
+    const keptExpiry = local.expiresAt === base.expiresAt ? disk.expiresAt : local.expiresAt;
+    const current = (row: CooldownRow): CooldownRow => row.cooldownReason === "auth-failure" && (row.refreshToken !== keptToken || row.accessToken !== keptAccessToken || row.expiresAt !== keptExpiry)
         ? { ...row, coolingDownUntil: undefined, cooldownReason: undefined } : row;
     base = current(base);
     disk = current(disk);
@@ -98,11 +99,13 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
     const limits = mergeAccountRateLimits(base, disk, local);
     const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
     const refreshToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
-    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && row.refreshToken === refreshToken ? row.authInvalidatedAt : undefined;
+    const expiresAt = local.expiresAt === base.expiresAt ? disk.expiresAt : local.expiresAt;
+    const sameCredential = (a: AccountMetadataV3, b: AccountMetadataV3) => a.accessToken === b.accessToken && a.refreshToken === b.refreshToken && a.expiresAt === b.expiresAt;
+    const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && row.refreshToken === refreshToken && row.expiresAt === expiresAt ? row.authInvalidatedAt : undefined;
     const diskInvalidation = currentInvalidation(disk), localInvalidation = currentInvalidation(local);
     const clearedInvalidation = currentInvalidation(base) !== undefined && (
-        (disk.accessToken === base.accessToken && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
-        (local.accessToken === base.accessToken && local.authInvalidatedAt === undefined && disk.authInvalidatedAt === base.authInvalidatedAt));
+        (sameCredential(disk, base) && sameCredential(local, base) && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
+        (sameCredential(local, base) && sameCredential(disk, base) && local.authInvalidatedAt === undefined && disk.authInvalidatedAt === base.authInvalidatedAt));
     const invalidated = (diskInvalidation ?? 0) >= (localInvalidation ?? 0) ? disk : local;
     const authInvalidatedAt = clearedInvalidation ? undefined : currentInvalidation(invalidated);
     const runtime = {
@@ -205,7 +208,7 @@ export function mergeAccountRuntimeObservations(base: AccountStorageV3, current:
         prior.lastUsed = Math.max(prior.lastUsed, next.lastUsed);
         if (next.enabled === false) prior.enabled = false;
         const disk = current.accounts.find(row => matches(prior, row));
-        if (disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken) {
+        if (disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken && next.expiresAt === disk.expiresAt) {
             prior.accessToken = disk.accessToken;
             prior.refreshToken = disk.refreshToken;
             prior.expiresAt = disk.expiresAt;

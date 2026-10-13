@@ -1,4 +1,4 @@
-import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../quota-probe.js";
 import { isCodexUnavailableError } from "../errors.js";
@@ -192,7 +192,7 @@ export async function runRuntimeAccountCheck(
 			}
 
 			if (!accessToken) {
-				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => workingStorage.accounts.includes(account));
 				if (refreshResult.type !== "success") {
 					state.errors += 1;
 					const message =
@@ -297,6 +297,7 @@ export async function runRuntimeAccountCheck(
 					`[${i + 1}/${total}] ${label}: ${deps.formatCodexQuotaLine(snapshot)}`,
 				);
 			} catch (error) {
+				if (error instanceof PendingAuthLocalError) throw error;
 				if (isCodexUnavailableError(error)) {
 					state.warnings += 1;
 					state.ok += 1;
@@ -312,6 +313,7 @@ export async function runRuntimeAccountCheck(
 				}
 			}
 		} catch (error) {
+			if (error instanceof PendingAuthLocalError) throw error;
 			state.errors += 1;
 			const message = error instanceof Error ? error.message : String(error);
 			deps.showLine(

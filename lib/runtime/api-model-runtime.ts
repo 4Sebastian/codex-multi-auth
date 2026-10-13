@@ -407,14 +407,13 @@ export class ApiModelRuntime {
                     lastRejection = Response.json({error:sanitized},{status:response.status});
 					continue;
 				}
-				if (![401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
+				if (![401, 403, 429].includes(response.status)) {
                     return Response.json({error:sanitized},{status:response.status});
                 }
 			} catch (error) {
                 if (error instanceof ClientCancellationError) throw error;
 				if (signal?.aborted) throw new ClientCancellationError();
-				lastStatus = 502;
-				lastRejection = undefined;
+				return this.failure(502, "upstream_transport_error", "Upstream request failed after dispatch; not replayed.");
 			} finally {
 				clearTimeout(timer);
 				signal?.removeEventListener("abort", abort);

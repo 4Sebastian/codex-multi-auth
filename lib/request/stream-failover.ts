@@ -121,14 +121,15 @@ async function readChunkWithSoftHardTimeout(
 }
 
 /**
- * Wraps an SSE-like streaming Response so the stream can switch to fallback sources on stalls or errors to keep the client session alive.
+ * Monitors an SSE-like Response and permits fallback only after an explicit HTTP rejection.
  *
  * The returned Response streams bytes from the initialResponse body and, when the stream stalls or errors, will attempt up to `maxFailovers` failovers by calling `getFallbackResponse(attempt, emittedBytes)`. On each successful failover a textual marker is injected into the stream identifying the failover attempt (and `requestInstanceId` when provided). The function performs best-effort cleanup of underlying readers and enforces soft/hard read timeouts as configured via `options`.
  *
 	 * Concurrency assumptions: the implementation expects a single consumer reading the returned Response body; callers must not concurrently read the same stream body from multiple consumers. Filesystem/platform note: behavior is platform-agnostic; no filesystem access is performed (Windows-specific filesystem semantics do not apply). Token redaction: any request identifiers embedded in the injected marker are limited to the normalized `requestInstanceId` (trimmed and truncated to 64 chars) to avoid leaking long tokens.
 	 *
 	 * Failover safety: once the wrapper has already emitted bytes from the primary stream,
-	 * it will stop attempting fallback replays. Reissuing the upstream request after partial
+	 * it will stop attempting fallback replays. An accepted response also cannot be replayed before output.
+	 * Reissuing the upstream request after partial
 	 * output can duplicate streamed text and any side-effectful tool activity.
  *
  * @param initialResponse - The original Response whose body will be streamed and monitored for stalls/errors.
@@ -202,7 +203,8 @@ export function withStreamingFailover(
 	};
 	const body = new ReadableStream<Uint8Array>({
 		start(controller) {
-			let currentReader = initialResponse.body?.getReader() ?? null;
+			let currentResponse = initialResponse;
+			let currentReader = currentResponse.body?.getReader() ?? null;
 			let failoverAttempt = 0;
 			let emittedBytes = 0;
 
@@ -223,6 +225,7 @@ export function withStreamingFailover(
 			releaseCurrentReaderForCancel = releaseCurrentReader;
 
 			const tryFailover = async (): Promise<boolean> => {
+				if (![401, 403, 429].includes(currentResponse.status)) return false;
 				if (failoverAttempt >= maxFailovers) {
 					return false;
 				}
@@ -240,6 +243,7 @@ export function withStreamingFailover(
 					: `: codex-multi-auth failover ${failoverAttempt}\n\n`;
 				const marker = new TextEncoder().encode(markerLabel);
 				controller.enqueue(marker);
+				currentResponse = fallback;
 				currentReader = fallback.body.getReader();
 				return true;
 			};

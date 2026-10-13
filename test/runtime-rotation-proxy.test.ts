@@ -1893,13 +1893,13 @@ describe("runtime rotation proxy", () => {
 				type: "error",
 				status: HTTP_STATUS.TOO_MANY_REQUESTS,
 			});
-			expect(
+			await vi.waitFor(() => expect(
 				Math.max(
 					...Object.values(
 						accountManager.getAccountByIndex(0)?.rateLimitResetTimes ?? {},
 					),
 				),
-			).toBeGreaterThan(now + 150_000);
+			).toBeGreaterThan(now + 150_000));
 		} finally {
 			socket.terminate();
 			await upstream.close();
@@ -1969,8 +1969,10 @@ describe("runtime rotation proxy", () => {
 				input: [],
 			}));
 			expect(JSON.parse(await secondResponse)).toMatchObject({ type: "response.failed" });
-			expect(accountManager.getAccountByIndex(0)?.lastRateLimitReason).toBe("quota");
-			expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("server-error");
+			await vi.waitFor(() => {
+				expect(accountManager.getAccountByIndex(0)?.lastRateLimitReason).toBe("quota");
+				expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("server-error");
+			});
 		} finally {
 			firstClient.terminate();
 			secondClient?.terminate();
@@ -3359,7 +3361,7 @@ describe("runtime rotation proxy", () => {
 		});
 	});
 
-	it("retries a healthy forced pin after a zero-cooldown upstream 503", async () => {
+	it("allows an independent pinned turn after a zero-cooldown upstream 503 without replay", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
@@ -3394,15 +3396,19 @@ describe("runtime rotation proxy", () => {
 			input: [{ type: "message", role: "user", content: "hi" }],
 		});
 
-		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(await response.text()).toBe("upstream failed");
+		expect(calls).toHaveLength(1);
+		const later = await postResponses(proxy, {model: "gpt-5-codex", stream: true, input: "independent turn"});
+		expect(later.status).toBe(HTTP_STATUS.OK);
+		expect(await later.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
 		expect(
 			calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)),
 		).toEqual(["acc_1", "acc_1"]);
-		expect(proxy.getStatus().retries).toBe(1);
+		expect(proxy.getStatus().retries).toBe(0);
 	});
 
-	it("bounds forced-pin transport retries by the configured attempt budget", async () => {
+	it("does not spend the configured attempt budget replaying an ambiguous pinned transport failure", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
 		const { calls, fetchImpl } = createRecordingFetch(() => {
@@ -3448,10 +3454,10 @@ describe("runtime rotation proxy", () => {
 			code: "codex_pinned_account_unavailable",
 			reason: "network-error",
 		});
-		expect(calls).toHaveLength(3);
+		expect(calls).toHaveLength(1);
 		expect(
 			calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)),
-		).toEqual(["acc_1", "acc_1", "acc_1"]);
+		).toEqual(["acc_1"]);
 	});
 
 	it("caps forced-pin upstream attempts regardless of how high the pool retry knob goes", async () => {
@@ -3500,25 +3506,14 @@ describe("runtime rotation proxy", () => {
 			code: "codex_pinned_account_unavailable",
 			reason: "network-error",
 		});
-		// `retryAllAccountsMaxRetries` is the "retry when every account is
-		// rate-limited" POOL knob. For a pin each unit of it is another copy of
-		// the same non-idempotent request to the same upstream, so it is capped
-		// at MAX_PINNED_TRANSIENT_ATTEMPTS instead of being spent 1:1.
-		expect(calls).toHaveLength(4);
+		// A pool retry budget never authorizes replay after dispatch.
+		expect(calls).toHaveLength(1);
 		expect(
 			new Set(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))),
 		).toEqual(new Set(["acc_1"]));
 	});
 
-	it("retries a forced pin through the cooldown its own failure created", async () => {
-		// Every transient branch cools the account down before continuing, and
-		// chooseAccount refuses a cooling-down pin. With a REAL cooldown (the
-		// shipped defaults are 4s/6s, not 0) the retry budget was unreachable and
-		// a pin got exactly one upstream attempt -- the bug this whole change is
-		// supposed to fix. Zeroing the cooldown, as the other tests here do,
-		// bypasses the only thing that was blocking the retry, so this one uses
-		// a deliberately huge 60s cooldown: the retry has to happen because a
-		// pinned retry WAIVES its own cooldown, not because it outlasted one.
+	it("preserves a forced pin's cooldown across independent turns after an ambiguous send", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
@@ -3535,7 +3530,7 @@ describe("runtime rotation proxy", () => {
 			proxy = await startProxy({
 				accountManager,
 				fetchImpl,
-				options: { forcedAccountIndex: 0 },
+				options: { forcedAccountIndex: 0, now: () => now },
 			});
 		} finally {
 			if (previousNetworkErrorCooldown === undefined) {
@@ -3557,15 +3552,19 @@ describe("runtime rotation proxy", () => {
 			input: [{ type: "message", role: "user", content: "hi" }],
 		});
 
-		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: recovered\n\n" + COMPLETED_FRAME);
-		expect(calls).toHaveLength(3);
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		await response.text();
+		const later = await postResponses(proxy, {model: "gpt-5-codex", input: "independent turn"});
+		expect(later.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		await later.text();
+		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("network-error");
+		expect(calls).toHaveLength(1);
 		expect(
 			new Set(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))),
 		).toEqual(new Set(["acc_1"]));
-		// A pin re-attempts ONE account; none of that is a rotation.
+		// Neither an ambiguous send nor a cooling-down later turn authorizes replay.
 		expect(proxy.getStatus().rotations).toBe(0);
-		expect(proxy.getStatus().retries).toBe(2);
+		expect(proxy.getStatus().retries).toBe(0);
 	});
 
 	it("never credits the pool token bucket during a pinned failure storm", async () => {
@@ -3606,6 +3605,7 @@ describe("runtime rotation proxy", () => {
 			}
 		}
 
+		for (let turn = 0; turn < 4; turn++) {
 		const response = await postResponses(proxy, {
 			model: "gpt-5-codex",
 			stream: true,
@@ -3613,6 +3613,8 @@ describe("runtime rotation proxy", () => {
 		});
 
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		await response.text();
+		}
 		expect(calls.length).toBeGreaterThan(1);
 		expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBe(before);
 	});
@@ -3677,9 +3679,7 @@ describe("runtime rotation proxy", () => {
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
 			attempt === 17
 				? textEventStream("data: recovered\n\n")
-				: new Response("upstream failed", {
-						status: HTTP_STATUS.SERVICE_UNAVAILABLE,
-					}),
+				: Response.json({error: {code: "workspace_disabled", message: "workspace disabled"}}, {status: 403}),
 		);
 		const previousServerErrorCooldown =
 			process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
@@ -3717,7 +3717,7 @@ describe("runtime rotation proxy", () => {
 		).toBe(17);
 	});
 
-	it("reports the final server error at the forced-pin budget boundary", async () => {
+	it("forwards the original pinned server error without replaying to reach a retry budget", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
 		const { calls, fetchImpl } = createRecordingFetch(
@@ -3757,24 +3757,10 @@ describe("runtime rotation proxy", () => {
 			stream: true,
 			input: [{ type: "message", role: "user", content: "hi" }],
 		});
-		const payload = (await response.json()) as {
-			error: {
-				code: string;
-				message: string;
-				reason: string | null;
-				account_skip_reasons: Record<string, string>;
-			};
-		};
-
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		expect(payload.error).toMatchObject({
-			code: "codex_pinned_account_unavailable",
-			reason: "server-error",
-			account_skip_reasons: { "0": "server-error" },
-		});
-		expect(payload.error.message).toContain("(upstream server error)");
-		expect(payload.error.message).not.toContain("(server-error)");
-		expect(calls).toHaveLength(2);
+		expect(await response.text()).toBe("upstream failed");
+		expect(calls).toHaveLength(1);
+		expect(proxy.getStatus().retries).toBe(0);
 	});
 
 	it("ends a forced-pin loop immediately when nothing in it can change the verdict", async () => {
@@ -3957,11 +3943,7 @@ describe("runtime rotation proxy", () => {
 		});
 
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		// A pin has no other account to fall back to, so it spends its bounded
-		// retry budget (MAX_PINNED_TRANSIENT_ATTEMPTS) before giving up. It used
-		// to stop after one attempt only because its own cooldown blocked
-		// re-selection.
-		expect(calls).toHaveLength(4);
+		expect(calls).toHaveLength(1);
 		const payload = (await response.json()) as {
 			error: {
 				code: string;
@@ -4035,14 +4017,18 @@ describe("runtime rotation proxy", () => {
 				previousServerErrorCooldown,
 			);
 		}
+		for (let turn = 0; turn < 2; turn++) {
+			const failed = await postResponses(proxy, {model: "gpt-5-codex", stream: true, input: "independent turn"});
+			expect(failed.status).toBe(503);
+			expect(await failed.text()).toBe("upstream failed");
+		}
 		const response = await postResponses(proxy, {
 			model: "gpt-5-codex",
 			stream: true,
 			input: [{ type: "message", role: "user", content: "hi" }],
 		});
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		// The first two 5xx responses and the disabling 403 all happen inside
-		// this request's bounded pin-retry budget.
+		// Each failed POST belongs to a separate caller turn.
 		expect(calls).toHaveLength(3);
 		expect(accountManager.getAccountByIndex(0)?.enabled).toBe(false);
 
@@ -4348,8 +4334,8 @@ describe("runtime rotation proxy", () => {
 		// exhaustion path in the same block already answers this way.
 		expect(response.status).toBe(HTTP_STATUS.OK);
 		expect(payload.goal).toBeNull();
-		// Both accounts are tried before the pool is declared exhausted.
-		expect(calls).toHaveLength(2);
+		// The local fallback does not replay the ambiguous upstream request.
+		expect(calls).toHaveLength(1);
 	});
 
 	it("forwards TUI thread goal set requests without duplicating codex path", async () => {
@@ -5264,7 +5250,7 @@ describe("runtime rotation proxy", () => {
 		);
 	});
 
-	it("reports a transient exhaustion reason when deactivated skips also occurred", async () => {
+	it("forwards the terminal server response after a safely rejected deactivated account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 3));
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
@@ -5282,18 +5268,17 @@ describe("runtime rotation proxy", () => {
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
 		const response = await postResponses(proxy, { model: "gpt-5-codex" });
-		const payload = (await response.json()) as { error: { reason: string } };
+		const body = await response.text();
 
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		expect(payload.error.reason).toBe("server-error");
+		expect(body).toBe("upstream failed");
 		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
 			"acc_1",
 			"acc_2",
-			"acc_3",
 		]);
 		expect(accountManager.getAccountByIndex(0)?.enabled).toBe(false);
 		expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("server-error");
-		expect(accountManager.getAccountByIndex(2)?.enabled).toBe(false);
+		expect(accountManager.getAccountByIndex(2)?.enabled).toBe(true);
 	});
 
 	it("forwards unrelated 402 errors without disabling the account", async () => {
@@ -5387,7 +5372,7 @@ describe("runtime rotation proxy", () => {
 		]);
 	});
 
-	it("cools down server-error and network-failure accounts before retrying", async () => {
+	it("cools down failed accounts for independent future turns without replaying either request", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 3));
 		const saveToDiskDebouncedSpy = vi.spyOn(accountManager, "saveToDiskDebounced");
@@ -5403,6 +5388,12 @@ describe("runtime rotation proxy", () => {
 		});
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
+		const serverFailure = await postResponses(proxy, {model: "gpt-5-codex", stream: true});
+		expect(serverFailure.status).toBe(503); expect(await serverFailure.text()).toBe("upstream failed");
+		expect(calls).toHaveLength(1);
+		const transportFailure = await postResponses(proxy, {model: "gpt-5-codex", stream: true});
+		expect(transportFailure.status).toBe(503); await transportFailure.text();
+		expect(calls).toHaveLength(2);
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
 
 		expect(response.status).toBe(HTTP_STATUS.OK);
@@ -5415,6 +5406,7 @@ describe("runtime rotation proxy", () => {
 		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("server-error");
 		expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("network-error");
 		expect(saveToDiskDebouncedSpy).toHaveBeenCalled();
+		expect(proxy.getStatus().retries).toBe(0);
 		// The 5xx is the account's own failure and credits its breaker. The
 		// transport failure on acc_2 is a property of the network path, so it
 		// cools that account down without crediting anything (#677).
@@ -5888,7 +5880,7 @@ describe("runtime rotation proxy", () => {
 			.mockResolvedValueOnce(freshManager);
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
 			attempt === 1
-				? new Response("first account failed", { status: HTTP_STATUS.SERVICE_UNAVAILABLE })
+				? Response.json({error: {code: "workspace_disabled", message: "workspace disabled"}}, {status: 403})
 				: textEventStream(),
 		);
 		try {
@@ -5922,11 +5914,11 @@ describe("runtime rotation proxy", () => {
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
 		const response = await postResponses(proxy, { model: "gpt-5-codex" });
-		const payload = (await response.json()) as { error: { reason: string } };
+		const body = await response.text();
 
 		expect(response.status).toBe(503);
-		expect(payload.error.reason).toBe("budget");
-		expect(calls).toHaveLength(4);
+		expect(body).toBe("upstream failed");
+		expect(calls).toHaveLength(1);
 	});
 
 	it("times out a hung upstream fetch and cools down the account", async () => {
@@ -8734,7 +8726,7 @@ describe("final asynchronous admission", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	it.each(["cooldown", "circuit"])("does not waive a concurrent %s while preparing a pinned cooldown retry", async restriction => {
+	it.each(["cooldown", "circuit"])("does not waive a concurrent %s while preparing a pinned request", async restriction => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
 		const account = manager.getAccountByIndex(0)!;
 		let admissions = 0, held = false;
@@ -8745,7 +8737,7 @@ describe("final asynchronous admission", () => {
 		const journal = manager.isAccountJournalEligible.bind(manager);
 		vi.spyOn(manager, "isAccountJournalEligible").mockImplementation(async selected => {
 			const eligible = await journal(selected);
-			if (admissions === 2 && !held) {
+			if (admissions === 1 && !held) {
 				held = true;
 				if (restriction === "cooldown") manager.markAccountCoolingDown(account, 120000, "auth-failure");
 				else for (let i = 0; i < 3; i++) getCircuitBreaker(account.circuitKeyId!).recordFailure();
@@ -8757,7 +8749,7 @@ describe("final asynchronous admission", () => {
 		const response = await postResponses(proxy, {model: "gpt-5-codex", input: "fixture"}); await response.text();
 		expect(held).toBe(true);
 		expect(response.status).toBe(503);
-		expect(calls).toHaveLength(1);
+		expect(calls).toHaveLength(0);
 	});
 
 	it("keeps the owned half-open HTTP probe without consuming another admission", async () => {
@@ -9146,6 +9138,24 @@ describe("review boundary regressions", () => {
 });
 
 describe("independent transport review",()=>{
+ it("does not replay a consumed HTTP POST that disconnects before headers", async () => {
+  let creates = 0;
+  const upstream = createServer((request, _response) => { request.resume(); request.once("end", () => {creates++; request.socket.destroy();}); });
+  upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+  const address = upstream.address(); if (!address || typeof address === "string") throw Error("listen");
+  const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+  const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
+  const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: `http://127.0.0.1:${address.port}`}});
+  try {
+   for (let turn = 1; turn <= 2; turn++) {
+    const response = await postResponses(proxy, {model: "model-test", input: "fixture"});
+    expect(response.status).toBe(503); expect((await response.json()).error).toMatchObject({code: "codex_runtime_rotation_pool_exhausted", reason: "network-error"});
+    expect(creates).toBe(turn); expect(proxy.getStatus().retries).toBe(0);
+   }
+   expect(append).toHaveBeenCalledTimes(2); expect(append.mock.calls.map(call => call[0].outcome)).toEqual(["failure", "failure"]);
+  } finally {append.mockRestore(); await new Promise<void>(resolve => upstream.close(() => resolve()));}
+ });
+
  it.each(["cancel-before", "close-before", "cancel-after"])("does not replay or penalize accounts after %s",async mode=>{
   const upstream=createServer(),wss=new WebSocketServer({server:upstream});let count=0,received!:()=>void,closed!:()=>void;
   const requestReceived=new Promise<void>(r=>received=r),upstreamClosed=new Promise<void>(r=>closed=r);

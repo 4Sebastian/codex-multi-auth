@@ -225,7 +225,7 @@ export async function runBestCommand(
 		let probeAccountId =
 			account.accountId ?? deps.extractAccountId(account.accessToken);
 		if (!deps.hasUsableAccessToken(account, now)) {
-			const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
+			const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 			if (refreshResult.type !== "success") {
 				refreshFailures.set(i, {
 					...refreshResult,

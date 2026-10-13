@@ -300,7 +300,7 @@ describe("autoSyncActiveAccountToCodex fingerprint short-circuit", () => {
 			harness.preWriteHook = null;
 		};
 
-		expect(await autoSyncActiveAccountToCodex()).toBe(true);
+		expect(await autoSyncActiveAccountToCodex()).toBe(false);
 		expect(harness.setSelectionCalls).toHaveLength(1);
 		expect(authTokens().access_token).toBe("access-a");
 
@@ -326,7 +326,7 @@ describe("autoSyncActiveAccountToCodex fingerprint short-circuit", () => {
 
 		const switched = makeStorage(
 			[
-				makeAccount(),
+				stale,
 				makeAccount({
 					email: "b@example.com",
 					accountId: "acc_b",
@@ -390,7 +390,7 @@ describe("autoSyncActiveAccountToCodex fingerprint short-circuit", () => {
 			harness.postWriteHook = null;
 		};
 
-		expect(await autoSyncActiveAccountToCodex()).toBe(true);
+		expect(await autoSyncActiveAccountToCodex()).toBe(false);
 		expect(authTokens().access_token).toBe("access-a");
 
 		expect(await autoSyncActiveAccountToCodex()).toBe(true);

@@ -2035,6 +2035,7 @@ function forwardToRealCodexOnce(
 			process.stdin.once("close", onProcessStdinEnd);
 			process.stdin.once("error", onProcessStdinError);
 			child.stdin?.on("drain", onChildStdinDrain);
+			child.stdin?.once("error", closeChildStdin);
 			child.stdout?.on("data", onChildStdoutData);
 			child.stdout?.on("end", onChildStdoutEnd);
 			child.stderr?.on("data", onChildStderrData);

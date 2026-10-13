@@ -1,7 +1,7 @@
 import type { AccountManager, ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
-import { PendingAuthSettlementError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import {
 	isTokenInvalidationError,
 	isTokenRefreshRetryable,
@@ -20,9 +20,9 @@ export function applyMonotonicAuthCooldown(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	cooldownMs: number,
-	submittedAccessToken = account.access,
+	submitted = {accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires},
 ): void {
-	if (accountManager.getAccountByIndex(account.index) !== account || account.access !== submittedAccessToken) return;
+	if (accountManager.getAccountByIndex(account.index) !== account || account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return;
 	const existing = accountManager.getAccountByIndex(account.index)?.coolingDownUntil ?? 0;
 	// Intentionally Date.now(), not the proxy's injected now(): coolingDownUntil is
 	// written by markAccountCoolingDown via nowMs() (== Date.now()), so both sides of
@@ -102,7 +102,7 @@ export async function ensureFreshAccessToken(params: {
 	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
 	const refreshResult = await withRefreshCredentialRetention(account,
 		() => queuedRefresh(submittedRefreshToken, storagePath),
-		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath);
+		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath, undefined, storagePath);
 	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
 		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
 		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
@@ -119,7 +119,7 @@ export async function ensureFreshAccessToken(params: {
 			accountManager.recordFailure(account, family, model);
 			accountManager.incrementAuthFailures(account);
 			if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
-			applyMonotonicAuthCooldown(accountManager, account, invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submittedAccessToken);
+			applyMonotonicAuthCooldown(accountManager, account, invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
 		});
 		return { ok: false, retryable: !applied || isTokenRefreshRetryable(refreshResult), invalidated: applied && invalidated };
 	}
@@ -155,11 +155,11 @@ export async function ensureFreshAccessToken(params: {
 			account: resolvedAccount,
 		};
 	} catch (error) {
-		if (error instanceof PendingAuthSettlementError) throw error;
+		if (error instanceof PendingAuthLocalError) throw error;
 		if (account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
 		await accountManager.withCurrentAccountCredential(account, submitted, () => {
 			accountManager.recordFailure(account, family, model);
-			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submittedAccessToken);
+			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
 		});
 		return { ok: false, retryable: true };
 	}
