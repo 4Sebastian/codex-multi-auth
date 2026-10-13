@@ -14,6 +14,8 @@ import { captureRefreshCredentialAuthority, getPendingAuthPath, PendingAuthSettl
 import { mergeAccountRuntimeObservations, mergeAccountSnapshot } from "../lib/storage/snapshot-merge.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
 import * as refreshQueue from "../lib/refresh-queue.js";
+import * as storageModule from "../lib/storage.js";
+import { CodexAuthError } from "../lib/errors.js";
 import type { OAuthAuthDetails, TokenSuccess } from "../lib/types.js";
 
 let dir: string, path: string;
@@ -120,6 +122,34 @@ it("keeps an explicit pool independent of ambient path changes", async () => {
  expect(returned).toBe(result); expect(owner).toEqual(row());
 });
 
+it.each(["expiry", "live", "journal", "corrupt", "reset", "current"])("validates the original owner before classifying a real OAuth refusal (%s)", async change => {
+ const manager = new AccountManager(undefined, await loadAccounts()), account = manager.getAccountByIndex(0)!;
+ account.consecutiveAuthFailures = 2;
+ manager.markAccountCoolingDown(account, 60000, "auth-failure");
+ const cooldown = account.coolingDownUntil;
+ const auth = manager.toAuthDetails(account);
+ const entered = gate(), release = gate();
+ const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+  entered.resolve(); await release.promise;
+  return Response.json({error: "invalid_grant", error_description: "fixture refusal"}, {status: 400});
+ });
+ const setter = vi.fn();
+ const pending = refreshAndUpdateToken(auth, {auth: {set: setter}} as never, {accountManager: manager, account}).catch(error => error);
+ await entered.promise;
+ if (change === "expiry") account.expires = 2;
+ if (change === "live") manager.updateFromAuth(account, {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires});
+ if (change === "journal" || change === "corrupt") await fs.writeFile(getPendingAuthPath(path), change === "corrupt" ? "{" : JSON.stringify({version: 1, entries: [{prior: createHash("sha256").update("fixture-refresh").digest("hex"), recordId: account.recordId, refreshToken: result.refresh, accessToken: result.access, expiresAt: result.expires, at: 1}]}));
+ if (change === "reset") await fs.writeFile(getIntentionalResetMarkerPath(path), "{}");
+ const before = structuredClone(account);
+ release.resolve();
+ const error = await pending;
+ if (change === "current") {expect(error).toBeInstanceOf(CodexAuthError); expect(error.retryable).toBe(false);}
+ else {expect(error).not.toBeInstanceOf(CodexAuthError); expect(error.code).toBe("EPENDINGAUTHADMISSION");}
+ expect(account).toEqual(before); expect(account.consecutiveAuthFailures).toBe(2);
+ if (change !== "live") expect(account.coolingDownUntil).toBe(cooldown);
+ expect(setter).not.toHaveBeenCalled(); expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it.each(["ENOSPC", "EIO"])("retains newest material and the first host persistence error (%s)", async code => {
  const auth: OAuthAuthDetails = {type: "oauth", access: "fixture-access", refresh: "fixture-refresh", expires: 1};
  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({access_token: result.access, refresh_token: result.refresh, expires_in: 3600}));
@@ -170,27 +200,68 @@ it.each([false, true])("does not relabel an old invalidation with a replacement 
  }
 });
 
-it("preserves primary publication failure without authentication refusal or predecessor respend", async () => {
+it.each(["EINVAL", "EBUSY", "EACCES"])("preserves primary publication failure without authentication refusal or predecessor respend (%s)", async code => {
  const manager = new AccountManager(undefined, await loadAccounts()), account = manager.getAccountByIndex(0)!;
  account.consecutiveAuthFailures = 2;
+ manager.markAccountCoolingDown(account, 60000, "auth-failure");
+ const cooldown = account.coolingDownUntil;
+ vi.spyOn(manager, "saveToDiskDebounced").mockImplementation(() => undefined);
  const failure = vi.spyOn(manager, "recordFailure"), success = vi.spyOn(manager, "recordSuccess");
  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({access_token: result.access, refresh_token: result.refresh, expires_in: 3600}));
- const cause = Object.assign(Error("fixture primary publication failed"), {code: "EINVAL"});
+ const cause = Object.assign(Error("fixture primary publication failed"), {code});
  const rename = fs.rename.bind(fs);
  vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
   if (String(to) === path) throw cause;
   return rename(from, to);
  });
- const error = await ensureFreshAccessToken({accountManager: manager, account, family: "codex", model: "gpt-5", now: Date.now(), tokenRefreshSkewMs: 0, tokenInvalidationCooldownMs: 300000}).catch(value => value);
+ const params = {accountManager: manager, account, family: "codex" as const, model: "gpt-5", now: Date.now(), tokenRefreshSkewMs: 0, tokenInvalidationCooldownMs: 300000};
+ const errors = await Promise.all([ensureFreshAccessToken(params), ensureFreshAccessToken(params)].map(pending => pending.catch(value => value)));
+ const error = errors[0];
+ expect(errors[1]).toBe(error);
  expect(error).toBeInstanceOf(PendingAuthSettlementError);
- expect(error.cause).toMatchObject({code: "EINVAL", cause});
- expect(error.cause.cause).toBe(cause); expect(error.durability).toBe("unverified");
+ expect(error.cause).toMatchObject({code, cause});
+ expect(error.cause.cause).toBe(cause); expect(error.durability).toBe(code === "EINVAL" ? "unverified" : "journal");
+ expect(account.coolingDownUntil).toBe(cooldown); expect(account.cooldownReason).toBe("auth-failure");
  expect(account).toMatchObject({access: result.access, refreshToken: result.refresh, consecutiveAuthFailures: 2});
  expect(account.enabled).not.toBe(false); expect(manager.getAccountByIndex(0)).toBe(account);
  expect(failure).not.toHaveBeenCalled(); expect(success).not.toHaveBeenCalled();
  expect((await loadAccounts())?.accounts[0]?.refreshToken).toBe(result.refresh);
  await expect(refreshQueue.getRefreshQueue().refresh("fixture-refresh", path)).resolves.toMatchObject({type: "success", refresh: result.refresh});
  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it.each(["journal-after-load", "journal-before-load", "corrupt", "reset", "disable", "selection"])("does not mirror or cache a stale usable selection (%s)", async change => {
+ vi.stubEnv("CODEX_MULTI_AUTH_DIR", dir); vi.stubEnv("CODEX_CLI_AUTH_PATH", join(dir, "auth.json")); vi.stubEnv("CODEX_CLI_CONFIG_PATH", join(dir, "config.toml")); vi.stubEnv("CODEX_CLI_ACCOUNTS_PATH", join(dir, "mirror.json")); vi.stubEnv("CODEX_MULTI_AUTH_SYNC_CODEX_CLI", "1");
+ const globalPath = join(dir, "openai-codex-accounts.json");
+ const initial = pool(); initial.accounts[0]!.expiresAt = result.expires;
+ await fs.writeFile(globalPath, JSON.stringify(initial));
+ const journal = JSON.stringify({version: 1, entries: [{prior: createHash("sha256").update("fixture-refresh").digest("hex"), recordId: "owner-A", refreshToken: result.refresh, accessToken: result.access, expiresAt: result.expires, at: 1}]});
+ if (change === "journal-before-load") await fs.writeFile(getPendingAuthPath(globalPath), journal);
+ const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({access_token: result.access, refresh_token: result.refresh, expires_in: 3600}));
+ const originalLoad = storageModule.loadAccounts;
+ vi.spyOn(storageModule, "loadAccounts").mockImplementationOnce(async () => {
+  const loaded = change === "journal-before-load" ? structuredClone(initial) : await originalLoad();
+  if (change === "journal-after-load") await refreshQueue.getRefreshQueue().refresh("fixture-refresh", globalPath);
+  if (change === "corrupt") await fs.writeFile(getPendingAuthPath(globalPath), "{");
+  if (change === "reset") await fs.writeFile(getIntentionalResetMarkerPath(globalPath), "{}");
+  if (change === "disable" || change === "selection") {
+   const disk = structuredClone(initial);
+   if (change === "disable") disk.accounts[0]!.enabled = false;
+   else {disk.accounts.push({...row(), recordId: "owner-B", refreshToken: "other-refresh"}); disk.activeIndex = 1;}
+   await fs.writeFile(globalPath, JSON.stringify(disk));
+  }
+  return loaded;
+ });
+ const outcome = await autoSyncActiveAccountToCodex().catch(error => error);
+ expect(outcome === false || outcome?.code === "EPENDINGAUTHADMISSION" || outcome?.code === "EPENDINGAUTHUNREADABLE").toBe(true);
+ await expect(fs.readFile(join(dir, "auth.json"))).rejects.toMatchObject({code: "ENOENT"});
+ if (change.startsWith("journal")) {
+  expect(await fs.readFile(globalPath, "utf8")).toBe(JSON.stringify(initial));
+  expect(await autoSyncActiveAccountToCodex()).toBe(true);
+  expect(JSON.parse(await fs.readFile(join(dir, "auth.json"), "utf8")).tokens.refresh_token).toBe(result.refresh);
+  expect(await autoSyncActiveAccountToCodex()).toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(change === "journal-after-load" ? 1 : 0);
+ }
 });
 
 it.each(["journal", "corrupt", "reset"])("observes changed warm-sync authority (%s)", async change => {

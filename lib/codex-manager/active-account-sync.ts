@@ -1,4 +1,4 @@
-import { capturePendingAuth, captureRefreshCredentialAuthority, getPendingAuthPath, withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { applyPendingAuth, capturePendingAuth, captureRefreshCredentialAuthority, getPendingAuthPath, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { captureAuthorityRevision } from "../storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
 import { createHash } from "node:crypto";
@@ -230,9 +230,10 @@ function recordActiveSelectionSync(
 	syncedContentHash: string | null,
 	preMirrorFingerprints: Map<string, ActiveSyncFingerprint | null>,
 	requiredMirrorPaths: ReadonlySet<string>,
+	authorityCurrent: () => boolean,
 ): void {
 	const storage = statFingerprint(storagePath);
-	if (!storage || storage.contentHash !== syncedContentHash) {
+	if (!authorityCurrent() || !storage || storage.contentHash !== syncedContentHash) {
 		ACTIVE_SYNC_FINGERPRINTS.delete(storagePath);
 		return;
 	}
@@ -251,7 +252,7 @@ function recordActiveSelectionSync(
 		}
 		mirror.set(path, fingerprint);
 	}
-	ACTIVE_SYNC_FINGERPRINTS.set(storagePath, { storage, mirror, authorityCurrent: captureAuthorityRevision([getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]) });
+	ACTIVE_SYNC_FINGERPRINTS.set(storagePath, { storage, mirror, authorityCurrent });
 }
 
 /**
@@ -271,8 +272,8 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 	// bytes, so a transient refresh failure, a torn mirror, or a mid-pass
 	// mutation is retried on the next call.
 	const storagePath = getStoragePath();
-	await capturePendingAuth(storagePath, []);
 	const authorityCurrent = captureAuthorityRevision([getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
+	const pendingAuth = await capturePendingAuth(storagePath, []);
 	if (!authorityCurrent()) return false;
 	if (isActiveSelectionSyncCurrent(storagePath)) {
 		return true;
@@ -298,8 +299,11 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 	if (!account) {
 		return false;
 	}
-	if (account.enabled === false || account.authInvalidatedAt) return false;
+	if (account.enabled === false || account.authInvalidatedAt || !authorityCurrent()) return false;
+	const effectiveStorage = await applyPendingAuth(storagePath, structuredClone(storage), pendingAuth.entries);
+	if (!authorityCurrent() || JSON.stringify(effectiveStorage?.accounts[activeIndex]) !== JSON.stringify(account)) return false;
 	const refreshAuthority = captureRefreshCredentialAuthority(account);
+	let mirrorAuthorityCurrent = authorityCurrent;
 	const accountMatch = {
 		accountId: account.accountId,
 		email: account.email,
@@ -384,6 +388,8 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 			Object.assign(target, {refreshToken: syncRefreshToken, accessToken: syncAccessToken, expiresAt: syncExpiresAt, email: nextStoredAccount.email,
 				accountId: nextStoredAccount.accountId, accountIdSource: nextStoredAccount.accountIdSource});
 			await persist(nextStorage);
+			if (!refreshAuthority({type: "success", access: syncAccessToken ?? "", refresh: syncRefreshToken, expires: syncExpiresAt ?? 0})) return null;
+			mirrorAuthorityCurrent = captureAuthorityRevision([getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
 			persisted = true;
 			// Still inside the file lock: this fingerprint is provably the exact
 			// bytes this pass persisted, i.e. what the mirror is built from.
@@ -414,9 +420,8 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 		return false;
 	}
 
-	await capturePendingAuth(storagePath, []);
-	const mirrorAuthorityCurrent = captureAuthorityRevision([storagePath, getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
-	if (!mirrorAuthorityCurrent()) return false;
+	const mirrorRevisionCurrent = captureAuthorityRevision([storagePath]);
+	if (!mirrorAuthorityCurrent() || !refreshAuthority({type: "success", access: syncAccessToken ?? "", refresh: syncRefreshToken, expires: syncExpiresAt ?? 0})) return false;
 	const synced = await setCodexCliActiveSelection({
 		accountId: codexCliAccountIdFor(
 			nextStoredAccount ?? account,
@@ -429,7 +434,7 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 		expiresAt: syncExpiresAt,
 		...(syncIdToken ? { idToken: syncIdToken } : {}),
 	});
-	if (!mirrorAuthorityCurrent()) return false;
+	if (!mirrorRevisionCurrent() || !mirrorAuthorityCurrent() || !refreshAuthority({type: "success", access: syncAccessToken ?? "", refresh: syncRefreshToken, expires: syncExpiresAt ?? 0})) return false;
 	if (synced) {
 		// The writer always (re)writes auth.json when the selection carries a
 		// token pair; treat its disappearance before the record as a torn
@@ -448,7 +453,8 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 			baseContentHash,
 			preMirrorFingerprints,
 			requiredMirrorPaths,
+			mirrorAuthorityCurrent,
 		);
 	}
-	return synced && captureAuthorityRevision([], [getIntentionalResetMarkerPath(storagePath)])();
+	return synced && mirrorAuthorityCurrent();
 }

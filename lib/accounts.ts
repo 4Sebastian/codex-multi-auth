@@ -1879,7 +1879,6 @@ export class AccountManager {
 	): Promise<ManagedAccount | null> {
 		const initialLive = this.getAccountByIdentity(source, auth);
 		const initialState = initialLive ? structuredClone(initialLive) : undefined;
-		const initialObservation = initialLive ? this.nativeAuthSnapshots.get(initialLive) : undefined;
 		const priorRefreshToken = initialState?.refreshToken ?? source.refreshToken;
 		const storagePath = this.resolveSelectionStoragePath();
 		const authorityCurrent = initialLive ? captureRefreshCredentialAuthority({...initialLive, ...source},
@@ -1977,7 +1976,7 @@ export class AccountManager {
 					if (newerInvalidation || newerCooldown) {
 						storedAccount.coolingDownUntil = previousLiveAccountState.coolingDownUntil;
 						storedAccount.cooldownReason = previousLiveAccountState.cooldownReason;
-					} else {this.clearAccountCooldown(liveAccount); this.clearAuthFailures(liveAccount);}
+					} else {this.clearAccountCooldown(liveAccount);}
 					const attemptedState = structuredClone(liveAccount);
 					const attemptedObservation = this.nativeAuthSnapshots.get(liveAccount);
 
@@ -1990,15 +1989,15 @@ export class AccountManager {
 							throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during commit"), {code: "ESTALE"}));
 						}
 					} catch (error) {
-						if (isRetryableAuthPersistenceError(error)) throw error;
-						const observationUnchanged = this.nativeAuthSnapshots.get(liveAccount)?.observedAt === attemptedObservation?.observedAt;
+						const observationUnchanged = this.getAccountByIndex(liveAccount.index) === liveAccount &&
+							this.resolveSelectionStoragePath() === storagePath &&
+							(["recordId", "access", "refreshToken", "expires"] as const).every(field => liveAccount[field] === attemptedState[field]) &&
+							this.nativeAuthSnapshots.get(liveAccount)?.observedAt === attemptedObservation?.observedAt;
 						const authFields = ["access", "refreshToken", "expires", "accountId", "accountIdSource", "email", "authInvalidatedAt", "authInvalidationErrorCode"] as const;
 						if (observationUnchanged && authFields.every(field => liveAccount[field] === attemptedState[field])) {
 							for (const field of authFields) Object.assign(liveAccount, {[field]: previousLiveAccountState[field]});
 						}
-						for (const field of ["enabled", "consecutiveAuthFailures"] as const) {
-							if (observationUnchanged && liveAccount[field] === attemptedState[field]) Object.assign(liveAccount, {[field]: previousLiveAccountState[field]});
-						}
+						if (observationUnchanged && liveAccount.enabled === attemptedState.enabled) liveAccount.enabled = previousLiveAccountState.enabled;
 						if (observationUnchanged && liveAccount.coolingDownUntil === attemptedState.coolingDownUntil && liveAccount.cooldownReason === attemptedState.cooldownReason) {
 							liveAccount.coolingDownUntil = previousLiveAccountState.coolingDownUntil;
 							liveAccount.cooldownReason = previousLiveAccountState.cooldownReason;
@@ -2010,6 +2009,7 @@ export class AccountManager {
 						throw error;
 					}
 
+					if (!newerInvalidation && !newerCooldown && liveAccount.consecutiveAuthFailures === previousLiveAccountState.consecutiveAuthFailures) this.clearAuthFailures(liveAccount);
 					return liveAccount;
 				}
 
@@ -2031,22 +2031,11 @@ export class AccountManager {
 			if (live) {
 				if (live === initialLive && initialState &&
 					(["access", "refreshToken", "expires"] as const).every(field => live[field] === initialState[field])) {
-					const authorizationChanged = this.nativeAuthSnapshots.get(live)?.observedAt !== initialObservation?.observedAt ||
-						live.authInvalidatedAt !== initialState.authInvalidatedAt || live.enabled !== initialState.enabled;
-					const invalidatedAt = live.authInvalidatedAt, invalidationCode = live.authInvalidationErrorCode;
+					const coolingDownUntil = live.coolingDownUntil, cooldownReason = live.cooldownReason;
 					this.updateFromAuth(live, auth);
-					if (authorizationChanged && auth.access === initialState.access) {
-						live.authInvalidatedAt = invalidatedAt;
-						live.authInvalidationErrorCode = invalidationCode;
-					}
-					if (live.cooldownReason === "auth-failure" && auth.access !== initialState.access) this.clearAccountCooldown(live);
-					if (!authorizationChanged) {
-						if (live.cooldownReason === "auth-failure") this.clearAccountCooldown(live);
-						this.clearAuthFailures(live);
-					}
+					live.coolingDownUntil = coolingDownUntil;
+					live.cooldownReason = cooldownReason;
 				}
-				const settlementState = structuredClone(live);
-				const settlementObservation = this.nativeAuthSnapshots.get(live);
 				// The debounced save needs this process to survive and the file to
 				// unlock. Journal the rotated credential beside the pool so the next
 				// load (any process) applies it even if neither happens.
@@ -2068,7 +2057,12 @@ export class AccountManager {
 					const baselineRow = this.persistenceBaseline?.accounts.find(row => row.refreshToken === priorRefreshToken);
 					if (baselineRow) Object.assign(baselineRow, journaled);
 					if (this.nativeAuthSnapshots.get(live)?.observedAt === retainedObservation?.observedAt && live.access === retainedAuth.accessToken && live.refreshToken === retainedAuth.refreshToken && live.expires === retainedAuth.expiresAt && live.authInvalidatedAt === retainedAuth.authInvalidatedAt && (live.enabled === false) === (retainedAuth.enabled === false)) {
-						if (live.access !== journaled.accessToken || live.refreshToken !== journaled.refreshToken || live.expires !== journaled.expiresAt) this.updateFromAuth(live, {type: "oauth", access: journaled.accessToken, refresh: journaled.refreshToken, expires: journaled.expiresAt});
+						if (live.access !== journaled.accessToken || live.refreshToken !== journaled.refreshToken || live.expires !== journaled.expiresAt) {
+							const coolingDownUntil = live.coolingDownUntil, cooldownReason = live.cooldownReason;
+							this.updateFromAuth(live, {type: "oauth", access: journaled.accessToken, refresh: journaled.refreshToken, expires: journaled.expiresAt});
+							live.coolingDownUntil = coolingDownUntil;
+							live.cooldownReason = cooldownReason;
+						}
 						live.authInvalidatedAt = journaled.authInvalidatedAt;
 						live.authInvalidationErrorCode = journaled.authInvalidationErrorCode;
 						if (journaled.enabled === false) live.enabled = false;
@@ -2086,21 +2080,17 @@ export class AccountManager {
 					});
 					}
 				} catch (journalError) {
-					log.error("Account storage could not be read or written and the rotated credential could not be journaled; it is only in memory. Keep this process running until the accounts file is readable, or the account will need a re-login.", {
+					log.error("Account publication failed and journal rescue could not be verified. Keep this process running until account storage recovers.", {
 						sourceIndex: source.index,
 						code: typeof (journalError as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((journalError as NodeJS.ErrnoException).code ?? "") ? (journalError as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
 					});
-					if (initialState && live === initialLive && this.nativeAuthSnapshots.get(live) === settlementObservation &&
-						live.access === settlementState.access && live.refreshToken === settlementState.refreshToken && live.expires === settlementState.expires) {
-						for (const field of ["consecutiveAuthFailures", "coolingDownUntil", "cooldownReason"] as const) {
-							if (live[field] === settlementState[field]) Object.assign(live, {[field]: initialState[field]});
-						}
-					}
 					this.saveToDiskDebounced();
-					throw new PendingAuthSettlementError({type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires}, error);
+					const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
+					throw new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");
 				}
 				this.saveToDiskDebounced();
-				return live;
+				const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
+				throw new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "journal");
 			}
 			const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
 			const settlement = new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");

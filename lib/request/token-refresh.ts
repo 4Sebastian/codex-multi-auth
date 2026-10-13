@@ -99,13 +99,13 @@ export async function refreshAndUpdateToken(
 	const accountCurrent = source ? captureRefreshCredentialAuthority(source.account, sourceCurrent, undefined, storagePath) : () => true;
 	const publish = async () => {
 		const result = await queuedRefresh(refreshToken, storagePath);
+		if (!authCurrent(result.type === "success" ? result : undefined) || !accountCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before publication"), {code: "ESTALE"}));
 		if (result.type === "failed") {
 			throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
 				retryable: isRetryableRefreshFailure(result),
 				context: {refreshFailureReason: result.reason, statusCode: result.statusCode},
 			});
 		}
-		if (!authCurrent(result) || !accountCurrent(result)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before publication"), {code: "ESTALE"}));
 		try {
 			await authSetter.set({
 				path: {id: "openai"},

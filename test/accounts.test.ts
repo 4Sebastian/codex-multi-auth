@@ -2105,8 +2105,7 @@ describe("AccountManager", () => {
 				accounts: [{ refreshToken: "old-refresh", accessToken: "old-access", expiresAt: now, addedAt: now, lastUsed: now }],
 			} as any);
 			const account = manager.getAccountByIndex(0)!;
-			const committed = await manager.commitRefreshedAuth(account, { type: "oauth", access: "header.payload.signature", refresh: "new-refresh", expires: now + 3_600_000 });
-			expect(committed).toBe(account);
+			await expect(manager.commitRefreshedAuth(account, { type: "oauth", access: "header.payload.signature", refresh: "new-refresh", expires: now + 3_600_000 })).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, durability: "journal"});
 			expect(account.refreshToken).toBe("new-refresh");
 		});
 
@@ -2148,9 +2147,8 @@ describe("AccountManager", () => {
 
 			// The refresh already spent old-refresh upstream; dropping new-refresh
 			// would force a re-login, so it is kept (and journaled) for a later save.
-			const committed = await manager.commitRefreshedAuth(account, refreshedAuth);
+			await expect(manager.commitRefreshedAuth(account, refreshedAuth)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EBUSY"}, durability: "journal"});
 
-			expect(committed).toBe(account);
 			expect(account.refreshToken).toBe("new-refresh");
             const { resolveAccountRecordId } = await import("../lib/accounts.js");
             expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({recordId: resolveAccountRecordId(stored.accounts[0]!)}));

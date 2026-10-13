@@ -155,7 +155,7 @@ it("protects the final slot across distinct-process OAuth spend and failed manag
 	const boundary = await b.next(["blocked", "spend"]);
 	a.child.send("release");
 	const [aResult, bResult] = await Promise.all([a.next(["settled"]), b.next(["error"])]);
-	await a.next(["done"]);
+	expect(await a.next(["error"])).toMatchObject({code: "EPENDINGAUTHSETTLEMENT"});
 	expect(boundary.event).toBe("blocked");
 	expect(aResult.result?.type).toBe("success");
 	expect(bResult).toMatchObject({event: "error", code: "EPENDINGAUTHCAPACITY"});
@@ -197,7 +197,7 @@ it("recovers a dead pre-settlement owner without retaining invented credentials"
 	await exited;
 	const b = await worker("B");
 	expect((await b.next(["settled"])).result?.type).toBe("success");
-	await b.next(["done"]);
+	expect(await b.next(["error"])).toMatchObject({code: "EPENDINGAUTHSETTLEMENT"});
 	const entries = (await capturePendingAuth(path, [])).entries;
 	expect(entries.some(row => row.prior === sha("A"))).toBe(false);
 	expect(entries.find(row => row.prior === sha("B"))?.refreshToken).toBe("B-next");
@@ -259,7 +259,7 @@ it("commits managed rescue to its captured pool after the default storage path c
 		if (String(to) === path) throw Object.assign(Error("fixture primary denied"), {code: "EACCES"});
 		return rename(from, to);
 	});
-	await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires});
+	await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires})).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EACCES"}, durability: "journal"});
 	expect((await capturePendingAuth(path, [])).entries[0]).toMatchObject({recordId: "A", refreshToken: "A-next"});
 	expect(await fs.readFile(other, "utf8")).toBe(otherContent);
 });
