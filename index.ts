@@ -181,6 +181,7 @@ import {
 } from "./lib/recovery.js";
 import { RefreshGuardian } from "./lib/refresh-guardian.js";
 import { queuedRefresh } from "./lib/refresh-queue.js";
+import { PendingAuthCapacityError, PendingAuthSettlementError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
 import {
 	parseEnvInt,
 	parseFailoverMode,
@@ -1397,12 +1398,13 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											account,
 										) as OAuthAuthDetails;
 										try {
-											if (shouldRefreshToken(accountAuth, tokenRefreshSkewMs)) {
+											if (shouldRefreshToken(accountAuth, tokenRefreshSkewMs, accountManager.resolveSelectionStoragePath())) {
 												runtimeMetrics.authRefreshRequests += 1;
 												syncRuntimeObservability(requestTraceId);
 												accountAuth = (await refreshAndUpdateToken(
 													accountAuth,
 													client,
+													{accountManager, account},
 												)) as OAuthAuthDetails;
 												await accountManager.commitRefreshedAuth(
 													account,
@@ -1410,6 +1412,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												);
 											}
 										} catch (err) {
+											if (err instanceof PendingAuthSettlementError || err instanceof PendingAuthCapacityError) throw err;
 											logDebug(
 												`[${PLUGIN_NAME}] Auth refresh failed for account: ${(err as Error)?.message ?? String(err)}`,
 											);
@@ -2505,6 +2508,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	shouldRefreshToken(
 																		fallbackAuth,
 																		tokenRefreshSkewMs,
+																		accountManager.resolveSelectionStoragePath(),
 																	)
 																) {
 																	runtimeMetrics.authRefreshRequests += 1;
@@ -2512,6 +2516,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	fallbackAuth = (await refreshAndUpdateToken(
 																		fallbackAuth,
 																		client,
+																		{accountManager, account: fallbackAccount},
 																	)) as OAuthAuthDetails;
 																	await accountManager.commitRefreshedAuth(
 																		fallbackAccount,
@@ -2519,6 +2524,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	);
 																}
 															} catch (refreshError) {
+																if (refreshError instanceof PendingAuthSettlementError || refreshError instanceof PendingAuthCapacityError) throw refreshError;
 																logWarn(
 																	`Stream failover refresh failed for account ${fallbackAccount.index + 1}.`,
 																	{
@@ -2746,6 +2752,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																);
 																return fallbackResponse;
 															} catch (streamFailoverError) {
+															if (streamFailoverError instanceof PendingAuthSettlementError || streamFailoverError instanceof PendingAuthCapacityError) throw streamFailoverError;
 																accountManager.refundToken(
 																	fallbackAccount,
 																	modelFamily,
@@ -4425,7 +4432,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 						const label = formatAccountLabel(account, i);
 						try {
-							const refreshResult = await queuedRefresh(account.refreshToken);
+							const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
 							if (refreshResult.type === "success") {
 								results.push(
 									`  ${getStatusMarker(ui, "ok")} ${label}: Healthy`,
@@ -4655,9 +4662,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 									const label = formatAccountLabel(account, i);
 
 									try {
-										const refreshResult = await queuedRefresh(
-											account.refreshToken,
-										);
+										const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
 										if (refreshResult.type === "success") {
 											account.refreshToken = refreshResult.refresh;
 											account.accessToken = refreshResult.access;

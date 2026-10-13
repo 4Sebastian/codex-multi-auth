@@ -5,7 +5,10 @@
  */
 
 import type { Auth, CodexClient } from "@codex-ai/sdk";
-import { queuedRefresh } from "../refresh-queue.js";
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { getStoragePath } from "../storage.js";
+import type { AccountManager, ManagedAccount } from "../accounts.js";
+import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
 import type { TokenResult } from "../types.js";
 import { CodexAuthError } from "../errors.js";
 import { HTTP_STATUS, ERROR_MESSAGES } from "../constants.js";
@@ -30,8 +33,9 @@ interface CodexAuthSetter {
  * @param auth - Current authentication state
  * @returns True if token is expired or invalid
  */
-export function shouldRefreshToken(auth: Auth, skewMs = 0): boolean {
+export function shouldRefreshToken(auth: Auth, skewMs = 0, storagePath = getStoragePath()): boolean {
 	if (auth.type !== "oauth") return true;
+	if (getRefreshQueue().isRefreshing(auth.refresh, storagePath)) return true;
 	if (!auth.access) return true;
 
 	const safeSkewMs = Math.max(0, Math.floor(skewMs));
@@ -107,6 +111,7 @@ function isRetryableAuthSetterError(error: unknown): boolean {
 export async function refreshAndUpdateToken(
 	currentAuth: Auth,
 	client: CodexClient,
+	source?: {accountManager: AccountManager; account: ManagedAccount},
 ): Promise<Auth> {
 	const authSetter = (client as Partial<CodexAuthSetter>).auth;
 	if (!authSetter || typeof authSetter.set !== "function") {
@@ -116,7 +121,15 @@ export async function refreshAndUpdateToken(
 	}
 
 	const refreshToken = currentAuth.type === "oauth" ? currentAuth.refresh : "";
-	const refreshResult = await queuedRefresh(refreshToken);
+	const storagePath = source?.accountManager.resolveSelectionStoragePath() ?? getStoragePath();
+	const refresh = () => queuedRefresh(refreshToken, storagePath);
+	const refreshAuth = () => currentAuth.type === "oauth"
+		? withRefreshCredentialRetention(currentAuth, refresh)
+		: refresh();
+	const refreshResult = source
+		? await withRefreshCredentialRetention(source.account, refreshAuth,
+			() => source.accountManager.getAccountByIndex(source.account.index) === source.account && source.accountManager.resolveSelectionStoragePath() === storagePath)
+		: await refreshAuth();
 
 	if (refreshResult.type === "failed") {
 		throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {

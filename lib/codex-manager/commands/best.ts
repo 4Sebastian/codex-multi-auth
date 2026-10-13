@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
 import {
 	codexCliAccountIdFor,
 	shouldUpdateAccountIdFromToken,
@@ -224,7 +225,7 @@ export async function runBestCommand(
 		let probeAccountId =
 			account.accountId ?? deps.extractAccountId(account.accessToken);
 		if (!deps.hasUsableAccessToken(account, now)) {
-			const refreshResult = await deps.queuedRefresh(account.refreshToken);
+			const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
 			if (refreshResult.type !== "success") {
 				refreshFailures.set(i, {
 					...refreshResult,

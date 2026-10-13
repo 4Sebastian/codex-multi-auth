@@ -498,6 +498,8 @@ vi.mock("../lib/accounts.js", async () => {
 			return new MockAccountManager();
 		}
 
+		resolveSelectionStoragePath() { return "/mock/path/accounts.json"; }
+
 		getAccountCount() {
 			return this.accounts.length;
 		}
@@ -1755,6 +1757,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			},
 			getAccountByIndex: (index: number) => accounts[index] ?? null,
 			getAccountsSnapshot: () => accounts,
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: (index: number) => Boolean(accounts[index]),
 			toAuthDetails: (account: (typeof accounts)[number]) => ({
 				type: "oauth" as const,
@@ -3649,6 +3652,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			hasEnabledWorkspaces: () => true,
 			setActiveIndex: () => accountOne,
 			getAccountsSnapshot: () => [accountOne, accountTwo],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 		};
 		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
 			customManager as never,
@@ -5079,6 +5083,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5188,6 +5193,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5287,6 +5293,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5375,6 +5382,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5499,6 +5507,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5600,6 +5609,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5697,6 +5707,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5789,6 +5800,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5897,6 +5909,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -6017,6 +6030,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -6127,6 +6141,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -6257,6 +6272,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				getCurrentWorkspace: () => null,
 				getAccountByIndex: () => null,
 				getAccountsSnapshot: () => [requestAccount],
+				resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 				isAccountAvailableForFamily: () => true,
 				toAuthDetails: () => ({
 					type: "oauth" as const,
@@ -6420,6 +6436,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 		);
 		const fallbackCancelSpy = vi.spyOn(fallback429Response.body!, "cancel");
 		const manager = {
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			getAccountCount: () => 2,
 			getCurrentOrNextForFamilyHybrid: () => currentAccount,
 			getCurrentOrNextForFamily: () => currentAccount,
@@ -6578,6 +6595,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			{ status: 500 },
 		);
 		const manager = {
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			getAccountCount: () => 2,
 			getCurrentOrNextForFamilyHybrid: () => currentAccount,
 			getCurrentOrNextForFamily: () => currentAccount,

@@ -6,12 +6,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSync } from "esbuild";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { RefreshQueue, resetRefreshQueue } from "../lib/refresh-queue.js";
+import { runRuntimeAccountCheck } from "../lib/runtime/account-check.js";
+import { hydrateRuntimeEmails } from "../lib/runtime/hydrate-emails.js";
+import { verifyRuntimeFlaggedAccounts } from "../lib/runtime/verify-flagged.js";
+import { runHealthCheck } from "../lib/codex-manager/health-check.js";
+import { runFix, type RepairCommandDeps } from "../lib/codex-manager/repair-commands.js";
+import { autoSyncActiveAccountToCodex } from "../lib/codex-manager/active-account-sync.js";
+import { proactiveRefreshAccount } from "../lib/proactive-refresh.js";
+import { RefreshGuardian } from "../lib/refresh-guardian.js";
+import { refreshAndUpdateToken } from "../lib/request/token-refresh.js";
+import { persistAndSyncSelectedAccount } from "../lib/codex-manager/persist-selected-account.js";
+import { queuedRefresh, RefreshQueue, resetRefreshQueue } from "../lib/refresh-queue.js";
 import { RefreshLeaseCoordinator } from "../lib/refresh-lease.js";
 import { AccountManager } from "../lib/accounts.js";
 import { ensureFreshAccessToken } from "../lib/runtime/rotation-token-refresh.js";
-import { loadAccounts, loadFlaggedAccounts, getFlaggedAccountsPath, saveAccounts, setStoragePathDirect } from "../lib/storage.js";
-import { applyPendingAuth, capturePendingAuth, getPendingAuthPath, prunePendingAuth } from "../lib/storage/pending-auth.js";
+import { loadAccounts, loadFlaggedAccounts, getFlaggedAccountsPath, getStoragePath, saveAccounts, setStoragePathDirect } from "../lib/storage.js";
+import { PendingAuthSettlementError, applyPendingAuth, capturePendingAuth, getPendingAuthPath, prunePendingAuth } from "../lib/storage/pending-auth.js";
 import { collectRestorableCredentials } from "../lib/storage/recovery-credentials.js";
 import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
@@ -45,6 +55,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 	resetRefreshQueue();
 	setStoragePathDirect(null);
 	for (const child of children.splice(0)) {
@@ -421,4 +432,311 @@ it.each(["corrupt-journal", "corrupt-primary", "locked"])("denies admission befo
 		});
 	} else expect((await queue().refresh("A", path)).type).toBe("failed");
 	expect(fetch).not.toHaveBeenCalled();
+}, 20000);
+
+function denyJournalSettlement() {
+	const rename = fs.rename.bind(fs);
+	const cause = Object.assign(Error("fixture journal full"), {code: "ENOSPC"});
+	const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+		if (String(to) === getPendingAuthPath(path)) throw cause;
+		return rename(from, to);
+	});
+	return {cause, spy};
+}
+
+it.each([".bak.1", ".bak.2"])("retains older flagged recovery roots through saves and capacity admission (%s)", async suffix => {
+	const roots = ["flagged", ...Array.from({length: 998}, (_, index) => `root-${index}`)];
+	await fs.writeFile(path, JSON.stringify(pool(["A", "B"])));
+	await fs.writeFile(`${path}.snapshot-old`, JSON.stringify(pool(roots.slice(1))));
+	await fs.writeFile(`${getFlaggedAccountsPath()}${suffix}`, JSON.stringify({version: 1, accounts: pool(["flagged"]).accounts.map(row => ({...row, flaggedAt: 1}))}));
+	await fs.writeFile(getPendingAuthPath(path), JSON.stringify({version: 1, entries: roots.map(token => ({prior: sha(token), recordId: token, refreshToken: `${token}-next`, accessToken: `access-${token}-next`, expiresAt: 2, at: 1}))}));
+	await saveAccounts((await loadAccounts())!);
+	expect((await capturePendingAuth(path, [])).entries).toHaveLength(999);
+	const fetch = injectRefresh();
+	expect(await queue().refresh("A", path)).toMatchObject({type: "success", refresh: "A-next"});
+	expect(await queue().refresh("B", path)).toMatchObject({type: "failed"});
+	expect(fetch).toHaveBeenCalledTimes(1);
+	expect((await capturePendingAuth(path, [])).entries).toHaveLength(1000);
+	expect((await loadFlaggedAccounts()).accounts[0]?.refreshToken).toBe("flagged-next");
+});
+
+it.each(["openai-codex-flagged-accounts.json", "openai-codex-blocked-accounts.json"])("rejects changed and corrupt older flagged roots (%s)", async name => {
+	await seedNearCapacity();
+	const source = join(dir, `${name}.bak.2`);
+	await fs.writeFile(source, JSON.stringify({version: 1, accounts: pool(["old-0"]).accounts}));
+	const read = fs.readFile.bind(fs);
+	const spy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+		const content = await read(...args);
+		if (String(args[0]) === source) await fs.writeFile(source, JSON.stringify({version: 1, accounts: pool(["changed-root"]).accounts}));
+		return content;
+	});
+	await expect(collectRestorableCredentials(path)).rejects.toThrow("changed during scan");
+	spy.mockRestore();
+	await fs.writeFile(source, "{");
+	const fetch = injectRefresh();
+	expect(await queue().refresh("A", path)).toMatchObject({type: "success"});
+	const bytes = await fs.readFile(getPendingAuthPath(path), "utf8");
+	expect(await queue().refresh("B", path)).toMatchObject({type: "failed"});
+	await prunePendingAuth(path, pool(["A-next", "B"]), () => collectRestorableCredentials(path));
+	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(bytes);
+	expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it.each(["proactive", "request", "selected"])("retains new credentials and first error in the real %s consumer", async consumer => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	const manager = new AccountManager(undefined, (await loadAccounts())!);
+	const account = manager.getAccountByIndex(0)!;
+	account.consecutiveAuthFailures = 2;
+	const fetch = injectRefresh();
+	const {cause, spy} = denyJournalSettlement();
+	const auth = {type: "oauth" as const, access: account.access!, refresh: account.refreshToken, expires: account.expires!};
+	const setter = vi.fn();
+	const stored = (await loadAccounts())!;
+	const operation = consumer === "proactive" ? proactiveRefreshAccount(account)
+		: consumer === "request" ? refreshAndUpdateToken(auth, {auth: {set: setter}} as never, {accountManager: manager, account})
+		: persistAndSyncSelectedAccount({storage: stored, targetIndex: 0, parsed: 1, switchReason: "manual"});
+	const error = await operation.catch(value => value);
+	expect(error).toBeInstanceOf(PendingAuthSettlementError);
+	expect(error.cause).toBe(cause);
+	expect(JSON.stringify(error)).not.toContain("access-A");
+	expect(JSON.stringify(error)).not.toContain("A-next");
+	if (consumer === "selected") expect(stored.accounts[0]).toMatchObject({refreshToken: "A-next", accessToken: "access-A-next"});
+	else expect(account).toMatchObject({refreshToken: "A-next", access: "access-A-next", consecutiveAuthFailures: 2});
+	if (consumer === "request") expect(auth).toMatchObject({refresh: "A-next", access: "access-A-next"});
+	expect(setter).not.toHaveBeenCalled();
+	expect((await capturePendingAuth(path, [])).entries).toHaveLength(0);
+	await expect(queue().refresh("A", path)).rejects.toBe(error);
+	await expect(queue().refresh("A-next", path)).rejects.toBe(error);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	spy.mockRestore();
+	expect(await queue().refresh("A-next", path)).toMatchObject({type: "success", refresh: "A-next"});
+	expect((await loadAccounts())?.accounts[0]?.refreshToken).toBe("A-next");
+	expect(await queue().refresh("A-next", path)).toMatchObject({type: "success", refresh: "A-next-next"});
+	expect(fetch).toHaveBeenCalledTimes(2);
+	vi.unstubAllEnvs();
+});
+
+it("retains Guardian live credentials without healing or an authentication failure", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	const manager = new AccountManager(undefined, (await loadAccounts())!);
+	const account = manager.getAccountByIndex(0)!;
+	account.consecutiveAuthFailures = 2;
+	const success = vi.spyOn(manager, "recordSuccess");
+	const failure = vi.spyOn(manager, "incrementAuthFailures");
+	const fetch = injectRefresh();
+	const {cause} = denyJournalSettlement();
+	const guardian = new RefreshGuardian(() => manager);
+	await guardian.tick();
+	expect(account).toMatchObject({refreshToken: "A-next", access: "access-A-next", consecutiveAuthFailures: 2});
+	expect(guardian.getStats()).toMatchObject({failed: 1, networkFailed: 1, authFailed: 0, refreshed: 0});
+	expect(success).not.toHaveBeenCalled();
+	expect(failure).not.toHaveBeenCalled();
+	await guardian.tick();
+	await expect(queue().refresh("A", path)).rejects.toMatchObject({cause});
+	expect(fetch).toHaveBeenCalledTimes(1);
+	vi.unstubAllEnvs();
+});
+
+it.each(["record", "expiry", "credential", "disable", "reset"])("does not overwrite changed authority after settlement failure (%s)", async change => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	const manager = new AccountManager(undefined, (await loadAccounts())!);
+	const account = manager.getAccountByIndex(0)!;
+	const entered = deferred(), release = deferred();
+	const fetch = injectRefresh({token: "A", entered, release});
+	denyJournalSettlement();
+	const pending = proactiveRefreshAccount(account).catch(error => error);
+	await entered.promise;
+	if (change === "record") account.recordId = "replacement";
+	else if (change === "expiry") account.expires = 2;
+	else if (change === "credential") {account.access = "B-access"; account.refreshToken = "B";}
+	else if (change === "disable") account.enabled = false;
+	else await fs.writeFile(getIntentionalResetMarkerPath(path), "fixture-reset");
+	const expected = {...account};
+	release.resolve();
+	const error = await pending;
+	expect(error).toBeInstanceOf(PendingAuthSettlementError);
+	expect(account).toEqual(expected);
+	await expect(queue().refresh("A", path)).rejects.toBe(error);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	vi.unstubAllEnvs();
+});
+
+it("coalesces failed settlement followers across queue instances and retains scope isolation", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	const entered = deferred(), release = deferred();
+	const fetch = injectRefresh({token: "A", entered, release});
+	denyJournalSettlement();
+	const first = queue(true).refresh("A", path).catch(error => error);
+	await entered.promise;
+	const follower = queue().refresh("A", path).catch(error => error);
+	release.resolve();
+	const error = await first;
+	expect(await follower).toBe(error);
+	await expect(queue().refresh("A-next", path)).rejects.toBe(error);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	const other = join(dir, "other.json");
+	await fs.writeFile(other, JSON.stringify(pool(["A"])));
+	expect(await queue().refresh("A", other)).toMatchObject({type: "success", refresh: "A-next"});
+	expect(fetch).toHaveBeenCalledTimes(2);
+	expect((await fs.readdir(join(dir, "leases"))).filter(file => file.endsWith(".result.json"))).toEqual([]);
+});
+
+it("retains a failed same-token renewal until persistence-only settlement", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({access_token: "renewed-access", refresh_token: "A", expires_in: 3600}));
+	const {spy} = denyJournalSettlement();
+	const error = await queue().refresh("A", path).catch(value => value);
+	await expect(queue().refresh("A", path)).rejects.toBe(error);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	spy.mockRestore();
+	expect(await queue().refresh("A", path)).toMatchObject({type: "success", refresh: "A", access: "renewed-access"});
+	expect(fetch).toHaveBeenCalledTimes(1);
+	expect((await loadAccounts())?.accounts[0]?.accessToken).toBe("renewed-access");
+});
+
+it("settles retained material after a compatible primary save without another OAuth spend", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	const fetch = injectRefresh();
+	const {spy} = denyJournalSettlement();
+	const error = await queue().refresh("A", path).catch(value => value);
+	spy.mockRestore();
+	const saved = pool(["A"]);
+	Object.assign(saved.accounts[0]!, {accessToken: error.result.access, refreshToken: error.result.refresh, expiresAt: error.result.expires});
+	await fs.writeFile(path, JSON.stringify(saved));
+	expect(await queue().refresh("A-next", path)).toMatchObject(error.result);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	expect(await queue().refresh("A-next", path)).toMatchObject({type: "success", refresh: "A-next-next"});
+	expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+
+it.each(["health", "repair", "sync"])("keeps the original settlement error in the real CLI %s path", async consumer => {
+	vi.stubEnv("CODEX_MULTI_AUTH_DIR", dir);
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	setStoragePathDirect(null);
+	path = getStoragePath();
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	const fetch = injectRefresh();
+	const {cause} = denyJournalSettlement();
+	vi.spyOn(console, "log").mockImplementation(() => undefined);
+	const deps: RepairCommandDeps = {
+		stylePromptText: text => text,
+		styleAccountDetailText: text => text,
+		formatResultSummary: segments => segments.map(segment => segment.text).join(" | "),
+		resolveActiveIndex: () => 0,
+		hasUsableAccessToken: () => false,
+		hasLikelyInvalidRefreshToken: () => false,
+		normalizeFailureDetail: (message, reason) => message ?? reason ?? "unknown",
+		buildQuotaEmailFallbackState: () => new Map(),
+		updateQuotaCacheForAccount: () => false,
+		cloneQuotaCacheData: cache => structuredClone(cache),
+		pruneUnsafeQuotaEmailCacheEntry: () => false,
+		formatCompactQuotaSnapshot: () => "fixture",
+		resolveStoredAccountIdentity: (accountId, accountIdSource) => ({accountId, accountIdSource}),
+		applyTokenAccountIdentity: () => false,
+		reboundUnauthorizedAccountIdentity: async () => null,
+		refreshCodexCliMirror: async () => null,
+	};
+	const operation = consumer === "health" ? runHealthCheck({forceRefresh: true})
+		: consumer === "repair" ? runFix(["--json"], deps) : autoSyncActiveAccountToCodex();
+	const error = await operation.catch(value => value);
+	expect(error).toBeInstanceOf(PendingAuthSettlementError);
+	expect(error.cause).toBe(cause);
+	expect(error.result).toMatchObject({access: "access-A-next", refresh: "A-next"});
+	await expect(queue().refresh("A", path)).rejects.toBe(error);
+	expect(fetch).toHaveBeenCalledTimes(1);
+	expect((await loadAccounts())?.accounts).toHaveLength(1);
+	expect((await capturePendingAuth(path, [])).entries).toHaveLength(0);
+});
+
+it("does not flag or remove an account on failed settlement during a real account check", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	const fetch = injectRefresh();
+	const {cause, spy} = denyJournalSettlement();
+	const showLine = vi.fn();
+	const flag = vi.fn();
+	const probe = vi.fn(async () => {throw Error("Unexpected fixture quota probe");});
+	const deps: Parameters<typeof runRuntimeAccountCheck>[1] = {
+		hydrateEmails: async storage => storage, loadAccounts, createEmptyStorage: () => pool([]),
+		loadFlaggedAccounts: async () => ({version: 1, accounts: []}),
+		createAccountCheckWorkingState: flaggedStorage => ({flaggedStorage, removeFromActive: new Set(), storageChanged: false, flaggedChanged: false, ok: 0, errors: 0, disabled: 0}),
+		lookupCodexCliTokensByEmail: async () => null, extractAccountId: () => undefined,
+		shouldUpdateAccountIdFromToken: () => false, sanitizeEmail: email => email, extractAccountEmail: () => undefined,
+		queuedRefresh, isRuntimeFlaggableFailure: () => true, fetchCodexQuotaSnapshot: probe,
+		resolveRequestAccountId: () => undefined, formatCodexQuotaLine: () => "fixture",
+		clampRuntimeActiveIndices: () => undefined, MODEL_FAMILIES: ["codex"], saveAccounts,
+		invalidateAccountManagerCache: () => undefined, saveFlaggedAccounts: flag, showLine,
+	};
+	await runRuntimeAccountCheck(true, deps);
+	expect(showLine).toHaveBeenCalledWith("Results: 0 ok, 1 error, 0 disabled");
+	expect(flag).not.toHaveBeenCalled();
+	expect(probe).not.toHaveBeenCalled();
+	expect((await loadAccounts())?.accounts[0]?.refreshToken).toBe("A");
+	await expect(queue().refresh("A", path)).rejects.toMatchObject({cause, result: {refresh: "A-next"}});
+	spy.mockRestore();
+	await runRuntimeAccountCheck(true, deps);
+	expect(showLine).toHaveBeenCalledWith("Results: 1 ok, 0 error, 0 disabled");
+	expect((await loadAccounts())?.accounts[0]?.refreshToken).toBe("A-next");
+	expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("retains hydrate credentials in their actual live row without claiming a completed save", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	vi.stubEnv("VITEST_WORKER_ID", undefined);
+	vi.stubEnv("NODE_ENV", "production");
+	vi.stubEnv("CODEX_SKIP_EMAIL_HYDRATE", "0");
+	const storage = (await loadAccounts())!;
+	const fetch = injectRefresh();
+	const {cause} = denyJournalSettlement();
+	const save = vi.fn();
+	const warn = vi.fn();
+	await hydrateRuntimeEmails(storage, {
+		queuedRefresh, extractAccountId: () => undefined, sanitizeEmail: email => email, extractAccountEmail: () => undefined,
+		shouldUpdateAccountIdFromToken: () => false, saveAccounts: save, logWarn: warn, pluginName: "fixture",
+	});
+	expect(storage.accounts[0]).toMatchObject({refreshToken: "A-next", accessToken: "access-A-next"});
+	expect(save).not.toHaveBeenCalled();
+	expect(warn).toHaveBeenCalledTimes(1);
+	await expect(queue().refresh("A", path)).rejects.toMatchObject({cause});
+	expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("retains flagged credentials without restoring an unsettled sign-in", async () => {
+	await fs.writeFile(path, JSON.stringify(pool(["A"])));
+	vi.stubEnv("CODEX_AUTH_REFRESH_LEASE", "0");
+	const flagged = {version: 1 as const, accounts: pool(["flagged"]).accounts.map(row => ({...row, flaggedAt: 1, enabled: false}))};
+	await fs.writeFile(getFlaggedAccountsPath(), JSON.stringify(flagged));
+	const fetch = injectRefresh();
+	const {cause} = denyJournalSettlement();
+	const restore = vi.fn();
+	const save = vi.fn();
+	const showLine = vi.fn();
+	await verifyRuntimeFlaggedAccounts({
+		loadFlaggedAccounts: async () => flagged, lookupCodexCliTokensByEmail: async () => null, queuedRefresh,
+		resolveTokenSuccessAccount: tokens => tokens, persistAccounts: restore,
+		invalidateAccountManagerCache: () => undefined, saveFlaggedAccounts: save, showLine,
+	});
+	expect(save).toHaveBeenCalledWith({version: 1, accounts: [expect.objectContaining({refreshToken: "flagged-next", accessToken: "access-flagged-next", enabled: false})]});
+	expect(restore).not.toHaveBeenCalled();
+	await expect(queue().refresh("flagged", path)).rejects.toMatchObject({cause});
+	expect(fetch).toHaveBeenCalledTimes(1);
+	expect(showLine.mock.calls.flat().join(" ")).not.toContain("access-flagged");
+});
+
+it("backpressures at 1000 unsettled owners without evicting spent authority", async () => {
+	const tokens = Array.from({length: 1001}, (_, index) => `bound-${index}`);
+	await fs.writeFile(path, JSON.stringify(pool(tokens)));
+	const fetch = injectRefresh();
+	denyJournalSettlement();
+	for (const token of tokens.slice(0, 1000)) await expect(queue().refresh(token, path)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT"});
+	expect(queue().pendingCount).toBe(1000);
+	await expect(queue().refresh(tokens[1000]!, path)).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+	await expect(queue().refresh(tokens[0]!, path)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT"});
+	expect(fetch).toHaveBeenCalledTimes(1000);
+	expect(queue().pendingCount).toBe(1000);
 }, 20000);

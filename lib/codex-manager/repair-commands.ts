@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { existsSync, promises as fs } from "node:fs";
 import { ACCOUNT_LIMITS } from "../constants.js";
 import { DEFAULT_DASHBOARD_DISPLAY_SETTINGS } from "../dashboard-settings.js";
@@ -947,7 +948,7 @@ export async function runVerifyFlagged(
 				index: i,
 				flagged,
 				label: formatAccountLabel(flagged, i),
-				result: await queuedRefresh(flagged.refreshToken),
+				result: await withRefreshCredentialRetention(flagged, () => queuedRefresh(flagged.refreshToken)),
 			});
 		}
 		return refreshChecks;
@@ -1429,7 +1430,7 @@ export async function runFix(
 			}
 		}
 
-		const refreshResult = await queuedRefresh(account.refreshToken);
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
 		if (refreshResult.type === "success") {
 			const nextEmail = sanitizeEmail(
 				extractAccountEmail(refreshResult.access, refreshResult.idToken),
@@ -2307,7 +2308,7 @@ export async function runDoctor(
 							message: `Prepared active-account token refresh for account ${activeIndex + 1} (dry-run)`,
 						});
 					} else {
-						const refreshResult = await queuedRefresh(activeAccount.refreshToken);
+						const refreshResult = await withRefreshCredentialRetention(activeAccount, () => queuedRefresh(activeAccount.refreshToken));
 						if (refreshResult.type === "success") {
 							const refreshedEmail = sanitizeEmail(
 								extractAccountEmail(refreshResult.access, refreshResult.idToken),

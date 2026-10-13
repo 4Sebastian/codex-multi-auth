@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
 import type { DashboardDisplaySettings } from "../../dashboard-settings.js";
 import { extractAccountEmail, sanitizeEmail } from "../../accounts.js";
 import { shouldUpdateAccountIdFromToken } from "../../auth/token-utils.js";
@@ -273,7 +274,7 @@ export async function runForecastCommand(
 		let probeAccountId =
 			account.accountId ?? deps.extractAccountId(account.accessToken);
 		if (!deps.hasUsableAccessToken(account, now)) {
-			const refreshResult = await deps.queuedRefresh(account.refreshToken);
+			const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
 			if (refreshResult.type !== "success") {
 				refreshFailures.set(i, {
 					...refreshResult,

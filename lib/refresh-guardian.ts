@@ -1,3 +1,4 @@
+import { PendingAuthSettlementError } from "./storage/pending-auth.js";
 import { createLogger } from "./logger.js";
 import { refreshExpiringAccounts } from "./proactive-refresh.js";
 import type { AccountManager } from "./accounts.js";
@@ -171,6 +172,11 @@ export class RefreshGuardian {
 						sourceIndex: sourceAccount.index,
 						error: error instanceof Error ? error.message : String(error),
 					});
+					if (error instanceof PendingAuthSettlementError) {
+						this.stats.failed += 1;
+						this.stats.networkFailed += 1;
+						return false;
+					}
 					const account =
 						manager.getAccountByIdentity(sourceAccount, refreshedAuth) ??
 						manager.getAccountByIdentity(sourceAccount);
@@ -289,6 +295,8 @@ export class RefreshGuardian {
 						requiresSave = true;
 					}
 				},
+				manager.resolveSelectionStoragePath(),
+				source => manager.getAccountByIdentity(source),
 			);
 			if (refreshResults.size === 0) {
 				this.stats.runs += 1;
@@ -302,6 +310,10 @@ export class RefreshGuardian {
 			this.stats.runs += 1;
 			this.stats.lastRunAt = Date.now();
 		} catch (error) {
+			if (error instanceof PendingAuthSettlementError) {
+				this.stats.failed += 1;
+				this.stats.networkFailed += 1;
+			}
 			log.warn("Refresh guardian tick failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});

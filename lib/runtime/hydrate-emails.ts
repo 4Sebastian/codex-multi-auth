@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import type { AccountStorageV3 } from "../storage.js";
 import type { AccountIdSource, TokenResult } from "../types.js";
 
@@ -27,10 +28,7 @@ export async function hydrateRuntimeEmails(
 		process.env.CODEX_SKIP_EMAIL_HYDRATE === "1";
 	if (skipHydrate) return storage;
 
-	const accountsCopy = storage.accounts.map((account) =>
-		account ? { ...account } : account,
-	);
-	const accountsToHydrate = accountsCopy.filter(
+	const accountsToHydrate = storage.accounts.filter(
 		(account) => account && !account.email,
 	);
 	if (accountsToHydrate.length === 0) return storage;
@@ -39,7 +37,7 @@ export async function hydrateRuntimeEmails(
 	await Promise.all(
 		accountsToHydrate.map(async (account) => {
 			try {
-				const refreshed = await deps.queuedRefresh(account.refreshToken);
+				const refreshed = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
 				if (refreshed.type !== "success") return;
 				const id = deps.extractAccountId(refreshed.access);
 				const email = deps.sanitizeEmail(
@@ -85,14 +83,6 @@ export async function hydrateRuntimeEmails(
 	);
 
 	if (changed) {
-		// Patch by index, not by accountId. Multiple accounts can share
-		// `accountId === undefined`, and a Map keyed on accountId would
-		// collapse them and apply one account's hydrated tokens to another.
-		// `accountsCopy` was built via `.map` so it has the same length and
-		// order as `storage.accounts`.
-		storage.accounts = storage.accounts.map(
-			(account, index) => accountsCopy[index] ?? account,
-		);
 		await deps.saveAccounts(storage);
 	}
 	return storage;

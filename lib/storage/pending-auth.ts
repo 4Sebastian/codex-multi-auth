@@ -6,12 +6,13 @@ import { z } from "zod";
 import { withRetry } from "../fs-retry.js";
 import { createLogger } from "../logger.js";
 import { tempPathFor } from "../temp-path.js";
-import type { TokenResult, TokenSuccess } from "../types.js";
+import type { OAuthAuthDetails, TokenResult, TokenSuccess } from "../types.js";
 import { AnyAccountStorageSchema } from "../schemas.js";
 import { migrateV1ToV3 } from "./migrations.js";
 import { captureAuthorityRevision } from "./authority-revision.js";
 import { withFileTransactionLock } from "./file-lock.js";
 import { getIntentionalResetMarkerPath } from "./backup-paths.js";
+import type { ManagedAccount } from "../accounts.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
 import { collectRestorableCredentials, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 export { getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
@@ -39,7 +40,7 @@ const entrySchema = z.object({
 });
 /** The writer keeps the journal at this size; the reader accepts any size so an
  * over-cap file an earlier writer left behind still loads and is trimmed on the next write. */
-const MAX_ENTRIES = 1000;
+export const MAX_PENDING_AUTH_ENTRIES = 1000;
 const fileSchema = z.object({ version: z.literal(1), entries: z.array(entrySchema) });
 type PendingAuth = z.infer<typeof entrySchema>;
 const retry = { maxAttempts: 6, backoffMs: 25 };
@@ -86,7 +87,7 @@ async function read(path: string): Promise<PendingAuth[]> {
 }
 
 async function write(path: string, entries: PendingAuth[]): Promise<void> {
-	if (entries.length > MAX_ENTRIES) throw new PendingAuthCapacityError();
+	if (entries.length > MAX_PENDING_AUTH_ENTRIES) throw new PendingAuthCapacityError();
 	if (!entries.length) {
 		await withRetry(() => fs.rm(path, { force: true }), retry);
 		return;
@@ -128,7 +129,7 @@ export class PendingAuthCapacityError extends Error {
 }
 
 async function trimToCapacity(storagePath: string, entries: PendingAuth[], protectedPrior: string, reserve = 0): Promise<PendingAuth[]> {
-	const excess = entries.length + reserve - MAX_ENTRIES;
+	const excess = entries.length + reserve - MAX_PENDING_AUTH_ENTRIES;
 	if (excess <= 0) return entries;
 	let roots: PendingAuthRecoveryCredential[];
 	try {
@@ -146,9 +147,45 @@ async function trimToCapacity(storagePath: string, entries: PendingAuth[], prote
 
 export class PendingAuthSettlementError extends Error {
 	readonly code = "EPENDINGAUTHSETTLEMENT";
-	constructor(readonly result: TokenSuccess, cause: unknown) {
+	constructor(readonly result: TokenSuccess, cause: unknown, readonly authorityCurrent: () => boolean = () => true, readonly owner?: AccountMetadataV3) {
 		super("Rotated credentials could not be durably retained; they remain only in memory", {cause});
 		this.name = "PendingAuthSettlementError";
+		Object.defineProperties(this, {result: {enumerable: false}, owner: {enumerable: false}, authorityCurrent: {enumerable: false}});
+	}
+}
+
+export async function withRefreshCredentialRetention<T>(
+	account: ManagedAccount | AccountMetadataV3 | OAuthAuthDetails,
+	operation: () => Promise<T>,
+	current: () => boolean = () => true,
+	retainAccount: () => typeof account | null = () => account,
+): Promise<T> {
+	const binding = (owner: typeof account) => "type" in owner
+		? [owner.type, owner.access, owner.refresh, owner.expires]
+		: [owner.recordId, "index" in owner ? owner.access : owner.accessToken, owner.refreshToken,
+			"index" in owner ? owner.expires : owner.expiresAt, owner.accountId, owner.enabled, owner.authInvalidatedAt, owner.authInvalidationErrorCode];
+	const submitted = binding(account);
+	try {
+		return await operation();
+	} catch (error) {
+		const owner = retainAccount();
+		if (owner && error instanceof PendingAuthSettlementError && error.authorityCurrent() && current() &&
+			binding(owner).every((value, index) => value === submitted[index])) {
+			if ("type" in owner) {
+				owner.access = error.result.access;
+				owner.refresh = error.result.refresh;
+				owner.expires = error.result.expires;
+			} else if ("index" in owner) {
+				owner.access = error.result.access;
+				owner.refreshToken = error.result.refresh;
+				owner.expires = error.result.expires;
+			} else {
+				owner.accessToken = error.result.access;
+				owner.refreshToken = error.result.refresh;
+				owner.expiresAt = error.result.expires;
+			}
+		}
+		throw error;
 	}
 }
 
@@ -156,6 +193,7 @@ export async function withPendingAuthRefresh(
 	storagePath: string,
 	refreshToken: string,
 	refresh: () => Promise<TokenResult>,
+	settlement?: PendingAuthSettlementError,
 ): Promise<TokenResult> {
 	const current = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
 	return withFileTransactionLock(storagePath, () => withFileTransactionLock(getPendingAuthPath(storagePath), async () => {
@@ -170,6 +208,16 @@ export async function withPendingAuthRefresh(
 		const entries = await read(getPendingAuthPath(storagePath));
 		const effective = await applyPendingAuth(storagePath, primary, entries);
 		const owner = effective?.accounts.find(row => row.refreshToken === refreshToken);
+		if (settlement && !settlement.authorityCurrent()) {
+			const captured = settlement.owner;
+			const row = captured && primary?.accounts.find(account => captured.recordId
+				? account.recordId === captured.recordId : account.refreshToken === captured.refreshToken);
+			const sameAuthority = captured && row && row.accountId === captured.accountId && row.enabled === captured.enabled &&
+				row.authInvalidatedAt === captured.authInvalidatedAt && row.authInvalidationErrorCode === captured.authInvalidationErrorCode;
+			const sameCredential = captured && row && row.accessToken === captured.accessToken && row.refreshToken === captured.refreshToken && row.expiresAt === captured.expiresAt;
+			const settledCredential = row && row.accessToken === settlement.result.access && row.refreshToken === settlement.result.refresh && row.expiresAt === settlement.result.expires;
+			if (!sameAuthority || (!sameCredential && !settledCredential)) throw settlement;
+		}
 		const prior = hash(refreshToken);
 		const retained = entries.find(entry => entry.prior === prior && entry.refreshToken !== refreshToken);
 		if (!current()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
@@ -194,7 +242,7 @@ export async function withPendingAuthRefresh(
 			if (journaled.refreshToken === result.refresh && journaled.accessToken === result.access && journaled.expiresAt === result.expires) return result;
 			return {...result, refresh: journaled.refreshToken, access: journaled.accessToken, expires: journaled.expiresAt};
 		} catch (cause) {
-			throw new PendingAuthSettlementError(result, cause);
+			throw new PendingAuthSettlementError(result, cause, current, owner ? structuredClone(owner) : undefined);
 		}
 	}));
 }

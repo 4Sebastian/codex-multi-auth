@@ -4,7 +4,7 @@ import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-
 export { resolveAccountRecordId } from "./storage/record-identity.js";
 import { existsSync } from "node:fs";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
-import { applyPendingAuth, getPendingAuthPath, PendingAuthCapacityError } from "./storage/pending-auth.js";
+import { applyPendingAuth, getPendingAuthPath, PendingAuthSettlementError } from "./storage/pending-auth.js";
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
 import { createNativeAccountStorageReader, type NativeAccountSnapshot } from "./runtime/native-account-storage.js";
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
@@ -2033,6 +2033,8 @@ export class AccountManager {
 						this.clearAuthFailures(live);
 					}
 				}
+				const settlementState = structuredClone(live);
+				const settlementObservation = this.nativeAuthSnapshots.get(live);
 				// The debounced save needs this process to survive and the file to
 				// unlock. Journal the rotated credential beside the pool so the next
 				// load (any process) applies it even if neither happens.
@@ -2072,16 +2074,18 @@ export class AccountManager {
 					});
 					}
 				} catch (journalError) {
-					if (journalError instanceof PendingAuthCapacityError) {
-						this.saveToDiskDebounced();
-						throw new CodexAuthError(journalError.message, {retryable: false, cause: error});
-					}
 					log.error("Account storage could not be read or written and the rotated credential could not be journaled; it is only in memory. Keep this process running until the accounts file is readable, or the account will need a re-login.", {
 						sourceIndex: source.index,
 						code: typeof (journalError as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((journalError as NodeJS.ErrnoException).code ?? "") ? (journalError as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
 					});
+					if (initialState && live === initialLive && this.nativeAuthSnapshots.get(live) === settlementObservation &&
+						live.access === settlementState.access && live.refreshToken === settlementState.refreshToken && live.expires === settlementState.expires) {
+						for (const field of ["consecutiveAuthFailures", "coolingDownUntil", "cooldownReason"] as const) {
+							if (live[field] === settlementState[field]) Object.assign(live, {[field]: initialState[field]});
+						}
+					}
 					this.saveToDiskDebounced();
-					throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {retryable: false, cause: error});
+					throw new PendingAuthSettlementError({type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires}, error);
 				}
 				this.saveToDiskDebounced();
 				return live;

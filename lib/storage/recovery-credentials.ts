@@ -6,7 +6,7 @@ import { captureAuthorityRevision } from "./authority-revision.js";
 import { getAccountsBackupRecoveryCandidates, getAccountsWalPath, ACCOUNTS_WAL_SUFFIX, RESET_MARKER_SUFFIX } from "./backup-paths.js";
 import { isCacheLikeBackupArtifactName } from "./cache-artifacts.js";
 import type { AccountMetadataV3 } from "./public-types.js";
-import { FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME, getFlaggedAccountsPath } from "./file-paths.js";
+import { FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME, getFlaggedAccountsPath, getFlaggedBackupPaths } from "./file-paths.js";
 
 const log = createLogger("storage");
 export type PendingAuthRecoveryCredential = Pick<AccountMetadataV3,
@@ -65,7 +65,7 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 	const directoryCurrent = captureAuthorityRevision([dirname(path)]);
 	const candidates = await getAccountsBackupRecoveryCandidatesWithDiscovery(path, true);
 	const flagged = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME]
-		.flatMap(name => {const source = getFlaggedAccountsPath(path, name); return [source, `${source}.bak`];});
+		.flatMap(name => {const source = getFlaggedAccountsPath(path, name); return [source, ...getFlaggedBackupPaths(source)];});
 	const sources = [...(includePrimary ? [path] : []), ...candidates, ...flagged, getAccountsWalPath(path)];
 	const sourcesCurrent = captureAuthorityRevision(sources);
 	const tokens: PendingAuthRecoveryCredential[] = [];

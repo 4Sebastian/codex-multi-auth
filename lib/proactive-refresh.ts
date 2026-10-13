@@ -10,8 +10,10 @@
  * - Works alongside the existing reactive refresh in fetch-helpers
  */
 
-import { queuedRefresh } from "./refresh-queue.js";
+import { withRefreshCredentialRetention } from "./storage/pending-auth.js";
+import { getRefreshQueue, queuedRefresh } from "./refresh-queue.js";
 import { createLogger, maskEmail } from "./logger.js";
+import { getStoragePath } from "./storage.js";
 import type { ManagedAccount } from "./accounts.js";
 import type { TokenResult } from "./types.js";
 import {
@@ -50,6 +52,7 @@ export interface ProactiveRefreshResult {
 export function shouldRefreshProactively(
 	account: ManagedAccount,
 	bufferMs: number = DEFAULT_PROACTIVE_BUFFER_MS,
+	storagePath = getStoragePath(),
 ): boolean {
 	// No access token - definitely needs refresh
 	if (!account.access) {
@@ -62,6 +65,7 @@ export function shouldRefreshProactively(
 	}
 
 	// Clamp buffer to minimum
+	if (getRefreshQueue().isRefreshing(account.refreshToken, storagePath)) return true;
 	const safeBufferMs = Math.max(MIN_PROACTIVE_BUFFER_MS, bufferMs);
 
 	// Check if token expires within buffer window
@@ -95,8 +99,10 @@ export function getTimeUntilExpiry(account: ManagedAccount): number {
 export async function proactiveRefreshAccount(
 	account: ManagedAccount,
 	bufferMs: number = DEFAULT_PROACTIVE_BUFFER_MS,
+	storagePath = getStoragePath(),
+	retainAccount: () => ManagedAccount | null = () => account,
 ): Promise<ProactiveRefreshResult> {
-	if (!shouldRefreshProactively(account, bufferMs)) {
+	if (!shouldRefreshProactively(account, bufferMs, storagePath)) {
 		return { refreshed: false, reason: "not_needed" };
 	}
 
@@ -119,7 +125,7 @@ export async function proactiveRefreshAccount(
 		snapshot.authRefreshRequests += 1;
 		snapshot.runtimeMetrics.authRefreshRequests += 1;
 	});
-	const result = await queuedRefresh(account.refreshToken);
+	const result = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken, storagePath), undefined, retainAccount);
 
 	if (result.type === "success") {
 		log.info("Proactive refresh succeeded", {
@@ -151,10 +157,12 @@ export async function refreshExpiringAccounts(
 		account: ManagedAccount,
 		result: ProactiveRefreshResult,
 	) => Promise<void> | void,
+	storagePath = getStoragePath(),
+	resolveAccount?: (account: ManagedAccount) => ManagedAccount | null,
 ): Promise<Map<number, ProactiveRefreshResult>> {
 	const results = new Map<number, ProactiveRefreshResult>();
 	const accountsToRefresh = accounts.filter((a) =>
-		shouldRefreshProactively(a, bufferMs),
+		shouldRefreshProactively(a, bufferMs, storagePath),
 	);
 
 	if (accountsToRefresh.length === 0) {
@@ -171,7 +179,7 @@ export async function refreshExpiringAccounts(
 		if (index > 0) {
 			await new Promise((resolve) => setTimeout(resolve, PROACTIVE_REFRESH_STAGGER_MS));
 		}
-		const result = await proactiveRefreshAccount(account, bufferMs);
+		const result = await proactiveRefreshAccount(account, bufferMs, storagePath, resolveAccount ? () => resolveAccount(account) : undefined);
 		await onResult?.(account, result);
 		outcomes.push({ index: account.index, result });
 	}

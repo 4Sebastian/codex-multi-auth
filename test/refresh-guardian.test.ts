@@ -6,7 +6,7 @@ import {
   sanitizeEmail,
 } from "../lib/auth/token-utils.js";
 import { CodexAuthError } from "../lib/errors.js";
-import { findMatchingAccountIndex } from "../lib/storage.js";
+import { findMatchingAccountIndex, getStoragePath } from "../lib/storage.js";
 import type { OAuthAuthDetails } from "../lib/types.js";
 
 const refreshExpiringAccountsMock = vi.fn();
@@ -98,6 +98,7 @@ function findAccountByIdentity(
 function createManagerMock(accounts: ManagedAccount[]): AccountManager {
   return {
     getAccountsSnapshot: vi.fn(() => accounts),
+    resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
     getAccountByIndex: vi.fn(
       (index: number) =>
         accounts.find((account) => account.index === index) ?? null,
@@ -381,6 +382,7 @@ describe("refresh-guardian", () => {
     ];
     let readCount = 0;
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -461,6 +463,7 @@ describe("refresh-guardian", () => {
     ];
     let readCount = 0;
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -542,6 +545,7 @@ describe("refresh-guardian", () => {
     ];
     let readCount = 0;
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -621,6 +625,7 @@ describe("refresh-guardian", () => {
     ];
     let readCount = 0;
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -801,6 +806,7 @@ describe("refresh-guardian", () => {
     let snapshotReads = 0;
 
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(() => {
         if (snapshotReads === 0) {
           snapshotReads += 1;
@@ -1182,6 +1188,7 @@ describe("refresh-guardian", () => {
     let snapshotReads = 0;
 
     const manager = {
+      resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
       getAccountsSnapshot: vi.fn(() => {
         snapshotReads += 1;
         if (snapshotReads === 1) return [originalA, originalB];

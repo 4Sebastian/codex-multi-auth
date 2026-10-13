@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { subscriptionStatus, formatSubscriptionStatus } from "./formatters/subscription-status.js";
 import { getAccountPolicyKey, loadAccountPolicyStore } from "../account-policy.js";
 import { automaticCheckWorkspaceId } from "../runtime/automatic-account-checks.js";
@@ -244,7 +245,7 @@ export async function runHealthCheck(
 			}
 			continue;
 		}
-		const result = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: refreshing sign-in`, () => queuedRefresh(account.refreshToken), console.log);
+		const result = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: refreshing sign-in`, () => withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken)), console.log);
 		if (result.type === "success") {
 			const tokenAccountId = extractAccountId(result.access);
 			const nextEmail = sanitizeEmail(

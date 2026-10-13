@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import {
@@ -308,7 +309,7 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 	let selectionDrifted = false;
 
 	if (!hasUsableAccessToken(account, now)) {
-		const refreshResult = await queuedRefresh(account.refreshToken);
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
 		if (refreshResult.type !== "success") {
 			return false;
 		}

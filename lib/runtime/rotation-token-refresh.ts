@@ -1,12 +1,12 @@
 import type { AccountManager, ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
-import { queuedRefresh } from "../refresh-queue.js";
-import { PendingAuthSettlementError } from "../storage/pending-auth.js";
+import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
+import { PendingAuthSettlementError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import {
 	isTokenInvalidationError,
 	isTokenRefreshRetryable,
 } from "../request/rate-limit-decision.js";
-import type { OAuthAuthDetails, TokenResult } from "../types.js";
+import type { OAuthAuthDetails } from "../types.js";
 
 /** @internal */
 export const DEFAULT_AUTH_FAILURE_COOLDOWN_MS = 30_000;
@@ -93,25 +93,16 @@ export async function ensureFreshAccessToken(params: {
 > {
 	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
 		params;
-	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs)) {
+	const storagePath = accountManager.resolveSelectionStoragePath();
+	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs) && !getRefreshQueue().isRefreshing(account.refreshToken, storagePath)) {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
 	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
 	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
-	const storagePath = accountManager.resolveSelectionStoragePath();
-	let refreshResult: TokenResult;
-	try {
-		refreshResult = await queuedRefresh(submittedRefreshToken, storagePath);
-	} catch (error) {
-		if (error instanceof PendingAuthSettlementError && accountManager.getAccountByIndex(account.index) === account &&
-			account.recordId === submitted.recordId && account.access === submittedAccessToken && account.refreshToken === submittedRefreshToken && account.expires === submitted.expiresAt) {
-			account.access = error.result.access;
-			account.refreshToken = error.result.refresh;
-			account.expires = error.result.expires;
-		}
-		throw error;
-	}
+	const refreshResult = await withRefreshCredentialRetention(account,
+		() => queuedRefresh(submittedRefreshToken, storagePath),
+		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath);
 	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
 		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
 		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
@@ -163,7 +154,8 @@ export async function ensureFreshAccessToken(params: {
 			accessToken,
 			account: resolvedAccount,
 		};
-	} catch {
+	} catch (error) {
+		if (error instanceof PendingAuthSettlementError) throw error;
 		if (account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
 		await accountManager.withCurrentAccountCredential(account, submitted, () => {
 			accountManager.recordFailure(account, family, model);

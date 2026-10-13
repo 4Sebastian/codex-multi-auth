@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import {
 	extractAccountEmail,
 	extractAccountId,
@@ -88,7 +89,7 @@ export async function persistAndSyncSelectedAccount({
 	let syncIdToken = initialSyncIdToken;
 
 	if (!hasUsableAccessToken(account, switchNow)) {
-		const refreshResult = await queuedRefresh(account.refreshToken);
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken));
 		if (refreshResult.type === "success") {
 			const tokenAccountId = extractAccountId(refreshResult.access);
 			const nextEmail = sanitizeEmail(

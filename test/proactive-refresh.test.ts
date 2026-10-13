@@ -11,8 +11,10 @@ import {
 import type { ManagedAccount } from "../lib/accounts.js";
 import * as logger from "../lib/logger.js";
 import * as refreshQueue from "../lib/refresh-queue.js";
+import { getStoragePath } from "../lib/storage.js";
 
-vi.mock("../lib/refresh-queue.js", () => ({
+vi.mock("../lib/refresh-queue.js", async importOriginal => ({
+	...await importOriginal<typeof import("../lib/refresh-queue.js")>(),
 	queuedRefresh: vi.fn(),
 }));
 
@@ -386,7 +388,7 @@ describe("proactive-refresh", () => {
 			expect(results.has(0)).toBe(true);
 			expect(results.has(1)).toBe(false);
 			expect(refreshQueue.queuedRefresh).toHaveBeenCalledTimes(1);
-			expect(refreshQueue.queuedRefresh).toHaveBeenCalledWith("refresh-0");
+			expect(refreshQueue.queuedRefresh).toHaveBeenCalledWith("refresh-0", getStoragePath());
 		});
 
 		it("refreshes multiple accounts in parallel", async () => {

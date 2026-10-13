@@ -26,6 +26,10 @@ export function getAccountsBackupRecoveryCandidates(path: string): string[] {
 	return getBackupRecoveryCandidates(path, ACCOUNTS_BACKUP_HISTORY_DEPTH);
 }
 
+export function getFlaggedBackupPaths(path: string): string[] {
+	return [`${path}.bak`, `${path}.bak.1`, `${path}.bak.2`];
+}
+
 export function getFlaggedAccountsPath(
 	storagePath: string,
 	fileName: string,

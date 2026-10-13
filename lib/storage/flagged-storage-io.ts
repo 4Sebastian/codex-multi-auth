@@ -5,6 +5,7 @@ import type { FlaggedAccountStorageV1 } from "./public-types.js";
 import { readFileWithRetry } from "./flagged-storage-file.js";
 import { FILE_RETRY_CODES } from "../fs-retry.js";
 import { tempPathFor } from "../temp-path.js";
+import { getFlaggedBackupPaths } from "./file-paths.js";
 
 // storage-07: align with the single shared retryable-code set (adds ENOTEMPTY/
 // EACCES) instead of a local subset.
@@ -50,13 +51,6 @@ function parseFlaggedStorageContent(content: string, context: string): unknown {
 		return validated;
 	}
 	return JSON.parse(content) as unknown;
-}
-
-/**
- * Return the ordered backup paths consulted for flagged-account recovery.
- */
-function getFlaggedBackupPaths(path: string): string[] {
-	return [`${path}.bak`, `${path}.bak.1`, `${path}.bak.2`];
 }
 
 async function unlinkWithRetry(candidatePath: string): Promise<void> {

@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
 import { promises as fs } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
@@ -368,7 +369,7 @@ export async function runReportCommand(
 					);
 					continue;
 				}
-				const refreshResult = await deps.queuedRefresh(account.refreshToken);
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
 				if (refreshResult.type !== "success") {
 					refreshFailures.set(i, {
 						...refreshResult,

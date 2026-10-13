@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../quota-probe.js";
 import { isCodexUnavailableError } from "../errors.js";
@@ -191,7 +192,7 @@ export async function runRuntimeAccountCheck(
 			}
 
 			if (!accessToken) {
-				const refreshResult = await deps.queuedRefresh(account.refreshToken);
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken));
 				if (refreshResult.type !== "success") {
 					state.errors += 1;
 					const message =

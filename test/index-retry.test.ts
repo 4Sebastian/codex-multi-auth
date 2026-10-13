@@ -1,4 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { getStoragePath } from "../lib/storage.js";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 
 process.env.CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS = "1";
 
@@ -83,8 +88,8 @@ vi.mock("../lib/request/fetch-helpers.js", () => ({
 	rewriteUrlForCodex: (url: string) => url,
 	applyProxyCompatibleInit: (_url: string, init: RequestInit) => init,
 	transformRequestForCodex: async (init: any) => ({ updatedInit: init, body: { model: "gpt-5.1" } }),
-	shouldRefreshToken: () => false,
-	refreshAndUpdateToken: async (auth: any) => auth,
+	shouldRefreshToken: vi.fn(() => false),
+	refreshAndUpdateToken: vi.fn(async (auth: any) => auth),
 	createCodexHeaders: (_requestInit: any, accountId?: string) =>
 		new Headers(accountId ? { "x-account-id": accountId } : {}),
 	handleErrorResponse: async (response: Response) => {
@@ -159,6 +164,8 @@ vi.mock("../lib/accounts.js", async () => {
 		static async loadFromDisk() {
 			return new AccountManager();
 		}
+
+		resolveSelectionStoragePath() { return getStoragePath(); }
 
 		getAccountCount() {
 			return accountManagerState.accounts.length;
@@ -252,6 +259,15 @@ vi.mock("../lib/accounts.js", async () => {
 		markToastShown() {}
 
 		clearAuthFailures() {}
+
+		incrementAuthFailures(account: Record<string, unknown>) {
+			account.consecutiveAuthFailures = Number(account.consecutiveAuthFailures ?? 0) + 1;
+			return Number(account.consecutiveAuthFailures);
+		}
+
+		removeAccount(account: Record<string, unknown>) {
+			accountManagerState.accounts = accountManagerState.accounts.filter(row => row !== account);
+		}
 
 		setAccountEnabled(index: number, enabled: boolean) {
 			accountManagerState.setAccountEnabledCalls.push({ index, enabled });
@@ -470,6 +486,59 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		}
 
 		vi.restoreAllMocks();
+	});
+
+	it("retains actual post-spend settlement failure without authentication removal or another OAuth spend", async () => {
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-settlement-"));
+		const path = join(dir, "accounts.json");
+		const account = createMockAccount({recordId: "record-A", expires: 1, enabled: true, consecutiveAuthFailures: 2});
+		accountManagerState.accounts = [account];
+		accountManagerState.accountSelections = [account];
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager.prototype, "resolveSelectionStoragePath").mockReturnValue(path);
+		const helpers = await import("../lib/request/fetch-helpers.js");
+		const realRefresh = await import("../lib/request/token-refresh.js");
+		vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => true);
+		vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(realRefresh.refreshAndUpdateToken);
+		const {getPendingAuthPath, PendingAuthSettlementError} = await import("../lib/storage/pending-auth.js");
+		const {getRefreshQueue, resetRefreshQueue} = await import("../lib/refresh-queue.js");
+		const {RefreshLeaseCoordinator} = await import("../lib/refresh-lease.js");
+		vi.spyOn(RefreshLeaseCoordinator.prototype, "acquire").mockResolvedValue({role: "leader", release: async () => undefined});
+		await fs.writeFile(path, JSON.stringify({version: 3, activeIndex: 0, accounts: [{
+			recordId: "record-A", refreshToken: account.refreshToken, accessToken: account.access, expiresAt: 1, enabled: true, addedAt: 1, lastUsed: 1,
+		}]}));
+		const cause = Object.assign(Error("fixture settlement failed"), {code: "ENOSPC"});
+		const rename = fs.rename.bind(fs);
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === getPendingAuthPath(path)) throw cause;
+			return rename(from, to);
+		});
+		const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			expect(String(input)).toBe("https://auth.openai.com/oauth/token");
+			expect(new URLSearchParams(String(init?.body)).get("refresh_token")).toBe("refresh-token-account-1");
+			return Response.json({access_token: "fixture-new-access", refresh_token: "fixture-new-refresh", expires_in: 3600});
+		});
+		globalThis.fetch = fetch;
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-token-account-1", refresh: "refresh-token-account-1", expires: 1, multiAccount: true}), {options: {}, models: {}});
+			const error = await sdk.fetch!("https://example.com", {}).catch(value => value);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toBe(cause);
+			expect(account).toMatchObject({access: "fixture-new-access", refreshToken: "fixture-new-refresh", consecutiveAuthFailures: 2, enabled: true});
+			expect(accountManagerState.accounts).toEqual([account]);
+			expect(client.auth.set).not.toHaveBeenCalled();
+			expect(accountManagerState.setAccountEnabledCalls).toEqual([]);
+			await expect(getRefreshQueue().refresh("refresh-token-account-1", path)).rejects.toBe(error);
+			expect(fetch).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => false);
+			vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(async auth => auth);
+			resetRefreshQueue();
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
 	});
 
 	it("waits and retries when all accounts are rate-limited", async () => {

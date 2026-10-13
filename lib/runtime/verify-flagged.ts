@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
 import type { FlaggedAccountMetadataV1 } from "../storage.js";
 import type { TokenSuccessWithAccount } from "./account-selection.js";
@@ -110,7 +111,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 				}
 			}
 
-			const refreshResult = await deps.queuedRefresh(flagged.refreshToken);
+			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken));
 			if (refreshResult.type !== "success") {
 				deps.showLine(
 					`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: STILL FLAGGED (${refreshResult.message ?? refreshResult.reason ?? "refresh failed"})`,
