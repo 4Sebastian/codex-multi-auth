@@ -1,11 +1,12 @@
 import type { AccountManager, ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import { queuedRefresh } from "../refresh-queue.js";
+import { PendingAuthSettlementError } from "../storage/pending-auth.js";
 import {
 	isTokenInvalidationError,
 	isTokenRefreshRetryable,
 } from "../request/rate-limit-decision.js";
-import type { OAuthAuthDetails } from "../types.js";
+import type { OAuthAuthDetails, TokenResult } from "../types.js";
 
 /** @internal */
 export const DEFAULT_AUTH_FAILURE_COOLDOWN_MS = 30_000;
@@ -98,7 +99,19 @@ export async function ensureFreshAccessToken(params: {
 
 	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
 	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
-	const refreshResult = await queuedRefresh(submittedRefreshToken, accountManager.resolveSelectionStoragePath());
+	const storagePath = accountManager.resolveSelectionStoragePath();
+	let refreshResult: TokenResult;
+	try {
+		refreshResult = await queuedRefresh(submittedRefreshToken, storagePath);
+	} catch (error) {
+		if (error instanceof PendingAuthSettlementError && accountManager.getAccountByIndex(account.index) === account &&
+			account.recordId === submitted.recordId && account.access === submittedAccessToken && account.refreshToken === submittedRefreshToken && account.expires === submitted.expiresAt) {
+			account.access = error.result.access;
+			account.refreshToken = error.result.refresh;
+			account.expires = error.result.expires;
+		}
+		throw error;
+	}
 	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
 		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
 		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)

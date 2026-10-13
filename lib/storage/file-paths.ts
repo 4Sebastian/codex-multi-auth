@@ -10,6 +10,8 @@ import {
 } from "./backup-paths.js";
 
 const ACCOUNTS_BACKUP_HISTORY_DEPTH = 3;
+export const FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-flagged-accounts.json";
+export const LEGACY_FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-blocked-accounts.json";
 
 export {
 	ACCOUNTS_BACKUP_SUFFIX,

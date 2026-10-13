@@ -1177,7 +1177,6 @@ interface PreparedWebSocketRequest {
 interface ActiveWebSocketRequest extends AccountDispatchBinding {
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
-	frame: PendingWebSocketFrame;
 }
 
 interface WebSocketTerminalEvent {
@@ -2540,7 +2539,7 @@ function bridgeWebSocketConnection(
 		}
 		if (!admission) throw createRuntimeProxyHttpError("Circuit admission is unavailable.", 503, "routing_configuration_changed");
 		frame.submittedAccount = forwardingAccount;
-		activeRequests.push({...binding, circuitAdmission: admission, request, frame});
+		activeRequests.push({...binding, circuitAdmission: admission, request});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2735,11 +2734,9 @@ function bridgeWebSocketConnection(
 					settlingTurn = true;
 					await settlePendingHandshake("failure", "upstream_websocket_closed", true);
 					if (activeRequests.length === 0) {settlingTurn = false; drainPending(); return;}
-					const continuationLost = activeRequests.some(active => hasConnectionScopedContinuation(active.frame));
-					await settleAll("failure", continuationLost ? "websocket_continuation_lost" : "upstream_websocket_closed", true);
+					await settleAll("failure", "upstream_websocket_closed", true);
 					if (closed || client.readyState !== WebSocket.OPEN) return;
-					if (continuationLost) reportConnectionScopedContinuationLoss();
-					else sendBuffered(client, JSON.stringify({type: "error", status: HTTP_STATUS.BAD_GATEWAY, error: {code: "upstream_websocket_closed", message: "Upstream closed after request dispatch. The submitted turn was not replayed."}}));
+					sendBuffered(client, JSON.stringify({type: "error", status: HTTP_STATUS.BAD_GATEWAY, error: {code: "upstream_websocket_closed", message: "Upstream closed after request dispatch. The submitted turn was not replayed."}}));
 					settlingTurn = false;
 					drainPending();
 				})().catch(rejectConnection);

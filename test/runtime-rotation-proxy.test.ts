@@ -48,7 +48,7 @@ import {
 	getTokenTracker,
 	resetTrackers,
 } from "../lib/rotation.js";
-import { loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
+import { getStoragePath, loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 import { estimateUsageCostUsd } from "../lib/usage/pricing.js";
 import type { UsageTokenCounts } from "../lib/usage/types.js";
 
@@ -2285,14 +2285,17 @@ describe("runtime rotation proxy", () => {
 		}
 	});
 
-	it("reports a retryable protocol error when an in-flight continuation loses its upstream", async () => {
+	it.each([false, true])("does not invite retry when a submitted continuation loses its upstream (created=%s)", async created => {
 		let connectionCount = 0;
+		let receivedCreates = 0;
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
 		const upstream = await startTestWebSocketUpstream({
 			onConnection: (socket) => {
 				connectionCount += 1;
 				let requestCount = 0;
 				socket.on("message", () => {
 					requestCount += 1;
+					receivedCreates += 1;
 					if (requestCount === 1) {
 						socket.send(JSON.stringify({
 							type: "response.completed",
@@ -2300,7 +2303,8 @@ describe("runtime rotation proxy", () => {
 						}));
 						return;
 					}
-					socket.terminate();
+					if (created) socket.send(JSON.stringify({type: "response.created", response: {id: "response-2"}}), () => socket.close());
+					else socket.terminate();
 				});
 			},
 		});
@@ -2321,7 +2325,12 @@ describe("runtime rotation proxy", () => {
 				response: { id: "response-1" },
 			});
 
-			const continuationError = nextWebSocketMessage(socket);
+			const continuationMessages: unknown[] = [];
+			const continuationError = new Promise<string>(resolve => socket.on("message", data => {
+				const event = JSON.parse(String(data));
+				continuationMessages.push(event);
+				if (event.type === "error") resolve(String(data));
+			}));
 			socket.send(JSON.stringify({
 				type: "response.create",
 				model: "gpt-5.6-sol",
@@ -2329,11 +2338,15 @@ describe("runtime rotation proxy", () => {
 				input: [{ type: "message", role: "user", content: [] }],
 			}));
 			expect(JSON.parse(await continuationError)).toMatchObject({
-				type: "error",
-				error: { code: "previous_response_not_found" },
+				type: "error", status: 502,
+				error: { code: "upstream_websocket_closed" },
 			});
+			expect(continuationMessages).toHaveLength(created ? 2 : 1);
 			expect(socket.readyState).toBe(WebSocket.OPEN);
 			expect(connectionCount).toBe(1);
+			expect(receivedCreates).toBe(2);
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			expect(append.mock.calls[1]?.[0]).toMatchObject({outcome: "failure", accountIndex: 0, errorCode: "upstream_websocket_closed"});
 			expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("network-error");
 		} finally {
 			socket.terminate();
@@ -5507,16 +5520,17 @@ describe("runtime rotation proxy", () => {
 		await accountManager.flushPendingSave();
 	});
 
-	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
+	it("uses a durably settled renewal while its managed commit is pending", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 1);
 		const account = storage.accounts[0];
 		if (!account) throw new Error("expected account");
 		account.accessToken = "expired-access";
 		account.expiresAt = now - 60_000;
+		await fs.writeFile(getStoragePath(), JSON.stringify(storage));
 		const persisted: AccountStorageV3[] = [];
 		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-			handler(null, async (nextStorage: AccountStorageV3) => {
+			handler(await loadAccounts(), async (nextStorage: AccountStorageV3) => {
 				persisted.push(structuredClone(nextStorage));
 				await saveAccountsMock(nextStorage);
 			}),
@@ -5527,12 +5541,6 @@ describe("runtime rotation proxy", () => {
 				access: "fresh-access-1",
 				refresh: "refresh-1",
 				expires: now + 3_600_000,
-			})
-			.mockResolvedValueOnce({
-				type: "success",
-				access: "fresh-access-2",
-				refresh: "refresh-1",
-				expires: now + 7_200_000,
 			});
 		const accountManager = new AccountManager(undefined, storage);
 		vi.spyOn(accountManager, "saveToDiskDebounced").mockImplementation(() => undefined);
@@ -5556,9 +5564,14 @@ describe("runtime rotation proxy", () => {
 		await vi.waitFor(() => expect(commitSpy).toHaveBeenCalledTimes(1));
 		resetRefreshQueue();
 		const second = postResponses(proxy, { model: "gpt-5-codex" });
-		await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(2));
-		releaseCommit?.();
-		const responses = await Promise.all([first, second]);
+		let secondResponse: Response;
+		try {
+			secondResponse = await second;
+		} finally {
+			releaseCommit?.();
+		}
+		const responses = await Promise.all([first, Promise.resolve(secondResponse)]);
+		expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
 
 		expect(responses.map((response) => response.status)).toEqual([
 			HTTP_STATUS.OK,

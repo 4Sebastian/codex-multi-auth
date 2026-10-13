@@ -37,7 +37,7 @@ it.each(["unchanged","disabled","revoked","deleted","replacement","rebuild","old
  const manager=new AccountManager(undefined,await loadAccounts()),account=manager.getAccountByIndex(0)!;
  const rename=filesystem.rename.bind(filesystem);const blocked=vi.spyOn(filesystem,"rename").mockImplementation(async(source,target)=>{if(target===getStoragePath() || target===pendingAuth.getPendingAuthPath(getStoragePath())) throw Object.assign(Error("fixture locked"),{code:"EACCES"});return rename(source,target);});
  const timer=vi.spyOn(manager,"saveToDiskDebounced").mockImplementation(()=>undefined);
- await manager.commitRefreshedAuth(account,{type:"oauth",access:"fixture-B",refresh:"fixture-B-refresh",expires:Date.now()+7200000});blocked.mockRestore();
+ await expect(manager.commitRefreshedAuth(account,{type:"oauth",access:"fixture-B",refresh:"fixture-B-refresh",expires:Date.now()+7200000})).rejects.toMatchObject({cause:{cause:{code:"EACCES"}}});blocked.mockRestore();
  expect(account.access).toBe("fixture-B");
  const external=structuredClone(initial);
  if(change==="old-expiry") external.accounts[0]!.expiresAt=Date.now()+3600000;

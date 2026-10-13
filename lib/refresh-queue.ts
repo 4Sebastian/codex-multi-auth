@@ -14,8 +14,10 @@ import type { TokenResult } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
-import { assertPendingAuthRefreshCapacity } from "./storage/pending-auth.js";
+import { PendingAuthSettlementError, withPendingAuthRefresh } from "./storage/pending-auth.js";
 import { getStoragePath } from "./storage.js";
+import { captureAuthorityRevision } from "./storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
 
 const log = createLogger("refresh-queue");
 
@@ -122,6 +124,8 @@ export class RefreshQueue {
    */
   async refresh(refreshToken: string, storagePath = getStoragePath()): Promise<TokenResult> {
     this.cleanup();
+    const token = refreshToken;
+    refreshToken = `${storagePath}\0${token}`;
 
     // Check for existing in-flight refresh (direct match)
     const existing = this.pending.get(refreshToken);
@@ -171,51 +175,45 @@ export class RefreshQueue {
       });
       return current.promise;
     };
+    const authorityCurrent = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
     const promise = (async (): Promise<TokenResult> => {
-      let lease: Awaited<ReturnType<RefreshLeaseCoordinator["acquire"]>>;
+      let lease: Awaited<ReturnType<RefreshLeaseCoordinator["acquire"]>> | undefined;
       try {
-        lease = await this.leaseCoordinator.acquire(refreshToken);
-      } catch (error) {
-        log.warn("Refresh lease acquire failed; falling back to local refresh", {
-          tokenSuffix: tokenFingerprint(refreshToken),
-          error: (error as Error)?.message ?? String(error),
-        });
-        const supersedingPromise = getSupersedingPromise();
-        if (supersedingPromise) {
-          return supersedingPromise;
-        }
-        markStage("refresh");
-        return this.executeRefreshWithRotationTracking(refreshToken, storagePath);
-      }
-      if (lease.role === "follower" && lease.result) {
-        log.info("Using refresh result from cross-process lease", {
-          tokenSuffix: tokenFingerprint(refreshToken),
-        });
-        return lease.result;
-      }
-
-      try {
-        const supersedingPromise = getSupersedingPromise();
-        if (supersedingPromise) {
-          return supersedingPromise;
-        }
-        markStage("refresh");
-        const result = await this.executeRefreshWithRotationTracking(refreshToken, storagePath);
+        if (!authorityCurrent()) throw Object.assign(Error("Account pool was reset"), {code: "ESTALE"});
         try {
-          await lease.release(result);
+          lease = await this.leaseCoordinator.acquire(refreshToken);
+        } catch (error) {
+          log.warn("Refresh lease acquire failed; falling back to local refresh", {
+            tokenSuffix: tokenFingerprint(token),
+            error: (error as Error)?.message ?? String(error),
+          });
+        }
+        const supersedingPromise = getSupersedingPromise();
+        if (supersedingPromise) return supersedingPromise;
+        markStage("refresh");
+        const cached = lease?.role === "follower" ? lease.result : undefined;
+        if (!authorityCurrent()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+        const result = await withPendingAuthRefresh(storagePath, token, () => cached
+          ? Promise.resolve(cached)
+          : this.executeRefreshWithRotationTracking(token, storagePath));
+        try {
+          await lease?.release(result);
         } catch (error) {
           log.warn("Failed to publish lease refresh result", {
-            tokenSuffix: tokenFingerprint(refreshToken),
+            tokenSuffix: tokenFingerprint(token),
             error: (error as Error)?.message ?? String(error),
           });
         }
         return result;
+      } catch (error) {
+        if (error instanceof PendingAuthSettlementError) throw error;
+        return {type: "failed", reason: "network_error", message: error instanceof Error ? error.message : "Refresh admission failed"};
       } finally {
         try {
-          await lease.release();
+          await lease?.release();
         } catch (error) {
           log.warn("Failed to release refresh lease", {
-            tokenSuffix: tokenFingerprint(refreshToken),
+            tokenSuffix: tokenFingerprint(token),
             error: (error as Error)?.message ?? String(error),
           });
         }
@@ -258,10 +256,10 @@ export class RefreshQueue {
   }
 
   private async executeRefreshWithRotationTracking(refreshToken: string, storagePath: string): Promise<TokenResult> {
-    const result = await this.executeRefresh(refreshToken, storagePath);
+    const result = await this.executeRefresh(refreshToken);
     
     if (result.type === "success" && result.refresh !== refreshToken) {
-      this.tokenRotationMap.set(refreshToken, result.refresh);
+      this.tokenRotationMap.set(`${storagePath}\0${refreshToken}`, `${storagePath}\0${result.refresh}`);
       log.info("Token rotated during refresh", {
         oldTokenSuffix: tokenFingerprint(refreshToken),
         newTokenSuffix: tokenFingerprint(result.refresh),
@@ -274,7 +272,7 @@ export class RefreshQueue {
   /**
    * Execute the actual refresh and log results.
    */
-  private async executeRefresh(refreshToken: string, storagePath: string): Promise<TokenResult> {
+  private async executeRefresh(refreshToken: string): Promise<TokenResult> {
     const startTime = Date.now();
     log.info("Starting token refresh", { tokenSuffix: tokenFingerprint(refreshToken) });
     const timeoutMs = Math.max(1_000, this.maxEntryAgeMs);
@@ -282,8 +280,6 @@ export class RefreshQueue {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      const capacity = assertPendingAuthRefreshCapacity(storagePath, refreshToken);
-      if (capacity) await capacity;
       const timeoutErrorMessage = `Refresh timeout after ${timeoutMs}ms`;
       const timeoutPromise = new Promise<TokenResult>((_resolve, reject) => {
         timeoutId = setTimeout(() => {
@@ -401,8 +397,8 @@ export class RefreshQueue {
    * @param refreshToken - The refresh token to check
    * @returns True if refresh is in progress
    */
-  isRefreshing(refreshToken: string): boolean {
-    return this.pending.has(refreshToken);
+  isRefreshing(refreshToken: string, storagePath = getStoragePath()): boolean {
+    return this.pending.has(`${storagePath}\0${refreshToken}`);
   }
 
   /**

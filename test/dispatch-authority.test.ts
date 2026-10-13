@@ -1000,16 +1000,16 @@ it.each(["independent", "continuation", "stale"])("retains submitted custom acco
 	const result = await pending;
 	expect(result.type).toBe("error");
 	if (mode === "independent") expect(result.error.code).toBe("upstream_websocket_closed");
-	if (mode === "continuation") expect(result.error.code).toBe("previous_response_not_found");
+	if (mode === "continuation") expect(result.error.code).toBe("upstream_websocket_closed");
 	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
 	const row = (await readUsageLedgerRows()).find(row => !before.has(row.id));
 	expect(row).toMatchObject({outcome: "failure", account: {index: 0}});
 	expect(f.creates).toHaveLength(mode === "continuation" ? 2 : 1);
-	if (mode === "independent") {
+	if (mode !== "stale") {
 		const later = await turn(ws);
 		expect(later.type).toBe("response.completed");
 		await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(2));
-		expect(f.creates).toHaveLength(2);
+		expect(f.creates).toHaveLength(mode === "continuation" ? 3 : 2);
 		expect((await readUsageLedgerRows()).filter(row => !before.has(row.id)).map(record => record.outcome)).toEqual(["failure", "success"]);
 	}
 });

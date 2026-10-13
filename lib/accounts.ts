@@ -1882,7 +1882,7 @@ export class AccountManager {
 		const initialObservation = initialLive ? this.nativeAuthSnapshots.get(initialLive) : undefined;
 		const priorRefreshToken = initialState?.refreshToken ?? source.refreshToken;
 		try {
-			return await withAccountStorageTransaction(async (_current, persist) => {
+			return await runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (_current, persist) => {
 				if (!_current && this.hadPersistedStorage) throw Object.assign(new Error("Account storage was removed; reload before saving."), {code:"ESTALE"});
 				const currentLive = this.getAccountByIdentity(source, auth);
 				const currentAuth = currentLive === initialLive && currentLive?.access && currentLive.expires !== undefined && initialState &&
@@ -2007,7 +2007,7 @@ export class AccountManager {
 					sourceIndex: source.index,
 				});
 				return null;
-			});
+			}));
 		} catch (error) {
 			// The refresh already rotated the token upstream; the old one is spent.
 			// A locked or unreadable accounts file must not discard the only valid
@@ -2080,6 +2080,8 @@ export class AccountManager {
 						sourceIndex: source.index,
 						code: typeof (journalError as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((journalError as NodeJS.ErrnoException).code ?? "") ? (journalError as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
 					});
+					this.saveToDiskDebounced();
+					throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {retryable: false, cause: error});
 				}
 				this.saveToDiskDebounced();
 				return live;

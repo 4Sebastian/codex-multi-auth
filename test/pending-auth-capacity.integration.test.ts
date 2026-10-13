@@ -8,7 +8,7 @@ import { buildSync } from "esbuild";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import { clearAccounts, loadAccounts, saveAccounts, setStoragePathDirect } from "../lib/storage.js";
-import { applyPendingAuth, assertPendingAuthRefreshCapacity, capturePendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth } from "../lib/storage/pending-auth.js";
+import { applyPendingAuth, withPendingAuthRefresh, capturePendingAuth, getPendingAuthPath, prunePendingAuth, recordPendingAuth } from "../lib/storage/pending-auth.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
 import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
 import { withRetry } from "../lib/fs-retry.js";
@@ -101,7 +101,7 @@ it.each(["missing-primary", "corrupt-primary", "corrupt-wal", "corrupt-backup", 
 	}
 	const before = await fs.readFile(getPendingAuthPath(path), "utf8");
 	await expect(recordPendingAuth(path, rotation("spent", "fresh"))).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
-	await expect(assertPendingAuthRefreshCapacity(path, "spent")).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+	await expect(withPendingAuthRefresh(path, "spent", async () => {throw Error("must not spend");})).rejects.toMatchObject({code: mode === "discovery" ? "EACCES" : mode === "changing" ? "ESTALE" : "EPENDINGAUTHCAPACITY"});
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
 });
 

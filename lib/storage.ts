@@ -84,6 +84,8 @@ import {
 	toAccountIdentityRef,
 } from "./storage/identity.js";
 import {
+	FLAGGED_ACCOUNTS_FILE_NAME,
+	LEGACY_FLAGGED_ACCOUNTS_FILE_NAME,
 	getFlaggedAccountsPath as buildFlaggedAccountsPath,
 	getLegacyFlaggedAccountsPath as buildLegacyFlaggedAccountsPath,
 } from "./storage/file-paths.js";
@@ -171,8 +173,6 @@ export type {
 
 const log = createLogger("storage");
 const ACCOUNTS_FILE_NAME = "openai-codex-accounts.json";
-const FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-flagged-accounts.json";
-const LEGACY_FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-blocked-accounts.json";
 const ACCOUNTS_BACKUP_HISTORY_DEPTH = 3;
 const BACKUP_COPY_MAX_ATTEMPTS = 5;
 const BACKUP_COPY_BASE_DELAY_MS = 10;
@@ -913,13 +913,6 @@ export async function exportNamedBackup(
 
 export function getFlaggedAccountsPath(): string {
 	return buildFlaggedAccountsPath(getStoragePath(), FLAGGED_ACCOUNTS_FILE_NAME);
-}
-
-function getLegacyFlaggedAccountsPath(): string {
-	return buildLegacyFlaggedAccountsPath(
-		getStoragePath(),
-		LEGACY_FLAGGED_ACCOUNTS_FILE_NAME,
-	);
 }
 
 async function migrateLegacyProjectStorageIfNeeded(options?: {
@@ -2887,9 +2880,10 @@ export async function clearAccounts(): Promise<void> {
 }
 
 export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
-	return loadFlaggedAccountsEntry({
-		getFlaggedAccountsPath,
-		getLegacyFlaggedAccountsPath,
+	const storagePath = getStoragePath();
+	const storage = await loadFlaggedAccountsEntry({
+		getFlaggedAccountsPath: () => buildFlaggedAccountsPath(storagePath, FLAGGED_ACCOUNTS_FILE_NAME),
+		getLegacyFlaggedAccountsPath: () => buildLegacyFlaggedAccountsPath(storagePath, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME),
 		getIntentionalResetMarkerPath,
 		normalizeFlaggedStorage: (data) =>
 			normalizeFlaggedStorage(data, {
@@ -2934,6 +2928,8 @@ export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
 			log.info(message, details);
 		},
 	});
+	await applyPendingAuth(storagePath, {version: 3, activeIndex: 0, accounts: storage.accounts});
+	return storage;
 }
 
 async function saveFlaggedAccountsUnlocked(

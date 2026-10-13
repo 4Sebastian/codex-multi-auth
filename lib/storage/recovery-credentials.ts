@@ -6,6 +6,7 @@ import { captureAuthorityRevision } from "./authority-revision.js";
 import { getAccountsBackupRecoveryCandidates, getAccountsWalPath, ACCOUNTS_WAL_SUFFIX, RESET_MARKER_SUFFIX } from "./backup-paths.js";
 import { isCacheLikeBackupArtifactName } from "./cache-artifacts.js";
 import type { AccountMetadataV3 } from "./public-types.js";
+import { FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME, getFlaggedAccountsPath } from "./file-paths.js";
 
 const log = createLogger("storage");
 export type PendingAuthRecoveryCredential = Pick<AccountMetadataV3,
@@ -63,7 +64,9 @@ export async function getAccountsBackupRecoveryCandidatesWithDiscovery(
 export async function collectRestorableCredentials(path: string, includePrimary = false): Promise<PendingAuthRecoveryCredential[]> {
 	const directoryCurrent = captureAuthorityRevision([dirname(path)]);
 	const candidates = await getAccountsBackupRecoveryCandidatesWithDiscovery(path, true);
-	const sources = [...(includePrimary ? [path] : []), ...candidates, getAccountsWalPath(path)];
+	const flagged = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME]
+		.flatMap(name => {const source = getFlaggedAccountsPath(path, name); return [source, `${source}.bak`];});
+	const sources = [...(includePrimary ? [path] : []), ...candidates, ...flagged, getAccountsWalPath(path)];
 	const sourcesCurrent = captureAuthorityRevision(sources);
 	const tokens: PendingAuthRecoveryCredential[] = [];
 	const collectContent = (raw: string): void => {
@@ -93,7 +96,7 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 		}
 	};
 	if (includePrimary) collectContent(await fs.readFile(path, "utf-8"));
-	for (const candidate of candidates) {
+	for (const candidate of [...candidates, ...flagged]) {
 		try {
 			collectContent(await fs.readFile(candidate, "utf-8"));
 		} catch (error) {

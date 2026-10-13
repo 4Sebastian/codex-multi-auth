@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { decodeJWT } from "../auth/auth.js";
-import { promises as fs, statSync } from "node:fs";
+import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
 import { withRetry } from "../fs-retry.js";
 import { createLogger } from "../logger.js";
 import { tempPathFor } from "../temp-path.js";
+import type { TokenResult, TokenSuccess } from "../types.js";
+import { AnyAccountStorageSchema } from "../schemas.js";
+import { migrateV1ToV3 } from "./migrations.js";
+import { captureAuthorityRevision } from "./authority-revision.js";
 import { withFileTransactionLock } from "./file-lock.js";
 import { getIntentionalResetMarkerPath } from "./backup-paths.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
@@ -140,18 +144,59 @@ async function trimToCapacity(storagePath: string, entries: PendingAuth[], prote
 	return entries.filter(entry => !dropped.has(entry));
 }
 
-export function assertPendingAuthRefreshCapacity(storagePath: string, refreshToken: string): Promise<void> | undefined {
-	const path = getPendingAuthPath(storagePath);
-	try { statSync(path); }
-	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw error;
+export class PendingAuthSettlementError extends Error {
+	readonly code = "EPENDINGAUTHSETTLEMENT";
+	constructor(readonly result: TokenSuccess, cause: unknown) {
+		super("Rotated credentials could not be durably retained; they remain only in memory", {cause});
+		this.name = "PendingAuthSettlementError";
 	}
-	return withFileTransactionLock(path, async () => {
-		const entries = await read(path);
+}
+
+export async function withPendingAuthRefresh(
+	storagePath: string,
+	refreshToken: string,
+	refresh: () => Promise<TokenResult>,
+): Promise<TokenResult> {
+	const current = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
+	return withFileTransactionLock(storagePath, () => withFileTransactionLock(getPendingAuthPath(storagePath), async () => {
+		if (!current()) throw Object.assign(Error("Account pool was reset"), {code: "ESTALE"});
+		let primary: AccountStorageV3 | null = null;
+		try {
+			const stored = AnyAccountStorageSchema.parse(JSON.parse(await fs.readFile(storagePath, "utf8")));
+			primary = stored.version === 3 ? stored : migrateV1ToV3(stored);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new PendingAuthCapacityError({cause: error});
+		}
+		const entries = await read(getPendingAuthPath(storagePath));
+		const effective = await applyPendingAuth(storagePath, primary, entries);
+		const owner = effective?.accounts.find(row => row.refreshToken === refreshToken);
 		const prior = hash(refreshToken);
+		const retained = entries.find(entry => entry.prior === prior && entry.refreshToken !== refreshToken);
+		if (!current()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+		if (retained) return {type: "success", access: retained.accessToken, refresh: retained.refreshToken, expires: retained.expiresAt};
 		await trimToCapacity(storagePath, entries, prior, entries.some(entry => entry.prior === prior) ? 0 : 1);
-	});
+		if (!current()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+		const result = await refresh();
+		if (result.type !== "success") return result;
+		try {
+			if (!current()) throw Object.assign(Error("Account authority changed during refresh"), {code: "ESTALE"});
+			const journaled = await recordPendingAuthLocked(storagePath, {
+				priorRefreshToken: refreshToken,
+				recordId: owner?.recordId,
+				refreshToken: result.refresh,
+				accessToken: result.access,
+				expiresAt: result.expires,
+				enabled: owner?.enabled === false ? false : undefined,
+				authInvalidatedAt: owner?.accessToken === result.access ? owner.authInvalidatedAt : undefined,
+				authInvalidationErrorCode: owner?.accessToken === result.access ? owner.authInvalidationErrorCode : undefined,
+				at: Date.now(),
+			}, entries.find(entry => entry.prior === prior));
+			if (journaled.refreshToken === result.refresh && journaled.accessToken === result.access && journaled.expiresAt === result.expires) return result;
+			return {...result, refresh: journaled.refreshToken, access: journaled.accessToken, expires: journaled.expiresAt};
+		} catch (cause) {
+			throw new PendingAuthSettlementError(result, cause);
+		}
+	}));
 }
 
 /** Record a rotated credential beside the account pool. */
@@ -159,61 +204,70 @@ export async function recordPendingAuth(
 	storagePath: string,
 	auth: Omit<PendingAuth, "prior" | "committed"> & {priorRefreshToken: string},
 ): Promise<Omit<PendingAuth, "prior">> {
+	return withFileTransactionLock(getPendingAuthPath(storagePath), () => recordPendingAuthLocked(storagePath, auth));
+}
+
+async function recordPendingAuthLocked(
+	storagePath: string,
+	auth: Parameters<typeof recordPendingAuth>[1],
+	observed?: PendingAuth,
+): Promise<Omit<PendingAuth, "prior">> {
 	const path = getPendingAuthPath(storagePath);
-	return withFileTransactionLock(path, async () => {
-        try {
-            await fs.stat(getIntentionalResetMarkerPath(storagePath));
-            throw Object.assign(new Error("Account pool was reset; rotated credentials were not retained."), {code:"ESTALE"});
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-		const prior = hash(auth.priorRefreshToken);
-		const existing = await read(path);
-		const authorities = existing.filter(entry => entry.committed).map(entry => ({...entry}));
-		const recorded = existing.find(entry => entry.prior === prior);
-		// Pruning can remove intermediate aliases, not this predecessor's authoritative mapping.
-		const credential = recorded && !isNewerCredential(auth, recorded) ? recorded : auth;
-		let retained: Omit<PendingAuth, "prior"> = {...credential, ...mergeAuthorization(credential.accessToken, [auth, ...(recorded ? [recorded] : [])])};
-		const followed = new Set<string>();
-		for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
-			if (followed.has(next.prior)) throw Error("Cyclic pending credential rotation");
-			followed.add(next.prior);
-			const sameToken = next.refreshToken === retained.refreshToken;
-			const credential = sameToken && isNewerCredential(retained, next) ? retained : next;
-			retained = {...credential, ...mergeAuthorization(credential.accessToken, [retained, next])};
-			if (sameToken) break;
-		}
-		const replacement: Omit<PendingAuth, "prior"> = {recordId: retained.recordId ?? auth.recordId ?? recorded?.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained.accessToken, [retained]), at: retained.at};
-		replacement.committed = undefined;
-		const entries = existing.filter(
-			(entry) => entry.prior !== prior && (entry.prior !== hash(replacement.refreshToken) || entry.refreshToken === replacement.refreshToken),
-		);
-		// Rotating a token that is itself only journaled: extend that entry to the
-		// newest credential, but ALSO keep an entry keyed by the token this
-		// rotation just spent. A backup slot or WAL can still hold that
-		// intermediate token, and pruning now keeps entries whose spent token any
-		// recovery source can surface — a stale-snapshot restore then self-heals
-		// straight to the newest credential instead of reviving a spent token.
-		const chained = entries.filter(entry => entry.refreshToken === auth.priorRefreshToken);
-		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...chained]));
-		for (const entry of chained) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
-		const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
-		Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
-		const identities = new Set(aliases.map(entry => entry.recordId).filter(id => id !== undefined));
-		if (identities.size === 1) replacement.recordId ??= identities.values().next().value;
-		const committedFor = (candidate: Omit<PendingAuth, "prior">): PendingAuth["committed"] => authorities.some(authority =>
-			(auth.recordId === undefined || auth.recordId === authority.recordId) && candidate.recordId === authority.recordId &&
-			candidate.refreshToken === authority.refreshToken && candidate.accessToken === authority.accessToken && candidate.expiresAt === authority.expiresAt &&
-			candidate.authInvalidatedAt === authority.authInvalidatedAt && candidate.authInvalidationErrorCode === authority.authInvalidationErrorCode &&
-			(candidate.enabled === false) === (authority.enabled === false)) ? true : undefined;
-		replacement.committed = committedFor(replacement);
-		for (const entry of aliases) {
-			const updated = {...replacement, recordId: entry.recordId ?? replacement.recordId};
-			Object.assign(entry, {...updated, committed: committedFor(updated)});
-		}
-		const current: PendingAuth = {prior, ...replacement};
-		entries.push(current);
-		await write(path, await trimToCapacity(storagePath, entries, prior));
-		return replacement;
-	});
+	try {
+		await fs.stat(getIntentionalResetMarkerPath(storagePath));
+		throw Object.assign(new Error("Account pool was reset; rotated credentials were not retained."), {code:"ESTALE"});
+	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	const prior = hash(auth.priorRefreshToken);
+	const existing = await read(path);
+	const authorities = existing.filter(entry => entry.committed).map(entry => ({...entry}));
+	const recorded = existing.find(entry => entry.prior === prior);
+	// Pruning can remove intermediate aliases, not this predecessor's authoritative mapping.
+	const spentObservedCredential = recorded && observed && recorded.refreshToken === auth.priorRefreshToken &&
+		JSON.stringify(recorded) === JSON.stringify(observed);
+	const credential = recorded && !spentObservedCredential && !isNewerCredential(auth, recorded) ? recorded : auth;
+	let retained: Omit<PendingAuth, "prior"> = {...credential, ...mergeAuthorization(credential.accessToken, [auth, ...(recorded ? [recorded] : [])])};
+	const followed = new Set<string>();
+	for (let next = existing.find(entry => entry.prior === hash(retained.refreshToken)); next; next = existing.find(entry => entry.prior === hash(retained.refreshToken))) {
+		if (next.prior === prior && spentObservedCredential) break;
+		if (followed.has(next.prior)) throw Error("Cyclic pending credential rotation");
+		followed.add(next.prior);
+		const sameToken = next.refreshToken === retained.refreshToken;
+		const credential = sameToken && isNewerCredential(retained, next) ? retained : next;
+		retained = {...credential, ...mergeAuthorization(credential.accessToken, [retained, next])};
+		if (sameToken) break;
+	}
+	const replacement: Omit<PendingAuth, "prior"> = {recordId: retained.recordId ?? auth.recordId ?? recorded?.recordId, refreshToken: retained.refreshToken, accessToken: retained.accessToken, expiresAt: retained.expiresAt, ...mergeAuthorization(retained.accessToken, [retained]), at: retained.at};
+	replacement.committed = undefined;
+	const entries = existing.filter(
+		(entry) => entry.prior !== prior && (entry.prior !== hash(replacement.refreshToken) || entry.refreshToken === replacement.refreshToken),
+	);
+	// Rotating a token that is itself only journaled: extend that entry to the
+	// newest credential, but ALSO keep an entry keyed by the token this
+	// rotation just spent. A backup slot or WAL can still hold that
+	// intermediate token, and pruning now keeps entries whose spent token any
+	// recovery source can surface — a stale-snapshot restore then self-heals
+	// straight to the newest credential instead of reviving a spent token.
+	const chained = entries.filter(entry => entry.refreshToken === auth.priorRefreshToken);
+	Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...chained]));
+	for (const entry of chained) Object.assign(entry, {...replacement, recordId: entry.recordId ?? replacement.recordId});
+	const aliases = entries.filter(entry => entry.refreshToken === replacement.refreshToken);
+	Object.assign(replacement, mergeAuthorization(replacement.accessToken, [replacement, ...aliases]));
+	const identities = new Set(aliases.map(entry => entry.recordId).filter(id => id !== undefined));
+	if (identities.size === 1) replacement.recordId ??= identities.values().next().value;
+	const committedFor = (candidate: Omit<PendingAuth, "prior">): PendingAuth["committed"] => authorities.some(authority =>
+		(auth.recordId === undefined || auth.recordId === authority.recordId) && candidate.recordId === authority.recordId &&
+		candidate.refreshToken === authority.refreshToken && candidate.accessToken === authority.accessToken && candidate.expiresAt === authority.expiresAt &&
+		candidate.authInvalidatedAt === authority.authInvalidatedAt && candidate.authInvalidationErrorCode === authority.authInvalidationErrorCode &&
+		(candidate.enabled === false) === (authority.enabled === false)) ? true : undefined;
+	replacement.committed = committedFor(replacement);
+	for (const entry of aliases) {
+		const updated = {...replacement, recordId: entry.recordId ?? replacement.recordId};
+		Object.assign(entry, {...updated, committed: committedFor(updated)});
+	}
+	const current: PendingAuth = {prior, ...replacement};
+	entries.push(current);
+	await write(path, await trimToCapacity(storagePath, entries, prior));
+	return replacement;
 }
 
 /** Overlay pending rotated credentials on rows that still hold the spent token. */

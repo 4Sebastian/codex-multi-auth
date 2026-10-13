@@ -2122,7 +2122,7 @@ describe("AccountManager", () => {
 			);
 
 			const storageModule = await import("../lib/storage.js");
-            const journal = vi.spyOn(storageModule, "recordPendingAuth").mockResolvedValue(undefined);
+            const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
             const now = Date.now();
 			const stored = {
 				version: 3 as const,
