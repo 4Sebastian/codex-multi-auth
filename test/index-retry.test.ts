@@ -190,6 +190,8 @@ vi.mock("../lib/accounts.js", async () => {
 			);
 		}
 
+		async withCurrentAccountCredential(_account: unknown, _submitted: unknown, mutate: () => boolean | void) { return mutate() !== false; }
+
 		recordSuccess() {}
 
 		recordRateLimit() {}
@@ -486,6 +488,71 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		}
 
 		vi.restoreAllMocks();
+	});
+
+	it.each(["primary", "safe-rejection-fallback", "accepted-empty"])("preserves raw refresh-only plugin accounts at the dispatch boundary (%s)", async route => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-first-token-"));
+		const path = join(dir, "accounts.json");
+		const firstRefresh = `fixture-first-refresh-${route}`;
+		const nextRefresh = `fixture-first-next-${route}`;
+		const firstAccess = `fixture-first-access-${route}`;
+		const firstRecordId = `first-token-${route}`;
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: firstRecordId, accountId: `workspace-first-${route}`, refreshToken: firstRefresh, addedAt: 1, lastUsed: 1}]};
+		if (route !== "primary") storage.accounts.unshift({recordId: "primary-token", accountId: "workspace-primary", refreshToken: "fixture-primary-refresh", accessToken: "fixture-primary-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js");
+		const realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) {
+			vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		}
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage);
+		expect(manager.resolveSelectionStoragePath()).toBe(path);
+		expect(storageModule.getStoragePath()).toBe(path);
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js");
+		const realRefresh = await import("../lib/request/token-refresh.js");
+		vi.mocked(helpers.shouldRefreshToken).mockImplementation(auth => auth.type !== "oauth" || !auth.access);
+		vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(realRefresh.refreshAndUpdateToken);
+		const {RefreshLeaseCoordinator} = await import("../lib/refresh-lease.js");
+		vi.spyOn(RefreshLeaseCoordinator.prototype, "acquire").mockResolvedValue({role: "leader", release: async () => undefined});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn(async () => undefined)}};
+		const oauth = vi.fn(), inference = vi.fn();
+		globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+			if (String(input) === "https://auth.openai.com/oauth/token") {oauth(); return Response.json({access_token: firstAccess, refresh_token: nextRefresh, expires_in: 3600});}
+			inference();
+			if (route === "accepted-empty") return new Response("", {headers: {"Content-Type": "text/event-stream"}});
+			if (route === "safe-rejection-fallback") {
+				if (inference.mock.calls.length === 1) return Response.json({error: {code: "rate_limit_exceeded"}}, {status: 429, headers: {"retry-after": "60"}});
+				return new Response('data: {"type":"response.completed","response":{"id":"first-token","output":[],"usage":{"input_tokens":7,"output_tokens":3}}}\n\n', {headers: {"Content-Type": "text/event-stream"}});
+			}
+			return Response.json({id: "first-token", output: []});
+		});
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "", refresh: firstRefresh, expires: 0, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", route !== "primary" ? {body: JSON.stringify({model: "gpt-5.1", stream: true})} : {});
+			expect(response.status).toBe(200); const body = await response.text();
+			if (route === "safe-rejection-fallback") expect(body).toContain('"id":"first-token"');
+			if (route === "accepted-empty") expect(body).toBe("");
+			expect(oauth).toHaveBeenCalledTimes(route === "accepted-empty" ? 0 : 1);
+			expect(inference).toHaveBeenCalledTimes(route === "safe-rejection-fallback" ? 2 : 1);
+			expect(client.auth.set).toHaveBeenCalledTimes(route === "accepted-empty" ? 0 : 1);
+			expect(storageModule.getStoragePath()).toBe(path);
+			expect((await storageModule.loadAccounts())?.accounts.find(row => row.recordId === firstRecordId)?.refreshToken).toBe(route === "accepted-empty" ? firstRefresh : nextRefresh);
+		} finally {
+			vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => false);
+			vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(async auth => auth);
+			(await import("../lib/refresh-queue.js")).resetRefreshQueue();
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); storageModule.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
 	});
 
 	it("retains actual post-spend settlement failure without authentication removal or another OAuth spend", async () => {

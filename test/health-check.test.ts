@@ -155,8 +155,7 @@ describe("runHealthCheck quick check", () => {
 		expect(logged()).toContain("0 need re-login");
 		// The active account's session was validated, so the CLI state is synced.
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accountId: "acc_a" }),
-		);
+			expect.objectContaining({ accountId: "acc_a" }), expect.objectContaining({account: expect.any(Object)}));
 		// Nothing changed, so no storage write.
 		expect(saveAccountsMock).not.toHaveBeenCalled();
 	});
@@ -198,8 +197,7 @@ describe("runHealthCheck quick check", () => {
 		expect(logged()).toContain("1 working");
 		// The refreshed account is active, so its new tokens reach the CLI state.
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accessToken: "access-new" }),
-		);
+			expect.objectContaining({ accessToken: "access-new" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("counts an expired account with a failed refresh as needing re-login", async () => {
@@ -406,8 +404,7 @@ describe("runHealthCheck with a Codex CLI mirror", () => {
 		await runHealthCheck();
 
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accountId: "ws-authorized" }),
-		);
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 });
 

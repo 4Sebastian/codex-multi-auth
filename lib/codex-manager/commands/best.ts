@@ -1,3 +1,4 @@
+import type { CodexCliSelectionSource } from "../../codex-cli/writer.js";
 import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
 import {
 	codexCliAccountIdFor,
@@ -157,7 +158,7 @@ export interface BestCommandDeps {
 		refreshToken: string;
 		expiresAt?: number;
 		idToken?: string;
-	}) => Promise<boolean>;
+	}, source?: CodexCliSelectionSource) => Promise<boolean>;
 	logInfo?: (message: string) => void;
 	logWarn?: (message: string) => void;
 	logError?: (message: string) => void;
@@ -379,7 +380,7 @@ export async function runBestCommand(
 				...(probeIdTokenByIndex.has(bestIndex)
 					? { idToken: probeIdTokenByIndex.get(bestIndex) }
 					: {}),
-			});
+			}, {account: bestAccount, current: () => storage.accounts[bestIndex] === bestAccount});
 			if (!alreadyBestSynced && !options.json) {
 				logWarn(
 					"Codex auth sync did not complete. Multi-auth routing will still use this account.",

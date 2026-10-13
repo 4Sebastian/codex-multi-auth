@@ -433,7 +433,7 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 		refreshToken: syncRefreshToken,
 		expiresAt: syncExpiresAt,
 		...(syncIdToken ? { idToken: syncIdToken } : {}),
-	});
+	}, {account: nextStoredAccount ?? account, storagePath, current: () => mirrorAuthorityCurrent() && mirrorRevisionCurrent()});
 	if (!mirrorRevisionCurrent() || !mirrorAuthorityCurrent() || !refreshAuthority({type: "success", access: syncAccessToken ?? "", refresh: syncRefreshToken, expires: syncExpiresAt ?? 0})) return false;
 	if (synced) {
 		// The writer always (re)writes auth.json when the selection carries a

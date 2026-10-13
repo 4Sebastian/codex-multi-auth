@@ -55,10 +55,11 @@ vi.mock("../lib/codex-cli/writer.js", async () => {
 		...actual,
 		setCodexCliActiveSelection: async (
 			selection: Parameters<typeof actual.setCodexCliActiveSelection>[0],
+			source: Parameters<typeof actual.setCodexCliActiveSelection>[1],
 		) => {
 			harness.setSelectionCalls.push(selection as Record<string, unknown>);
 			await harness.preWriteHook?.();
-			const result = await actual.setCodexCliActiveSelection(selection);
+			const result = await actual.setCodexCliActiveSelection(selection, source);
 			await harness.postWriteHook?.();
 			return result;
 		},
@@ -302,7 +303,7 @@ describe("autoSyncActiveAccountToCodex fingerprint short-circuit", () => {
 
 		expect(await autoSyncActiveAccountToCodex()).toBe(false);
 		expect(harness.setSelectionCalls).toHaveLength(1);
-		expect(authTokens().access_token).toBe("access-a");
+		expect(existsSync(authPath)).toBe(false);
 
 		// The post-forward call must re-read and correct — with the buggy cache
 		// this returned early and left the mirror on acc_a forever.

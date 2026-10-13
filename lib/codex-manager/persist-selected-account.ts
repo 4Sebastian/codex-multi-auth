@@ -160,6 +160,6 @@ export async function persistAndSyncSelectedAccount({
 		refreshToken: syncRefreshToken,
 		expiresAt: syncExpiresAt,
 		...(syncIdToken ? { idToken: syncIdToken } : {}),
-	});
+	}, {account, current: () => storage.accounts[targetIndex] === account});
 	return { synced, wasDisabled };
 }

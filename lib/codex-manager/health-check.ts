@@ -408,7 +408,7 @@ export async function runHealthCheck(
 				accessToken: activeAccount.accessToken,
 				refreshToken: activeAccount.refreshToken,
 				expiresAt: activeAccount.expiresAt,
-			});
+			}, {account: activeAccount, current: () => storage.accounts[activeIndex] === activeAccount});
 		}
 	}
 

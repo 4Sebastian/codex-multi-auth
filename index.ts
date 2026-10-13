@@ -1654,6 +1654,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 										let shortRateLimitRetryCount = 0;
 										let successAccountForResponse = account;
+										let successSubmittedAccount = structuredClone(account);
+										let successSubmittedCredential = {recordId: account.recordId, accessToken: accountAuth.access, refreshToken: accountAuth.refresh, expiresAt: account.expires, accountId};
 										let successEntitlementAccountKey = entitlementAccountKey;
 										while (true) {
 											if (
@@ -2592,6 +2594,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																},
 															);
 
+															const fallbackSubmittedAccount = structuredClone(fallbackAccount);
+															const fallbackSubmittedCredential = {recordId: fallbackAccount.recordId, accessToken: fallbackAuth.access, refreshToken: fallbackAuth.refresh, expiresAt: fallbackAccount.expires, accountId: fallbackAccountId};
 															const fallbackController = new AbortController();
 															const fallbackTimeoutId = setTimeout(
 																() =>
@@ -2698,6 +2702,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																}
 
 																successAccountForResponse = fallbackAccount;
+																successSubmittedAccount = fallbackSubmittedAccount;
+																successSubmittedCredential = fallbackSubmittedCredential;
 																successEntitlementAccountKey =
 																	fallbackEntitlementAccountKey;
 																runtimeMetrics.streamFailoverRecoveries += 1;
@@ -2809,38 +2815,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											);
 
 
-											if (successAccountForResponse.index !== account.index) {
-												accountManager.markSwitched(
-													successAccountForResponse,
-													"rotation",
-													modelFamily,
-												);
-											}
-											const successAccountKey = successEntitlementAccountKey;
-											accountManager.recordSuccess(
-												successAccountForResponse,
-												modelFamily,
-												model,
-											);
-											capabilityPolicyStore.recordSuccess(
-												successAccountKey,
-												capabilityModelKey,
-											);
-											entitlementCache.clear(
-												successAccountKey,
-												capabilityModelKey,
-											);
-											if (
-												!responseContinuationEnabled ||
-												(!isStreaming && !storedResponseIdForSuccess)
-											) {
-												sessionAffinityStore?.rememberWithVersion(
-													sessionAffinityKey,
-													successAccountForResponse.index,
-													Date.now(),
-													sessionAffinityVersion,
-												);
-											}
 											runtimeMetrics.successfulRequests++;
 											runtimeMetrics.lastError = null;
 											usageCompletion = {
@@ -2850,8 +2824,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												account: {
 													index: successAccountForResponse.index,
 													accountId:
-														successAccountForResponse.accountId ?? null,
-													email: successAccountForResponse.email ?? null,
+														successSubmittedAccount.accountId ?? null,
+													email: successSubmittedAccount.email ?? null,
 												},
 												// Already known for a non-streaming response, which
 												// reported its usage while the body was being
@@ -2867,8 +2841,42 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												usageDeferral.defer(usageCompletion);
 												usageCompletion = null;
 											}
+											const successApplied = await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
+												if (successAccountForResponse.index !== account.index) {
+													accountManager.markSwitched(
+														successAccountForResponse,
+														"rotation",
+														modelFamily,
+													);
+												}
+												const successAccountKey = successEntitlementAccountKey;
+												accountManager.recordSuccess(
+													successAccountForResponse,
+													modelFamily,
+													model,
+												);
+												capabilityPolicyStore.recordSuccess(
+													successAccountKey,
+													capabilityModelKey,
+												);
+												entitlementCache.clear(
+													successAccountKey,
+													capabilityModelKey,
+												);
+												if (
+													!responseContinuationEnabled ||
+													(!isStreaming && !storedResponseIdForSuccess)
+												) {
+													sessionAffinityStore?.rememberWithVersion(
+														sessionAffinityKey,
+														successAccountForResponse.index,
+														Date.now(),
+														sessionAffinityVersion,
+													);
+												}
+											}, false);
 											if (
-												lastCodexCliActiveSyncIndex !==
+												successApplied && lastCodexCliActiveSyncIndex !==
 												successAccountForResponse.index
 											) {
 												void accountManager.syncCodexCliActiveSelectionForIndex(

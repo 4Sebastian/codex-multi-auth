@@ -586,7 +586,7 @@ describe("runtime rotation proxy", () => {
 			expect(receivedFrames).toHaveLength(2);
 			expect(consumed).toHaveBeenCalledTimes(2);
 			expect(usageRecorder).toHaveBeenCalledTimes(2);
-			expect(usageRecords).toHaveLength(2);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(2));
 			expect(usageRecords).toEqual([
 				expect.objectContaining({ outcome: "success", inputTokens: 1, totalTokens: 3 }),
 				expect.objectContaining({ outcome: "success", inputTokens: 2, totalTokens: 4 }),
@@ -784,7 +784,7 @@ describe("runtime rotation proxy", () => {
 				await response;
 			}
 			expect(upstreamFrames).toBe(2);
-			expect(usageRecords).toHaveLength(2);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(2));
 			expect(usageRecords[0]).toMatchObject({
 				inputTokens: 20_000,
 				outputTokens: 2_000,
@@ -850,7 +850,7 @@ describe("runtime rotation proxy", () => {
 				input: [],
 			}));
 			await response;
-			expect(usageRecords).toHaveLength(1);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(1));
 			expect(usageRecords[0]).toMatchObject({
 				inputTokens: 1_000_000,
 				outputTokens: 500_000,
@@ -1781,7 +1781,7 @@ describe("runtime rotation proxy", () => {
 				"Bearer access-2",
 			]);
 			expect(evaluatePolicy).toHaveBeenLastCalledWith(expect.objectContaining({model: "gpt-5.6-sol"}));
-			expect(usageRecords).toHaveLength(2);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(2));
 			expect(usageRecords[1]).toMatchObject({
 				outcome: "success",
 				account: expect.objectContaining({ index: 1 }),
@@ -1850,7 +1850,7 @@ describe("runtime rotation proxy", () => {
 				type: "response.completed",
 			});
 			expect(evaluatePolicy).toHaveBeenLastCalledWith(expect.objectContaining({model: "gpt-5.6-sol"}));
-			expect(usageRecords).toHaveLength(2);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(2));
 			expect(usageRecords[1]).toMatchObject({ outcome: "success" });
 		} finally {
 			socket.terminate();
@@ -2127,7 +2127,7 @@ describe("runtime rotation proxy", () => {
 		const gate = new Promise<void>(resolve => {release = resolve;});
 		const ready = new Promise<void>(resolve => {entered = resolve;});
 		const restriction = manager.withCurrentAccountCredential.bind(manager);
-		const held = vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered(); await gate; return restriction(...args);});
+		const held = vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return restriction(...args); entered(); await gate; return restriction(...args);});
 		const sent: string[] = [], completed: string[] = [];
 		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", raw => {
 			const body = JSON.parse(raw.toString());
@@ -2638,13 +2638,13 @@ describe("runtime rotation proxy", () => {
 			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
 			expect(JSON.parse(await interruptedResponse)).toMatchObject({type: "error", error: {code: "upstream_websocket_closed"}});
 			expect(connectionCount).toBe(2);
-			expect(usageRecords).toHaveLength(2);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(2));
 			expect(usageRecords[1]).toMatchObject({outcome: "failure", account: expect.objectContaining({index: 1})});
 			const recoveredResponse = nextWebSocketMessage(socket);
 			socket.send(JSON.stringify({ type: "response.create", model: "gpt-5.6-sol", input: [] }));
 			expect(JSON.parse(await recoveredResponse)).toMatchObject({type: "response.completed"});
 			expect(usageRecorder).toHaveBeenCalledTimes(3);
-			expect(usageRecords).toHaveLength(3);
+			await vi.waitFor(() => expect(usageRecords).toHaveLength(3));
 			expect(usageRecords[2]).toMatchObject({outcome: "success", account: expect.objectContaining({index: 2})});
 		} finally {
 			socket.terminate();

@@ -1151,13 +1151,13 @@ function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDis
 		account.expires === binding.expiresAt && workspaceModelScopes(account).some(scope => scope.accountId === binding.accountId && scope.routable);
 }
 
-async function applyDispatchRestriction(state: RotationProxyState, binding: AccountDispatchBinding, mutate: () => void): Promise<boolean> {
+async function applyDispatchRestriction(state: RotationProxyState, binding: AccountDispatchBinding, mutate: () => void, persistChanges = true): Promise<boolean> {
 	return binding.accountManager.withCurrentAccountCredential(binding.account, binding, () => {
 		if (state.activeAccountManager !== binding.accountManager ||
 			!workspaceModelScopes(binding.account).some(scope => scope.accountId === binding.accountId && scope.routable)) return false;
 		mutate();
 		return true;
-	});
+	}, persistChanges);
 }
 
 interface PreparedWebSocketAccount extends AccountDispatchBinding {
@@ -1175,6 +1175,7 @@ interface PreparedWebSocketRequest {
 }
 
 interface ActiveWebSocketRequest extends AccountDispatchBinding {
+	submittedAccount: ManagedAccount;
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
 }
@@ -1754,16 +1755,18 @@ async function applyWebSocketTerminalAccountFailure(
 	}
 }
 
-function applyWebSocketTerminalAccountSuccess(
+async function applyWebSocketTerminalAccountSuccess(
 	state: RotationProxyState,
 	active: ActiveWebSocketRequest,
 	terminal: WebSocketTerminalEvent,
-): void {
+): Promise<void> {
 	if (terminal.record.outcome !== "success") return;
-	if (!isDispatchBindingCurrent(state, active)) return;
-	active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model, active.circuitAdmission);
-	state.lastGlobalAccountIndex = active.account.index;
-	state.lastGlobalSwitchAt = state.now();
+	await applyDispatchRestriction(state, active, () => {
+		active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model, active.circuitAdmission);
+		recordRuntimeAccountRecovery(active.account.index);
+		state.lastGlobalAccountIndex = active.account.index;
+		state.lastGlobalSwitchAt = state.now();
+	}, false);
 }
 
 function isSendableWebSocketCloseCode(code: number): boolean {
@@ -2189,8 +2192,14 @@ async function connectManagedWebSocket(
 			}
 			await validateWebSocketRequestForAccount(state, request, prepared, prepared.circuitAdmission);
 			if (lifecycle.isClosed() || !prepared.tokenRefundable || upstream.readyState !== WebSocket.OPEN) throw new ClientCancellationError();
-			if (!prepared.circuitAdmission.halfOpen) accountManager.recordSuccess(account, context.family, context.model, prepared.circuitAdmission);
-			recordRuntimeAccountRecovery(account.index);
+			const recovered = await applyDispatchRestriction(state, prepared, () => {
+				if (!prepared.circuitAdmission.halfOpen) accountManager.recordSuccess(account, context.family, context.model, prepared.circuitAdmission);
+				recordRuntimeAccountRecovery(account.index);
+			}, false);
+			if (!recovered) {
+				upstream.terminate();
+				throw createRuntimeProxyHttpError("Account authority changed during handshake.", 503, "routing_configuration_changed");
+			}
 			recordLastRuntimeAccount(
 				state.status,
 				accountIdentityFromAccount(account, state.now()),
@@ -2356,7 +2365,7 @@ function bridgeWebSocketConnection(
 				outcome,
 				statusCode: outcome === "failure" ? HTTP_STATUS.BAD_GATEWAY : null,
 				errorCode,
-				account: active.account,
+				account: active.submittedAccount,
 			});
 		}
 		if (failure) throw failure.error;
@@ -2538,8 +2547,8 @@ function bridgeWebSocketConnection(
 			return;
 		}
 		if (!admission) throw createRuntimeProxyHttpError("Circuit admission is unavailable.", 503, "routing_configuration_changed");
-		frame.submittedAccount = forwardingAccount;
-		activeRequests.push({...binding, circuitAdmission: admission, request});
+		frame.submittedAccount = structuredClone(forwardingAccount);
+		activeRequests.push({...binding, submittedAccount: frame.submittedAccount, circuitAdmission: admission, request});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2684,8 +2693,9 @@ function bridgeWebSocketConnection(
 				if (terminal) {
 					const settled = activeRequests.shift();
 					if (settled) {
-						applyWebSocketTerminalAccountSuccess(state, settled, terminal);
-						const restriction = applyWebSocketTerminalAccountFailure(state, settled, terminal);
+						const restriction = terminal.record.outcome === "success"
+							? applyWebSocketTerminalAccountSuccess(state, settled, terminal)
+							: applyWebSocketTerminalAccountFailure(state, settled, terminal);
 						if (
 							settled.request.context.stableSessionKey &&
 							settled.request.context.model &&
@@ -2707,7 +2717,7 @@ function bridgeWebSocketConnection(
 							try {
 								await restriction;
 							} finally {
-								await settled.request.usageRecorder.record({...terminal.record, account: settled.account});
+								await settled.request.usageRecorder.record({...terminal.record, account: settled.submittedAccount});
 								settlingTurn = false;
 							}
 							drainPending();
@@ -4374,7 +4384,7 @@ async function handleRequestInner(
 				);
 			} catch (error) {
                 if (clientGone() || (error instanceof ClientCancellationError)) {
-                    await usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled", account: refreshed.account});
+                    await usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled", account: submittedUsageAccount});
                     if (!res.destroyed) res.destroy();
                     return;
                 }
@@ -4425,14 +4435,14 @@ async function handleRequestInner(
 						outcome: "failure",
 						statusCode: 502,
 						errorCode: "upstream_redirect_rejected",
-						account: refreshed.account,
+						account: submittedUsageAccount,
 					});
 					return;
 				}
 				if (state.webSocketRequestSent?.()) {
 					const errorCode = "upstream_websocket_disconnected";
 					writeJson(res, 502, {error: {code: errorCode, message: "Upstream request failed after dispatch; not replayed."}});
-					await usageRecorder.record({outcome: "failure", statusCode: 502, errorCode, account: refreshed.account});
+					await usageRecorder.record({outcome: "failure", statusCode: 502, errorCode, account: submittedUsageAccount});
 					return;
 				}
 				// A timeout may occur after generation; do not retry within this request.
@@ -4445,7 +4455,7 @@ async function handleRequestInner(
 					});
 					await usageRecorder.record({
 						outcome: "failure", statusCode: 502,
-						errorCode: "image_upstream_transport_error", account: refreshed.account,
+						errorCode: "image_upstream_transport_error", account: submittedUsageAccount,
 					});
 					return;
 				}
@@ -4468,7 +4478,7 @@ async function handleRequestInner(
 						"network-error",
 					);
 				}).catch(async restrictionError => {
-					await requestUsage.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "upstream_transport_error", account: refreshed.account});
+					await requestUsage.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "upstream_transport_error", account: submittedUsageAccount});
 					throw restrictionError;
 				});
 				accountSkipReasons.set(refreshed.account.index, "network-error");
@@ -4587,7 +4597,7 @@ async function handleRequestInner(
 							outcome: "failure",
 							statusCode: upstream.status,
 							errorCode: "client_disconnected_during_capacity_wait",
-							account: refreshed.account,
+							account: submittedUsageAccount,
 						});
 						return;
 					}
@@ -4630,7 +4640,7 @@ async function handleRequestInner(
 					if (!restricted && !alreadyRestricted) {
 						res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
 						res.end(bodyText);
-						await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode, account: refreshed.account});
+						await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode, account: submittedUsageAccount});
 						return;
 					}
      if(requestScope && refreshed.account.workspaces?.length) {
@@ -4659,7 +4669,7 @@ async function handleRequestInner(
 								outcome: "failure",
 								statusCode: upstream.status,
 								errorCode: "thread_goal_session_key_required",
-								account: refreshed.account,
+								account: submittedUsageAccount,
 							});
 							return;
 						}
@@ -4667,7 +4677,7 @@ async function handleRequestInner(
 							outcome: "failure",
 							statusCode: HTTP_STATUS.BAD_REQUEST,
 							errorCode: "thread_goal_session_key_required",
-							account: refreshed.account,
+							account: submittedUsageAccount,
 						});
 						writeJson(res, HTTP_STATUS.BAD_REQUEST, {
 							error: {
@@ -4682,7 +4692,7 @@ async function handleRequestInner(
 						outcome: "failure",
 						statusCode: upstream.status,
 						errorCode: "thread_goal_upstream_blocked",
-						account: refreshed.account,
+						account: submittedUsageAccount,
 					});
 					if (context.upstreamPath.endsWith("/set")) {
 						setThreadGoalFallback(state.threadGoalFallbacks, fallbackKey, goal);
@@ -4701,7 +4711,7 @@ async function handleRequestInner(
 						outcome: "failure",
 						statusCode: upstream.status,
 						errorCode,
-						account: refreshed.account,
+						account: submittedUsageAccount,
 					});
 					return;
 				}
@@ -4711,7 +4721,7 @@ async function handleRequestInner(
 					outcome: "failure",
 					statusCode: upstream.status,
 					errorCode,
-					account: refreshed.account,
+					account: submittedUsageAccount,
 				});
 				return;
 			}
@@ -4727,7 +4737,7 @@ async function handleRequestInner(
 				if (!restricted) {
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
 					res.end(invalidated ? buildTokenInvalidationBody(bodyText) : bodyText);
-					await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText), account: refreshed.account});
+					await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText), account: submittedUsageAccount});
 					return;
 				}
 				if (invalidated) {
@@ -4748,7 +4758,7 @@ async function handleRequestInner(
 						outcome: "failure",
 						statusCode: upstream.status,
 						errorCode: "token_invalidated",
-						account: refreshed.account,
+						account: submittedUsageAccount,
 					});
 					return;
 				}
@@ -4771,7 +4781,7 @@ async function handleRequestInner(
 				await usageRecorder.record({
 					outcome: "failure", statusCode: upstream.status,
 					errorCode: forwarded ? "image_upstream_error" : "stream_forward_failed",
-					account: refreshed.account,
+					account: submittedUsageAccount,
 				});
 				return;
 			}
@@ -4789,7 +4799,7 @@ async function handleRequestInner(
 							outcome: "failure",
 							statusCode: upstream.status,
 							errorCode: "client_disconnected_during_capacity_wait",
-							account: refreshed.account,
+							account: submittedUsageAccount,
 						});
 						return;
 					}
@@ -4813,7 +4823,7 @@ async function handleRequestInner(
 						outcome: "failure",
 						statusCode: upstream.status,
 						errorCode: "thread_goal_upstream_error",
-						account: refreshed.account,
+						account: submittedUsageAccount,
 					});
 					return;
 				}
@@ -4828,7 +4838,7 @@ async function handleRequestInner(
 					outcome: "failure",
 					statusCode: upstream.status,
 					errorCode: forwarded ? "thread_goal_upstream_error" : "stream_forward_failed",
-					account: refreshed.account,
+					account: submittedUsageAccount,
 				});
 				return;
 			}
@@ -4838,7 +4848,7 @@ async function handleRequestInner(
 			if (restrictionFailure && isThreadGoalRequest && upstream.status >= 400) {
 				const bodyText = await readUpstreamErrorBody();
 				const usage = extractResponsesUsage(parseRequestBody(Buffer.from(bodyText)));
-				await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText) ?? "thread_goal_upstream_error", account: refreshed.account, ...(usage ?? {})});
+				await usageRecorder.record({outcome: "failure", statusCode: upstream.status, errorCode: extractErrorCodeFromBody(bodyText) ?? "thread_goal_upstream_error", account: submittedUsageAccount, ...(usage ?? {})});
 				if (context.upstreamPath.endsWith("/get")) {
 					writeJson(res, HTTP_STATUS.OK, {goal: context.sessionKey ? getThreadGoalFallback(state.threadGoalFallbacks, context.sessionKey) : null});
 				} else if (isThreadGoalFallbackStatus(upstream.status) && context.sessionKey) {
@@ -4996,10 +5006,10 @@ async function handleRequestInner(
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			const completion = responseOutcome.finish();
 			if (forwarded && upstream.ok && !restrictionFailure) {
-				if (isDispatchBindingCurrent(state, binding)) {
+				await applyDispatchRestriction(state, binding, () => {
 					accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
 					recordRuntimeAccountRecovery(refreshed.account.index);
-				}
+				}, false).catch(captureRestrictionFailure);
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
@@ -5036,7 +5046,7 @@ async function handleRequestInner(
 				outcome: forwarded && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
 				statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
 				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
-				account: refreshed.account,
+				account: submittedUsageAccount,
 				...(usageTokens ?? {}),
 			});
 			if (restrictionFailure) throw restrictionFailure.error;

@@ -116,7 +116,9 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 }
 it.each(["disable", "delete", "remove", "corrupt", "reset"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
 	const f = await fixture(false), ws = await f.connect();
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
 	const first = await turn(ws);
+	await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
 	expect(first).toMatchObject({type: "response.completed"});
 	const other = new AccountManager(undefined, f.pool);
 	if (mutation === "disable") {other.setAccountEnabled(0, false); await other.saveToDisk();}
@@ -320,6 +322,8 @@ it.each(["http", "custom", "native", "http-stream", "native-stream"].flatMap(tra
 it("rejects a delayed refresh refusal against another manager's durable recovery", async () => {
 	const f = await fixture(false), account = f.manager.getAccountByIndex(0)!;
 	account.expires = 0;
+	f.pool.accounts[0]!.expiresAt = 0;
+	await fs.writeFile(f.path, JSON.stringify(f.pool));
 	const entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	vi.spyOn(refreshQueue, "queuedRefresh").mockImplementation(async () => {entered.resolve(); await release.promise; return {type: "failed", reason: "http_error", statusCode: 401, message: "OAuth token has been invalidated"};});
@@ -328,7 +332,7 @@ it("rejects a delayed refresh refusal against another manager's durable recovery
 	const other = new AccountManager(undefined, (await loadAccounts())!);
 	other.updateFromAuth(other.getAccountByIndex(0)!, {type: "oauth", access: "B", refresh: "refresh-B", expires: Date.now() + 7200000});
 	await other.saveToDisk(); release.resolve();
-	expect(await pending).toMatchObject({ok: false, retryable: true, invalidated: false});
+	await expect(pending).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
 	expect(account.authInvalidatedAt).toBeUndefined();
 	expect(account.coolingDownUntil).toBeUndefined();
 	expect(account.consecutiveAuthFailures ?? 0).toBe(0);
@@ -518,6 +522,7 @@ it.each(["header", "event"])("does not admit pending %s quota against an expiry-
 	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let held = false;
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return transaction(...args);
 		if (!held) {held = true; entered.resolve(); await release.promise;}
 		return transaction(...args);
 	});
@@ -563,7 +568,7 @@ it("does not apply a delayed refresh refusal to an expiry-only replacement", asy
 	replacement.getAccountByIndex(0)!.expires = Date.now() + 7200000;
 	await replacement.saveToDisk();
 	release.resolve();
-	expect(await pending).toMatchObject({ok: false, retryable: true, invalidated: false});
+	await expect(pending).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
 	expect(account.cooldownReason).toBeUndefined();
 	expect((await loadAccounts())!.accounts[0]!.authInvalidatedAt).toBeUndefined();
 });
@@ -876,6 +881,7 @@ it.each([false, true].flatMap(sawEvent => ["success", "reject", "stale"].flatMap
 	cleanups.push(async () => {release.resolve();});
 	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return actual(...args);
 		entered.resolve(); await release.promise;
 		try {if (restriction === "reject") throw Error("fixture restriction failure"); return await actual(...args);}
 		finally {finished.resolve();}
@@ -912,6 +918,7 @@ it("retains original cancellation accounting during a synchronous send failure",
 	cleanups.push(async () => {release.resolve();});
 	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return restrict(...args);
 		entered.resolve(); await release.promise;
 		try {return await restrict(...args);} finally {finished.resolve();}
 	});
@@ -939,6 +946,7 @@ it.each([401, 429, 503])("retains handshake accounting while its failed restrict
 	cleanups.push(async () => {release.resolve();});
 	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return restrict(...args);
 		entered.resolve(); await release.promise;
 		try {return await restrict(...args);} finally {finished.resolve();}
 	});
@@ -962,7 +970,7 @@ it("retains the submitted account while a dispatched custom disconnect settles",
 	cleanups.push(async () => {release.resolve();});
 	const ws = await f.connect(), before = new Set((await readUsageLedgerRows()).map(row => row.id));
 	const restriction = f.manager.withCurrentAccountCredential.bind(f.manager);
-	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return restriction(...args);});
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return restriction(...args); entered.resolve(); await release.promise; return restriction(...args);});
 	f.setReply(socket => {socket.close();});
 	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
 	await entered.promise;
@@ -986,7 +994,7 @@ it.each(["independent", "continuation", "stale"])("retains submitted custom acco
 	if (first) await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !initialRows.has(row.id))).toHaveLength(1));
 	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
 	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
-	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return actual(...args);});
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return actual(...args); entered.resolve(); await release.promise; return actual(...args);});
 	f.setReply(socket => {socket.close();});
 	const pending = turn(ws, first ? {previous_response_id: first.response.id} : {});
 	await entered.promise;
@@ -1034,6 +1042,7 @@ it.each(["header", "near", "event"].flatMap(boundary => ["journal", "persist"].f
 		});
 	};
 	if (boundary === "near") vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return actual(...args);
 		restrictions++;
 		if (restrictions === 1) {const result = await actual(...args); await fail(); return result;}
 		return actual(...args);
@@ -1268,7 +1277,7 @@ it("does not drain a closing channel before its terminal restriction settles", a
 	const f = await fixture(false), entered = deferred(), release = deferred();
 	cleanups.push(async () => {release.resolve();});
 	const restrict = f.manager.withCurrentAccountCredential.bind(f.manager);
-	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {entered.resolve(); await release.promise; return restrict(...args);});
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return restrict(...args); entered.resolve(); await release.promise; return restrict(...args);});
 	f.setReply(ws => {ws.send(JSON.stringify({type: "response.failed", status: 503, response: {id: "A", status: "failed", error: {code: "server_error"}}})); ws.close();});
 	const ws = await f.connect(), first = turn(ws);
 	await entered.promise; await first;
@@ -1384,6 +1393,7 @@ it.each(["primary", "secondary"])("checkpoint preserves pending independent %s q
 	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let held = false;
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return original(...args);
 		if (!held) {held = true; entered.resolve(); await release.promise;}
 		return original(...args);
 	});
@@ -1431,6 +1441,7 @@ it.each(["primary", "secondary"].flatMap(exhausted =>
 	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let started = 0, completed = 0;
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return original(...args);
 		if (++started === (sequence === "header" ? 2 : 1)) {entered.resolve(); await release.promise;}
 		const result = await original(...args);
 		completed++;
@@ -1512,6 +1523,7 @@ it.each(["free", "pro"].flatMap(planType => [false, true].map(replace => ({planT
 	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let held = false;
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return original(...args);
 		if (!held) {held = true; entered.resolve(); await release.promise;}
 		return original(...args);
 	});
@@ -1579,6 +1591,7 @@ it.each(["primary", "secondary"].flatMap(exhausted => ["event", "header"].map(in
 	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let commit = deferred();
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return actual(...args);
 		const notification = commit;
 		const applied = await actual(...args);
 		expect(applied).toBe(true);
@@ -1644,6 +1657,7 @@ it.each(["primary", "secondary"].flatMap(exhausted => [false, true].map(held => 
 	const actual = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let started = 0, commit = deferred();
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return actual(...args);
 		const notification = commit;
 		if (++started === 2 && held) {entered.resolve(); await release.promise;}
 		const applied = await actual(...args);
@@ -1710,7 +1724,7 @@ it.each(["primary", "secondary"])("receipt-order regression retains newer %s exh
 	});
 	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let committed = 0;
-	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {const value = await transaction(...args); committed++; return value;});
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return transaction(...args); const value = await transaction(...args); committed++; return value;});
 	const other = window === "primary" ? "secondary" : "primary";
 	const quota = (field: string, used: number) => ({type: "codex.rate_limits", rate_limits: {[field]: {used_percent: used, reset_at: Math.floor(Date.now() / 1000) + 600}}});
 	emit(a, quota(other, 10)); await entered.promise;
@@ -1747,6 +1761,7 @@ it("failed-worker regression retains pending exhaustion after the first transact
 	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
 	let held = false;
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return transaction(...args);
 		const value = await transaction(...args);
 		if (!held) {held = true; entered.resolve(); await release.promise; throw Error("fixture quota transaction completion failure");}
 		return value;
@@ -1815,6 +1830,7 @@ it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native 
 	});
 	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return transaction(...args);
 		const result = await transaction(...args); committed++; return result;
 	});
 	const other = window === "primary" ? "secondary" : "primary";
@@ -1889,6 +1905,7 @@ it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native 
 	let failed = false;
 	const transaction = f.manager.withCurrentAccountCredential.bind(f.manager);
 	if (failure === "completion") vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+		if (args[3] === false) return transaction(...args);
 		const result = await transaction(...args);
 		if (!failed) {failed = true; entered.resolve(); await release.promise; throw Error("fixture first quota completion failure");}
 		return result;
@@ -1930,4 +1947,42 @@ it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native 
 	const next = await f.post(); const text = await next.text();
 	expect(next.status, text).not.toBe(200);
 	expect(native ? f.creates.length : f.fetched.length).toBe(1);
+});
+
+it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credential", "expiry", "disable", "workspace", "reset", "journal"].map(change => ({transport, change}))))
+("validates durable submitted ownership before terminal healing (%j)", async ({transport, change}) => {
+ const f = await fixture(transport === "native"), entered = deferred();
+ const account = f.manager.getAccountByIndex(0)!;
+ const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+ const completed = {type: "response.completed", response: {id: "held-authority", status: "completed", output: [], usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+ let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+ let socket: WebSocket | undefined;
+ f.setReply(ws => {socket = ws; entered.resolve();});
+ f.setPostResponse(async () => new Response(new ReadableStream<Uint8Array>({start(value) {controller = value; value.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"held-authority"}}\n\n')); entered.resolve();}}), {headers: {"content-type": "text/event-stream"}}));
+ let body: Promise<unknown>;
+ if (transport !== "http") {const ws = await f.connect(); body = turn(ws);}
+ else {const response = await f.post(); body = response.text();}
+ await entered.promise;
+ account.consecutiveAuthFailures = 2;
+ const success = vi.spyOn(f.manager, "recordSuccess"); success.mockClear();
+ const disk: AccountStorageV3 = JSON.parse(await fs.readFile(f.path, "utf8"));
+ if (change === "credential") {disk.accounts[0]!.accessToken = "replacement"; disk.accounts[0]!.refreshToken = "replacement-refresh";}
+ if (change === "expiry") disk.accounts[0]!.expiresAt = (disk.accounts[0]!.expiresAt ?? 0) + 1;
+ if (change === "disable") disk.accounts[0]!.enabled = false;
+ if (change === "workspace") disk.accounts[0]!.workspaces![0]!.enabled = false;
+ if (["credential", "expiry", "disable", "workspace"].includes(change)) await fs.writeFile(f.path, JSON.stringify(disk));
+ if (change === "reset") await fs.writeFile(`${f.path}.reset-intent`, "{}");
+ if (change === "journal") await fs.writeFile(getPendingAuthPath(f.path), "{");
+ if (socket) socket.send(JSON.stringify(completed));
+ else {if (!controller) throw Error("Missing held HTTP stream"); controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(completed)}\n\n`)); controller.close();}
+ const output = await body;
+ expect(typeof output === "string" ? output : JSON.stringify(output)).toContain("response.completed");
+ await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+ const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+ expect(rows[0]).toMatchObject({outcome: "success", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+ expect(success).toHaveBeenCalledTimes(change === "healthy" ? 1 : 0);
+ expect(account.consecutiveAuthFailures).toBe(change === "healthy" ? 0 : 2);
+ expect(transport === "http" ? f.fetched.length : f.creates.length).toBe(1);
+ if (change === "journal") await fs.unlink(getPendingAuthPath(f.path));
+ if (change === "reset") await fs.unlink(`${f.path}.reset-intent`);
 });

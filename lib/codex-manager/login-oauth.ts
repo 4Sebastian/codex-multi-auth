@@ -30,6 +30,7 @@ import { MODEL_FAMILIES, type ModelFamily } from "../prompts/codex.js";
 import {
 	type AccountMetadataV3,
 	findMatchingAccountIndex,
+	loadAccounts,
 	withAccountStorageTransaction,
 } from "../storage.js";
 import { cloneAccountStorageForPersistence } from "../storage/account-persistence.js";
@@ -791,6 +792,9 @@ export async function syncSelectionToCodex(
 	const email = sanitizeEmail(
 		extractAccountEmail(tokens.access, tokens.idToken),
 	);
+	const storage = await loadAccounts();
+	const account = storage?.accounts[storage.activeIndexByFamily?.codex ?? storage.activeIndex];
+	if (!account || account.accessToken !== tokens.access || account.refreshToken !== tokens.refresh || account.expiresAt !== tokens.expires) return;
 	await setCodexCliActiveSelection({
 		accountId,
 		email,
@@ -798,5 +802,5 @@ export async function syncSelectionToCodex(
 		refreshToken: tokens.refresh,
 		expiresAt: tokens.expires,
 		idToken: tokens.idToken,
-	});
+	}, {account});
 }

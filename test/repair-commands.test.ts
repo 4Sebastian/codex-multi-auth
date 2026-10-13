@@ -60,13 +60,14 @@ const codexCliStateMocks = createCodexCliStateMocks({
 const codexCliWriterMocks = createCodexCliWriterMocks();
 const runtimeObservabilityMocks = createRuntimeObservabilityMocks();
 
-vi.mock("node:fs", () => ({
-	existsSync: existsSyncMock,
-	promises: {
-		stat: statMock,
-		readFile: readFileMock,
-	},
-}));
+vi.mock("node:fs", async importOriginal => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		existsSync: (path: Parameters<typeof actual.existsSync>[0]) => String(path).startsWith("/mock/") ? existsSyncMock(path) : actual.existsSync(path),
+		promises: {...actual.promises, stat: statMock, readFile: readFileMock},
+	};
+});
 
 vi.mock("../lib/forecast.js", () => ({
 	evaluateForecastAccounts: evaluateForecastAccountsMock,
@@ -2077,8 +2078,7 @@ describe("repair-commands direct deps coverage", () => {
 				accountId: "personal-id",
 				accessToken: "org-access",
 				refreshToken: "org-refresh",
-			}),
-		);
+			}), expect.objectContaining({account: expect.any(Object)}));
 		const persisted = persist.mock.calls[0]?.[0] as {
 			accounts: Array<{
 				accountId?: string;
@@ -2518,8 +2518,7 @@ describe("repair-commands direct deps coverage", () => {
 			expect(persisted.accounts[0]?.accountId).toBe("ws-team");
 			expect(persisted.accounts[0]?.codexCliMirror).toEqual(expectedMirror);
 			expect(codexCliWriterMocks.setCodexCliActiveSelection).toHaveBeenCalledExactlyOnceWith(
-				expect.objectContaining({ accountId: expectedSyncId }),
-			);
+				expect.objectContaining({ accountId: expectedSyncId }), expect.objectContaining({account: expect.any(Object)}));
 		} finally {
 			vi.unstubAllGlobals();
 		}

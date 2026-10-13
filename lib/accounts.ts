@@ -918,13 +918,14 @@ export class AccountManager {
 		if (index < 0 || index >= this.accounts.length) return;
 		const account = this.accounts[index];
 		if (!account) return;
+		const storagePath = this.resolveSelectionStoragePath();
 		await setCodexCliActiveSelection({
 			accountId: codexCliAccountIdFor(account, account.access),
 			email: account.email,
 			accessToken: account.access,
 			refreshToken: account.refreshToken,
 			expiresAt: account.expires,
-		});
+		}, {account, storagePath, current: () => this.getCurrentAccount() === account && this.resolveSelectionStoragePath() === storagePath});
 	}
 
 	getCurrentAccount(): ManagedAccount | null {
@@ -2027,7 +2028,12 @@ export class AccountManager {
 			// persist it once the file can be read.
 			// A write that still fails after the storage retries (e.g. a Windows lock)
 			// spends the old token just the same, so it is rescued like an unreadable file.
-			const live = isRetryableAuthPersistenceError(error) && authorityCurrent({type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires}) ? this.getAccountByIdentity(source, auth) : null;
+			const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
+			const settlement = new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");
+			let live: ManagedAccount | null = null;
+			try {
+				if (isRetryableAuthPersistenceError(error) && authorityCurrent(result)) live = this.getAccountByIdentity(source, auth);
+			} catch { throw settlement; }
 			if (live) {
 				if (live === initialLive && initialState &&
 					(["access", "refreshToken", "expires"] as const).every(field => live[field] === initialState[field])) {
@@ -2092,8 +2098,6 @@ export class AccountManager {
 				const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
 				throw new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "journal");
 			}
-			const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
-			const settlement = new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");
 			if (initialLive) {
 				// A failed retention observation must not replace the first publication error.
 				await withRefreshCredentialRetention(initialLive, () => Promise.reject(settlement),
@@ -2508,9 +2512,12 @@ export class AccountManager {
 		account: ManagedAccount,
 		submitted: CurrentAccountCredential,
 		mutate: () => boolean | void,
+		persistChanges = true,
 	): Promise<boolean> {
+		const storagePath = this.resolveSelectionStoragePath();
 		return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
-			if (!captureAuthorityRevision([], [getIntentionalResetMarkerPath(this.resolveSelectionStoragePath())])()) return false;
+			const revisionCurrent = captureAuthorityRevision([storagePath, getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
+			if (!revisionCurrent()) return false;
 			const primaryExists = existsSync(this.resolveSelectionStoragePath());
 			if (this.hadPersistedStorage && !primaryExists) return false;
 			if (!await this.isAccountJournalEligible(account)) return false;
@@ -2524,7 +2531,9 @@ export class AccountManager {
 			}
 			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
 				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return false;
+			if (!revisionCurrent() || this.resolveSelectionStoragePath() !== storagePath) return false;
 			if (mutate() === false) return false;
+			if (!persistChanges) return true;
 			this.reconcileSelectionFromDisk();
 			this.syncWorkspaceSelections(current);
 			await this.persistSnapshot(current, this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current), persist, undefined, true);

@@ -554,7 +554,7 @@ describe("syncCodexCliActiveSelectionIfDrifted", () => {
 			accessToken: active.accessToken,
 			refreshToken: active.refreshToken,
 			expiresAt: active.expiresAt,
-		});
+		}, expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("propagates a skipped CLI write as false", async () => {

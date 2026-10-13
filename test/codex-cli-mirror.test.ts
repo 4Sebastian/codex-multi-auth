@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import { codexCliAccountIdFor } from "../lib/auth/token-utils.js";
 import { clearCodexCliStateCache } from "../lib/codex-cli/state.js";
 import { buildUpdatedAccount } from "../lib/codex-manager/account-pool-write.js";
 import { syncCodexCliActiveSelectionIfDrifted } from "../lib/codex-manager/login-menu-data.js";
+import {setStoragePathDirect} from "../lib/storage.js";
 import { syncSelectionToCodex } from "../lib/codex-manager/login-oauth.js";
 import { safeParseAccountStorageV3 } from "../lib/schemas.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../lib/storage.js";
@@ -142,6 +143,8 @@ describe("explicit unauthorized id and Codex auth.json", () => {
 		process.env.CODEX_MULTI_AUTH_SYNC_CODEX_CLI = "1";
 		process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE = "0";
 		clearCodexCliStateCache();
+		setStoragePathDirect(join(tempDir, "pool.json"));
+		await writeFile(join(tempDir, "pool.json"), JSON.stringify(storage()));
 	});
 
 	afterEach(async () => {
@@ -150,6 +153,7 @@ describe("explicit unauthorized id and Codex auth.json", () => {
 			if (previousEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = previousEnv[key];
 		}
+		setStoragePathDirect(null);
 		await rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -212,6 +216,7 @@ describe("explicit unauthorized id and Codex auth.json", () => {
 		});
 
 		// Re-login bound a different explicit id; the old pair no longer applies.
+		await writeFile(join(tempDir, "pool.json"), JSON.stringify(storage(explicitAccount({accountId: "ws-other"}))));
 		await expect(
 			syncCodexCliActiveSelectionIfDrifted(storage(explicitAccount({ accountId: "ws-other" }))),
 		).resolves.toBe(true);

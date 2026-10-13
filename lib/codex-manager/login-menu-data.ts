@@ -598,7 +598,7 @@ export async function syncCodexCliActiveSelectionIfDrifted(
 			accessToken: account.accessToken,
 			refreshToken: account.refreshToken,
 			expiresAt: account.expiresAt,
-		});
+		}, {account, current: () => storage.accounts[activeIndex] === account});
 	} catch {
 		return false;
 	}

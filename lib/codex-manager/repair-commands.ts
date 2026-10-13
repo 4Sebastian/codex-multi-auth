@@ -1670,7 +1670,7 @@ export async function runFix(
 					accessToken: committedActive.accessToken,
 					refreshToken: committedActive.refreshToken,
 					expiresAt: committedActive.expiresAt,
-				});
+				}, {account: committedActive});
 			}
 		});
 	}
@@ -2063,6 +2063,7 @@ export async function runDoctor(
 	let storageFixChanged = false;
 	let structuralFixActions: DoctorFixAction[] = [];
 	let doctorRefreshMutation: DoctorRefreshMutation | null = null;
+	let pendingCodexSource: AccountMetadataV3 | undefined;
 	let pendingCodexActiveSync: {
 		accountId: string | undefined;
 		email: string | undefined;
@@ -2353,6 +2354,7 @@ export async function runDoctor(
 				}
 
 				if (!options.dryRun && canSyncActiveAccount) {
+					pendingCodexSource = activeAccount;
 					pendingCodexActiveSync = {
 						accountId: codexCliAccountIdFor(
 							activeAccount,
@@ -2443,8 +2445,8 @@ export async function runDoctor(
 		});
 	}
 
-	if (pendingCodexActiveSync && (!doctorRefreshMutation || storageFixChanged)) {
-		const synced = await setCodexCliActiveSelection(pendingCodexActiveSync);
+	if (pendingCodexActiveSync && pendingCodexSource && (!doctorRefreshMutation || storageFixChanged)) {
+		const synced = await setCodexCliActiveSelection(pendingCodexActiveSync, {account: pendingCodexSource, storagePath});
 		if (synced) {
 			supplementalFixActions.push({
 				key: "codex-active-sync",

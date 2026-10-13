@@ -117,7 +117,7 @@ describe("ensureFreshAccessToken", () => {
 		queuedRefreshMock.mockImplementation(async()=>{entered();await gate;return {type:"failed",reason:"http_error",statusCode:401,message:"OAuth token has been invalidated"};});
 		const pending=ensureFreshAccessToken(params);await ready;
 		manager.updateFromAuth(params.account,{type:"oauth",access:"access-new-login",refresh:"refresh-new-login",expires:FRESH_EXPIRES});
-		release();await pending;
+		release();await expect(pending).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
 		expect(params.account.authInvalidatedAt).toBeUndefined();
 		expect(params.account.coolingDownUntil).toBeUndefined();
 		expect(params.account.consecutiveAuthFailures ?? 0).toBe(0);
@@ -341,7 +341,7 @@ describe("ensureFreshAccessToken", () => {
 		);
 	});
 
-	it("keeps serving the rotated credential when the commit write stays locked", async () => {
+	it("retains the rotated credential but reports the locked primary publication", async () => {
 		const accountManager = managerWith(STALE_EXPIRES);
 		queuedRefreshMock.mockResolvedValue({
 			type: "success",
@@ -355,10 +355,7 @@ describe("ensureFreshAccessToken", () => {
 			Object.assign(new Error("locked"), { code: "EBUSY" }),
 		);
 
-		const result = await ensureFreshAccessToken(refreshParams(accountManager));
-
-		// The old refresh token is spent; the new one is journaled and used.
-		expect(result).toMatchObject({ ok: true, accessToken: "access-new" });
+		await expect(ensureFreshAccessToken(refreshParams(accountManager))).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EBUSY"}, durability: "journal"});
 		expect(accountManager.getAccountByIndex(0)?.refreshToken).toBe("refresh-new");
 	});
 });

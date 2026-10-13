@@ -124,7 +124,7 @@ describe("persistAndSyncSelectedAccount", () => {
 			accessToken: "access-b",
 			refreshToken: "refresh-b",
 			expiresAt: storage.accounts[1].expiresAt,
-		});
+		}, expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("re-enables a disabled account and reports it", async () => {
@@ -176,7 +176,7 @@ describe("persistAndSyncSelectedAccount", () => {
 			refreshToken: "refresh-new",
 			expiresAt: REAL_NOW + 7_200_000,
 			idToken: "id-new",
-		});
+		}, expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("warns and syncs the old tokens when the validation refresh fails", async () => {
@@ -204,8 +204,7 @@ describe("persistAndSyncSelectedAccount", () => {
 		expect(storage.accounts[0].refreshToken).toBe("refresh-a");
 		expect(saveAccountsMock).toHaveBeenCalledTimes(1);
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accessToken: "access-a" }),
-		);
+			expect.objectContaining({ accessToken: "access-a" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("preserves per-family selections when re-selecting the active account", async () => {
@@ -358,8 +357,7 @@ describe("persistAndSyncSelectedAccount", () => {
 		});
 
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ idToken: "id-initial" }),
-		);
+			expect.objectContaining({ idToken: "id-initial" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("reports synced=false when the CLI write is skipped", async () => {
@@ -398,8 +396,7 @@ describe("persistAndSyncSelectedAccount with a Codex CLI mirror", () => {
 		});
 
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accountId: "ws-authorized" }),
-		);
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
 		expect(storage.accounts[1]?.accountId).toBe("ws-team");
 	});
 });

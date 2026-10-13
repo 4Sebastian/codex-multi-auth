@@ -166,7 +166,9 @@ export class RefreshGuardian {
 						this.stats.networkFailed += 1;
 						return !!account;
 					}
-					manager.recordSuccess(committedAccount, REFRESH_HEALTH_FAMILY);
+					await manager.withCurrentAccountCredential(committedAccount, {
+						recordId: committedAccount.recordId, accessToken: refreshedAuth.access, refreshToken: refreshedAuth.refresh, expiresAt: refreshedAuth.expires,
+					}, () => manager.recordSuccess(committedAccount, REFRESH_HEALTH_FAMILY), false);
 				} catch (error) {
 					log.warn("Refresh guardian commit failed", {
 						sourceIndex: sourceAccount.index,

@@ -549,8 +549,7 @@ describe("runBestCommand with a Codex CLI mirror", () => {
 		expect(await runBestCommand(["--live"], deps)).toBe(0);
 
 		expect(deps.setCodexCliActiveSelection).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accountId: "ws-authorized" }),
-		);
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 });
 
@@ -600,7 +599,6 @@ describe("runBestCommand refresh keeps explicit bindings", () => {
 			expect.objectContaining({ accountId: "ws-team" }),
 		);
 		expect(deps.setCodexCliActiveSelection).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accountId: "ws-authorized" }),
-		);
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 });

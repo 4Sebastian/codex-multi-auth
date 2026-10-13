@@ -7,7 +7,7 @@ import { clearCodexCliStateCache } from "../lib/codex-cli/state.js";
 import { syncCodexCliActiveSelectionIfDrifted } from "../lib/codex-manager/login-menu-data.js";
 import { persistAndSyncSelectedAccount } from "../lib/codex-manager/persist-selected-account.js";
 import { nativeRateLimitsRpc } from "../lib/runtime/native-rate-limits.js";
-import type { AccountStorageV3 } from "../lib/storage.js";
+import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
 vi.mock("../lib/storage.js", async importOriginal => ({...await importOriginal<typeof import("../lib/storage.js")>(), saveAccounts: vi.fn(async () => {})}));
 const jwt = `h.${Buffer.from(JSON.stringify({sub: "fixture-user", exp: 4102444800, "https://api.openai.com/auth": {chatgpt_account_id: "native-default"}, "https://api.openai.com/profile": {email: "fixture@example.test"}})).toString("base64url")}.s`;
@@ -21,10 +21,13 @@ beforeEach(async () => {
 	vi.stubEnv("CODEX_MULTI_AUTH_SYNC_CODEX_CLI", "1");
 	vi.stubEnv("CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE", "0");
 	clearCodexCliStateCache();
+	setStoragePathDirect(join(dir, "pool.json"));
+	await writeFile(join(dir, "pool.json"), JSON.stringify(fixture()));
 });
 afterEach(async () => {
 	clearCodexCliStateCache();
 	vi.unstubAllEnvs();
+	setStoragePathDirect(null);
 	await removeWithRetry(dir, {recursive: true, force: true});
 });
 async function writtenAccount() { return JSON.parse(await readFile(join(dir, "auth.json"), "utf8")).tokens.account_id; }

@@ -1,3 +1,13 @@
+import type { ManagedAccount } from "../accounts.js";
+import { getStoragePath, loadAccounts, type AccountMetadataV3 } from "../storage.js";
+import { applyPendingAuth, captureRefreshCredentialAuthority, PendingAuthAdmissionError } from "../storage/pending-auth.js";
+import { captureAuthorityRevision } from "../storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
+import { withFileTransactionLock } from "../storage/file-lock.js";
+import { resolveAccountRecordId } from "../storage/record-identity.js";
+import { getPendingAuthPath } from "../storage/recovery-credentials.js";
+import { getStoragePathState, runWithStoragePathState } from "../storage/path-state.js";
+import { getTransactionSnapshotState, isStorageLockHeld, withStorageLock } from "../storage/transactions.js";
 import { withNativeBindingLock } from "../runtime/native-binding-lock.js";
 import { hasNativeProviderConfig } from "../runtime-constants.js";
 import { existsSync, promises as fs } from "node:fs";
@@ -33,6 +43,16 @@ interface ActiveSelection {
 	refreshToken?: string;
 	expiresAt?: number;
 	idToken?: string;
+}
+
+export interface CodexCliSelectionSource {
+	account: AccountMetadataV3 | ManagedAccount;
+	storagePath?: string;
+	current?: () => boolean;
+}
+
+function assertSelectionAuthority(authorityCurrent: () => boolean): void {
+	if (!authorityCurrent()) throw new PendingAuthAdmissionError(Object.assign(Error("Account selection changed before mirror publication"), {code: "ESTALE"}));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -217,10 +237,12 @@ function toIsoTime(ms: number | undefined): string {
 	return new Date().toISOString();
 }
 
-async function atomicWriteText(path: string, content: string): Promise<void> {
+async function atomicWriteText(path: string, content: string, authorityCurrent: () => boolean = () => true): Promise<void> {
 	const tempPath = tempPathFor(path);
+	assertSelectionAuthority(authorityCurrent);
 	await fs.mkdir(dirname(path), { recursive: true });
 	try {
+		assertSelectionAuthority(authorityCurrent);
 		await fs.writeFile(tempPath, content, {
 			encoding: "utf-8",
 			mode: 0o600,
@@ -229,7 +251,9 @@ async function atomicWriteText(path: string, content: string): Promise<void> {
 		let lastRenameError: NodeJS.ErrnoException | null = null;
 		for (let attempt = 0; attempt < 5; attempt += 1) {
 			try {
+				assertSelectionAuthority(authorityCurrent);
 				await fs.rename(tempPath, path);
+				assertSelectionAuthority(authorityCurrent);
 				return;
 			} catch (error) {
 				const code = (error as NodeJS.ErrnoException).code;
@@ -251,8 +275,8 @@ async function atomicWriteText(path: string, content: string): Promise<void> {
 	}
 }
 
-async function atomicWriteJson(path: string, payload: Record<string, unknown>): Promise<void> {
-	return atomicWriteText(path, JSON.stringify(payload, null, 2));
+async function atomicWriteJson(path: string, payload: Record<string, unknown>, authorityCurrent: () => boolean): Promise<void> {
+	return atomicWriteText(path, JSON.stringify(payload, null, 2), authorityCurrent);
 }
 
 /**
@@ -336,11 +360,14 @@ export function readTopLevelCodexCliAuthStoreMode(rawConfig: string): string | n
  */
 export async function ensureCodexCliFileAuthStore(
 	configPath: string = getCodexCliConfigPath(),
+	authorityCurrent: () => boolean = () => true,
 ): Promise<boolean> {
 	if (!shouldEnforceCodexCliFileAuthStore()) return false;
 
 	const desired = 'cli_auth_credentials_store = "file"';
+	assertSelectionAuthority(authorityCurrent);
 	const raw = existsSync(configPath) ? await fs.readFile(configPath, "utf-8") : "";
+	assertSelectionAuthority(authorityCurrent);
 
 	// Quote style is not ours to normalize: a literal-string `'file'` already
 	// keeps the CLI off the keychain, so rewriting it to `"file"` would churn a
@@ -382,15 +409,18 @@ export async function ensureCodexCliFileAuthStore(
 		return false;
 	}
 
-	await atomicWriteText(configPath, nextRaw);
+	await atomicWriteText(configPath, nextRaw, authorityCurrent);
 	return true;
 }
 
 async function writeCodexAuthState(
 	path: string,
 	selection: ActiveSelection,
+	authorityCurrent: () => boolean,
 ): Promise<boolean> {
+	assertSelectionAuthority(authorityCurrent);
 	const raw = existsSync(path) ? await fs.readFile(path, "utf-8") : "{}";
+	assertSelectionAuthority(authorityCurrent);
 	const parsed = JSON.parse(raw) as unknown;
 	if (!isRecord(parsed)) {
 		log.warn("Failed to persist Codex auth selection", {
@@ -514,7 +544,7 @@ async function writeCodexAuthState(
 	next.last_refresh = toIsoTime(selection.expiresAt);
 	next.codexMultiAuthSyncVersion = syncVersion;
 
-	await atomicWriteJson(path, next);
+	await atomicWriteJson(path, next, authorityCurrent);
 	lastCodexCliSelectionWriteAt = Math.max(lastCodexCliSelectionWriteAt, syncVersion);
 	return true;
 }
@@ -542,9 +572,21 @@ async function enqueueActiveSelectionWrite<T>(task: () => Promise<T>): Promise<T
 
 export async function setCodexCliActiveSelection(
 	selection: ActiveSelection,
+	source?: CodexCliSelectionSource,
 ): Promise<boolean> {
 	if (!isCodexCliSyncEnabled()) return false;
-	return enqueueActiveSelectionWrite(() => withNativeBindingLock(getCodexCliConfigPath(), async () => {
+	selection = {...selection};
+	const storagePath = source?.storagePath ?? getStoragePath();
+	let authorityCurrent = () => true;
+	if (source) {
+		try {
+			const ownerCurrent = captureRefreshCredentialAuthority(source.account, source.current, undefined, storagePath);
+			const revisionCurrent = captureAuthorityRevision([storagePath, getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
+			authorityCurrent = () => ownerCurrent() && revisionCurrent();
+		} catch { return false; }
+	}
+	const write = () => withNativeBindingLock(getCodexCliConfigPath(), async () => {
+		assertSelectionAuthority(authorityCurrent);
 		// Native app binding deliberately separates desktop identity from inference selection.
 		try {
 			if (hasNativeProviderConfig(await fs.readFile(getCodexCliConfigPath(), "utf8"))) return false;
@@ -552,6 +594,7 @@ export async function setCodexCliActiveSelection(
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
 		}
 
+		assertSelectionAuthority(authorityCurrent);
 		incrementCodexCliMetric("writeAttempts");
 		const accountsPath = getCodexCliAccountsPath();
 		const authPath = getCodexCliAuthPath();
@@ -577,7 +620,9 @@ export async function setCodexCliActiveSelection(
 			let wroteConfig = false;
 
 			if (hasAccountsPath) {
+				assertSelectionAuthority(authorityCurrent);
 				const raw = await fs.readFile(accountsPath, "utf-8");
+				assertSelectionAuthority(authorityCurrent);
 				const parsed = JSON.parse(raw) as unknown;
 				if (!isRecord(parsed) || !Array.isArray(parsed.accounts)) {
 					log.warn("Failed to persist Codex CLI active selection", {
@@ -657,7 +702,7 @@ export async function setCodexCliActiveSelection(
 							});
 							next.codexMultiAuthSyncVersion = syncVersion;
 
-							await atomicWriteJson(accountsPath, next);
+							await atomicWriteJson(accountsPath, next, authorityCurrent);
 							lastCodexCliSelectionWriteAt = Math.max(lastCodexCliSelectionWriteAt, syncVersion);
 							wroteAccounts = true;
 							log.debug("Persisted Codex CLI accounts selection", {
@@ -675,7 +720,7 @@ export async function setCodexCliActiveSelection(
 			}
 
 			if (hasAuthPath || wroteAccounts || selectionHasTokens) {
-				wroteAuth = await writeCodexAuthState(authPath, resolvedSelection);
+				wroteAuth = await writeCodexAuthState(authPath, resolvedSelection, authorityCurrent);
 				if (!wroteAuth) {
 					log.warn("Codex auth state update skipped after accounts selection update", {
 						operation: "write-active-selection",
@@ -704,7 +749,7 @@ export async function setCodexCliActiveSelection(
 			}
 
 			try {
-				wroteConfig = await ensureCodexCliFileAuthStore(configPath);
+				wroteConfig = await ensureCodexCliFileAuthStore(configPath, authorityCurrent);
 			} catch (error) {
 				log.warn("Failed to persist Codex config file auth store", {
 					operation: "write-active-selection",
@@ -714,6 +759,7 @@ export async function setCodexCliActiveSelection(
 				});
 			}
 
+			assertSelectionAuthority(authorityCurrent);
 			if (wroteAccounts || wroteAuth) {
 				clearCodexCliStateCache();
 				incrementCodexCliMetric("writeSuccesses");
@@ -751,7 +797,27 @@ export async function setCodexCliActiveSelection(
             code: (error as NodeJS.ErrnoException)?.code ?? "unknown",
         });
         return false;
-    }));
+    });
+	if (!source) return enqueueActiveSelectionWrite(write);
+	const publish = () => withFileTransactionLock(storagePath, async () => {
+		try {
+			assertSelectionAuthority(authorityCurrent);
+			const transaction = getTransactionSnapshotState();
+			const storage = transaction?.active && transaction.storagePath === storagePath ? transaction.snapshot : await runWithStoragePathState({...getStoragePathState(), currentStoragePath: storagePath}, loadAccounts);
+			const effective = await applyPendingAuth(storagePath, storage ? structuredClone(storage) : null);
+			assertSelectionAuthority(authorityCurrent);
+			const selected = effective?.accounts[effective.activeIndexByFamily?.codex ?? effective.activeIndex];
+			const owner = source.account;
+			const submitted = "index" in owner ? {...owner, accessToken: owner.access, expiresAt: owner.expires} : owner;
+			if (!selected || selected.enabled === false || selected.authInvalidatedAt ||
+				resolveAccountRecordId(selected) !== resolveAccountRecordId(submitted) ||
+				(["accessToken", "refreshToken", "expiresAt", "accountId", "currentWorkspaceIndex"] as const).some(field => selected[field] !== submitted[field]) ||
+				JSON.stringify(selected.workspaces) !== JSON.stringify(submitted.workspaces) ||
+				selection.accessToken !== submitted.accessToken || selection.refreshToken !== submitted.refreshToken || selection.expiresAt !== submitted.expiresAt) return false;
+			return enqueueActiveSelectionWrite(write);
+		} catch { return false; }
+	});
+	return (isStorageLockHeld() ? publish() : withStorageLock(publish)).catch(() => false);
 }
 
 export function getLastCodexCliSelectionWriteTimestamp(): number {

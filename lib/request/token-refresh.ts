@@ -95,7 +95,11 @@ export async function refreshAndUpdateToken(
 	const storagePath = source?.accountManager.resolveSelectionStoragePath() ?? getStoragePath();
 	const sourceCurrent = () => !source || source.accountManager.getAccountByIndex(source.account.index) === source.account &&
 		source.accountManager.resolveSelectionStoragePath() === storagePath;
-	const authCurrent = currentAuth.type === "oauth" ? captureRefreshCredentialAuthority(currentAuth, sourceCurrent, undefined, storagePath) : () => true;
+	const submittedAuth = currentAuth.type === "oauth" ? {access: currentAuth.access, refresh: currentAuth.refresh, expires: currentAuth.expires} : null;
+	const authCurrent = source && submittedAuth
+		? (result?: Extract<TokenResult, {type: "success"}>) => sourceCurrent() && currentAuth.type === "oauth" &&
+			([submittedAuth, result].some(expected => expected && currentAuth.access === expected.access && currentAuth.refresh === expected.refresh && currentAuth.expires === expected.expires))
+		: currentAuth.type === "oauth" ? captureRefreshCredentialAuthority(currentAuth, sourceCurrent, undefined, storagePath) : () => true;
 	const accountCurrent = source ? captureRefreshCredentialAuthority(source.account, sourceCurrent, undefined, storagePath) : () => true;
 	const publish = async () => {
 		const result = await queuedRefresh(refreshToken, storagePath);
@@ -120,9 +124,19 @@ export async function refreshAndUpdateToken(
 	const retainAuth = () => currentAuth.type === "oauth"
 		? withRefreshCredentialRetention(currentAuth, publish, sourceCurrent, undefined, storagePath)
 		: publish();
-	const refreshResult = source
-		? await withRefreshCredentialRetention(source.account, retainAuth, sourceCurrent, undefined, storagePath)
-		: await retainAuth();
+	let refreshResult: Extract<TokenResult, {type: "success"}>;
+	try {
+		refreshResult = source
+			? await withRefreshCredentialRetention(source.account, publish, sourceCurrent, undefined, storagePath)
+			: await retainAuth();
+	} catch (error) {
+		if (source && currentAuth.type === "oauth" && error instanceof PendingAuthSettlementError) {
+			let retain = false;
+			try { retain = authCurrent(error.result) && accountCurrent(error.result); } catch { retain = false; }
+			if (retain) Object.assign(currentAuth, {access: error.result.access, refresh: error.result.refresh, expires: error.result.expires});
+		}
+		throw error;
+	}
 
 	// Update current auth reference if it's OAuth type
 	if (currentAuth.type === "oauth") {
