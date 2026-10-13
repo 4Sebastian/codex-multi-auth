@@ -8585,7 +8585,7 @@ it("returns a warm picker cache immediately while expired workspace data refresh
  try{
   const r=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:`Bearer ${DEFAULT_CLIENT_API_KEY}`},signal:AbortSignal.timeout(10000)});
   expect((await r.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["old-model"]);
-  expect(reads).toBe(4);
+  await vi.waitFor(() => expect(reads).toBe(4));
  }finally{release();}
 });
 
