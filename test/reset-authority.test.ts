@@ -3,11 +3,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PreemptiveQuotaScheduler } from '../lib/preemptive-quota-scheduler.js';
+import { loadQuotaCache,saveQuotaCache,type QuotaCacheEntry } from '../lib/quota-cache.js';
 import { AccountManager } from '../lib/accounts.js';
 import { getStoragePath, setStoragePath, withAccountStorageTransaction, type AccountStorageV3 } from '../lib/storage.js';
 import { getPendingAuthPath } from '../lib/storage/pending-auth.js';
 import { createResetCreditService, resetTargetForStoredAccount } from '../lib/runtime/account-reset-credits.js';
 import { applyConfirmedReset, recoverResetQuota } from '../lib/runtime/reset-credit-routing.js';
+import {resetSnapshotQuota} from '../lib/runtime/reset-credits.js';
 import { resetCredentialOwner } from '../lib/runtime/reset-credits.js';
 import { workspaceModelScopes } from '../lib/runtime/workspace-model-scopes.js';
 import * as native from '../lib/runtime/native-rate-limits.js';
@@ -66,6 +69,88 @@ function operations():{method:string;params:{idempotencyKey?:string}}[]{
  try{return readFileSync(join(dir,'operations.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));}catch{return [];}
 }
 async function cleanBackend(){await vi.waitFor(async()=>expect((await readdir(dir)).filter(name=>name.startsWith('reset-rpc-'))).toEqual([]),{timeout:10000,interval:10});}
+it.each(['apply','recover'].flatMap(path=>['newer','equal','rollback'].map(clock=>({path,clock}))))('preserves received quota and its unsettled worker across reset waits (%j)',async({path,clock})=>{
+ const f=fixture(),scope=workspaceModelScopes(f.account)[0]!,now=Date.now(),key=JSON.stringify([scope.id,'gpt-5']);
+ const baseline:QuotaCacheEntry={updatedAt:now-100,status:200,model:'gpt-5',primary:{usedPercent:100,resetAtMs:now+60000},secondary:{usedPercent:70},planType:'pro'};
+ const observations=new Map([[key,baseline]]),scheduler=new PreemptiveQuotaScheduler();
+ const quotaForReset=(_account:unknown,_scope:unknown,reset:QuotaCacheEntry)=>Object.assign(scheduler.getResetSnapshot(scope.id,'original-owner',reset,observations.get(key)),{model:'gpt-5'});
+ const snapshot={updatedAt:now-10,accountId:scope.accountId,ordinaryUsageAllowed:true,credits:1,primary:{usedPercent:0},secondary:{usedPercent:0},planType:'pro',credentialOwner:resetCredentialOwner(f.account,scope.accountId)};
+ f.account.rateLimitResetTimes={codex:now+60000};f.account.lastRateLimitReason='quota';
+ let release!:()=>void,entered!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+ const held=withAccountStorageTransaction(async()=>{entered();await gate;});await ready;
+ const pending=path==='apply'?applyConfirmedReset({account:f.account,scope,model:'gpt-5',family:'codex',manager:f.manager,snapshot,lastRedemptionAt:now,observations,quotaForReset,now}):recoverResetQuota({model:'gpt-5',native:true,pinned:false,manager:f.manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>baseline,quotaForReset,service:{automatic:async()=>null,status:async()=>({snapshots:{[scope.id]:snapshot}})},observations,now:()=>now});
+ const exhausted={updatedAt:clock==='equal'?now-10:clock==='rollback'?now-1000:now-1,status:200,primary:{usedPercent:100,resetAtMs:now+120000},secondary:{},planType:'team'};
+ const receipt=scheduler.receive(scope.id,exhausted,'original-owner',baseline);
+ const visible=scheduler.observeReceipt(scope.id,receipt,baseline)!;observations.set(key,Object.assign(visible,{model:'gpt-5'}));
+ const sibling=scheduler.receive('sibling-model',{...exhausted,secondary:{usedPercent:99}},'sibling-owner');scheduler.observeReceipt('sibling-model',sibling);
+ const worker=withAccountStorageTransaction(async()=>{
+  const merged=scheduler.observeReceipt(scope.id,receipt,observations.get(key));expect(merged).toBeDefined();
+  if(!merged)throw Error('Original received quota lost its epoch');
+  observations.set(key,Object.assign(merged,{model:'gpt-5'}));
+  await saveQuotaCache({byAccountId:{},byEmail:{},byWorkspace:{[scope.id]:observations.get(key)!}});
+  scheduler.settleReceipt(scope.id,receipt,true,merged);
+ });
+ try{release();await held;expect(await pending).toBe(false);await worker;
+  expect(observations.get(key)).toMatchObject({primary:{usedPercent:100,resetAtMs:now+120000},secondary:{usedPercent:70},planType:'team'});
+  expect(f.account.rateLimitResetTimes.codex).toBe(now+60000);
+  expect(scheduler.getDeferral(scope.id,now,'original-owner',observations.get(key)).defer).toBe(true);
+  expect(scheduler.getDeferral('sibling-model',now,'sibling-owner').defer).toBe(true);
+  expect((await loadQuotaCache()).byWorkspace?.[scope.id]?.primary.usedPercent).toBe(100);
+ }finally{release();await held;await pending;await worker;}
+});
+
+it('publishes a genuinely newer healthy reset without retiring independent received fields',async()=>{
+ const f=fixture(),scope=workspaceModelScopes(f.account)[0]!,scheduler=new PreemptiveQuotaScheduler(),now=Date.now();
+ const baseline={updatedAt:now,status:200,primary:{usedPercent:100,resetAtMs:now+60000},secondary:{usedPercent:80}};
+ const exhausted=scheduler.receive(scope.id,baseline,'owner');scheduler.observeReceipt(scope.id,exhausted);
+ const healthy=scheduler.receive(scope.id,{updatedAt:now-1000,status:200,primary:{usedPercent:0},secondary:{}},'owner',baseline);
+ const applied=scheduler.observeReceipt(scope.id,healthy,baseline)!;scheduler.settleReceipt(scope.id,healthy,true,applied);
+ expect(applied).toMatchObject({primary:{usedPercent:0},secondary:{usedPercent:80}});
+ expect(scheduler.getDeferral(scope.id,now,'owner',applied).defer).toBe(false);
+ const observations=new Map<string,QuotaCacheEntry>();
+ const snapshot={updatedAt:now,ordinaryUsageAllowed:true,accountId:scope.accountId,credits:0,primary:{usedPercent:0},secondary:{},credentialOwner:resetCredentialOwner(f.account,scope.accountId)};
+ expect(await applyConfirmedReset({account:f.account,scope,manager:f.manager,model:'gpt-5',family:'codex',snapshot,lastRedemptionAt:0,observations,quotaForReset:()=>Object.assign(applied,{model:'gpt-5'}),now})).toBe(true);
+ expect(observations.get(JSON.stringify([scope.id,'gpt-5']))?.secondary.usedPercent).toBe(80);
+});
+
+it('accepts a later healthy native read after exhausted received quota without reusing the old receipt',async()=>{
+ const f=fixture(),scope=workspaceModelScopes(f.account)[0]!,scheduler=new PreemptiveQuotaScheduler(),now=Date.now();await backend();
+ let current:QuotaCacheEntry={updatedAt:now,status:200,model:'gpt-5',primary:{usedPercent:100,resetAtMs:now+120000},secondary:{usedPercent:80},planType:'team'};
+ const old=scheduler.receive(scope.id,current,'owner',current);
+ current=Object.assign(scheduler.observeReceipt(scope.id,old,current)!,{model:'gpt-5'});scheduler.settleReceipt(scope.id,old,true,current);
+ const service=createResetCreditService(f.manager,(_target,snapshot)=>{
+  const receipt=scheduler.receive(scope.id,resetSnapshotQuota(snapshot),'owner',current);
+  return()=>{const merged=scheduler.observeReceipt(scope.id,receipt,current);if(!merged)throw Error('Owned reset receipt lost');current=Object.assign(merged,{model:'gpt-5'});scheduler.settleReceipt(scope.id,receipt,true,current);};
+ });
+ const snapshots=await service.refresh([f.target]);
+ const observations=new Map<string,QuotaCacheEntry>();
+ f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:now+120000};
+ expect(await recoverResetQuota({manager:f.manager,model:'gpt-5',family:'codex',native:true,pinned:false,scopes:new Map([[f.account.index,[scope]]]),quotaForScope:()=>({...old.snapshot,model:'gpt-5'}),service:{automatic:async()=>null,status:async()=>({snapshots})},observations,quotaForReset:(_account,_scope,reset)=>Object.assign(scheduler.getResetSnapshot(scope.id,'owner',reset,current),{model:'gpt-5'}),now:Date.now})).toBe(true);
+ expect(current).toMatchObject({primary:{usedPercent:0},secondary:{usedPercent:0}});
+ expect(scheduler.getDeferral(scope.id,Date.now(),'owner',current).defer).toBe(false);
+ expect(scheduler.observeReceipt(scope.id,old,current)).toBeUndefined();
+ expect(f.account.rateLimitResetTimes).toEqual({});expect(operations()).toHaveLength(1);await cleanBackend();
+});
+
+it('keeps newer primary ingress while a real healthy native reset publishes independent fields',async()=>{
+ const f=fixture(),scope=workspaceModelScopes(f.account)[0]!,scheduler=new PreemptiveQuotaScheduler(),now=Date.now();await backend();
+ let current:QuotaCacheEntry={updatedAt:now-100,status:200,model:'gpt-5',primary:{usedPercent:100,resetAtMs:now+60000},secondary:{usedPercent:80},planType:'team'};
+ const initial=scheduler.receive(scope.id,current,'owner',current);current=Object.assign(scheduler.observeReceipt(scope.id,initial,current)!,{model:'gpt-5'});scheduler.settleReceipt(scope.id,initial,true,current);
+ let release!:()=>void,entered!:()=>void,received!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;}),receiptReady=new Promise<void>(r=>{received=r;});
+ const service=createResetCreditService(f.manager,(_target,snapshot)=>{
+  const receipt=scheduler.receive(scope.id,resetSnapshotQuota(snapshot),'owner',current);received();
+  return()=>{const merged=scheduler.observeReceipt(scope.id,receipt,current);if(merged)current=Object.assign(merged,{model:'gpt-5'});scheduler.settleReceipt(scope.id,receipt,true,current);};
+ });
+ const held=withFileTransactionLock(service.path,async()=>{entered();await gate;});await ready;
+ const pending=service.refresh([f.target]);await receiptReady;
+ const newest=scheduler.receive(scope.id,{updatedAt:now-1000,status:200,primary:{usedPercent:100,resetAtMs:now+120000},secondary:{},planType:'business'},'owner',current);current=Object.assign(scheduler.observeReceipt(scope.id,newest,current)!,{model:'gpt-5'});
+ try{release();await held;await pending;
+  expect(current).toMatchObject({primary:{usedPercent:100,resetAtMs:now+120000},secondary:{usedPercent:0},planType:'business'});
+  expect(scheduler.observeReceipt(scope.id,newest,current)).toBeDefined();scheduler.settleReceipt(scope.id,newest,true,current);
+  expect(scheduler.getDeferral(scope.id,Date.now(),'owner',current).defer).toBe(true);
+ }finally{release();await held;await pending;await cleanBackend();}
+});
+
 const mutations=['workspace-disabled','workspace-removed','workspace-selection','account-disabled','access','refresh','expiry','code-only','nonpositive-revocation','record','removed','primary-missing','reset','journal','member','path','unknown-root'] as const;
 async function mutate(f:ReturnType<typeof fixture>,mutation:typeof mutations[number]){
  const row=f.storage.accounts[0]!;
@@ -143,7 +228,7 @@ it('does not apply a persisted A snapshot to replacement B',async()=>{
  const scope=workspaceModelScopes(f.account)[0]!;await mutate(f,'access');
  f.account.lastRateLimitReason='quota';const until=Date.now()+90000;f.account.rateLimitResetTimes={codex:until};
  const observations=new Map();const clear=vi.fn();
- expect(await applyConfirmedReset({account:f.account,scope,model:'gpt-5',family:'codex',manager:f.manager,snapshot:snapshots[f.target.key],lastRedemptionAt:0,previous:null,observations,clearQuotaScheduler:clear,now:Date.now()})).toBe(false);
+ expect(await applyConfirmedReset({account:f.account,scope,model:'gpt-5',family:'codex',manager:f.manager,snapshot:snapshots[f.target.key],lastRedemptionAt:0,observations,quotaForReset:(_account,_scope,reset)=>reset,now:Date.now()})).toBe(false);
  expect(observations.size).toBe(0);expect(f.account.rateLimitResetTimes.codex).toBe(until);expect(clear).not.toHaveBeenCalled();
 });
 it('retains B restrictions when automatic recovery waits for local status',async()=>{
@@ -153,7 +238,7 @@ it('retains B restrictions when automatic recovery waits for local status',async
  const service={automatic:async()=>null,status:async()=>{entered();await gate;return f.service.status();}};
  const until=Date.now()+90000;f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:until};
  const observations=new Map();const clear=vi.fn();
- const pending=recoverResetQuota({model:'gpt-5',native:true,pinned:false,manager:f.manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:0,status:200,model:'gpt-5',primary:{usedPercent:100},secondary:{}}),service,observations,clearQuotaScheduler:clear,now:Date.now});
+ const pending=recoverResetQuota({model:'gpt-5',native:true,pinned:false,manager:f.manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:0,status:200,model:'gpt-5',primary:{usedPercent:100},secondary:{}}),service,observations,quotaForReset:(_account,_scope,reset)=>reset,now:Date.now});
  await readyStatus;await mutate(f,'access');release();
  expect(await pending).toBe(false);expect(observations.size).toBe(0);expect(f.account.rateLimitResetTimes.codex).toBe(until);expect(clear).not.toHaveBeenCalled();
 });
@@ -164,7 +249,7 @@ it('revalidates a manual reset application after its pool transaction wait',asyn
  const holder=withAccountStorageTransaction(async()=>{entered();await gate;});await locked;
  const until=Date.now()+90000;f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:until};
  const observations=new Map();const clear=vi.fn();
- const pending=applyConfirmedReset({account:f.account,scope,model:'gpt-5',family:'codex',manager:f.manager,snapshot:snapshots[f.target.key],lastRedemptionAt:0,previous:null,observations,clearQuotaScheduler:clear,now:Date.now()});
+ const pending=applyConfirmedReset({account:f.account,scope,model:'gpt-5',family:'codex',manager:f.manager,snapshot:snapshots[f.target.key],lastRedemptionAt:0,observations,quotaForReset:(_account,_scope,reset)=>reset,now:Date.now()});
  await mutate(f,'expiry');release();await holder;
  expect(await pending).toBe(false);expect(observations.size).toBe(0);expect(f.account.rateLimitResetTimes.codex).toBe(until);expect(clear).not.toHaveBeenCalled();
 });

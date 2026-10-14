@@ -10,7 +10,7 @@
 
 import { createHash } from "node:crypto";
 import { refreshAccessToken } from "./auth/auth.js";
-import type { TokenResult } from "./types.js";
+import type { TokenResult, TokenSuccess } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
@@ -263,6 +263,16 @@ export class RefreshQueue {
     this.pending.set(key, {stage: "unsettled", error, token: priorRefreshToken, promise,
       startedAt: Date.now(), acquireEvictionAgeMs: this.maxEntryAgeMs, generation: ++RefreshQueue.nextGeneration});
     this.tokenRotationMap.set(key, `${storagePath}\0${error.result.refresh}`);
+  }
+
+  /** Carry the existing unsettled result's original source proof, never recapture it. */
+  captureSettlementAuthority(storagePath: string, credential: {access: string | undefined; refresh: string; expires: number | undefined}): ((result?: TokenSuccess) => boolean) | undefined {
+    const key = `${storagePath}\0${credential.refresh}`;
+    const entry = this.pending.get(this.findOriginalToken(key) ?? key);
+    if (entry?.stage !== "unsettled" || entry.error.result.access !== credential.access ||
+      entry.error.result.refresh !== credential.refresh || entry.error.result.expires !== credential.expires) return undefined;
+    const original = entry.error;
+    return result => (!result || result.access === credential.access && result.refresh === credential.refresh && result.expires === credential.expires) && original.authorityCurrent();
   }
 
   /** No entry means no retry and, importantly, no OAuth request. */

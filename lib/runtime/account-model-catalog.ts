@@ -7,6 +7,11 @@ export class CatalogRetryError extends Error {
  constructor(readonly retryAfterMs: number) { super("Catalog temporarily rate limited"); }
 }
 
+export const CATALOG_AUTHORITY = Symbol('catalog-authority');
+export function withCatalogAuthority(value:unknown,current:()=>boolean){
+ if(!isRecord(value))throw Error('Invalid account model catalog');
+ return {...value,[CATALOG_AUTHORITY]:current};
+}
 export type CatalogModel = Record<string, unknown> & { slug: string };
 
 /** Upper bound for a catalog 429 backoff, whatever Retry-After the upstream sends. */
@@ -25,7 +30,7 @@ export function clampCatalogRetryMs(retryAfterMs: number | null | undefined): nu
 export class AccountModelCatalog {
 	private readonly cache = new Map<
 		string,
-		{ expires: number; checkedAt: number; error: boolean; models: CatalogModel[] | null; lastGood: CatalogModel[] | null }
+		{ expires: number; checkedAt: number; error: boolean; models: CatalogModel[] | null; lastGood: CatalogModel[] | null; authority?:()=>boolean }
 	>();
 	private readonly updated = new Set<() => void>();
 	private readonly pending = new Map<string, Promise<CatalogModel[] | null>>();
@@ -36,11 +41,12 @@ export class AccountModelCatalog {
 	) {}
 	private async read(key: string): Promise<CatalogModel[] | null> {
 		const cached = this.cache.get(key);
-		if (cached && cached.expires > this.now()) return cached.models;
+		if (cached && cached.expires > this.now()) return cached.authority && !cached.authority()?null:cached.models;
 		const existing = this.pending.get(key);
 		if (existing) return existing;
 		const task = (async () => {
 			let models: CatalogModel[] | null = null;
+			let authority:(()=>boolean)|undefined;
             let retryMs = Math.min(this.ttlMs, 5000);
 			try {
 				const value = await this.fetchCatalog(key);
@@ -59,6 +65,7 @@ export class AccountModelCatalog {
 					throw new Error("Invalid account model catalog");
 				}
 				models = value.models as CatalogModel[];
+				if(CATALOG_AUTHORITY in value){const proof=value[CATALOG_AUTHORITY];if(typeof proof==='function')authority=()=>{try{return proof()===true;}catch{return false;}};}
 			} catch (error) {
                 if (error instanceof CatalogRetryError) retryMs = clampCatalogRetryMs(error.retryAfterMs);
 				/* Unknown; list() advertises nothing from it and supports() fails open. */
@@ -68,6 +75,7 @@ export class AccountModelCatalog {
 				this.cache.delete(this.cache.keys().next().value ?? "");
 			this.cache.set(key, {
 				lastGood: models ?? previous?.lastGood ?? null,
+				authority: authority ?? previous?.authority,
                 checkedAt: this.now(), error: models === null,
 				expires:
 					this.now() +
@@ -88,7 +96,7 @@ export class AccountModelCatalog {
 	cachedList(accountKeys: string[]): CatalogModel[] {
 		return buildVisibleModelUnion(accountKeys.map((key, index) => {
 			const entry = this.cache.get(key);
-			const usable = entry && !entry.error && entry.checkedAt <= this.now() && this.now() - entry.checkedAt < 15 * 60_000;
+			const usable = entry && (!entry.authority || entry.authority()) && !entry.error && entry.checkedAt <= this.now() && this.now() - entry.checkedAt < 15 * 60_000;
 			return {id: key, kind: "oauth" as const, priority: index, enabled: true, models: usable ? entry.models ?? [] : [], visibleModels: null};
 		}));
 	}
@@ -97,7 +105,7 @@ export class AccountModelCatalog {
 	refresh(): void { for (const entry of this.cache.values()) entry.expires = Number.NEGATIVE_INFINITY; }
 	supportsCached(key: string, model: string, effort?: string, tier?: string): boolean {
 		const cached = this.cache.get(key);
-		return Boolean(cached && !cached.error && cached.expires > this.now() && cached.models?.some(entry => entry.slug === model && supportsModelSettings(entry, effort, tier)));
+		return Boolean(cached && (!cached.authority || cached.authority()) && !cached.error && cached.expires > this.now() && cached.models?.some(entry => entry.slug === model && supportsModelSettings(entry, effort, tier)));
 	}
 	/**
 	 * Routing view: the last successful catalog decides, whatever its age. A workspace
@@ -105,7 +113,8 @@ export class AccountModelCatalog {
 	 * unknown and stays routable; only a fetched catalog can exclude a model.
 	 */
 	supportsForRouting(key: string, model: string, effort?: string, tier?: string): boolean {
-		const known = this.cache.get(key)?.lastGood;
+		const entry=this.cache.get(key);
+		const known = entry?.authority && !entry.authority()?null:entry?.lastGood;
 		return !known || known.some(entry => entry.slug === model && supportsModelSettings(entry, effort, tier));
 	}
 	/** Refresh in the background; one fresh eligible route is enough to dispatch early.
@@ -143,10 +152,12 @@ export class AccountModelCatalog {
 	/** True unless a successfully fetched catalog omits the model. */
 	async supports(accountKey: string, model: string, effort?: string, tier?: string): Promise<boolean> {
 		const models = await this.read(accountKey);
+		const current=this.cache.get(accountKey)?.authority;
+		if(current&&!current())return true;
 		return models === null ? true : models.some((entry) => entry.slug === model && supportsCatalogSettings(entry, effort, tier));
 	}
 	snapshot(key: string) {
 		const entry=this.cache.get(key);
-		return {checkedAt:entry?.checkedAt??0,models:entry?.models?.map(m=>m.slug)??[],entitlements:entry?.models?.map(modelEntitlements)??[],error:entry?.error ?? true};
+		return {[CATALOG_AUTHORITY]:entry?.authority,checkedAt:entry?.checkedAt??0,models:entry?.models?.map(m=>m.slug)??[],entitlements:entry?.models?.map(modelEntitlements)??[],error:entry?.error ?? true};
 	}
 }

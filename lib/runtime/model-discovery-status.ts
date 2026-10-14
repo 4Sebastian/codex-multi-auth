@@ -5,11 +5,14 @@ import { mapWithConcurrency } from "../concurrency.js";
 import { ApiModelCapabilities } from "./api-model-capabilities.js";
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, writeFileSync, renameSync } from "node:fs";
+import { captureRefreshCredentialAuthority } from '../storage/pending-auth.js';
+import { getRefreshQueue } from '../refresh-queue.js';
 import { join, dirname } from "node:path";
 import { z } from "zod";
 import { modelScopeId, workspaceModelScopes } from "./workspace-model-scopes.js";
-import { AccountManager } from "../accounts.js";
+import { AccountManager,type ManagedAccount } from "../accounts.js";
+import type { TokenSuccess } from '../types.js';
 import { type AccountStorageV3, loadAccounts, getStoragePath } from "../storage.js";
 import {captureAuthorityRevision} from "../storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
@@ -20,7 +23,7 @@ import {
 	updateApiModelDiscovery,
 } from "../api-route-store.js";
 import { ApiModelRuntime, boundedJson } from "./api-model-runtime.js";
-import { AccountModelCatalog } from "./account-model-catalog.js";
+import { AccountModelCatalog, CATALOG_AUTHORITY, withCatalogAuthority } from "./account-model-catalog.js";
 import { resolveCatalogClientVersion } from "./catalog-client-version.js";
 import { ensureFreshAccessToken } from "./rotation-token-refresh.js";
 import { createCodexHeaders } from "../request/headers.js";
@@ -62,7 +65,25 @@ const schema = z.object({
 		.optional(),
 	entries: z.array(entrySchema).max(3000),
 });
-export type ModelInventory = z.infer<typeof schema>;
+export type ModelInventory = Omit<z.infer<typeof schema>,'entries'> & {entries:(z.infer<typeof entrySchema> & {[CATALOG_AUTHORITY]?:()=>boolean})[]};
+export function captureCatalogAuthority(manager:AccountManager,account:ManagedAccount){
+ const path=manager.resolveSelectionStoragePath();let owned:TokenSuccess|undefined;
+ const retained={access:account.access,refresh:account.refreshToken,expires:account.expires};
+ const sourceCurrent=getRefreshQueue().captureSettlementAuthority(path,retained);
+ const membership=()=>manager.resolveSelectionStoragePath()===path&&getStoragePath()===path&&manager.getAccountByIndex(account.index)===account;
+ const current=sourceCurrent
+  ?(result?:TokenSuccess)=>membership()&&account.access===retained.access&&account.refreshToken===retained.refresh&&account.expires===retained.expires&&sourceCurrent(result)
+  :captureRefreshCredentialAuthority(account,membership);
+ return(result?:TokenSuccess)=>{const valid=current(result??owned);if(valid&&result)owned=result;return valid;};
+}
+export function revalidateModelInventory(value:ModelInventory):ModelInventory {
+ value.entries=value.entries.map(entry=>{
+  if(entry.kind!=='oauth')return entry;
+  let current=false;try{current=entry[CATALOG_AUTHORITY]?.()===true;}catch{}
+  return current?entry:{...entry,enabled:false,routable:false,visibleModels:[],error:true,bound:false,selected:false};
+ });
+ return value;
+}
 const probeCacheSchema = z.object({
 	version: z.literal(1),
 	ownerLosses: z.array(z.tuple([z.string().regex(/^[0-9a-f]{64}$/), z.number().finite().nonnegative()])).max(1000).optional(),
@@ -122,7 +143,11 @@ export async function discoverModelInventory(
 		},
 	);
 	const entries: ModelInventory["entries"] = [];
-	const scopes = manager.getAccountsSnapshot().flatMap(workspaceModelScopes);
+	const scopes = manager.getAccountsSnapshot().flatMap(workspaceModelScopes).map(scope=>{
+  const account=manager.getAccountByIndex(scope.accountIndex);let original:ReturnType<typeof captureCatalogAuthority>|undefined;
+  try{if(account)original=captureCatalogAuthority(manager,account);}catch{}
+  return {...scope,original};
+ });
 	const clientVersion = scopes.some(scope => scope.enabled)
 		? await resolveCatalogClientVersion(options.clientVersion)
 		: options.clientVersion;
@@ -130,6 +155,7 @@ export async function discoverModelInventory(
   const scope = scopes.find(item=>item.id===key);
 		const account = scope?.enabled ? manager.getAccountByIndex(scope.accountIndex) : null;
 		if (!account || account.enabled === false || manager.getManagedAccountRuntimeSkipReason(account, "codex", null)) throw Error("Account unavailable");
+		const sourceCurrent=scope?.original;if(!sourceCurrent)throw Error('Catalog authority unavailable');
 		const fresh = await ensureFreshAccessToken({
 			accountManager: manager,
 			account,
@@ -138,6 +164,7 @@ export async function discoverModelInventory(
 			now: now(),
 			tokenRefreshSkewMs: 60000,
 			tokenInvalidationCooldownMs: 30000,
+			authorityCurrent:sourceCurrent,
 		});
 		if (!fresh.ok) throw Error("Authentication unavailable");
 		const id = scope?.accountId;
@@ -147,6 +174,7 @@ export async function discoverModelInventory(
 		const path = manager.resolveSelectionStoragePath();
 		const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(path)]);
 		const binding = {recordId: account.recordId, accessToken: fresh.accessToken, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: id};
+		const publicationCurrent=()=>sourceCurrent()&&resetCurrent()&&(binding.expiresAt??0)>now()&&account.access===binding.accessToken&&account.refreshToken===binding.refreshToken&&account.expires===binding.expiresAt&&!manager.isAccountAuthInvalidated(account)&&workspaceModelScopes(account).some(scope=>scope.id===key&&scope.routable);
 		const authorize = async (): Promise<void> => {
 			const snapshot = await manager.readDispatchAccountStorage();
 			if (snapshot) {
@@ -175,7 +203,7 @@ export async function discoverModelInventory(
 		const value = await boundedJson(response);
 		try {await authorize();}
 		catch (error) {catalog.invalidate(key); throw error;}
-		return value;
+		return withCatalogAuthority(value,publicationCurrent);
 	}, now);
 	try {
   entries.push(...await mapWithConcurrency(scopes, 3, async scope=>{
@@ -254,12 +282,7 @@ export async function discoverModelInventory(
 			entitlements: s.entitlements,
 		})),
 	);
-	return {
-		version: 1,
-		checkedAt: now(),
-		clientVersion,
-		entries,
-	};
+	return revalidateModelInventory({version:1,checkedAt:now(),clientVersion,entries});
 }
 function inventoryPath(): string {
 	return join(getCodexMultiAuthDir(), "model-discovery.json");
@@ -271,9 +294,8 @@ export async function loadModelInventory(): Promise<ModelInventory | null> {
 			const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
 			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
 			if (bytesRead > 4 * 1024 * 1024) return null;
-			return schema.parse(
-				JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")),
-			);
+			// Loaded entries are historical observations, not dispatch authority.
+			return schema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
 		} finally {
 			await file.close();
 		}
@@ -288,28 +310,34 @@ export function saveModelInventory(value: ModelInventory): Promise<void> {
 		withFileTransactionLock(path, () => saveModelInventorySerial(value, path)),
 	);
 	inventoryWrites = pending.catch(() => undefined);
-	return pending;
+	return pending.then(()=>{revalidateModelInventory(value);});
 }
 async function saveModelInventorySerial(
 	value: ModelInventory,
 	path: string,
 ): Promise<void> {
-	const data = schema.parse(withInventoryChanges(value, await loadModelInventory()));
-	const serialized = JSON.stringify(data) + "\n";
-	if (Buffer.byteLength(serialized) > 4 * 1024 * 1024)
-		throw Error("Model discovery status exceeds size limit");
-	await writeFileAtomic(path, serialized);
+	const previous=await loadModelInventory();
+	await writeFileAtomic(path,()=>{
+	 const data=schema.parse(withInventoryChanges(revalidateModelInventory(value),previous));
+	 const serialized=JSON.stringify(data)+'\n';
+	 if(Buffer.byteLength(serialized)>4*1024*1024)throw Error('Model discovery status exceeds size limit');
+	 return serialized;
+	});
 }
-async function writeFileAtomic(path: string, serialized: string): Promise<void> {
+async function writeFileAtomic(path: string, serialized: string | (()=>string)): Promise<void> {
 	const temp = tempPathFor(path);
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const retry = { maxAttempts: 6, backoffMs: 25 };
 	try {
-		await fs.writeFile(temp, serialized, {
+		await fs.writeFile(temp, typeof serialized==='string'?serialized:serialized(), {
 			mode: 0o600,
 			flag: "wx",
 		});
-		await withRetry(() => fs.rename(temp, path), retry);
+		await withRetry(() => {
+		 if(typeof serialized==='string')return fs.rename(temp,path);
+		 writeFileSync(temp,serialized(),{mode:0o600});renameSync(temp,path);
+		 return Promise.resolve();
+		}, retry);
 	} finally {
 		await withRetry(() => fs.unlink(temp), retry).catch((e) => {
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
@@ -426,7 +454,7 @@ export async function refreshAndPrintModelInventory(
 		await saveModelInventory(value);
    return value;
   }, log);
-		for (const line of formatModelInventory(withInventoryChanges(value,previous))) log(line);
+		for (const line of formatModelInventory(withInventoryChanges(revalidateModelInventory(value),previous))) log(line);
   return true;
 	} catch {
 		log(

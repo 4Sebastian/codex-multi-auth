@@ -25,7 +25,7 @@ const terminal = new Set([
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
 type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string; requestSent?: boolean };
-export type DispatchAuthorization = (input: string | URL | Request, init: RequestInit) => Promise<void>;
+export type DispatchAuthorization = (input: string | URL | Request, init: RequestInit) => Promise<void | (() => void)>;
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -141,8 +141,9 @@ class SocketSession {
 		// handshake is refused, the turn (and the session) uses plain HTTP.
 		const apiCredential = !headers.has("chatgpt-account-id");
 		const dispatchHttp = async () => {
-			await authorize?.(input, init);
+			const onDispatch = await authorize?.(input, init);
 			if (context.signal.aborted || init.signal?.aborted || this.closed) throw new ClientCancellationError();
+			onDispatch?.();
 			context.requestSent = true;
 			try {
 				return await this.httpFetch(input, init);
@@ -287,8 +288,9 @@ class SocketSession {
 			this.channels.set(key, socket);
 		}
 		const active = socket;
+		let onDispatch: void | (() => void);
 		try {
-			await authorize?.(input, init);
+			onDispatch = await authorize?.(input, init);
 			if (context.signal.aborted || init.signal?.aborted || this.closed) throw new ClientCancellationError();
 		} catch (error) {
 			active.terminate();
@@ -402,6 +404,7 @@ class SocketSession {
 				abort();
 				return;
 			}
+			onDispatch?.();
 			this.stats.upstreamRequests++;
 			context.requestSent = true;
 			active.send(JSON.stringify(body), (error) => {
@@ -459,7 +462,9 @@ export class ResponsesWebSocketGateway {
 			new URL(String(input)).pathname.endsWith("/responses")
 		)
 			return context.session.fetch(input, init, context, authorize);
-		await authorize?.(input, init ?? {});
+		const onDispatch = await authorize?.(input, init ?? {});
+		if (init?.signal?.aborted) throw new ClientCancellationError();
+		onDispatch?.();
 		return this.upstreamFetch(input, init);
 	};
 	requestSent(): boolean {

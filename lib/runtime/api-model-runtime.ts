@@ -1,3 +1,6 @@
+import { isRuntimeProxyHttpError } from "./rotation-server-types.js";
+import { CodexValidationError } from '../errors.js';
+import { PendingAuthLocalError } from "../storage/pending-auth.js";
 import { ClientCancellationError } from "../request/client-cancellation.js";
 import { mapWithConcurrency } from "../concurrency.js";
 import {
@@ -411,7 +414,7 @@ export class ApiModelRuntime {
                     return Response.json({error:sanitized},{status:response.status});
                 }
 			} catch (error) {
-                if (error instanceof ClientCancellationError) throw error;
+                if (error instanceof ClientCancellationError || error instanceof CodexValidationError || error instanceof PendingAuthLocalError || isRuntimeProxyHttpError(error)) throw error;
 				if (signal?.aborted) throw new ClientCancellationError();
 				return this.failure(502, "upstream_transport_error", "Upstream request failed after dispatch; not replayed.");
 			} finally {

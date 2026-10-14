@@ -13,9 +13,10 @@ import { MAX_RATE_LIMIT_DELAY_MS } from '../constants.js';
 export interface ResetTarget { key: string; accountId: string }
 const windowSchema=z.object({usedPercent:z.number().min(0).max(100).optional(),resetsAt:z.number().nonnegative().nullish(),windowDurationMins:z.number().nonnegative().nullish()});
 const snapshotSchema=z.object({credentialOwner:z.string().optional(),updatedAt:z.number(),availableCount:z.number().int().nonnegative().nullable(),ordinaryUsageAllowed:z.boolean().nullable(),planType:z.string().nullable(),primary:windowSchema,secondary:windowSchema});
-export type ResetSnapshot=z.infer<typeof snapshotSchema>;
+const RESET_PUBLICATION=Symbol('reset-publication');
+export type ResetSnapshot=z.infer<typeof snapshotSchema> & {[RESET_PUBLICATION]?:()=>void};
 const stateSchema=z.object({version:z.literal(1),policy:z.enum(['manual','last-resort']).default('manual'),snapshots:z.record(z.string(),snapshotSchema).default({}),pending:z.object({key:z.string(),idempotencyKey:z.string().uuid(),credentialOwner:z.string().optional()}).optional(),lastAutomaticCheckAt:z.number().optional(),lastRedemptionAt:z.number().optional(),lastRedemption:z.object({key:z.string(),at:z.number(),outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed']),automatic:z.boolean()}).optional()});
-type State=z.infer<typeof stateSchema>;
+type State=Omit<z.infer<typeof stateSchema>,'snapshots'> & {snapshots:Record<string,ResetSnapshot>};
 const readSchema=z.object({accountId:z.string(),ordinaryUsageAllowed:z.boolean().nullish(),rateLimitResetCredits:z.object({availableCount:z.number().int().nonnegative()}).nullish(),rateLimits:z.object({planType:z.string().nullish(),primary:windowSchema.nullish(),secondary:windowSchema.nullish()})});
 const outcomeSchema=z.object({outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed'])});
 export type ResetOutcome=z.infer<typeof outcomeSchema>['outcome'];
@@ -37,7 +38,7 @@ export function resetCredentialOwner(account:Pick<ManagedAccount,'recordId'|'acc
  return modelScopeId('reset',account.recordId??'',workspaceId,account.access??'',account.refreshToken,String(account.expires));
 }
 export interface ResetCreditBinding {
- read:()=>Promise<unknown>;
+ read:()=>Promise<{value:unknown;publish?:()=>void}>;
  consume:(idempotencyKey:string)=>Promise<unknown>;
  authorize:(accept:()=>void)=>Promise<void>;
  credentialOwner?:string;
@@ -57,7 +58,7 @@ export class ResetCreditService {
  private now(){return this.io.now?.()??Date.now();}
  private bind(target:ResetTarget):ResetCreditBinding {
   const io=this.io;
-  return 'bind' in io?io.bind(target):{read:()=>io.read(target),consume:key=>io.consume(target,key),authorize:accept=>Promise.resolve().then(accept)};
+  return 'bind' in io?io.bind(target):{read:async()=>({value:await io.read(target)}),consume:key=>io.consume(target,key),authorize:accept=>Promise.resolve().then(accept)};
  }
  async status():Promise<State>{
   try { const stat=await fs.lstat(this.path);if(!stat.isFile()||stat.isSymbolicLink())throw Error('Invalid reset-credit state file');return stateSchema.parse(JSON.parse(await fs.readFile(this.path,'utf8'))); }
@@ -68,12 +69,15 @@ export class ResetCreditService {
   try {
    const file=await fs.open(path,'wx',0o600);
    try {await file.writeFile(JSON.stringify(stateSchema.parse(state))+'\n');await file.sync();} finally {await file.close();}
-   await withRetry(()=>'bind' in this.io?authorize(()=>renameSync(path,this.path)):fs.rename(path,this.path),{maxAttempts:6,backoffMs:25});
+   await withRetry(()=>'bind' in this.io?authorize(()=>{
+    renameSync(path,this.path);
+    for(const snapshot of Object.values(state.snapshots)){const publish=snapshot[RESET_PUBLICATION];delete snapshot[RESET_PUBLICATION];publish?.();}
+   }):fs.rename(path,this.path),{maxAttempts:6,backoffMs:25});
   }
   finally {await fs.rm(path,{force:true});}
  }
  async setPolicy(policy:State['policy']){await withFileTransactionLock(this.path,async()=>{const s=await this.status();s.policy=policy;await this.save(s);});}
- private async read(target:ResetTarget,binding:ResetCreditBinding){return {...parseResetSnapshot(await binding.read(),target.accountId,this.now()),...(binding.credentialOwner?{credentialOwner:binding.credentialOwner}:{})};}
+ private async read(target:ResetTarget,binding:ResetCreditBinding):Promise<ResetSnapshot>{const read=await binding.read();return {...parseResetSnapshot(read.value,target.accountId,this.now()),...(binding.credentialOwner?{credentialOwner:binding.credentialOwner}:{}),[RESET_PUBLICATION]:read.publish};}
  async refresh(targets:ResetTarget[]):Promise<Record<string,ResetSnapshot>>{
   const bindings=targets.map(target=>{try{return {target,binding:this.bind(target)}}catch{return null}});
   const results=await mapWithConcurrency(bindings,3,async item=>{try{return item&&{...item,snapshot:await this.read(item.target,item.binding)}}catch{return null}});

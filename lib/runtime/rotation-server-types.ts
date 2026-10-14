@@ -110,6 +110,24 @@ export type RuntimeProxyHttpError = Error & {
 	code: string;
 };
 
+export function createRuntimeProxyHttpError(
+	message: string,
+	statusCode: number,
+	code: string,
+): RuntimeProxyHttpError {
+	return Object.assign(new Error(message), { statusCode, code });
+}
+
+export function isRuntimeProxyHttpError(error: unknown): error is RuntimeProxyHttpError {
+	return (
+		error instanceof Error &&
+		"statusCode" in error &&
+		typeof error.statusCode === "number" &&
+		"code" in error &&
+		typeof error.code === "string"
+	);
+}
+
 export interface RuntimeRotationAccountIdentity {
 	index: number;
 	label: string;

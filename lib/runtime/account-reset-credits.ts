@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { AccountManager, extractAccountId, resolveAccountRecordId, sanitizeEmail } from '../accounts.js';
+import { AccountManager, type CurrentAccountCredential, extractAccountId, resolveAccountRecordId, sanitizeEmail } from '../accounts.js';
 import { loadAccounts, type AccountMetadataV3 } from '../storage.js';
 import { getCodexMultiAuthDir } from '../runtime-paths.js';
 import { ensureFreshAccessToken } from './rotation-token-refresh.js';
@@ -9,7 +9,7 @@ import { captureRefreshCredentialAuthority, PendingAuthAdmissionError } from '..
 import type { TokenSuccess } from '../types.js';
 import { codexCliAccountIdFor } from '../auth/token-utils.js';
 import { isRecord } from '../utils.js';
-import { ResetCreditService, resetCredentialOwner, type ResetTarget } from './reset-credits.js';
+import { ResetCreditService, resetCredentialOwner, parseResetSnapshot, type ResetSnapshot, type ResetTarget } from './reset-credits.js';
 import { withCheckProgress } from '../ui/check-progress.js';
 
 export function resetTargetForStoredAccount(account:AccountMetadataV3):ResetTarget|null{
@@ -28,7 +28,7 @@ export function isResetTargetEnabled(account:AccountMetadataV3,target:ResetTarge
  return !target.accountId.startsWith('org-')&&scopeKey===target.key&&Boolean(account.workspaces?.some(w=>w.id===target.accountId&&w.enabled!==false));
 }
 
-export function createResetCreditService(manager?:AccountManager):ResetCreditService {
+export function createResetCreditService(manager?:AccountManager,observe?:(target:ResetTarget,snapshot:ResetSnapshot,submitted:CurrentAccountCredential)=>()=>void):ResetCreditService {
  return new ResetCreditService(join(getCodexMultiAuthDir(),'reset-credits.json'),{bind:target=>{
   const matches=manager?.getAccountsSnapshot().filter(a=>isResetTargetEnabled({...a,accessToken:a.access},target));
   if(matches&&matches.length>1)throw Error('Reset account identity is ambiguous; repair duplicate records before checking or redeeming');
@@ -67,10 +67,11 @@ export function createResetCreditService(manager?:AccountManager):ResetCreditSer
    read:async()=>{
     const freshAuth=await auth();
     const sent=codexCliAccountIdFor(freshAuth,freshAuth.accessToken)??freshAuth.accountId;
-    const reply=await nativeRateLimitsRpc(freshAuth,'account/rateLimits/read',{excludeResetCreditDetails:true});
+    let publish:(()=>void)|undefined;
+    const reply=await nativeRateLimitsRpc({...freshAuth,onResponse:value=>{if(observe&&sourceCurrent(result))publish=observe(target,parseResetSnapshot(value,sent,Date.now()),{...submitted});}},'account/rateLimits/read',{excludeResetCreditDetails:true});
     await authorize(()=>{});
     if(!isRecord(reply)||reply.accountId!==sent)throw Error('Reset credit workspace identity mismatch');
-    return {...reply,accountId:target.accountId};
+    return {value:{...reply,accountId:target.accountId},publish};
    },
    consume:async idempotencyKey=>{
     const freshAuth=await auth();

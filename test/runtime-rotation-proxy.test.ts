@@ -150,6 +150,8 @@ async function startProxy(params: {
 	options?: Partial<Parameters<typeof startRuntimeRotationProxy>[0]>;
 }): Promise<RuntimeRotationProxyServer> {
 	openManagers.push(params.accountManager);
+	// A managed catalog now retains its physical pre-await source authority.
+	if (params.options?.nativeOpenai && !existsSync(getStoragePath())) writeAccountSourceFixture({version: 3, activeIndex: 0, accounts: params.accountManager.getAccountsSnapshot().map(account => ({...account, accessToken: account.access, expiresAt: account.expires}))});
 	const proxy = await startRuntimeRotationProxy({
 		accountManager: params.accountManager,
 		fetchImpl: params.fetchImpl,
@@ -441,7 +443,7 @@ beforeEach(async () => {
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockReset();
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(existsSync(getStoragePath()) ? await loadAccounts() : null, async () => undefined),
+		handler(existsSync(getStoragePath()) ? await loadAccounts() : null, async next => {writeAccountSourceFixture(next);}),
 	);
 });
 
@@ -6979,12 +6981,13 @@ describe("review transport boundary regressions", () => {
 		disk.accounts[1]!.enabled = false;
 		disk.accounts.reverse();
 		if (removed) disk.accounts.pop();
+		writeAccountSourceFixture(disk);
 		let release!: () => void, captured!: () => void;
 		const barrier = new Promise<void>(resolve => {release = resolve;});
 		const reading = new Promise<void>(resolve => {captured = resolve;});
 		const overlay = pendingAuth.applyPendingAuth;
 		const pending = vi.spyOn(pendingAuth, "applyPendingAuth").mockImplementation(async (path, storage) => {captured(); await barrier; return overlay(path, storage);});
-		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async next => {disk = structuredClone(next);}));
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async next => {disk = structuredClone(next);writeAccountSourceFixture(disk);}));
 		const {calls, fetchImpl} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "shared"}, ...(call.headers.get("chatgpt-account-id") === "acc_1" ? [{slug: "first-only"}] : [])]}) : textEventStream());
 		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk), readApiRoutes: async () => []}});
 		const responsePromise = postResponses(proxy, {model: "first-only", input: []}, "/responses", {authorization: `Bearer ${bearer}`});
@@ -7554,7 +7557,7 @@ describe("review transport boundary regressions", () => {
 			if (++reads === 1) {captured(); await barrier;}
 			return overlay(path, storage);
 		});
-		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async next => {disk = structuredClone(next);}));
+		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async next => {disk = structuredClone(next);writeAccountSourceFixture(disk);}));
 		const {calls, fetchImpl} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "shared"}, {slug: call.headers.get("chatgpt-account-id") === "acc_1" ? "first-only" : "second-only"}]}) : textEventStream());
 		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk)}});
 		let request: Promise<Response> | undefined;
@@ -7582,6 +7585,7 @@ describe("review transport boundary regressions", () => {
 			delete disk.accounts[0]!.coolingDownUntil;
 			delete disk.accounts[0]!.cooldownReason;
 			expect(disk.accounts[0]!.rateLimitResetTimes?.["codex:unrelated"]).toBeGreaterThan(Date.now());
+			writeAccountSourceFixture(disk);
 			const recovered = await fetch(`${proxy.baseUrl}/models?client_version=1.0.0&refresh_capabilities=1`, {headers: {authorization: `Bearer ${bearer ? "access-1" : DEFAULT_CLIENT_API_KEY}`}});
 			expect(recovered.status).toBe(200);
 			expect((await recovered.json()).models).toEqual(expect.arrayContaining([expect.objectContaining({slug: "first-only"})]));
@@ -7990,8 +7994,9 @@ describe("PR review regressions", () => {
   const started=new Promise<void>(resolve=>{refreshStarted=resolve;});
   const gate=new Promise<void>(resolve=>{release=resolve;});
   refreshAccessTokenMock.mockImplementation(async()=>{refreshStarted();await gate;return {type:'success',access:'renewed',refresh:'renewed-refresh',expires:now+3600_000};});
+  const manager=new AccountManager(undefined,storage);
+  storage.accounts[0]!.recordId=manager.getAccountByIndex(0)!.recordId;
   writeAccountSourceFixture(storage);
-const manager=new AccountManager(undefined,storage);
   const {fetchImpl,calls}=createRecordingFetch(call=>Response.json({models:[{slug:`model-${new URL(call.url).searchParams.get('client_version')}`}]}));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
   const refreshCalls=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken");
@@ -8000,6 +8005,7 @@ const manager=new AccountManager(undefined,storage);
   // Wait until the second request reaches token refresh, without timing a network delay.
   await vi.waitFor(()=>expect(refreshCalls).toHaveBeenCalledTimes(2));release();refreshCalls.mockRestore();
   const [a,b]=await Promise.all([first,second]);
+  expect(a.status,await a.clone().text()).toBe(200);expect(b.status,await b.clone().text()).toBe(200);
   expect((await a.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-1.0']);
   expect((await b.json()).models.map((m:{slug:string})=>m.slug)).toEqual(['model-2.0']);
   expect(calls.map(c=>new URL(c.url).searchParams.get('client_version')).sort()).toEqual(['1.0','2.0']);
@@ -8110,7 +8116,7 @@ describe("catalog review concurrency and backoff",()=>{
  it("still recovers stale state when another account lacks the model",async()=>{
   const storage=createStorage(Date.now(),2),manager=new AccountManager(undefined,storage);
   manager.markAccountCoolingDown(manager.getAccountByIndex(1)!,60000,'network-error');
-  const reload=vi.spyOn(AccountManager,'loadFromDisk').mockResolvedValue(new AccountManager(undefined,storage));
+  const reload=vi.spyOn(AccountManager,'loadFromDisk').mockImplementation(async()=>{writeAccountSourceFixture(storage);return new AccountManager(undefined,storage);});
   const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('authorization')==='Bearer access-1'?'other':'model-test'}]}):textEventStream());
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
   const catalog=await getModels(proxy);await catalog.text();
@@ -8650,8 +8656,10 @@ it("serves native picker models within its deadline while a slow workspace finis
   expect(response.status).toBe(200);
   expect((await response.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["specialized-fixture","zdr/api-fixture"]);
   release();
-  const full=await getModels(proxy,"/models?client_version=1.0.0");
-  expect((await full.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["specialized-fixture","late-model","zdr/api-fixture"]);
+  await vi.waitFor(async()=>{
+   const full=await getModels(proxy,"/models?client_version=1.0.0");
+   expect((await full.json()).models.map((m:{slug:string})=>m.slug)).toEqual(["specialized-fixture","late-model","zdr/api-fixture"]);
+  });
   expect([...reads].sort()).toEqual(["acc_1","acc_2"]);
  }finally{release();}
 });
@@ -9012,7 +9020,7 @@ describe('earned reset last-resort integration',()=>{
   const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation(async(auth,method)=>{
    if(method==='account/rateLimitResetCredit/consume'){consumptions++;return {outcome:'reset'};}
    const allowed=auth.accountId==='acc_2';
-   return {accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};
+   const reply={accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};auth.onResponse?.(reply);return reply;
   });
   const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-pin-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
   const service=createResetCreditService();await service.setPolicy('last-resort');
@@ -9034,7 +9042,7 @@ describe('earned reset last-resort integration',()=>{
   const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation(async(auth,method)=>{
    if(method==='account/rateLimitResetCredit/consume'){redeemed=true;consumptions++;return {outcome:'reset'};}
    const allowed=(otherUsable&&auth.accountId==='acc_2')||(redeemed&&auth.accountId==='acc_1');
-   return {accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:redeemed?0:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};
+   const reply={accountId:auth.accountId,ordinaryUsageAllowed:allowed,rateLimitResetCredits:{availableCount:redeemed?0:1},rateLimits:{planType:'pro',primary:{usedPercent:allowed?0:100,resetsAt:Math.floor(Date.now()/1000)+3600},secondary:{usedPercent:0}}};auth.onResponse?.(reply);return reply;
   });
   const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-integration-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
   const service=createResetCreditService();await service.setPolicy('last-resort');

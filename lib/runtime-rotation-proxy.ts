@@ -10,7 +10,7 @@ import { resetSnapshotQuota, resetCredentialOwner } from "./runtime/reset-credit
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
 import { recoverResetQuota, applyConfirmedReset } from "./runtime/reset-credit-routing.js";
 import { readSubscriptionQuotaEvent } from "./runtime/subscription-quota-event.js";
-import { loadQuotaCache } from "./quota-cache.js";
+import { loadQuotaCache,type QuotaCacheEntry } from "./quota-cache.js";
 import { findQuotaCacheEntryForAccount } from "./quota-readiness.js";
 import { subscriptionQuotaPreference, compareSubscriptionQuota, type SubscriptionQuotaPreference } from "./runtime/subscription-quota-order.js";
 import { inferenceAccountKey } from "./runtime/inference-activity.js";
@@ -19,7 +19,7 @@ import { RuntimeCapabilityFailures, classifyCapabilityFailure } from "./runtime/
 import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway, type DispatchAuthorization } from "./runtime/responses-websocket.js";
 import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
-import { saveModelInventory } from "./runtime/model-discovery-status.js";
+import { saveModelInventory, revalidateModelInventory, captureCatalogAuthority } from "./runtime/model-discovery-status.js";
 import { resolveCatalogClientVersion } from "./runtime/catalog-client-version.js";
 import { loadApiRoutes, updateApiModelDiscovery, getApiRoutesPath, type ApiRouteCredential } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
@@ -27,7 +27,7 @@ import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, isRouteM
 import { isSameNativeAccount, syncNativeAccountCredentials } from "./runtime/native-account-sync.js";
 import { resolveAccountRecordId } from "./storage/record-identity.js";
 import { isNativeClientToken } from "./runtime/native-client-auth.js";
-import { CatalogRetryError, AccountModelCatalog, clampCatalogRetryMs } from "./runtime/account-model-catalog.js";
+import { CatalogRetryError, AccountModelCatalog, clampCatalogRetryMs, withCatalogAuthority } from "./runtime/account-model-catalog.js";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
@@ -138,14 +138,15 @@ import {
 	recoverStaleRuntimeState,
 	type RotationProxyState,
 } from "./runtime/rotation-proxy-state.js";
-import type {
-	ExhaustionReason,
-	RequestContext,
-	RuntimeProxyHttpError,
-	RuntimeRotationAccountIdentity,
-	RuntimeRotationProxyOptions,
-	RuntimeRotationProxyServer,
-	RuntimeRotationProxyStatus,
+import {
+	createRuntimeProxyHttpError,
+	isRuntimeProxyHttpError,
+	type ExhaustionReason,
+	type RequestContext,
+	type RuntimeRotationAccountIdentity,
+	type RuntimeRotationProxyOptions,
+	type RuntimeRotationProxyServer,
+	type RuntimeRotationProxyStatus,
 } from "./runtime/rotation-server-types.js";
 import { readStorageMetaFromDisk } from "./runtime/rotation-storage-meta.js";
 import {
@@ -480,14 +481,18 @@ function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
  state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>capabilities.enrich(models,refresh,route,force):undefined,()=>{
   const runtime=state.apiModelRuntime;
   if(!runtime)return;
-  const models=[...(state.catalogOAuthModels??[]),...buildVisibleModelUnion(runtime.cachedCatalogs())];
-  setCatalogEtag(state,models);
+  const currentModels=()=>{
+   if(state.catalogInventory)revalidateModelInventory(state.catalogInventory);
+   const visible=new Set(state.catalogInventory?.entries.filter(entry=>entry.kind==='oauth'&&entry.routable).flatMap(entry=>entry.visibleModels));
+   return [...(state.catalogOAuthModels??[]).filter(model=>visible.has(model.slug)),...buildVisibleModelUnion(runtime.cachedCatalogs())];
+  };
+  setCatalogEtag(state,currentModels());
   if(state.catalogInventory){
    state.catalogInventory={...state.catalogInventory,checkedAt:state.now(),entries:[
     ...state.catalogInventory.entries.filter(entry=>entry.kind==="oauth"),
     ...runtime.statuses(state.catalogApiRoutes??[]).map(entry=>({id:modelScopeId(entry.kind,entry.id),label:entry.label,kind:entry.kind,enabled:runtime.cachedCatalogs().some(c=>c.id===entry.id&&c.enabled),checkedAt:entry.checkedAt,error:entry.error,models:entry.availableModels,visibleModels:entry.visibleModels,entitlements:entry.entitlements})),
    ]};
-   void saveModelInventory(state.catalogInventory).catch(()=>{state.status.lastError="Model discovery status could not be saved";});
+   void saveModelInventory(state.catalogInventory).then(()=>{setCatalogEtag(state,currentModels());}).catch(()=>{state.status.lastError="Model discovery status could not be saved";});
   }
  });
  return state.apiModelRuntime;
@@ -746,24 +751,6 @@ async function persistRuntimeActiveAccount(
 		// Runtime forwarding must not fail after a valid upstream response just
 		// because the local status mirrors are temporarily locked.
 	}
-}
-
-function createRuntimeProxyHttpError(
-	message: string,
-	statusCode: number,
-	code: string,
-): RuntimeProxyHttpError {
-	return Object.assign(new Error(message), { statusCode, code });
-}
-
-function isRuntimeProxyHttpError(error: unknown): error is RuntimeProxyHttpError {
-	return (
-		error instanceof Error &&
-		"statusCode" in error &&
-		typeof error.statusCode === "number" &&
-		"code" in error &&
-		typeof error.code === "string"
-	);
 }
 
 function isRecoverableWebSocketAccountError(error: unknown): boolean {
@@ -3496,7 +3483,7 @@ async function handleRequestInner(
 			res.on("close", abort);
 			try {
 				const apiRoutes = (await state.readApiRoutes?.()) ?? [];
-				const attempt: {credential?: ApiRouteCredential} = {};
+				const attempt: {credential?: ApiRouteCredential;onDispatch?:()=>void} = {};
 				const authorize: DispatchAuthorization = async (input, init) => {
 					if (init.method !== "POST" || !new URL(String(input)).pathname.endsWith("/responses")) return;
 					const policyCurrent = captureRuntimePolicyRevision();
@@ -3518,6 +3505,7 @@ async function handleRequestInner(
 						state.contextBudgetGuard.getAdvisory(context.stableSessionKey ?? "", state.now(), context.model).level === "hard") {
 						throw createRuntimeProxyHttpError("API dispatch eligibility changed.", 503, "routing_configuration_changed");
 					}
+					return attempt.onDispatch;
 				};
 				const upstream = await withDispatchAuthorization(state, authorize, () => apiRuntime.request(
 					apiModel,
@@ -3526,6 +3514,7 @@ async function handleRequestInner(
 					controller.signal,
 					(credentialIndex, credential) => {
 						attempt.credential = credential;
+						attempt.onDispatch = () => {
 						recordRuntimeInferenceRequest(`sha256:${modelScopeId(credential.kind, credential.id)}`, state.now());
 						const label = `${context.model?.startsWith("zdr/") ? "ZDR" : "API"} credential ${credentialIndex + 1}`;
 						state.status.upstreamRequests++;
@@ -3542,6 +3531,7 @@ async function handleRequestInner(
 							snapshot.lastAccountLabel = label;
 							snapshot.lastAccountUpdatedAt = state.now();
 						});
+						};
 					},
 				));
 				const responseOutcome = new ResponseOutcome(upstream.headers.get("content-type")?.includes("text/event-stream") === true);
@@ -3715,12 +3705,15 @@ async function handleRequestInner(
    const cached = findQuotaCacheEntryForAccount(subscriptionQuotaCache,account,accountManager.getAccountsSnapshot(),undefined,scope.accountId);
    const observed = state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id,context.model]));
    const reset=resetCreditState?.snapshots[scope.id];
-   if(reset && reset.credentialOwner===resetCredentialOwner(account,scope.accountId) && reset.updatedAt > Math.max(cached?.updatedAt??0,observed?.updatedAt??0) && reset.updatedAt <= state.now() && state.now()-reset.updatedAt<=60000)return resetSnapshotQuota(reset);
-   const baseline = observed && observed.updatedAt >= (cached?.updatedAt ?? 0) ? observed : cached;
-   const received = state.preemptiveQuotaScheduler.getSnapshot(buildQuotaScheduleKey(account, context.family, context.model),
-    quotaReceiptOwner(captureDispatchBinding(accountManager, account, account.access ?? "", scope.accountId)), baseline ?? null);
+   const baseline = observed ?? cached;
+   const key=buildQuotaScheduleKey(account,context.family,context.model),owner=quotaReceiptOwner(captureDispatchBinding(accountManager,account,account.access??'',scope.accountId));
+   const received=reset&&reset.credentialOwner===resetCredentialOwner(account,scope.accountId)&&reset.updatedAt<=state.now()&&state.now()-reset.updatedAt<=60000
+    ?state.preemptiveQuotaScheduler.getResetSnapshot(key,owner,resetSnapshotQuota(reset),baseline??null)
+    :state.preemptiveQuotaScheduler.getSnapshot(key,owner,baseline??null);
    return received ? Object.assign(received, {model: context.model ?? "unknown"}) : baseline;
   };
+  const quotaForReset=(account:ManagedAccount,scope:ReturnType<typeof workspaceModelScopes>[number],reset:QuotaCacheEntry):QuotaCacheEntry=>Object.assign(state.preemptiveQuotaScheduler.getResetSnapshot(
+   buildQuotaScheduleKey(account,context.family,context.model),quotaReceiptOwner(captureDispatchBinding(accountManager,account,account.access??'',scope.accountId)),reset,quotaForScope(account,scope)??null),{model:context.model??'unknown'});
   // A stored `switch` pin is a hard constraint in native mode too (#702), not a
   // preference: it fails with codex_pinned_account_unavailable rather than
   // silently serving from another account.
@@ -3749,7 +3742,8 @@ async function handleRequestInner(
     const account = scope ? discoveryManager.getAccountByIndex(scope.accountIndex) : null;
 				if (!account || account.enabled === false || discoveryManager.isAccountAuthInvalidated(account) ||
                     (account.cooldownReason === "auth-failure" && (account.coolingDownUntil ?? 0) > state.now())) throw new Error("Account unavailable");
-				const fresh = await ensureFreshAccessToken({					accountManager: discoveryManager, account,
+				const sourceCurrent=captureCatalogAuthority(discoveryManager,account);
+				const fresh = await ensureFreshAccessToken({					accountManager: discoveryManager, account,authorityCurrent:sourceCurrent,
 					family: "codex", model: null, now: state.now(), tokenRefreshSkewMs: state.tokenRefreshSkewMs,
 					tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs				});
 				if (!fresh.ok) throw new Error("Account authentication unavailable");
@@ -3761,6 +3755,7 @@ async function handleRequestInner(
 				const binding = captureDispatchBinding(discoveryManager, fresh.account, fresh.accessToken, accountId);
 				const sourcePath = discoveryManager.resolveSelectionStoragePath();
 				const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(sourcePath)]);
+				const publicationCurrent=()=>sourceCurrent()&&resetCurrent()&&isDispatchBindingCurrent(state,binding)&&(binding.expiresAt??0)>state.now()&&workspaceModelScopes(fresh.account).some(scope=>scope.id===key&&scope.routable);
 				const authorizeCatalog = async () => {
 					const rejection = await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
 					const current = !rejection && await discoveryManager.withCurrentAccountCredential(fresh.account, binding, () =>
@@ -3790,7 +3785,7 @@ async function handleRequestInner(
 				try {
 					await authorizeCatalog();
 				} catch (error) {modelCatalog.invalidate(key); throw error;}
-				return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+				return withCatalogAuthority(JSON.parse(Buffer.concat(chunks).toString("utf8")),publicationCurrent);
 			}, state.now);
 			const modelCatalog = state.modelCatalog;
 			if (catalogsByVersion.size >= 4 && !catalogsByVersion.has(versionKey)) catalogsByVersion.delete(catalogsByVersion.keys().next().value ?? "");
@@ -3851,12 +3846,6 @@ async function handleRequestInner(
 				const refresh = (async () => {
 				await oauthRefresh;
 				const apiCatalogs = await apiRefresh;
-				const oauthModels = modelCatalog.cachedList(routableKeys()).filter(model => !/^(api|zdr)\//.test(model.slug));
-				const models = [...oauthModels, ...buildVisibleModelUnion(apiCatalogs)];
-				if (state.modelCatalog === modelCatalog) {
-					state.catalogOAuthModels = oauthModels;
-					setCatalogEtag(state, models);
-				}
 
 				await saveModelInventory(state.catalogInventory = {
                     ...(apiConfigurationUnavailable ? {apiConfigurationUnavailable:true} : {}),
@@ -3894,6 +3883,9 @@ async function handleRequestInner(
 					state.status.lastError = "Model discovery status could not be saved";
 				});
 
+				const currentOAuth=modelCatalog.cachedList(routableKeys()).filter(model=>!/^(api|zdr)\//.test(model.slug));
+				const models=[...currentOAuth,...buildVisibleModelUnion(apiCatalogs)];
+				if(state.modelCatalog===modelCatalog){state.catalogOAuthModels=currentOAuth;setCatalogEtag(state,models);}
 				return models;
 				})();
 				// Observe background failures even after the picker response has finished.
@@ -3912,6 +3904,7 @@ async function handleRequestInner(
 						} finally { if (timer) clearTimeout(timer); }
 					}
 				}
+				models=pickerSnapshot();
 				res.setHeader("etag", setCatalogEtag(state, models));
 
 				writeJson(
@@ -3978,16 +3971,30 @@ async function handleRequestInner(
   if (state.nativeOpenai && isResponsesRequest && context.model && resetCreditState?.lastRedemptionAt !== undefined) {
    for(const [index,scopes] of workspaceCandidates){const account=accountManager.getAccountByIndex(index);if(!account)continue;
     for(const scope of scopes)await applyConfirmedReset({account,scope,model:context.model,family:context.family,manager:accountManager,snapshot:resetCreditState.snapshots[scope.id],lastRedemptionAt:resetCreditState.lastRedemptionAt,
-     previous:state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id,context.model])) ?? findQuotaCacheEntryForAccount(subscriptionQuotaCache,account,accountManager.getAccountsSnapshot(),undefined,scope.accountId),
-     observations:state.subscriptionQuotaObservations ??=new Map(),now:state.now(),clearQuotaScheduler:a=>state.preemptiveQuotaScheduler.clear(buildQuotaScheduleKey(a,context.family,context.model))});
+     quotaForReset,observations:state.subscriptionQuotaObservations ??=new Map(),now:state.now()});
    }
   }
   if (state.nativeOpenai && isResponsesRequest && context.model && !isPinned) {
    try {
     await recoverResetQuota({model:context.model,family:context.family,native:true,pinned:false,manager:accountManager,
-     scopes:workspaceCandidates,quotaForScope,priorityByAccount:policyDecision?.priorityByAccount,preferredIndex:storageMeta.pinnedAccountIndex,service:createResetCreditService(accountManager),
+     scopes:workspaceCandidates,quotaForScope,priorityByAccount:policyDecision?.priorityByAccount,preferredIndex:storageMeta.pinnedAccountIndex,service:createResetCreditService(accountManager,(target,snapshot,submitted)=>{
+      const account=accountManager.getAccountsSnapshot().map(row=>accountManager.getAccountByIndex(row.index)).find(row=>row&&workspaceModelScopes(row).some(scope=>scope.id===target.key));
+      const scope=account&&workspaceModelScopes(account).find(scope=>scope.id===target.key);
+      if(!account||!scope)return ()=>{};
+      const observations=state.subscriptionQuotaObservations??=new Map<string,QuotaCacheEntry>();
+      const scopeKey=JSON.stringify([scope.id,context.model]),key=buildQuotaScheduleKey(account,context.family,context.model);
+      const baseline=quotaForScope(account,scope)??{updatedAt:0,status:200,model:context.model??'unknown',primary:{},secondary:{}};
+      observations.set(scopeKey,baseline);
+      const receipt=state.preemptiveQuotaScheduler.receive(key,resetSnapshotQuota(snapshot),quotaReceiptOwner(submitted),baseline);
+      return ()=>{
+       const current=quotaForScope(account,scope)??baseline;
+       const merged=state.preemptiveQuotaScheduler.observeReceipt(key,receipt,current);
+       if(merged)observations.set(scopeKey,Object.assign(merged,{model:context.model??'unknown'}));
+       state.preemptiveQuotaScheduler.settleReceipt(key,receipt,true,merged??current);
+      };
+     }),
      observations:state.subscriptionQuotaObservations ??= new Map(),now:state.now,
-     clearQuotaScheduler:account=>state.preemptiveQuotaScheduler.clear(buildQuotaScheduleKey(account,context.family,context.model)),
+     quotaForReset,
     });
    } catch { state.status.lastError="Subscription reset recovery could not be confirmed; no further automatic redemption attempted."; }
    // Recovery may have redeemed and written new reset state; the next request re-reads it.

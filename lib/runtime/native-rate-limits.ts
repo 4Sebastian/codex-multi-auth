@@ -7,7 +7,7 @@ import type { CodexCliMirror } from '../storage/public-types.js';
 import { getCodexMultiAuthDir } from '../runtime-paths.js';
 import { isRecord } from '../utils.js';
 
-export interface NativeUsageAuth {accessToken:string;accountId:string;expiresAt:number;idToken?:string;codexCliMirror?:CodexCliMirror;withAuthority?:(accept:()=>void)=>Promise<void>}
+export interface NativeUsageAuth {accessToken:string;accountId:string;expiresAt:number;idToken?:string;codexCliMirror?:CodexCliMirror;withAuthority?:(accept:()=>void)=>Promise<void>;onResponse?:(value:unknown)=>void}
 /** Longer than any live session (15s timeout), so only crash leftovers are swept. */
 const STALE_HOME_MS=10*60_000;
 async function sweepStaleHomes(root:string):Promise<void>{
@@ -87,6 +87,7 @@ export async function nativeRateLimitsRpc(auth:NativeUsageAuth,method:Method,par
      }
      else if(phase===1){
       phase=-1;
+      try{auth.onResponse?.(reply.result);}catch(error){fail(error instanceof Error?error:Error('Native usage response observation failed'));return;}
       void authorize(()=>{if(done)return;done=true;clearTimeout(timer);resolve(reply.result);}).catch(error=>fail(error));
       return;
      }

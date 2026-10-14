@@ -417,6 +417,13 @@ export class PreemptiveQuotaScheduler {
 		return snapshot;
 	}
 
+	getResetSnapshot(key:string,owner:string,reset:QuotaSchedulerSnapshot,baseline?:QuotaSchedulerSnapshot|null):QuotaSchedulerSnapshot {
+	 const current=this.getSnapshot(key,owner,baseline);
+	 const state=current?this.receipts.get(current):undefined;
+	 if(state?.owner===owner&&(state.primary||state.secondary||state.planType))return current??reset;
+	 return !current||reset.updatedAt>current.updatedAt?mergeQuotaObservations(reset,current):current;
+	}
+
 	getDeferral(key: string, now = Date.now(), owner?: string, baseline?: QuotaSchedulerSnapshot | null): QuotaDeferralDecision {
 		this.maybePrune(now);
 		if (!this.enabled) {

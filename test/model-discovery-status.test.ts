@@ -1,18 +1,24 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
-	discoverModelInventory,
+	discoverModelInventory as discoverManagedModelInventory,
 	formatModelInventory,
 } from "../lib/runtime/model-discovery-status.js";
 import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
-import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
+import {existsSync} from 'node:fs';
+import {writeAccountSourceFixture} from './helpers/account-source-fixture.js';
+import {getStoragePath,setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
 import * as catalogVersion from "../lib/runtime/catalog-client-version.js";
 import {getPendingAuthPath} from "../lib/storage/pending-auth.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
+function discoverModelInventory(...args:Parameters<typeof discoverManagedModelInventory>){
+ if(args[0]&&!existsSync(getStoragePath()))writeAccountSourceFixture(args[0]);
+ return discoverManagedModelInventory(...args);
+}
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
@@ -20,6 +26,7 @@ beforeEach(async () => {
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
+ setStoragePathDirect(isolationJoin(multiAuthDir,'accounts.json'));
 });
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -28,6 +35,57 @@ afterEach(async () => {
 	else process.env.CODEX_MULTI_AUTH_DIR = previousMultiAuthDir;
 	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
+it.each(['api','write'].flatMap(stage=>['disabled','deleted','code-only','zero','expiry','credential','workspace','journal','reset','metadata'].map(mutation=>({stage,mutation}))))('retains original OAuth authority through final export and publication (%j)',async({stage,mutation})=>{
+ const {saveModelInventory}=await import('../lib/runtime/model-discovery-status.js');
+ const storage:AccountStorageV3={version:3,activeIndex:0,accounts:[
+  {recordId:'A',accountId:'W1',accessToken:'catalog-A',refreshToken:'refresh-A',expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1,workspaces:[{id:'W1',enabled:true}]},
+  {recordId:'B',accountId:'W2',accessToken:'catalog-B',refreshToken:'refresh-B',expiresAt:Date.now()+3600000,addedAt:2,lastUsed:2}
+ ]};
+ const path=isolationJoin(multiAuthDir,'accounts.json');setStoragePathDirect(path);await isolationFs.writeFile(path,JSON.stringify(storage));
+ let release!:()=>void,entered!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+ const fetcher:typeof fetch=async(_input,init)=>{
+  const auth=new Headers(init?.headers).get('authorization');
+  if(auth==='Bearer catalog-api'){if(stage==='api'){entered();await gate;}return Response.json({data:[{id:'independent-api'}]});}
+  return Response.json({models:[{slug:auth==='Bearer catalog-A'?'observed-A':'independent-B'}]});
+ };
+ const options={clientVersion:'0.160.0',fetchImpl:fetcher};
+ let pending:Promise<unknown>;
+ let inventory:Awaited<ReturnType<typeof discoverModelInventory>>|undefined;
+ if(stage==='api')pending=discoverModelInventory(storage,[{id:'api',kind:'api',label:'Fixture API',enabled:true,priority:0,apiKey:'catalog-api',probeCapabilities:false,visibleModels:['independent-api']}],options).then(value=>{inventory=value;});
+ else{
+  inventory=await discoverModelInventory(storage,[],options);
+  expect(inventory.entries[0]?.visibleModels).toEqual(['observed-A']);
+  const write=isolationFs.writeFile.bind(isolationFs);
+  vi.spyOn(isolationFs,'writeFile').mockImplementation(async(...args)=>{await write(...args);if(String(args[0]).includes('model-discovery.json.')&&!String(args[0]).endsWith('.lock')){entered();await gate;}});
+  pending=saveModelInventory(inventory);
+ }
+ await ready;
+ try{
+  const row=storage.accounts[0]!;
+  if(mutation==='disabled')row.enabled=false;
+  if(mutation==='deleted')storage.accounts.shift();
+  if(mutation==='code-only')row.authInvalidationErrorCode='token_invalidated';
+  if(mutation==='zero')row.authInvalidatedAt=0;
+  if(mutation==='expiry')row.expiresAt!+=1;
+  if(mutation==='credential')Object.assign(row,{accessToken:'replacement-A',refreshToken:'replacement-refresh'});
+  if(mutation==='workspace')row.workspaces![0]={id:'replacement-workspace',enabled:true};
+  if(mutation==='metadata')row.lastUsed+=1;
+  await isolationFs.writeFile(path,JSON.stringify(storage));
+  if(mutation==='journal')await isolationFs.writeFile(getPendingAuthPath(path),'malformed fixture journal');
+  if(mutation==='reset')await isolationFs.writeFile(path+'.reset-intent','{}');
+  release();await pending;
+  if(!inventory)throw Error('Missing discovered inventory');
+  if(stage==='api')await saveModelInventory(inventory);
+  const artifact=JSON.parse(await isolationFs.readFile(isolationJoin(multiAuthDir,'model-discovery.json'),'utf8'));
+  for(const rows of [inventory.entries,artifact.entries]){
+   const a=rows[0];
+   expect(a).toMatchObject(mutation==='metadata'?{routable:true,visibleModels:['observed-A']}:{routable:false,visibleModels:[],models:['observed-A']});
+   const b=rows[1];expect(b.visibleModels).toEqual(['journal','reset','zero'].includes(mutation)?[]:['independent-B']);
+  }
+  expect(JSON.stringify(artifact)).not.toMatch(/catalog-A|refresh-A|replacement-A|catalog-api/);
+ }finally{release();await pending;}
+});
+
 it.each(["invalidated", "code-only", "zero", "negative", "cooldown", "quota"])("does not submit initially restricted OAuth discovery (%s)", async restriction => {
 	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
 	const account = storage.accounts[0]!;
@@ -432,7 +490,7 @@ it("serializes independent inventory writers and preserves both successful basel
   if(String(args[1]).startsWith('{"version":1,"checkedAt":102,'))checkpoint();
  });
  const rename=vi.spyOn(fs,"rename").mockImplementation(async(...args)=>{if(parked&&String(args[1]).endsWith("model-discovery.json.write-lock"))checkpoint();return originalRename(...args);});
- const entry=(id:string,ok:boolean)=>({id,label:id,kind:"oauth" as const,enabled:true,error:!ok,checkedAt:ok?101:102,models:ok?[id]:[],visibleModels:[]});
+ const entry=(id:string,ok:boolean)=>({id,label:id,kind:"api" as const,enabled:true,error:!ok,checkedAt:ok?101:102,models:ok?[id]:[],visibleModels:[]});
  let pending:Promise<unknown>|undefined;
  try {
   const a=first.saveModelInventory({version:1,checkedAt:101,entries:[entry("writer-a",true),entry("writer-b",false)]});

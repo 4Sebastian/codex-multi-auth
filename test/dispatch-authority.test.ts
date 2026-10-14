@@ -24,7 +24,12 @@ import {getBudgetGuardPath} from "../lib/budget-guard.js";
 import {getRoutingProfilesPath} from "../lib/routing-profiles.js";
 import {resetRuntimePolicyCacheForTests} from "../lib/policy/runtime-policy-cache.js";
 import {ApiModelRuntime} from "../lib/runtime/api-model-runtime.js";
-import type {ApiRouteCredential} from "../lib/api-route-store.js";
+import {loadApiRoutes,saveApiRoutes,type ApiRouteCredential} from "../lib/api-route-store.js";
+import {getRuntimeObservabilitySnapshot} from '../lib/runtime/runtime-observability.js';
+import * as catalogVersion from '../lib/runtime/catalog-client-version.js';
+import {modelScopeId} from '../lib/runtime/workspace-model-scopes.js';
+import {ResponsesWebSocketGateway} from '../lib/runtime/responses-websocket.js';
+import {createRuntimeProxyHttpError} from '../lib/runtime/rotation-server-types.js';
 import {appendUsageLedgerRow, readUsageLedgerRows} from "../lib/usage/index.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -115,6 +120,99 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 	const post = (model = "shared", sessionKey?: string) => fetch(`${proxy.baseUrl}/responses`, {method: "POST", headers: {authorization: "Bearer fixture-client", "content-type": "application/json"}, body: JSON.stringify({model, input: [], ...(sessionKey ? {prompt_cache_key: sessionKey} : {})})});
 	return {root, path, pool, manager, proxy, upstreamBaseUrl: base, entered, release, creates, fetched, discoveries, httpWorkspaces, connect, post, rejectQuota: () => {quotaFailure = true;}, setPostResponse: (handler: (() => Promise<Response>) | undefined) => {postResponse = handler;}, connections: () => connections, setReply: (handler: ((ws: WebSocket) => void) | undefined) => {reply = handler;}};
 }
+it.each([[403,'policy_blocked'],[503,'runtime_policy_unavailable'],[503,'routing_configuration_changed']] as const)('retains the original typed API denial and first cause (%s/%s)',async(status,code)=>{
+ const original=createRuntimeProxyHttpError('Local dispatch denied',status,code);original.cause=Error('Owned local first cause');
+ let posts=0,selected=0;
+ const gateway=new ResponsesWebSocketGateway(async(_input,init)=>{if(init?.method==='POST')posts++;return Response.json({data:[{id:'shared'}]});},{maxPayloadBytes:1024*1024});
+ const runtime=new ApiModelRuntime(gateway.fetch),routes:ApiRouteCredential[]=['one','two'].map(id=>({id,kind:'api',label:id,apiKey:`fixture-${id}`,enabled:true,priority:0,visibleModels:['shared']}));
+ await expect(gateway.withDispatchAuthorization(async(_input,init)=>{if(init.method==='POST')throw original;},()=>runtime.request('api/shared',{input:[]},routes,undefined,()=>{selected++;}))).rejects.toBe(original);
+ expect(original.cause).toBeDefined();expect(posts).toBe(0);expect(selected).toBe(1);gateway.close();
+});
+
+it('does not retry an ambiguous sent API transport failure',async()=>{
+ let posts=0,submitted=0,selected=0;
+ const gateway=new ResponsesWebSocketGateway(async(_input,init)=>{if(init?.method==='POST'){posts++;throw Error('Owned EOF after submission');}return Response.json({data:[{id:'shared'}]});},{maxPayloadBytes:1024*1024});
+ const runtime=new ApiModelRuntime(gateway.fetch),routes:ApiRouteCredential[]=['one','two'].map(id=>({id,kind:'api',label:id,apiKey:`fixture-${id}`,enabled:true,priority:0,visibleModels:['shared']}));
+ const response=await gateway.withDispatchAuthorization(async(_input,init)=>init.method==='POST'?()=>{submitted++;}:undefined,()=>runtime.request('api/shared',{input:[]},routes,undefined,()=>{selected++;}));
+ expect(response.status).toBe(502);expect((await response.json()).error.code).toBe('upstream_transport_error');expect(posts).toBe(1);expect(submitted).toBe(1);expect(selected).toBe(1);gateway.close();
+});
+
+it.each(['http','native','fallback'].flatMap(transport=>['route','policy','valid'].map(mutation=>({transport,mutation}))))('classifies API pre-send denial and counts only actual submission (%j)',async({transport,mutation})=>{
+ const root=await fs.mkdtemp(join(tmpdir(),'api-presend-'));cleanups.push(()=>removeWithRetry(root,{recursive:true,force:true}));vi.stubEnv('CODEX_MULTI_AUTH_DIR',root);
+ const route:ApiRouteCredential={id:'prepared-api',kind:'api',label:'Fixture',apiKey:'owned-api-key',enabled:true,priority:0,visibleModels:['shared'],probeCapabilities:false};
+ await saveApiRoutes([route]);
+ const actualFetch=fetch;vi.stubGlobal('fetch',((input,init)=>new URL(String(input)).hostname==='developers.openai.com'?Promise.resolve(new Response('',{status:404})):actualFetch(input,init)) satisfies typeof fetch);
+ const entered=deferred(),release=deferred();cleanups.push(async()=>{release.resolve();});
+ if(transport==='http'){
+  const catalogs=ApiModelRuntime.prototype.catalogs;
+  vi.spyOn(ApiModelRuntime.prototype,'catalogs').mockImplementation(async function(...args){const value=await catalogs.apply(this,args);entered.resolve();await release.promise;return value;});
+ }
+ const f=await fixture(transport!=='http',transport!=='http',loadApiRoutes,transport==='fallback');
+ if(transport!=='http')routeApiToFixture(f.upstreamBaseUrl);
+ const before=getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount;
+ const ledgerBefore=new Set((await readUsageLedgerRows()).map(row=>row.id));
+ const ws=transport==='http'?undefined:await f.connect();
+ const pending=ws?turn(ws,{model:'api/shared'}):f.post('api/shared').then(async response=>{const text=await response.text();return {status:response.status,body:response.status>=400?JSON.parse(text):text};});
+ await (transport==='http'?entered.promise:f.entered.promise);
+ if(mutation==='route')await saveApiRoutes([{...route,enabled:false}]);
+ if(mutation==='policy')await fs.writeFile(getBudgetGuardPath(),'malformed policy fixture');
+ release.resolve();f.release.resolve();
+ const result=await pending;
+ if(mutation==='valid'){
+  expect(ws?result.type:result.status).toBe(ws?'response.completed':200);
+  expect(f.proxy.getStatus().upstreamRequests).toBe(1);
+  expect(f.creates.length+f.fetched.length).toBe(1);
+  expect(f.proxy.getStatus().websocketUpstreamRequests??0).toBe(transport==='native'?1:0);
+  expect(getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount[`sha256:${modelScopeId(route.kind,route.id)}`]).toBeGreaterThan(before[`sha256:${modelScopeId(route.kind,route.id)}`]??0);
+ }else{
+  const code=mutation==='route'?'routing_configuration_changed':'runtime_policy_unavailable';
+  expect(ws?result.error:result.body.error).toMatchObject({code});
+  if(!ws)expect(result.status).toBe(503);
+  expect(f.creates).toHaveLength(0);expect(f.fetched).toHaveLength(0);
+  expect(f.proxy.getStatus().upstreamRequests).toBe(0);expect(f.proxy.getStatus().websocketUpstreamRequests??0).toBe(0);
+  expect(getRuntimeObservabilitySnapshot().lastInferenceRequestAtByAccount).toEqual(before);
+  await vi.waitFor(async()=>{const rows=(await readUsageLedgerRows()).filter(row=>!ledgerBefore.has(row.id)&&row.model==='api/shared');expect(rows).toHaveLength(1);expect(rows[0]).toMatchObject({errorCode:code,statusCode:503});});
+ }
+});
+
+it('revalidates OAuth authority when background API capability enrichment publishes',async()=>{
+ const root=await fs.mkdtemp(join(tmpdir(),'catalog-background-'));cleanups.push(()=>removeWithRetry(root,{recursive:true,force:true}));vi.stubEnv('CODEX_MULTI_AUTH_DIR',root);
+ vi.spyOn(catalogVersion,'resolveCatalogClientVersion').mockResolvedValue('0.160.0');
+ const entered=deferred(),release=deferred();cleanups.push(async()=>{release.resolve();});
+ const server=createServer((request,response)=>{
+  if(request.method!=='POST'){response.end('# Owned fixture documentation');return;}
+  const chunks:Buffer[]=[];request.on('data',chunk=>chunks.push(Buffer.from(chunk)));request.on('end',()=>{entered.resolve();void release.promise.then(()=>{
+   const body=JSON.parse(Buffer.concat(chunks).toString());response.setHeader('content-type','application/json');response.end(JSON.stringify({id:'owned-probe',reasoning:body.reasoning,service_tier:body.service_tier,output:[{type:'function_call',name:'capability_probe'}]}));
+  });});
+ });
+ const base=await listen(server);cleanups.push(()=>new Promise<void>(done=>{server.closeAllConnections();server.close(()=>done());}));
+ const actualFetch=fetch;vi.stubGlobal('fetch',((input,init)=>actualFetch(new URL(String(input)).hostname==='developers.openai.com'?`${base}/documentation`:new URL(String(input)).hostname==='api.openai.com'?`${base}/responses`:input,init)) satisfies typeof fetch);
+ await saveApiRoutes([{id:'background',kind:'api',label:'Owned fixture',apiKey:'owned-probe-key',enabled:true,priority:0,probeCapabilities:true,visibleModels:['shared']}]);
+ const f=await fixture(true,false,loadApiRoutes),headers={authorization:'Bearer fixture-client'};
+ const response=await fetch(`${f.proxy.baseUrl}/models?client_version=0.160.0`,{headers});expect(response.status).toBe(200);await response.json();await entered.promise;
+ f.pool.accounts[0]!.enabled=false;await fs.writeFile(f.path,JSON.stringify(f.pool));release.resolve();
+ await vi.waitFor(async()=>{
+  const artifact=JSON.parse(await fs.readFile(join(root,'model-discovery.json'),'utf8'));
+  expect(artifact.entries.find(entry=>entry.kind==='api')?.entitlements?.some(model=>model.probes?.responses==='verified')).toBe(true);
+  expect(artifact.entries.filter(entry=>entry.kind==='oauth').every(entry=>!entry.routable&&entry.visibleModels.length===0)).toBe(true);
+ });
+ const current=await fetch(`${f.proxy.baseUrl}/models`,{headers});const body=await current.json();expect(body.models.map(model=>model.slug)).not.toContain('shared');expect(body.models.map(model=>model.slug)).toContain('api/shared');expect(current.headers.get('etag')).not.toBe(response.headers.get('etag'));
+});
+
+it('removes stale OAuth models and ETags after an actual inventory write wait',async()=>{
+ const root=await fs.mkdtemp(join(tmpdir(),'runtime-catalog-export-'));cleanups.push(()=>removeWithRetry(root,{recursive:true,force:true}));vi.stubEnv('CODEX_MULTI_AUTH_DIR',root);
+ vi.spyOn(catalogVersion,'resolveCatalogClientVersion').mockResolvedValue('0.160.0');
+ const f=await fixture(true),headers={authorization:'Bearer fixture-client'};
+ const first=await fetch(`${f.proxy.baseUrl}/models?refresh_capabilities=1`,{headers});expect((await first.json()).models.map(model=>model.slug)).toContain('shared');
+ const entered=deferred(),release=deferred();cleanups.push(async()=>{release.resolve();});
+ const write=fs.writeFile.bind(fs);vi.spyOn(fs,'writeFile').mockImplementation(async(...args)=>{await write(...args);if(String(args[0]).includes('model-discovery.json.')){entered.resolve();await release.promise;}});
+ const pending=fetch(`${f.proxy.baseUrl}/models?refresh_capabilities=1`,{headers});await entered.promise;
+ Object.assign(f.pool.accounts[0]!,{accessToken:'replacement-B',refreshToken:'replacement-refresh-B'});await fs.writeFile(f.path,JSON.stringify(f.pool));
+ release.resolve();const response=await pending;expect(response.status).toBe(503);expect((await response.json()).error.code).toBe('account_catalog_unavailable');expect(response.headers.get('etag')).not.toBe(first.headers.get('etag'));
+ const artifact=JSON.parse(await fs.readFile(join(root,'model-discovery.json'),'utf8'));
+ expect(artifact.entries.filter(entry=>entry.kind==='oauth').every(entry=>entry.routable===false&&entry.visibleModels.length===0)).toBe(true);
+});
+
 it.each(["disable", "delete", "remove", "corrupt", "reset"])("rejects durable custom restrictions from another manager (%s)", async mutation => {
 	const f = await fixture(false), ws = await f.connect();
 	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
@@ -226,8 +324,9 @@ it.each(["api", "zdr"] as const)("rejects a known %s model denial acquired durin
 	if (!advertised) throw Error("Missing fixture catalog");
 	advertised.capability_probe_status = {responses: "unsupported"};
 	release.resolve();
-	const denied = await pending; await denied.text();
-	expect(denied.status).toBe(502);
+	const denied = await pending;
+	expect((await denied.json()).error.code).toBe('routing_configuration_changed');
+	expect(denied.status).toBe(503);
 	expect(f.fetched).toEqual([]);
 });
 
@@ -247,8 +346,8 @@ it.each((["api", "zdr"] as const).flatMap(kind => [401, 429].map(status => ({kin
 	runtime.recordStreamFailure(routes[0]!, `${kind}/shared`, {}, {error: {code: status === 401 ? "invalid_api_key" : "quota_exceeded"}}, {status, headers: new Headers({"retry-after": "60"})});
 	release.resolve();
 	const denied = await pending;
-	await denied.text();
-	expect(denied.status).toBe(502);
+	expect((await denied.json()).error.code).toBe('routing_configuration_changed');
+	expect(denied.status).toBe(503);
 	expect(f.fetched).toEqual([]);
 	expect(f.creates).toEqual([]);
 });
@@ -431,7 +530,7 @@ it.each(["api", "zdr"].flatMap(kind => [false, true].map(refuse => ({kind, refus
 	if (!model) throw Error("Missing fixture catalog");
 	model.capability_probe_status = {responses: "unsupported"};
 	f.release.resolve();
-	expect(await pending).toMatchObject({type: "error", status: 502});
+	expect(await pending).toMatchObject({type: "error", status: 503,error:{code:'routing_configuration_changed'}});
 	expect(f.creates).toEqual([]);
 	expect(f.fetched).toEqual([]);
 });
@@ -456,7 +555,7 @@ it.each(["api", "zdr"] as const)("rejects known %s denial on a cached HTTP-only 
 	if (!model) throw Error("Missing fixture catalog");
 	model.capability_probe_status = {responses: "unsupported"};
 	release.resolve();
-	expect(await pending).toMatchObject({type: "error", status: 502});
+	expect(await pending).toMatchObject({type: "error", status: 503,error:{code:'routing_configuration_changed'}});
 	expect(f.creates).toEqual([]);
 	expect(f.fetched).toEqual(["Bearer fixture-key"]);
 });

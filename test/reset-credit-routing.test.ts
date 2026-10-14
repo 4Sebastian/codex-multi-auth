@@ -1,4 +1,5 @@
 import { expect, it, vi } from 'vitest';
+import { PreemptiveQuotaScheduler } from '../lib/preemptive-quota-scheduler.js';
 import { recoverResetQuota } from '../lib/runtime/reset-credit-routing.js';
 import { AccountManager } from '../lib/accounts.js';
 import { workspaceModelScopes } from '../lib/runtime/workspace-model-scopes.js';
@@ -13,13 +14,14 @@ function fixture(){
  const save=vi.spyOn(manager,'saveToDiskDebounced').mockImplementation(()=>{});
  const account=manager.getAccountByIndex(0)!;const scope=workspaceModelScopes(account)[0]!;
  const automatic=vi.fn(async()=>null);const status=vi.fn(async()=>({snapshots:{[scope.id]:{credentialOwner:resetCredentialOwner(account,scope.accountId),updatedAt:1000,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}}}}));
- const service={automatic,status};const observations=new Map();const clear=vi.fn();
- return {storage,manager,account,scope,service,observations,clear,save,args:{model:'chat-test',native:true,pinned:false,manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:900,status:200,model:'chat-test',planType:'pro',primary:{usedPercent:100},secondary:{}}),service,observations,clearQuotaScheduler:clear,now:()=>1000}};
+ const service={automatic,status};const observations=new Map();const scheduler=new PreemptiveQuotaScheduler();
+ const quotaForReset=(_account,scope,reset)=>Object.assign(scheduler.getResetSnapshot(scope.id,'owner',reset,observations.get(JSON.stringify([scope.id,'chat-test']))),{model:'chat-test'});
+ return {storage,manager,account,scope,service,observations,scheduler,quotaForReset,save,args:{model:'chat-test',native:true,pinned:false,manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:900,status:200,model:'chat-test',planType:'pro',primary:{usedPercent:100},secondary:{}}),service,observations,quotaForReset,now:()=>1000}};
 }
 it.each(['api/chat-test','zdr/chat-test'])('never redeems across the %s privacy pool',async model=>{const f=fixture();await recoverResetQuota({...f.args,model});expect(f.service.automatic).not.toHaveBeenCalled();});
 it.each([5,50,94,99])('uses remaining subscription quota at %s%% used without spending a reset',async used=>{const f=fixture();await recoverResetQuota({...f.args,quotaForScope:()=>({...f.args.quotaForScope(),primary:{usedPercent:used}})});expect(f.service.automatic).not.toHaveBeenCalled();});
 it('does not redeem for an explicit pin or non-native route',async()=>{const f=fixture();await recoverResetQuota({...f.args,pinned:true});await recoverResetQuota({...f.args,native:false});expect(f.service.automatic).not.toHaveBeenCalled();});
-it('applies confirmed scheduled recovery even when no credit was consumed',async()=>{const f=fixture();f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:Date.now()+90000};expect(await recoverResetQuota(f.args)).toBe(true);expect(f.save).toHaveBeenCalled();expect(f.clear).toHaveBeenCalledWith(f.account);expect(f.account.rateLimitResetTimes).toEqual({});expect(f.observations.size).toBe(1);});
+it('applies confirmed scheduled recovery even when no credit was consumed',async()=>{const f=fixture();f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:Date.now()+90000};expect(await recoverResetQuota(f.args)).toBe(true);expect(f.save).toHaveBeenCalled();expect(f.scheduler.getDeferral(f.scope.id,1000).defer).toBe(false);expect(f.account.rateLimitResetTimes).toEqual({});expect(f.observations.size).toBe(1);});
 it('does not erase authentication cooldowns or policy-blocked candidates',async()=>{const f=fixture();f.account.cooldownReason='auth-failure';f.account.coolingDownUntil=Date.now()+100000;await recoverResetQuota(f.args);expect(f.service.automatic).not.toHaveBeenCalled();expect(f.account.cooldownReason).toBe('auth-failure');});
 it('requires positive native permission before clearing blockers',async()=>{const f=fixture();const until=Date.now()+90000;f.service.status.mockResolvedValue({snapshots:{}});f.account.rateLimitResetTimes={codex:until};expect(await recoverResetQuota(f.args)).toBe(false);expect(f.account.rateLimitResetTimes).toEqual({codex:until});});
 
@@ -27,7 +29,7 @@ it('applies a manual redemption once, without erasing a later failure',async()=>
  const {applyConfirmedReset}=await import('../lib/runtime/reset-credit-routing.js');const f=fixture();const now=Date.now();
  f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:now+90000};
  const snapshot={credentialOwner:resetCredentialOwner(f.account,f.scope.accountId),updatedAt:now,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}};
- const apply=()=>applyConfirmedReset({account:f.account,scope:f.scope,model:'chat-test',family:'codex',manager:f.manager,snapshot,lastRedemptionAt:now-1000,previous:f.observations.get(JSON.stringify([f.scope.id,'chat-test'])),observations:f.observations,clearQuotaScheduler:f.clear,now});
+ const apply=()=>applyConfirmedReset({account:f.account,scope:f.scope,model:'chat-test',family:'codex',manager:f.manager,snapshot,lastRedemptionAt:now-1000,observations:f.observations,quotaForReset:f.quotaForReset,now});
  expect(await apply()).toBe(true);expect(f.account.rateLimitResetTimes).toEqual({});
  f.account.rateLimitResetTimes={codex:now+90000};expect(await apply()).toBe(false);expect(f.account.rateLimitResetTimes.codex).toBe(now+90000);
 });
