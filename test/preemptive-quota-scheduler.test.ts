@@ -5,6 +5,21 @@ import {
 } from "../lib/preemptive-quota-scheduler.js";
 
 describe("preemptive quota scheduler", () => {
+	it("reads received independent deltas without replaying a consumed field", () => {
+		const scheduler = new PreemptiveQuotaScheduler(), key = "account:model", owner = "A";
+		const first = scheduler.receive(key, {status: 200, updatedAt: 1000, primary: {usedPercent: 100}, secondary: {}, planType: "free"}, owner);
+		const baseline = scheduler.observeReceipt(key, first);
+		scheduler.settleReceipt(key, first, true);
+		const replacement = scheduler.receive(key, {status: 200, updatedAt: 1000, primary: {usedPercent: 0}, secondary: {}, planType: "pro"}, owner, baseline);
+		scheduler.observeReceipt(key, replacement, baseline);
+		const partial = scheduler.receive(key, {status: 200, updatedAt: 999, primary: {}, secondary: {usedPercent: 20}}, owner, scheduler.getSnapshot(key, owner, baseline));
+		scheduler.observeReceipt(key, partial, baseline);
+		expect(scheduler.getSnapshot(key, owner, baseline)).toMatchObject({primary: {usedPercent: 0}, secondary: {usedPercent: 20}, planType: "pro"});
+		expect(scheduler.observeReceipt(key, first, baseline)).toBeUndefined();
+		scheduler.clear(key);
+		expect(scheduler.observeReceipt(key, partial, baseline)).toBeUndefined();
+	});
+
 	it("reads quota snapshot from codex headers", () => {
 		const headers = new Headers({
 			"x-codex-primary-used-percent": "99",

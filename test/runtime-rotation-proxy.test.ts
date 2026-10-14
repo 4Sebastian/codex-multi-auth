@@ -8170,10 +8170,12 @@ describe("native inventory read resilience",()=>{
  });
  it("never authenticates a managed bearer with a stale snapshot",async()=>{
   const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
-  const read=vi.fn().mockResolvedValueOnce(storage).mockRejectedValueOnce(Object.assign(Error('busy'),{code:'EBUSY'})).mockResolvedValue({...storage,accounts:[{...storage.accounts[0]!,accessToken:undefined}]});
+  let revoke = false, transient = true;
+ const read=vi.fn(async()=>{if (!revoke) return storage; if (transient) {transient=false;throw Object.assign(Error('busy'),{code:'EBUSY'});} return {...storage,accounts:[{...storage.accounts[0]!,accessToken:undefined}]};});
   const {fetchImpl,calls}=createRecordingFetch(()=>Response.json({models:[{slug:'model-test'}]}));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:read}});
   expect((await getModels(proxy)).status).toBe(200);
+  revoke = true;
   for(let i=0;i<2;i++){const response=await getModels(proxy,undefined,{authorization:'Bearer access-1'});await response.text();expect(response.status).toBe(401);}
   expect(calls).toHaveLength(1);
  });
@@ -9369,6 +9371,122 @@ describe("unversioned catalog requests", () => {
 	});
 });
 
+
+describe("owned terminal settlement regressions", () => {
+ it.each(["http", "native", "api", "zdr"])("settles the persisted ledger before exposing completion and the next budget turn (%s)", async mode => {
+  const previousDir = process.env.CODEX_MULTI_AUTH_DIR; process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
+  const budgets = await import("../lib/budget-guard.js");
+  const store = await budgets.loadBudgetGuardStore(); budgets.upsertBudgetLimit(store, {key: "global", window: "day", maxRequests: 1}); await budgets.saveBudgetGuardStore(store);
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(r => {entered = r;}), gate = new Promise<void>(r => {release = r;});
+  const appendRow = usageLedger.appendUsageLedgerRow;
+  const append = vi.spyOn(usageLedger, "appendUsageLedgerRow").mockImplementation(async row => {if (row.outcome === "success") {entered(); await gate;} return appendRow(row);});
+  const delta = {type: "response.output_text.delta", delta: "visible"};
+  const terminal = {type: "response.completed", response: {id: "settled-turn", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}};
+  let creates = 0;
+  const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", () => {creates++; ws.send(JSON.stringify(delta)); ws.send(JSON.stringify(terminal));})});
+  const {fetchImpl} = createRecordingFetch(call => {
+   if (call.url.includes("/models")) return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});
+   creates++; return new Response(`data: ${JSON.stringify(delta)}\n\ndata: ${JSON.stringify(terminal)}\n\n`, {headers: {"content-type": "text/event-stream"}});
+  });
+  const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+  const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+   nativeOpenai: mode !== "http", upstreamBaseUrl: upstream.baseUrl,
+   readApiRoutes: async () => [{id: "settlement-paid", label: "Fixture", kind: mode === "zdr" ? "zdr" : "api", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}],
+  }});
+  const body = {model: mode === "api" || mode === "zdr" ? `${mode}/shared` : "shared", input: [], stream: true};
+  let client: WebSocket | undefined;
+  let received = "", completed = false;
+  let reading: Promise<unknown> | undefined;
+  try {
+   if (mode === "native") {
+    client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+    client.on("message", raw => {received += raw.toString(); if (JSON.parse(raw.toString()).type === "response.completed") completed = true;});
+    client.send(JSON.stringify({type: "response.create", ...body}));
+   } else {
+    const response = await postResponses(proxy, body);
+    reading = (async () => {for await (const chunk of response.body!) received += Buffer.from(chunk).toString(); completed = true;})();
+   }
+   await ready;
+   await vi.waitFor(() => expect(received).toContain("visible"));
+   expect(received).not.toContain("response.completed"); expect(completed).toBe(false);
+   expect(await usageLedger.readUsageLedgerRows()).toEqual([]);
+   release();
+   if (reading) await reading; else await vi.waitFor(() => expect(completed).toBe(true));
+   expect(await usageLedger.readUsageLedgerRows()).toEqual([expect.objectContaining({outcome: "success", tokens: expect.objectContaining({inputTokens: 17, outputTokens: 4, totalTokens: 21})})]);
+   if (client) {
+    const blocked = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", ...body}));
+    expect(await blocked).toContain("budget_blocked");
+   } else {const blocked = await postResponses(proxy, body); expect(blocked.status).toBe(429); expect(await blocked.text()).toContain("budget_blocked");}
+   expect(creates).toBe(1);
+  } finally {
+   release(); await reading; client?.terminate(); await upstream.close(); append.mockRestore();
+   if (previousDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR; else process.env.CODEX_MULTI_AUTH_DIR = previousDir;
+  }
+ });
+ it.each([false, true])("withholds terminal bytes while its credential restriction transaction is held (native=%s)", async native => {
+  const storage = createStorage(Date.now(), 1); writeAccountSourceFixture(storage);
+  const manager = new AccountManager(undefined, storage);
+  let entered!: () => void, release!: () => void, terminalSubmitted = false, held = false;
+  const ready = new Promise<void>(r => {entered = r;}), gate = new Promise<void>(r => {release = r;});
+  const actual = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+  withAccountStorageTransactionMock.mockImplementation(handler => actual.withAccountStorageTransaction(async (current, persist) => {
+   if (terminalSubmitted && !held) {held = true; entered(); await gate;}
+   return handler(current, persist);
+  }));
+  const delta = 'data: {"type":"response.output_text.delta","delta":"visible"}\n\n';
+  const terminal = 'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"token_invalidated"},"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+  const {fetchImpl} = createRecordingFetch(call => {
+   if (call.url.includes("/models")) return Response.json({models: [{slug: "shared"}]});
+   terminalSubmitted = true; return new Response(delta + terminal, {headers: {"content-type": "text/event-stream"}});
+  });
+  const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: native}});
+  const response = await postResponses(proxy, {model: "shared", input: [], stream: true});
+  let received = "";
+  const reading = (async () => {for await (const chunk of response.body!) received += Buffer.from(chunk).toString();})();
+  await ready;
+  try {
+   await vi.waitFor(() => expect(received).toBe(delta));
+   expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+   release(); await reading;
+   expect(received).toBe(delta + terminal);
+   expect(manager.getAccountByIndex(0)?.authInvalidationErrorCode).toBe("token_invalidated");
+   expect((await loadAccounts())?.accounts[0]?.authInvalidationErrorCode).toBe("token_invalidated");
+  } finally {release(); await reading;}
+ });
+ it.each(["workspace", "expiry", "code-only", "reset", "journal", "metadata"])("revalidates native catalog authority after reading its body (%s)", async mutation => {
+  const previousDir = process.env.CODEX_MULTI_AUTH_DIR; process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
+  const storage = createStorage(Date.now(), 2); storage.accounts[0]!.workspaces = [{id: "acc_1", enabled: true}];
+  writeAccountSourceFixture(storage);
+  const manager = new AccountManager(undefined, storage);
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(r => {entered = r;}), gate = new Promise<void>(r => {release = r;});
+  let bodies = 0;
+  const {fetchImpl, calls} = createRecordingFetch(call => new Response(new ReadableStream({async start(controller) {
+   const first = call.headers.get("chatgpt-account-id") === "acc_1";
+   if (++bodies === 2) entered();
+   await gate;
+   controller.enqueue(Buffer.from(JSON.stringify({models: [{slug: first ? "stale-A" : "independent-B"}]}))); controller.close();
+  }}), {headers: {"content-type": "application/json"}}));
+  const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: true}});
+  const pending = getModels(proxy, "/models?refresh_capabilities=1&client_version=1.0.0");
+  await ready;
+  try {
+   if (mutation === "workspace") storage.accounts[0]!.workspaces![0]!.enabled = false;
+   if (mutation === "expiry") storage.accounts[0]!.expiresAt! += 1000;
+   if (mutation === "code-only") storage.accounts[0]!.authInvalidationErrorCode = "token_invalidated";
+   if (mutation === "metadata") storage.accounts[0]!.lastUsed += 1;
+   if (mutation === "reset") await fs.writeFile(`${getStoragePath()}.reset-intent`, "{}");
+   if (mutation === "journal") await fs.writeFile(pendingAuth.getPendingAuthPath(getStoragePath()), "invalid journal");
+   else writeAccountSourceFixture(storage);
+   release(); const response = await pending; const result = await response.json();
+   expect(result.models?.some((model: {slug: string}) => model.slug === "stale-A") ?? false).toBe(mutation === "metadata");
+   if (!["reset", "journal", "code-only"].includes(mutation)) expect(result.models?.some((model: {slug: string}) => model.slug === "independent-B"), JSON.stringify({result, calls})).toBe(true);
+   expect(calls.filter(call => call.headers.get("chatgpt-account-id") === "acc_1")).toHaveLength(1);
+   expect(calls).toHaveLength(2);
+  } finally {release(); await pending; if (previousDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR; else process.env.CODEX_MULTI_AUTH_DIR = previousDir;}
+ });
+});
 
 it("retains known exclusions when a forced catalog refresh fails",async()=>{
  const manager=new AccountManager(undefined,createStorage(Date.now()));

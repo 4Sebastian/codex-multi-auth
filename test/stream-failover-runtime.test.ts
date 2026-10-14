@@ -211,6 +211,45 @@ describe("readErrorBody", () => {
 });
 
 describe("forwardStreamingResponse", () => {
+	it.each(["mixed", "bytewise", "crlf", "multiline"])("withholds terminal bytes behind owned settlement (%s)", async encoding => {
+		const delta = 'data: {"type":"response.output_text.delta","delta":"é"}\n\n';
+		let terminal = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":17,"output_tokens":4}}}\n\n';
+		if (encoding === "crlf") terminal = terminal.replaceAll("\n", "\r\n");
+		if (encoding === "multiline") terminal = terminal.replace(',"response"', ',\ndata: "response"');
+		const bytes = Buffer.from(delta + terminal);
+		const chunks = encoding === "bytewise" ? [...bytes].map(byte => Uint8Array.of(byte)) : [bytes];
+		const res = new FakeServerResponse();
+		let entered!: () => void, release!: () => void;
+		const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+		const settle = vi.fn(async () => {entered(); await gate; return {success: true, outcome: "success" as const, missingTerminal: false, errorCode: null};});
+		const upstream = new Response(streamOf(...chunks), {headers: {"content-type": "text/event-stream"}});
+		const pending = forwardStreamingResponse(upstream, res.asServerResponse(), createStatus(), () => undefined, 1000, undefined, undefined, settle);
+		await ready;
+		try {
+			expect(Buffer.concat(res.chunks).toString()).toBe(delta);
+			expect(res.ended).toBe(false);
+			release(); expect(await pending).toBe(true);
+			expect(Buffer.concat(res.chunks)).toEqual(bytes);
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(upstream.body?.locked).toBe(false);
+		} finally {release(); await pending;}
+	});
+	it("settles a reader failure before destroying the client body", async () => {
+		const res = new FakeServerResponse();
+		let entered!: () => void, release!: () => void;
+		const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+		const upstream = new Response(streamOf(Buffer.from("data: {}\n\n"), () => Promise.reject(Error("original read error"))), {headers: {"content-type": "text/event-stream"}});
+		const settle = vi.fn(async () => ({success: false, outcome: "failure" as const, missingTerminal: true, errorCode: "upstream_missing_terminal"}));
+		const pending = forwardStreamingResponse(upstream, res.asServerResponse(), createStatus(), async () => {entered(); await gate;}, 1000, undefined, undefined, settle);
+		await ready;
+		try {
+			expect(res.destroyed).toBe(false); expect(settle).not.toHaveBeenCalled();
+			release(); expect(await pending).toBe(false);
+			expect(res.destroyError?.message).toBe("original read error");
+			expect(settle).toHaveBeenCalledTimes(1);
+			expect(upstream.body?.locked).toBe(false);
+		} finally {release(); await pending;}
+	});
 	it("forwards status, filtered headers, and chunks, then ends the response", async () => {
 		const res = new FakeServerResponse();
 		const status = createStatus();

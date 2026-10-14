@@ -94,6 +94,20 @@ export async function ensureFreshAccessToken(params: {
 	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
 		params;
 	const storagePath = accountManager.resolveSelectionStoragePath();
+	const retainedBinding = {recordId: account.recordId, access: account.access, refresh: account.refreshToken, expires: account.expires};
+	const persistenceRetry = getRefreshQueue().retrySettlement(storagePath, retainedBinding);
+	if (persistenceRetry) {
+		const result = await persistenceRetry;
+		if (result.type !== "success" || accountManager.resolveSelectionStoragePath() !== storagePath ||
+			accountManager.getAccountByIndex(account.index) !== account || account.recordId !== retainedBinding.recordId ||
+			account.access !== retainedBinding.access || account.refreshToken !== retainedBinding.refresh || account.expires !== retainedBinding.expires ||
+			account.enabled === false || accountManager.isAccountAuthInvalidated(account) ||
+			!hasUsableAccessToken(account, Date.now(), tokenRefreshSkewMs)) return {ok: false, retryable: true};
+		// The queue's original source proof published the retained result to the
+		// existing journal without another OAuth request. Dispatch still performs
+		// its independent durable credential and workspace validation.
+		return {ok: true, accessToken: result.access, account};
+	}
 	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs) && !getRefreshQueue().isRefreshing(account.refreshToken, storagePath)) {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}

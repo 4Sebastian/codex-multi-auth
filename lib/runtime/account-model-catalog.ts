@@ -92,7 +92,7 @@ export class AccountModelCatalog {
 			return {id: key, kind: "oauth" as const, priority: index, enabled: true, models: usable ? entry.models ?? [] : [], visibleModels: null};
 		}));
 	}
-	invalidate(): void { this.cache.clear(); }
+	invalidate(key?: string): void { if (key === undefined) this.cache.clear(); else this.cache.delete(key); }
 	/** Retry discovery while retaining known routing exclusions if it fails. */
 	refresh(): void { for (const entry of this.cache.values()) entry.expires = Number.NEGATIVE_INFINITY; }
 	supportsCached(key: string, model: string, effort?: string, tier?: string): boolean {

@@ -1480,10 +1480,17 @@ async function validateAccountDispatch(
 		? await state.readNativeAccountStorage() : await accountManager.readDispatchAccountStorage();
 	if (snapshot) {
 		const storage = snapshot.verified || (state.nativeOpenai && snapshot.routingAvailable === true && await allowNativeGrace?.()) ? snapshot.storage : null;
-		if (!storage || state.activeAccountManager !== accountManager) throw createRuntimeProxyHttpError("Native authorization is unavailable.", 503, "routing_configuration_changed");
+		if (!storage || state.activeAccountManager !== accountManager) {
+			if (!authorityCurrent() && retryChangedAuthority && state.activeAccountManager === accountManager &&
+				isDispatchBindingCurrent(state, binding) && (binding.expiresAt ?? 0) > state.now()) {
+				return validateAccountDispatch(state, context, binding, admission, admittedCooldown, allowNativeGrace, false);
+			}
+			throw createRuntimeProxyHttpError("Native authorization is unavailable.", 503, "routing_configuration_changed");
+		}
 		if (syncNativeAccountCredentials(accountManager, storage, snapshot.capturedAt)) {
 			state.modelCatalog = undefined;
 			state.modelCatalogs?.clear();
+			state.catalogOAuthModels = undefined;
 		}
 		if (!storage.accounts.some(row => isSameNativeAccount(account, row))) throw createRuntimeProxyHttpError("Account generation changed.", 503, "routing_configuration_changed");
 	}
@@ -3176,7 +3183,12 @@ async function handleRequestInner(
 				writeUnauthorized(res);
 				return;
 			}
-			const snapshot = await state.readNativeAccountStorage();
+			const selectionManager = accountManager;
+			const selectionPath = accountManager.resolveSelectionStoragePath();
+			const selectionCurrent = captureAuthorityRevision([selectionPath, getPendingAuthPath(selectionPath)], [getIntentionalResetMarkerPath(selectionPath)]);
+			let snapshot = await state.readNativeAccountStorage();
+			if (apiKeyClient && !snapshot.verified && !selectionCurrent() && state.activeAccountManager === selectionManager &&
+				selectionManager.resolveSelectionStoragePath() === selectionPath) snapshot = await state.readNativeAccountStorage();
             const disk = snapshot.storage ?? {version: 3 as const, accounts: [], activeIndex: 0, activeIndexByFamily: {}};
             managedStorageVerified = snapshot.verified && snapshot.storage !== null;
             // A concurrent request may have replaced the manager while this read waited.
@@ -3239,20 +3251,29 @@ async function handleRequestInner(
                 state.activeAccountManager = accountManager;
 				state.modelCatalog = undefined;
                 state.modelCatalogs?.clear();
+                state.catalogOAuthModels = undefined;
 			} else if (syncNativeAccountCredentials(accountManager, disk, snapshot.capturedAt)) {
 				state.modelCatalog = undefined;
                 state.modelCatalogs?.clear();
+                state.catalogOAuthModels = undefined;
 			}
             }
 		}
 		if (!state.nativeOpenai && apiKeyClient) {
-			const snapshot = await accountManager.readDispatchAccountStorage();
+			const selectionManager = accountManager;
+			const selectionPath = accountManager.resolveSelectionStoragePath();
+			const selectionCurrent = captureAuthorityRevision([selectionPath, getPendingAuthPath(selectionPath)], [getIntentionalResetMarkerPath(selectionPath)]);
+			let snapshot = await accountManager.readDispatchAccountStorage();
+			// Before selection, retry one changed snapshot, never cached authority.
+			if (snapshot && !snapshot.verified && !selectionCurrent() && state.activeAccountManager === selectionManager &&
+				selectionManager.resolveSelectionStoragePath() === selectionPath) snapshot = await selectionManager.readDispatchAccountStorage();
 			accountManager = state.activeAccountManager;
 			if (snapshot) {
 				if (!snapshot.verified || !snapshot.storage) throw createRuntimeProxyHttpError("Account storage is unavailable.", 503, "routing_configuration_changed");
 				if (syncNativeAccountCredentials(accountManager, snapshot.storage, snapshot.capturedAt)) {
 					state.modelCatalog = undefined;
 					state.modelCatalogs?.clear();
+					state.catalogOAuthModels = undefined;
 				}
 			}
 		}
@@ -3367,7 +3388,7 @@ async function handleRequestInner(
 			policyError = error instanceof Error ? error.message : String(error);
 			state.status.lastError = policyError;
 		}
-		usageRecorder = createRuntimeUsageRecorder({
+		const requestUsageRecorder = usageRecorder = createRuntimeUsageRecorder({
 			source: "runtime-proxy",
 			operation: isModelsRequest
 				? "models"
@@ -3541,34 +3562,34 @@ async function handleRequestInner(
 						}
 					},
 				});
-				const forwarded = await forwardStreamingResponse(
-					upstream,
-					res,
-					state.status,
-					() => controller.abort(),
-					state.streamStallTimeoutMs,
-					scanner.push,
- state.catalogEtag ? {"x-models-etag":state.catalogEtag} : undefined,
-					() => {scanner.result();return responseOutcome.finish();},
+				let streamFailed = false;
+				await forwardStreamingResponse(
+					upstream, res, state.status,
+					() => {streamFailed = true; controller.abort();},
+					state.streamStallTimeoutMs, scanner.push,
+					state.catalogEtag ? {"x-models-etag":state.catalogEtag} : undefined,
+					async () => {
+						const usageTokens = scanner.result();
+						const completion = responseOutcome.finish();
+						const clientDisconnected = res.destroyed && !res.writableEnded;
+						if ((streamFailed || !completion.success) && !clientDisconnected && completion.outcome !== "cancelled" && attempt.credential && !nativeTerminal.event) {
+							apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, responseOutcome.rejection);
+						}
+						if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
+						if (usageTokens && context.stableSessionKey && context.model) {
+							state.contextBudgetGuard.update(context.stableSessionKey, {
+								model: context.model, contextTokens: usageTokens.inputTokens + usageTokens.outputTokens, updatedAt: state.now(),
+							});
+						}
+						await requestUsageRecorder.record({
+							outcome: !streamFailed && !clientDisconnected && completion.success && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
+							statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
+							errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (streamFailed ? "stream_forward_failed" : null),
+							...(usageTokens ?? {}),
+						});
+						return completion;
+					},
 				);
-				const clientDisconnected = res.destroyed && !res.writableEnded;
-				const completion = responseOutcome.finish();
-				if (!forwarded && !clientDisconnected && completion.outcome !== "cancelled" && attempt.credential && !nativeTerminal.event) apiRuntime.recordStreamFailure(attempt.credential, apiModel, body, responseOutcome.rejection);
-				if (apiRuntime.lastPersistenceError) state.status.lastError = apiRuntime.lastPersistenceError;
-				const usageTokens = scanner.result();
-				if (usageTokens && context.stableSessionKey && context.model) {
-					state.contextBudgetGuard.update(context.stableSessionKey, {
-						model: context.model,
-						contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
-						updatedAt: state.now(),
-					});
-				}
-				await usageRecorder.record({
-					outcome: forwarded && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
-					statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
-					errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
-					...(usageTokens ?? {}),
-				});
             } catch (error) {
                 if (error instanceof ClientCancellationError || res.destroyed) {
                     await usageRecorder.record({outcome: "cancelled", statusCode: null, errorCode: "client_cancelled"});
@@ -3695,7 +3716,10 @@ async function handleRequestInner(
    const observed = state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id,context.model]));
    const reset=resetCreditState?.snapshots[scope.id];
    if(reset && reset.updatedAt > Math.max(cached?.updatedAt??0,observed?.updatedAt??0) && reset.updatedAt <= state.now() && state.now()-reset.updatedAt<=60000)return resetSnapshotQuota(reset);
-   return observed && observed.updatedAt >= (cached?.updatedAt ?? 0) ? observed : cached;
+   const baseline = observed && observed.updatedAt >= (cached?.updatedAt ?? 0) ? observed : cached;
+   const received = state.preemptiveQuotaScheduler.getSnapshot(buildQuotaScheduleKey(account, context.family, context.model),
+    quotaReceiptOwner(captureDispatchBinding(accountManager, account, account.access ?? "", scope.accountId)), baseline ?? null);
+   return received ? Object.assign(received, {model: context.model ?? "unknown"}) : baseline;
   };
   // A stored `switch` pin is a hard constraint in native mode too (#702), not a
   // preference: it fails with codex_pinned_account_unavailable rather than
@@ -3735,8 +3759,15 @@ async function handleRequestInner(
 				url.pathname = url.pathname.replace(/\/+$/, "") + "/codex/models";
 				url.searchParams.set("client_version", catalogClientVersion);
 				const binding = captureDispatchBinding(discoveryManager, fresh.account, fresh.accessToken, accountId);
-				const rejection = await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
-				if (rejection) throw createRuntimeProxyHttpError("Catalog dispatch eligibility changed.", 503, "routing_configuration_changed");
+				const sourcePath = discoveryManager.resolveSelectionStoragePath();
+				const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(sourcePath)]);
+				const authorizeCatalog = async () => {
+					const rejection = await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
+					const current = !rejection && await discoveryManager.withCurrentAccountCredential(fresh.account, binding, () =>
+						resetCurrent() && discoveryManager.resolveSelectionStoragePath() === sourcePath && isDispatchBindingCurrent(state, binding), false);
+					if (!current) throw createRuntimeProxyHttpError("Catalog dispatch eligibility changed.", 503, "routing_configuration_changed");
+				};
+				await authorizeCatalog();
 				const response = await state.fetchImpl(url.toString(), {					method: "GET", redirect: "error",
 					headers: createOutboundHeaders(new Headers(), fresh.account, fresh.accessToken, accountId),
 					signal: AbortSignal.timeout(Math.min(state.fetchTimeoutMs, 15_000))				});
@@ -3755,9 +3786,10 @@ async function handleRequestInner(
 				const chunks: Uint8Array[] = []; let size = 0;
 				try {					for (;;) {						const part = await reader.read(); if (part.done) break; size += part.value.byteLength;
 						if (size > 8 * 1024 * 1024) throw new Error("Catalog too large"); chunks.push(part.value);					}				}
-				finally { await reader.cancel(); }
-				if (state.activeAccountManager !== discoveryManager || discoveryManager.getAccountByIndex(fresh.account.index) !== fresh.account ||
-					fresh.account.access !== binding.accessToken || fresh.account.recordId !== binding.recordId) throw new Error("Account authorization changed during discovery");
+				finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+				try {
+					await authorizeCatalog();
+				} catch (error) {modelCatalog.invalidate(key); throw error;}
 				return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 			}, state.now);
 			const modelCatalog = state.modelCatalog;
@@ -3789,7 +3821,11 @@ async function handleRequestInner(
 					);
 				const scopes = discovery.flatMap(workspaceModelScopes);
 				const enabledKeys = scopes.filter(scope => scope.enabled).map(scope => scope.id);
-				const routableKeys = scopes.filter(scope => scope.routable).map(scope => scope.id);
+				const currentScopes = () => {
+					const current = state.activeAccountManager.getAccountsSnapshot().flatMap(workspaceModelScopes);
+					return scopes.map(scope => current.find(item => item.id === scope.id) ?? {...scope, enabled: false, routable: false, bound: false, selected: false});
+				};
+				const routableKeys = () => currentScopes().filter(scope => scope.routable).map(scope => scope.id);
 				const oauthRefresh = modelCatalog.list(enabledKeys);
 				// Explicit check waits for all workspaces; picker discovery runs API and OAuth in parallel.
 				if (forceCatalogRefresh) await oauthRefresh;
@@ -3806,7 +3842,7 @@ async function handleRequestInner(
 				const forceProbes = forceCatalogRefresh && incomingUrl.searchParams.get("force_probes") === "1";
 				const apiRefresh = apiRuntime.catalogs(configuredRoutes, forceCatalogRefresh, forceProbes, forceCatalogRefresh);
 				const pickerSnapshot = () => [
-					...modelCatalog.cachedList(routableKeys).filter(model => !/^(api|zdr)\//.test(model.slug)),
+					...modelCatalog.cachedList(routableKeys()).filter(model => !/^(api|zdr)\//.test(model.slug)),
 					...buildVisibleModelUnion(apiRuntime.cachedCatalogs().flatMap(catalog => {
 						const route = configuredRoutes.find(route => route.id === catalog.id && route.enabled);
 						return route ? [{...catalog, visibleModels: route.visibleModels, priority: route.priority}] : [];
@@ -3815,7 +3851,7 @@ async function handleRequestInner(
 				const refresh = (async () => {
 				await oauthRefresh;
 				const apiCatalogs = await apiRefresh;
-				const oauthModels = modelCatalog.cachedList(routableKeys).filter(model => !/^(api|zdr)\//.test(model.slug));
+				const oauthModels = modelCatalog.cachedList(routableKeys()).filter(model => !/^(api|zdr)\//.test(model.slug));
 				const models = [...oauthModels, ...buildVisibleModelUnion(apiCatalogs)];
 				if (state.modelCatalog === modelCatalog) {
 					state.catalogOAuthModels = oauthModels;
@@ -3828,7 +3864,7 @@ async function handleRequestInner(
 					checkedAt: state.now(),
 					clientVersion: catalogClientVersion,
 					entries: [
-						...scopes.map((scope) => {
+						...currentScopes().map((scope) => {
 							const entry = modelCatalog.snapshot(scope.id) ?? {
 								checkedAt: 0,
 								models: [],
@@ -3836,7 +3872,7 @@ async function handleRequestInner(
 							};
 							return {
 								...entry,
-								id:scope.id,label:scope.label,routable:scope.routable,bound:scope.bound,selected:scope.selected,
+								id:scope.id,label:scope.label,routable:scope.routable && !entry.error,bound:scope.bound,selected:scope.selected,
         kind: "oauth" as const, enabled:scope.enabled,error:scope.enabled && entry.error,
         visibleModels: scope.routable?entry.models:[],
 							};
@@ -3930,7 +3966,11 @@ async function handleRequestInner(
 
    }
 			if (!supported) {
-				writeJson(res, 403, { error: { code: "model_not_available_in_account_catalog", message: "Selected model is not advertised by an eligible account. Refresh account access or account routing settings." } }); return;
+				const available = eligible.some(snapshot => {
+					const account = accountManager.getAccountByIndex(snapshot.index);
+					return account && workspaceModelScopes(account).some(scope => scope.routable);
+				});
+				writeJson(res, available ? 403 : 503, { error: { code: available ? "model_not_available_in_account_catalog" : "codex_runtime_rotation_pool_exhausted", message: available ? "Selected model is not advertised by an eligible account. Refresh account access or account routing settings." : "No eligible account workspace is available." } }); return;
 			}
 		}
 
@@ -4553,7 +4593,12 @@ async function handleRequestInner(
 					if (observations.size >= 1000) observations.delete(observations.keys().next().value ?? "");
 					observations.set(quotaScopeKey, quotaForScope(refreshed.account, requestScope) ?? {model: context.model ?? "unknown", status: 200, updatedAt: 0, primary: {}, secondary: {}});
 				}
-				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, quotaReceiptOwner(binding), currentQuotaScope());
+				const owner = quotaReceiptOwner(binding);
+				const baseline = state.preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, owner, currentQuotaScope());
+				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, owner, baseline);
+				// Admission sees received deltas immediately through the existing
+				// private epoch. Only the guarded worker can settle or persist them.
+				state.preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt, baseline);
 				pendingQuota = mergeQuotaReceipts(receipt, pendingQuota);
 				quotaUpdate ??= (async () => {
 					let failure: {error: unknown} | undefined;
@@ -4817,14 +4862,15 @@ async function handleRequestInner(
 			// Forward image validation/moderation/5xx errors without cross-account replay.
 			// Explicit 429 quota and 401 auth handling above still use the existing pool.
 			if (isImageRequest && upstream.status >= 400) {
-				const forwarded = await forwardStreamingResponse(
-					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
+				let streamFailed = false;
+				await forwardStreamingResponse(
+					upstream, res, state.status, () => {streamFailed = true;}, state.streamStallTimeoutMs,
+					undefined, undefined, async () => {
+						await requestUsageRecorder.record({outcome: "failure", statusCode: upstream.status,
+							errorCode: streamFailed ? "stream_forward_failed" : "image_upstream_error", account: submittedUsageAccount});
+						return {success: true, outcome: "failure", errorCode: null, missingTerminal: false};
+					},
 				);
-				await usageRecorder.record({
-					outcome: "failure", statusCode: upstream.status,
-					errorCode: forwarded ? "image_upstream_error" : "stream_forward_failed",
-					account: submittedUsageAccount,
-				});
 				return;
 			}
 			if (upstream.status >= 500) {
@@ -4869,19 +4915,15 @@ async function handleRequestInner(
 					});
 					return;
 				}
-				const forwarded = await forwardStreamingResponse(
-					upstream,
-					res,
-					state.status,
-					() => undefined,
-					state.streamStallTimeoutMs,
+				let streamFailed = false;
+				await forwardStreamingResponse(
+					upstream, res, state.status, () => {streamFailed = true;}, state.streamStallTimeoutMs,
+					undefined, undefined, async () => {
+						await requestUsageRecorder.record({outcome: "failure", statusCode: upstream.status,
+							errorCode: streamFailed ? "stream_forward_failed" : "thread_goal_upstream_error", account: submittedUsageAccount});
+						return {success: true, outcome: "failure", errorCode: null, missingTerminal: false};
+					},
 				);
-				await usageRecorder.record({
-					outcome: "failure",
-					statusCode: upstream.status,
-					errorCode: forwarded ? "thread_goal_upstream_error" : "stream_forward_failed",
-					account: submittedUsageAccount,
-				});
 				return;
 			}
 
@@ -4917,7 +4959,7 @@ async function handleRequestInner(
 				quotaReceiptOwner(binding),
 				state.nativeOpenai ? currentQuotaScope() ?? null : undefined,
 			);
-			const nearExhaustionWaitMs = quotaDeferral.defer
+			const nearExhaustionWaitMs = quotaSnapshot && quotaDeferral.defer
 				? quotaDeferral.waitMs
 				: 0;
 			if (!restrictionFailure && nearExhaustionWaitMs > 0) {
@@ -5000,7 +5042,7 @@ async function handleRequestInner(
 				},
 			});
 			let streamErrored = false;
-			const forwarded = await forwardStreamingResponse(
+			await forwardStreamingResponse(
 				upstream,
 				res,
 				state.status,
@@ -5024,9 +5066,9 @@ async function handleRequestInner(
 				{...(budgetAdvisory.level === "soft" ? buildContextBudgetHeaders(budgetAdvisory) : {}),...(state.catalogEtag ? {"x-models-etag":state.catalogEtag} : {})},
 				async () => {
 					usageScanner.result();
-					const completed = responseOutcome.finish();
-					if (!completed.success) await responseRestriction?.catch(captureRestrictionFailure);
-					if (!completed.success && !restrictionFailure) {
+					const completion = responseOutcome.finish();
+					if (!completion.success) await responseRestriction?.catch(captureRestrictionFailure);
+					if (!completion.success && !streamErrored && !res.destroyed && !restrictionFailure) {
 				await applyDispatchRestriction(state, binding, () => {
 					if (!circuitAdmission || !refreshed.account.circuitKeyId || !getCircuitBreaker(refreshed.account.circuitKeyId).isAdmissionCurrent(circuitAdmission)) return false;
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
@@ -5040,54 +5082,57 @@ async function handleRequestInner(
 					return true;
 				}, false).catch(captureRestrictionFailure);
 					}
-					return completed;
+					// Nonterminal quota observations own their receipt worker, not this
+					// response's terminal delivery. An unresolved observation also
+					// cannot authorize completion-dependent account healing.
+					const quotaObservationPending = quotaUpdate !== undefined;
+					await responseRestriction?.catch(captureRestrictionFailure);
+					// The client went away mid-stream: no upstream error, and the response was
+					// neither completed nor failed. That says nothing about the account.
+					const clientDisconnected = res.destroyed && !res.writableEnded;
+					if (!streamErrored && !clientDisconnected && upstream.ok && completion.success && !restrictionFailure && !quotaObservationPending) {
+						const recovered = await applyDispatchRestriction(state, binding, () => {
+							if (!accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission)) return false;
+							recordRuntimeAccountRecovery(refreshed.account.index);
+							state.sessionAffinityStore?.remember(context.sessionKey, refreshed.account.index, state.now());
+							state.lastGlobalAccountIndex = refreshed.account.index;
+							state.lastGlobalSwitchAt = state.now();
+							return true;
+						}, false).catch(captureRestrictionFailure);
+						if (recovered) await persistRuntimeActiveAccount(accountManager, refreshed.account, context.family, isPinned && refreshed.account.index === pinnedIndex, state.schedulingStrategy, state.nativeOpenai, binding).catch(captureRestrictionFailure);
+					}
+					// A stream that broke mid-flight still bills for whatever the upstream
+					// reported before the break, so record the counts on both outcomes.
+					const usageTokens = usageScanner.result();
+					// Responses is mostly stateless (store=false): each successful turn's
+					// input_tokens reflects the full conversation resent this call, so it
+					// doubles as a live read of the session's current context size. Record
+					// it even on a broken stream, matching the ledger's own choice above —
+					// the tokens upstream billed for were still resent as full context.
+					//
+					// input + output, NOT total: `usageTokens.totalTokens` is the
+					// provider's `total_tokens`, which also counts `reasoning_tokens`.
+					// Reasoning is not carried into the next turn's input, so counting
+					// it here inflates the measurement by this turn's thinking budget
+					// against a deliberately tight threshold. `outputTokens` is already
+					// reasoning-stripped (lib/usage/usage-extraction.ts).
+					if (usageTokens && context.stableSessionKey && context.model) {
+						state.contextBudgetGuard.update(context.stableSessionKey, {
+							model: context.model,
+							contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
+							updatedAt: state.now(),
+						});
+					}
+					await requestUsageRecorder.record({
+						outcome: !streamErrored && !clientDisconnected && upstream.ok && completion.success ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
+						statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
+						errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (streamErrored ? "stream_forward_failed" : null),
+						account: submittedUsageAccount,
+						...(usageTokens ?? {}),
+					});
+					return completion;
 				},
 			);
-			await Promise.all([responseRestriction?.catch(captureRestrictionFailure), quotaUpdate?.catch(captureRestrictionFailure)]);
-			// The client went away mid-stream: no upstream error, and the response was
-			// neither completed nor failed. That says nothing about the account.
-			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
-			const completion = responseOutcome.finish();
-			if (forwarded && upstream.ok && completion.success && !restrictionFailure) {
-				const recovered = await applyDispatchRestriction(state, binding, () => {
-					if (!accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission)) return false;
-					recordRuntimeAccountRecovery(refreshed.account.index);
-					state.sessionAffinityStore?.remember(context.sessionKey, refreshed.account.index, state.now());
-					state.lastGlobalAccountIndex = refreshed.account.index;
-					state.lastGlobalSwitchAt = state.now();
-					return true;
-				}, false).catch(captureRestrictionFailure);
-				if (recovered) await persistRuntimeActiveAccount(accountManager, refreshed.account, context.family, isPinned && refreshed.account.index === pinnedIndex, state.schedulingStrategy, state.nativeOpenai, binding).catch(captureRestrictionFailure);
-			}
-			// A stream that broke mid-flight still bills for whatever the upstream
-			// reported before the break, so record the counts on both outcomes.
-			const usageTokens = usageScanner.result();
-			// Responses is mostly stateless (store=false): each successful turn's
-			// input_tokens reflects the full conversation resent this call, so it
-			// doubles as a live read of the session's current context size. Record
-			// it even on a broken stream, matching the ledger's own choice above —
-			// the tokens upstream billed for were still resent as full context.
-			//
-			// input + output, NOT total: `usageTokens.totalTokens` is the
-			// provider's `total_tokens`, which also counts `reasoning_tokens`.
-			// Reasoning is not carried into the next turn's input, so counting
-			// it here inflates the measurement by this turn's thinking budget
-			// against a deliberately tight threshold. `outputTokens` is already
-			// reasoning-stripped (lib/usage/usage-extraction.ts).
-			if (usageTokens && context.stableSessionKey && context.model) {
-				state.contextBudgetGuard.update(context.stableSessionKey, {
-					model: context.model,
-					contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
-					updatedAt: state.now(),
-				});
-			}
-			await usageRecorder.record({
-				outcome: forwarded && upstream.ok && completion.success ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
-				statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
-				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
-				account: submittedUsageAccount,
-				...(usageTokens ?? {}),
-			});
 			return;
 		}
 

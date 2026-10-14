@@ -59,6 +59,20 @@ it("fails closed after a second metadata change to the same captured authority",
  await fs.writeFile(path, JSON.stringify(metadata)); expect(current(result)).toBe(false);
 });
 
+it("keeps one metadata reconciliation after an owned predecessor backup write", async () => {
+ const backup = `${path}.bak`;
+ await fs.writeFile(backup, JSON.stringify(pool({...row(), accessToken: "fixture-older-access", expiresAt: 0})));
+ const current = captureRefreshCredentialAuthority(row());
+ // A failed primary rename can still leave the predecessor in its backup.
+ // The unchanged primary remains the membership authority.
+ await fs.writeFile(backup, await fs.readFile(path));
+ expect(current(result)).toBe(true);
+ const metadata = pool(); metadata.accounts[0]!.lastUsed = 2;
+ await fs.writeFile(path, JSON.stringify(metadata)); expect(current(result)).toBe(true);
+ metadata.accounts[0]!.lastUsed = 3;
+ await fs.writeFile(path, JSON.stringify(metadata)); expect(current(result)).toBe(false);
+});
+
 it("permits ordinary same-owner success and unrelated metadata changes", async () => {
  const owner = row(); const returned = await withRefreshCredentialRetention(owner, async () => {
   const disk = pool(); disk.accounts[0]!.lastUsed = 2; await fs.writeFile(path, JSON.stringify(disk)); return result;

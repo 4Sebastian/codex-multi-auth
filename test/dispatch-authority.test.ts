@@ -16,6 +16,7 @@ import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import * as refreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import * as refreshQueue from "../lib/refresh-queue.js";
 import {getPendingAuthPath, recordPendingAuth} from "../lib/storage/pending-auth.js";
+import * as pendingAuth from "../lib/storage/pending-auth.js";
 import {loadAccounts, setStoragePathDirect, withAccountStorageTransaction, type AccountStorageV3} from "../lib/storage.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
 import {getAccountPolicyKey, getAccountPolicyPath, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
@@ -1996,6 +1997,32 @@ it.each(["success", "failure", "journal", "primary", "trailing"])("holds custom 
 	expect(f.creates).toHaveLength(1);
 	if (mode === "journal") await fs.unlink(getPendingAuthPath(f.path));
 	if (mode === "primary") await fs.writeFile(f.path, JSON.stringify(f.pool));
+});
+
+it.each([false, true].flatMap(native => ["metadata", "revocation", "journal"].map(change => ({native, change}))))
+("rereads one changed pre-selection snapshot without accepting lost authority (%j)", async ({native, change}) => {
+ const f = await fixture(native), entered = deferred(), release = deferred();
+ cleanups.push(async () => {release.resolve();});
+ const capture = pendingAuth.capturePendingAuth;
+ let held = false;
+ vi.spyOn(pendingAuth, "capturePendingAuth").mockImplementation(async (...args) => {
+  const observation = await capture(...args);
+  if (args[0] === f.path && !held) {held = true; entered.resolve(); await release.promise;}
+  return observation;
+ });
+ const response = f.post();
+ await entered.promise;
+ const disk: AccountStorageV3 = JSON.parse(await fs.readFile(f.path, "utf8"));
+ if (change === "metadata") disk.accounts[0]!.accountLabel = "Concurrent metadata";
+ if (change === "revocation") for (const row of disk.accounts) row.authInvalidationErrorCode = "token_invalidated";
+ await fs.writeFile(f.path, JSON.stringify(disk));
+ if (change === "journal") await fs.writeFile(getPendingAuthPath(f.path), "{");
+ release.resolve();
+ const result = await response, body = await result.text();
+ expect(result.status === 200).toBe(change === "metadata");
+ expect(f.fetched).toHaveLength(change === "metadata" ? 1 : 0);
+ if (change === "metadata") expect(body).toContain("response.completed");
+ if (change === "journal") await fs.unlink(getPendingAuthPath(f.path));
 });
 
 it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credential", "expiry", "disable", "workspace", "revocation", "revocation-code", "reset", "journal"].map(change => ({transport, change}))))

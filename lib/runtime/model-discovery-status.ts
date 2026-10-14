@@ -13,7 +13,6 @@ import { AccountManager } from "../accounts.js";
 import { type AccountStorageV3, loadAccounts, getStoragePath } from "../storage.js";
 import {captureAuthorityRevision} from "../storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
-import {getPendingAuthPath} from "../storage/pending-auth.js";
 import {syncNativeAccountCredentials} from "./native-account-sync.js";
 import {
 	type ApiRouteCredential,
@@ -145,18 +144,22 @@ export async function discoverModelInventory(
 		if (!id) throw Error("Identity unavailable");
 		const url = new URL(`${CODEX_BASE_URL}/codex/models`);
 		url.searchParams.set("client_version", clientVersion ?? "0.0.0");
-		const binding = {recordId: account.recordId, refreshToken: account.refreshToken, expires: account.expires};
-		const authorityCurrent = captureAuthorityRevision([getStoragePath(), getPendingAuthPath(getStoragePath())], [getIntentionalResetMarkerPath(getStoragePath())]);
-		const snapshot = await manager.readDispatchAccountStorage();
-		if (snapshot) {
-			if (!snapshot.verified || !snapshot.storage) throw Error("Account authority unavailable");
-			syncNativeAccountCredentials(manager, snapshot.storage, snapshot.capturedAt);
-		}
-		if (!await manager.isAccountJournalEligible(account) || !authorityCurrent() ||
-			manager.getAccountByIndex(account.index) !== account || account.recordId !== binding.recordId ||
-			account.refreshToken !== binding.refreshToken || account.access !== fresh.accessToken || account.expires !== binding.expires ||
-			(account.expires ?? 0) <= now() || manager.getManagedAccountRuntimeSkipReason(account, "codex", null) ||
-			!workspaceModelScopes(account).some(current => current.id === key && current.accountId === id && current.routable)) throw Error("Account authority changed");
+		const path = manager.resolveSelectionStoragePath();
+		const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(path)]);
+		const binding = {recordId: account.recordId, accessToken: fresh.accessToken, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: id};
+		const authorize = async (): Promise<void> => {
+			const snapshot = await manager.readDispatchAccountStorage();
+			if (snapshot) {
+				if (!snapshot.verified || !snapshot.storage) throw Error("Account authority unavailable");
+				syncNativeAccountCredentials(manager, snapshot.storage, snapshot.capturedAt);
+			}
+			const current = await manager.withCurrentAccountCredential(account, binding, () =>
+				resetCurrent() && manager.resolveSelectionStoragePath() === path && getStoragePath() === path &&
+				(account.expires ?? 0) > now() && !manager.getManagedAccountRuntimeSkipReason(account, "codex", null) &&
+				workspaceModelScopes(account).some(scope => scope.id === key && scope.accountId === id && scope.routable), false);
+			if (!current) throw Error("Account authority changed");
+		};
+		await authorize();
 		const response = await fetcher(url, {
 			headers: createCodexHeaders({
 				accountId: id,
@@ -169,14 +172,19 @@ export async function discoverModelInventory(
 			await response.body?.cancel();
 			throw Error("Catalog unavailable");
 		}
-		return boundedJson(response);
+		const value = await boundedJson(response);
+		try {await authorize();}
+		catch (error) {catalog.invalidate(key); throw error;}
+		return value;
 	}, now);
 	try {
   entries.push(...await mapWithConcurrency(scopes, 3, async scope=>{
     if(scope.enabled) await catalog.list([scope.id]);
     const snapshot = catalog.snapshot(scope.id);
-    return {id:scope.id,label:scope.label,kind:"oauth" as const,enabled:scope.enabled,routable:scope.routable,bound:scope.bound,selected:scope.selected,
-     ...snapshot,error:scope.enabled && snapshot.error,checkedAt:now(),visibleModels:scope.routable?snapshot.models:[]};
+    const current = manager.getAccountsSnapshot().flatMap(workspaceModelScopes).find(item => item.id === scope.id);
+    const enabled = current?.enabled === true, routable = current?.routable === true && !snapshot.error;
+    return {id:scope.id,label:scope.label,kind:"oauth" as const,enabled,routable,bound:current?.bound ?? false,selected:current?.selected ?? false,
+     ...snapshot,error:scope.enabled && snapshot.error,checkedAt:now(),visibleModels:routable?snapshot.models:[]};
    }));
 	} finally {
 		await manager.flushPendingSave();

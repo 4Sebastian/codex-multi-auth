@@ -6,6 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { AnyAccountStorageSchema } from "./schemas.js";
 import { migrateV1ToV3 } from "./storage/migrations.js";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
+import { getRefreshQueue } from "./refresh-queue.js";
 import { applyPendingAuth, captureRefreshCredentialAuthority, getPendingAuthPath, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthSettlementError, withRefreshCredentialRetention } from "./storage/pending-auth.js";
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
 import { createNativeAccountStorageReader, type NativeAccountSnapshot } from "./runtime/native-account-storage.js";
@@ -2129,7 +2130,10 @@ export class AccountManager {
 					});
 					this.saveToDiskDebounced();
 					const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
-					throw new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");
+					const failedPublication = new PendingAuthSettlementError(result, error, () => authorityCurrent(result), undefined, "unverified");
+					try { if (!(journalError instanceof PendingAuthLocalError) && authorityCurrent(result)) getRefreshQueue().retainSettlement(storagePath, priorRefreshToken, failedPublication); }
+					catch (retentionError) { log.error("Persistence-only refresh retry could not be queued", {error: retentionError}); }
+					throw failedPublication;
 				}
 				this.saveToDiskDebounced();
 				const result: TokenSuccess = {type: "success", access: auth.access, refresh: auth.refresh, expires: auth.expires};
@@ -2580,9 +2584,10 @@ export class AccountManager {
 				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
 				const row = matches.length === 1 ? matches[0] : undefined;
 				submittedRow = row;
+				const submittedWorkspace = row?.workspaces?.find(workspace => workspace.id === submitted.accountId);
 				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.expiresAt !== submitted.expiresAt || row.enabled === false || row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined ||
-					(submitted.accountId && (row.workspaces?.length
-						? !row.workspaces.some(workspace => workspace.id === submitted.accountId && workspace.enabled !== false)
+					(submitted.accountId && (submittedWorkspace
+						? submittedWorkspace.enabled === false
 						: (row.accountId?.trim() || extractAccountId(row.accessToken)?.trim()) !== submitted.accountId))) return false;
 			}
 			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||

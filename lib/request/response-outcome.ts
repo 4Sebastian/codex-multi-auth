@@ -37,6 +37,8 @@ export class ResponseOutcome {
 		}
 	}
 
+	hasTerminal(): boolean { return this.terminal !== undefined; }
+
 	/**
 	 * `response.incomplete` (e.g. max_output_tokens) is a delivered response, not an
 	 * account failure: it counts as success for health and affinity, and its terminal

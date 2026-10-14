@@ -253,6 +253,27 @@ export class RefreshQueue {
     }
   }
 
+  /** Retain an already-spent result for persistence-only retry in the bounded queue. */
+  retainSettlement(storagePath: string, priorRefreshToken: string, error: PendingAuthSettlementError): void {
+    const key = `${storagePath}\0${priorRefreshToken}`;
+    if (this.pending.has(key)) throw new PendingAuthAdmissionError(new Error("A refresh already owns this credential"));
+    if (this.pending.size >= MAX_PENDING_AUTH_ENTRIES) throw new PendingAuthCapacityError();
+    const promise = Promise.reject<TokenResult>(error);
+    void promise.catch(() => undefined);
+    this.pending.set(key, {stage: "unsettled", error, token: priorRefreshToken, promise,
+      startedAt: Date.now(), acquireEvictionAgeMs: this.maxEntryAgeMs, generation: ++RefreshQueue.nextGeneration});
+    this.tokenRotationMap.set(key, `${storagePath}\0${error.result.refresh}`);
+  }
+
+  /** No entry means no retry and, importantly, no OAuth request. */
+  retrySettlement(storagePath: string, credential: {access: string | undefined; refresh: string; expires: number | undefined}): Promise<TokenResult> | undefined {
+    const key = `${storagePath}\0${credential.refresh}`;
+    const entry = this.pending.get(this.findOriginalToken(key) ?? key);
+    if (entry?.stage !== "unsettled" || entry.error.result.access !== credential.access ||
+      entry.error.result.refresh !== credential.refresh || entry.error.result.expires !== credential.expires) return undefined;
+    return this.refresh(credential.refresh, storagePath);
+  }
+
   private findOriginalToken(newToken: string): string | undefined {
     for (const [oldToken, mappedNewToken] of this.tokenRotationMap.entries()) {
       if (mappedNewToken === newToken && this.pending.has(oldToken)) {

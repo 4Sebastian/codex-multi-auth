@@ -3,6 +3,7 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
+import * as oauth from "../lib/auth/auth.js";
 import { promises as filesystem } from "node:fs";
 import { createNativeAccountStorageReader } from "../lib/runtime/native-account-storage.js";
 import { syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
@@ -68,12 +69,15 @@ it.each(["unchanged","disabled","revoked","deleted","replacement","rebuild","old
  if(change==="disabled" || change==="deleted") expect(account.enabled).toBe(false);
  if(change==="revoked") expect(account.authInvalidatedAt).toBeDefined();
  if(change==="rebuild") {
+  const refresh = vi.spyOn(oauth, "refreshAccessToken").mockImplementation(async () => {throw Error("Spent credential must not be exchanged again");});
   const headers:string[]=[];
   const proxy=await startRuntimeRotationProxy({nativeOpenai:true,accountManager:manager,readNativeAccountStorage:async()=>(await createNativeAccountStorageReader()()).storage,clientApiKey:"fixture-independent",upstreamBaseUrl:"http://127.0.0.1:1",fetchImpl:async(_url,init)=>{headers.push(new Headers(init?.headers).get("authorization") ?? "");return Response.json({models:[{slug:"shared"}]});}});
   try {
    for(let i=0;i<2;i++) {const response=await fetch(`${proxy.baseUrl}/models`,{headers:{authorization:"Bearer fixture-B"}});expect(response.status).toBe(200);await response.text();}
    expect(headers).toContain("Bearer fixture-B");expect(headers).not.toContain("Bearer fixture-A");
-  } finally {await proxy.close();}
+   expect(refresh).not.toHaveBeenCalled();
+   expect((await loadAccounts())?.accounts.find(row => row.recordId === "first")).toMatchObject({accessToken: "fixture-B", refreshToken: "fixture-B-refresh", expiresAt: account.expires});
+  } finally {await proxy.close();refresh.mockRestore();}
  }
  timer.mockRestore();
 });

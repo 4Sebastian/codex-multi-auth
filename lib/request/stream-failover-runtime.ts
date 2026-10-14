@@ -1,7 +1,8 @@
 import { ClientCancellationError } from "./client-cancellation.js";
 import type { ServerResponse } from "node:http";
 import type { RuntimeRotationProxyStatus } from "../runtime/rotation-server-types.js";
-import type { StreamCompletion } from "./response-outcome.js";
+import { ResponseOutcome, type StreamCompletion } from "./response-outcome.js";
+import { createUsageStreamScanner } from "../usage/usage-extraction.js";
 
 export const HOP_BY_HOP_HEADERS = new Set([
 	"connection",
@@ -165,9 +166,31 @@ export async function forwardStreamingResponse(
 		...extraHeaders,
 	});
 	let clientDisconnected = false;
+	let settlement: Promise<StreamCompletion | undefined> | undefined;
+	const settle = () => settlement ??= Promise.resolve().then(() => completion?.());
+	const contentType = upstream.headers.get("content-type")?.toLowerCase() ?? "";
+	const sse = contentType.includes("text/event-stream");
+	const json = contentType.includes("json");
+	const terminal = new ResponseOutcome(sse);
+	const detector = createUsageStreamScanner({contentType: upstream.headers.get("content-type"), onEvent: event => terminal.observe(event)});
+	let pending: Uint8Array[] = [], pendingSize = 0, lineSize = 0, lastByte = 0;
+	const write = async (value: Uint8Array): Promise<void> => {
+		onChunk?.(value);
+		if (completion) {
+			detector.push(value);
+			if (terminal.hasTerminal()) await settle();
+		}
+		if (clientDisconnected || res.destroyed || res.writableEnded) return;
+		if (!res.write(Buffer.from(value)) && !res.destroyed) await waitForDrain(res);
+	};
+	const retain = (value: Uint8Array): void => {
+		pendingSize += value.byteLength;
+		if (pendingSize > 64 * 1024 * 1024) throw Error("upstream response frame exceeds size limit");
+		pending.push(value);
+	};
 	const finish = async (): Promise<boolean> => {
+		const result = await settle();
 		if (clientDisconnected || res.destroyed) return false;
-		const result = await completion?.();
 		// Already ended by a concurrent close path: never write after end.
 		if (res.writableEnded) return false;
 		if (result && !result.success) {
@@ -180,12 +203,13 @@ export async function forwardStreamingResponse(
 	if (!upstream.body) return finish();
 
 	const reader = upstream.body.getReader();
-	res.on("close", () => {
+	const onClose = () => {
 		if (!res.writableEnded) {
 			clientDisconnected = true;
 			void reader.cancel().catch(() => undefined);
 		}
-	});
+	};
+	res.on("close", onClose);
 	try {
 		while (true) {
 			const { done, value } = await withTimeout(
@@ -198,23 +222,38 @@ export async function forwardStreamingResponse(
 			);
 			if (done) break;
 			if (value && value.byteLength > 0) {
-				onChunk?.(value);
-				// If the response is already finished (clean end by a concurrent
-				// close-then-reader-cancel path), stop writing. A destroyed response
-				// is left to the next res.write(), which throws into the catch below;
-				// that path returns false without penalizing the upstream account.
-				if (res.writableEnded) break;
-				// Respect backpressure: when the client's socket buffer is full,
-				// pause upstream reads until it drains instead of buffering the
-				// whole stream in memory for a slow consumer.
-				if (!res.write(Buffer.from(value)) && !res.destroyed) {
-					await waitForDrain(res);
+				if (!completion || (!sse && !json)) await write(value);
+				else if (!sse) retain(value);
+				else {
+					let start = 0;
+					for (const [index, byte] of value.entries()) {
+						if (byte === 10) {
+							const boundary = lineSize === 0 || (lineSize === 1 && lastByte === 13);
+							lineSize = 0;
+							if (boundary) {
+								retain(value.subarray(start, index + 1));
+								const frame = Buffer.concat(pending);
+								pending = []; pendingSize = 0; start = index + 1;
+								await write(frame);
+							}
+						} else lineSize += 1;
+						lastByte = byte;
+					}
+					if (start < value.length) retain(value.subarray(start));
 				}
 			}
+		}
+		if (pendingSize) {
+			const tail = Buffer.concat(pending);
+			onChunk?.(tail);
+			detector.push(tail); detector.result();
+			await settle();
+			if (!clientDisconnected && !res.destroyed && !res.writableEnded && !res.write(tail)) await waitForDrain(res);
 		}
 		return await finish();
 	} catch (error) {
         if (clientDisconnected || res.destroyed || (error instanceof ClientCancellationError)) {
+            await settle();
             if (!res.destroyed) res.destroy();
             return false;
         }
@@ -222,10 +261,17 @@ export async function forwardStreamingResponse(
 		try {
 			await onStreamError();
 		} finally {
-			if (!res.destroyed) {
-				res.destroy(error instanceof Error ? error : undefined);
+			try {
+				if (pendingSize) onChunk?.(Buffer.concat(pending));
+				await settle();
+			} finally {
+				if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
 			}
 		}
 		return false;
+	} finally {
+		res.off("close", onClose);
+		await reader.cancel().catch(() => undefined);
+		reader.releaseLock();
 	}
 }

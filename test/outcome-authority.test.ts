@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import { getCircuitBreaker, clearCircuitBreakers, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
 import { RefreshGuardian } from "../lib/refresh-guardian.js";
+import * as proactiveRefresh from "../lib/proactive-refresh.js";
 import { ensureFreshAccessToken } from "../lib/runtime/rotation-token-refresh.js";
 import { queuedRefresh, resetRefreshQueue } from "../lib/refresh-queue.js";
 import { loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
@@ -54,6 +55,74 @@ it.each(["healthy", "removed", "changed", "backup-only", "foreign-token"])("refr
   expect(JSON.parse(await fs.readFile(getPendingAuthPath(path), "utf8")).entries[0].recordId).toBe("A");
  } else await expect(pending).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
  expect(fetch).toHaveBeenCalledTimes(change === "healthy" ? 1 : 0);
+});
+
+it.each(["replacement", "expiry", "disabled", "deleted", "reset", "journal", "cooldown", "current"])("guards guardian failure after the batch callback is delayed (%s)", async mutation => {
+ const storage = pool(); storage.accounts[0]!.expiresAt = Date.now() + 20000;
+ await fs.writeFile(path, JSON.stringify(storage));
+ const manager = new AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+ let entered!: () => void, release!: () => void;
+ const ready = new Promise<void>(r => {entered = r;}), gate = new Promise<void>(r => {release = r;});
+ const refreshBatch = proactiveRefresh.refreshExpiringAccounts;
+ vi.spyOn(proactiveRefresh, "refreshExpiringAccounts").mockImplementation((accounts, buffer, onResult, storagePath, resolveAccount) =>
+  refreshBatch(accounts, buffer, async (source, result) => {entered(); await gate; await onResult?.(source, result);}, storagePath, resolveAccount));
+ const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({error: "invalid_grant", error_description: "fixture refusal"}, {status: 400}));
+ const guardian = new RefreshGuardian(() => manager), pending = guardian.tick();
+ await ready;
+ try {
+  if (mutation === "replacement") Object.assign(account, {access: "access-B", refreshToken: "refresh-B"});
+  if (mutation === "expiry") account.expires! += 1000;
+  const disk = structuredClone(storage);
+  if (["replacement", "expiry"].includes(mutation)) Object.assign(disk.accounts[0]!, {accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires});
+  if (mutation === "disabled") disk.accounts[0]!.enabled = false;
+  if (mutation === "deleted") disk.accounts = [];
+  const newerCooldown = Date.now() + 600000;
+  if (mutation === "cooldown") Object.assign(disk.accounts[0]!, {coolingDownUntil: newerCooldown, cooldownReason: "auth-failure"});
+  if (mutation === "reset") await fs.writeFile(`${path}.reset-intent`, "{}");
+  if (mutation === "journal") await fs.writeFile(getPendingAuthPath(path), "invalid journal");
+  else await fs.writeFile(path, JSON.stringify(disk));
+  release(); await pending;
+  expect(fetch).toHaveBeenCalledTimes(1);
+  if (mutation === "current" || mutation === "cooldown") {
+   expect(account.consecutiveAuthFailures).toBe(1);
+   expect(account.coolingDownUntil).toBeGreaterThan(Date.now());
+   if (mutation === "cooldown") expect(account.coolingDownUntil).toBe(newerCooldown);
+   expect((await loadAccounts())?.accounts[0]?.cooldownReason).toBe("auth-failure");
+   expect((await loadAccounts())?.accounts[0]?.coolingDownUntil).toBe(account.coolingDownUntil);
+  } else {
+   expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+   expect(account.coolingDownUntil).toBeUndefined();
+   if (!["reset", "journal", "deleted"].includes(mutation)) {
+    const persisted = (await loadAccounts())!.accounts[0]!;
+    expect(persisted.coolingDownUntil).toBeUndefined();
+    expect(persisted.accessToken).toBe(disk.accounts[0]?.accessToken);
+    expect(persisted.expiresAt).toBe(disk.accounts[0]?.expiresAt);
+   }
+  }
+ } finally {release(); await pending; await manager.flushPendingSave();}
+});
+
+it("does not persist or count a guardian failure after its manager changes at the locked mutation boundary", async () => {
+ const storage = pool(); storage.accounts[0]!.expiresAt = Date.now() + 20000;
+ await fs.writeFile(path, JSON.stringify(storage));
+ const manager = new AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+ let current = manager;
+ const lockedMutation = manager.withCurrentAccountCredential.bind(manager);
+ vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation((target, submitted, mutate, persist) =>
+  lockedMutation(target, submitted, row => {
+   current = new AccountManager(undefined, storage);
+   return mutate(row);
+  }, persist));
+ const before = await fs.readFile(path, "utf8");
+ const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({error: "invalid_grant"}, {status: 400}));
+ const guardian = new RefreshGuardian(() => current);
+ await guardian.tick();
+ expect(fetch).toHaveBeenCalledOnce();
+ expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+ expect(current.getAccountByIndex(0)?.consecutiveAuthFailures ?? 0).toBe(0);
+ expect(guardian.getStats().failed).toBe(0);
+ expect(await fs.readFile(path, "utf8")).toBe(before);
+ await manager.flushPendingSave(); await current.flushPendingSave();
 });
 
 it.each(["guardian", "runtime"])("keeps an inference half-open probe owned during %s OAuth failure", async caller => {

@@ -74,6 +74,51 @@ it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journ
 	} finally {release(); await pending;}
 });
 
+it.each(["disabled", "deleted", "code-only", "expiry", "credential", "workspace", "journal", "reset", "metadata"])("rejects stale OAuth catalog publication after body reading (%s)", async mutation => {
+	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [
+		{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, workspaces: [{id: "W1", enabled: true}]},
+		{recordId: "R2", accountId: "W2", accessToken: "fixture-B", refreshToken: "fixture-refresh-B", expiresAt: Date.now() + 3600000, addedAt: 2, lastUsed: 2},
+	]};
+	const path = isolationJoin(multiAuthDir, "accounts.json");
+	setStoragePathDirect(path); await isolationFs.writeFile(path, JSON.stringify(storage));
+	let entered!: () => void, release!: () => void;
+	const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+	let bodies = 0;
+	const fetcher = vi.fn(async (_url, init) => {
+		const first = new Headers(init?.headers).get("chatgpt-account-id") === "W1";
+		return new Response(new ReadableStream({async start(controller) {
+			if (++bodies === 2) entered();
+			await gate;
+			controller.enqueue(new TextEncoder().encode(JSON.stringify({models: [{slug: first ? "stale-A" : "independent-B"}]}))); controller.close();
+		}}), {headers: {"content-type": "application/json"}});
+	});
+	const pending = discoverModelInventory(storage, [], {fetchImpl: fetcher});
+	await ready;
+	try {
+		const row = storage.accounts[0]!;
+		if (mutation === "disabled") row.enabled = false;
+		if (mutation === "deleted") storage.accounts.shift();
+		if (mutation === "code-only") row.authInvalidationErrorCode = "token_invalidated";
+		if (mutation === "expiry") row.expiresAt! += 1000;
+		if (mutation === "credential") Object.assign(row, {accessToken: "replacement-A", refreshToken: "replacement-refresh"});
+		if (mutation === "workspace") row.workspaces![0]!.enabled = false;
+		if (mutation === "metadata") row.lastUsed += 1;
+		if (mutation === "reset") await isolationFs.writeFile(`${path}.reset-intent`, "{}");
+		if (mutation === "journal") await isolationFs.writeFile(getPendingAuthPath(path), "invalid journal");
+		else await isolationFs.writeFile(path, JSON.stringify(storage));
+		release();
+		const inventory = await pending;
+		expect(inventory.entries[0]?.visibleModels).toEqual(mutation === "metadata" ? ["stale-A"] : []);
+		expect(inventory.entries[0]?.error).toBe(mutation !== "metadata");
+		if (!["reset", "journal", "code-only"].includes(mutation)) {
+			expect(inventory.entries[1]?.visibleModels).toEqual(["independent-B"]);
+			expect(fetcher).toHaveBeenCalledTimes(2);
+		}
+		expect(fetcher.mock.calls.filter(([, init]) => new Headers(init?.headers).get("chatgpt-account-id") === "W1")).toHaveLength(1);
+		expect(fetcher.mock.calls.filter(([, init]) => new Headers(init?.headers).get("chatgpt-account-id") === "W2").length).toBeLessThanOrEqual(1);
+	} finally {release(); await pending;}
+});
+
 it("discovers OAuth catalogs on a first check without a previously stored client version", async () => {
 	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{accountId: "fixture-account", refreshToken: "fixture-refresh", accessToken: "fixture-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
 	const fetcher = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {

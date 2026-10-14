@@ -208,6 +208,7 @@ export function captureRefreshCredentialAuthority(
 	try {assertRecoverySourceCount(paths.length);} catch (cause) {throw new PendingAuthAdmissionError(cause);}
 	const resetPaths = [storagePath, ...(source ? [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].map(name => getFlaggedAccountsPath(storagePath, name)) : [])].map(getIntentionalResetMarkerPath);
 	let revision = captureAuthorityRevision(paths, resetPaths);
+	const primaryRevision = captureAuthorityRevision([storagePath], resetPaths);
 	let revalidated = false;
 	let resultPublicationObserved = false;
 	const resetCurrent = captureAuthorityRevision([], resetPaths);
@@ -291,7 +292,20 @@ export function captureRefreshCredentialAuthority(
 		// One same-binding metadata reconciliation is independent of the one
 		// observed publication of this owned OAuth result into its primary.
 		const published = result && authoritative && sample(authoritative.path, result);
-		const ownsPublication = !!result && !!published &&
+		// A failed primary rename can still copy its predecessor into a known
+		// backup. That is owned publication lineage, not an external metadata
+		// reconciliation. The original unchanged primary still proves membership;
+		// every root must pass the complete binding validation below.
+		const predecessor = authoritative?.row;
+		const ownsLineagePublication = !source && !!result && primaryRevision() && !!predecessor &&
+			credentials(submitted).some((value, index) => value !== [result.access, result.refresh, result.expires][index]) &&
+			sampledRoots.some(({path, row}) => {
+				if (!accountBackups.includes(path)) return false;
+				const disk = sample(path, result);
+				return !!disk && (!row || refreshBinding(disk).some((value, index) => value !== refreshBinding(row)[index])) &&
+					refreshBinding(disk).every((value, index) => value === refreshBinding(predecessor)[index]);
+			});
+		const ownsPublication = ownsLineagePublication || !!result && !!published &&
 			credentials(published).every((value, index) => value === [result.access, result.refresh, result.expires][index]) &&
 			credentials(submitted).some((value, index) => value !== credentials(published)[index]);
 		if (ownsPublication ? resultPublicationObserved : revalidated) return false;

@@ -325,9 +325,8 @@ describe("refresh-guardian", () => {
     expect(
       manager.recordFailure as ReturnType<typeof vi.fn>,
     ).toHaveBeenCalledWith(accountB, "codex");
-    expect(
-      manager.saveToDiskDebounced as ReturnType<typeof vi.fn>,
-    ).toHaveBeenCalledTimes(1);
+    expect(manager.withCurrentAccountCredential).toHaveBeenCalled();
+    expect(manager.saveToDiskDebounced).not.toHaveBeenCalled();
 
     const stats = guardian.getStats();
     expect(stats.runs).toBe(1);
@@ -413,6 +412,7 @@ describe("refresh-guardian", () => {
       }),
       markAccountCoolingDown: vi.fn(),
       markRateLimited: vi.fn(),
+      withCurrentAccountCredential: vi.fn(async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false),
       saveToDiskDebounced: vi.fn(),
     } as unknown as AccountManager;
     const { RefreshGuardian } = await import("../lib/refresh-guardian.js");
@@ -973,9 +973,8 @@ describe("refresh-guardian", () => {
     expect(
       manager.incrementAuthFailures as ReturnType<typeof vi.fn>,
     ).toHaveBeenNthCalledWith(2, accountD);
-    expect(
-      manager.saveToDiskDebounced as ReturnType<typeof vi.fn>,
-    ).toHaveBeenCalledTimes(1);
+    expect(manager.withCurrentAccountCredential).toHaveBeenCalled();
+    expect(manager.saveToDiskDebounced).not.toHaveBeenCalled();
     expect(
       manager.getAccountsSnapshot as ReturnType<typeof vi.fn>,
     ).toHaveBeenCalledTimes(1);
@@ -1199,7 +1198,7 @@ describe("refresh-guardian", () => {
   it("handles account removal during tick without throwing", async () => {
     const originalA = createManagedAccount(0);
     const originalB = createManagedAccount(1);
-    const liveAfterRemoval = [{ ...originalB }];
+    const liveAfterRemoval = [{ ...originalB, index: 0 }];
     let snapshotReads = 0;
 
     const manager = {
@@ -1399,9 +1398,8 @@ describe("refresh-guardian", () => {
     expect(
       manager.markRateLimited as ReturnType<typeof vi.fn>,
     ).toHaveBeenCalledWith(accountB, 60_000, "codex");
-    expect(
-      manager.saveToDiskDebounced as ReturnType<typeof vi.fn>,
-    ).toHaveBeenCalledTimes(1);
+    expect(manager.withCurrentAccountCredential).toHaveBeenCalled();
+    expect(manager.saveToDiskDebounced).not.toHaveBeenCalled();
 
     const stats = guardian.getStats();
     expect(stats.runs).toBe(1);

@@ -1,27 +1,27 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { createRequire } from "node:module";
-import { isAbsolute } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const versionPattern = /^[0-9A-Za-z.+_-]{1,80}$/;
 
 async function readInstalledVersion(): Promise<string> {
-	const override = process.env.CODEX_MULTI_AUTH_REAL_CODEX_BIN?.trim();
-	let executable = "codex";
-	let args: string[] = [];
-	if (override) {
-		if (!isAbsolute(override)) throw Error("Codex executable must be absolute");
-		executable = override;
-	} else {
-		try {
-			args = [createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js")];
-			executable = process.execPath;
-		} catch {
-			// Standalone Codex installations expose their executable on PATH.
-		}
-	}
-	const { stdout } = await promisify(execFile)(executable, [...args, "--version"], {
-		timeout: 3000,
+	const packageUrl = pathToFileURL(createRequire(import.meta.url).resolve("codex-multi-auth/package.json"));
+	const resolverUrl = new URL("./scripts/codex-bin-resolver.js", packageUrl);
+	const { resolveRealCodexBin }: {
+		resolveRealCodexBin: (options: {spawnSyncImpl: (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>}) => {path: string; launchWithNode: boolean} | null;
+	} = await import(resolverUrl.href);
+	const deadline = performance.now() + 3000;
+	const resolved = resolveRealCodexBin({spawnSyncImpl: (command, args, options) => {
+		const timeout = Math.ceil(deadline - performance.now());
+		if (timeout <= 0) throw Error("Codex executable lookup timed out");
+		return spawnSync(command, args, {...options, timeout, maxBuffer: 4096});
+	}});
+	if (!resolved || performance.now() >= deadline) throw Error("Codex executable unavailable");
+	const executable = resolved.launchWithNode ? process.execPath : resolved.path;
+	const args = resolved.launchWithNode ? [resolved.path, "--version"] : ["--version"];
+	const { stdout } = await promisify(execFile)(executable, args, {
+		timeout: Math.max(1, Math.ceil(deadline - performance.now())),
 		maxBuffer: 4096,
 		windowsHide: true,
 	});

@@ -325,7 +325,7 @@ export class PreemptiveQuotaScheduler {
 	}
 
 	observeReceipt(key: string, receipt: QuotaObservationReceipt, baseline?: QuotaSchedulerSnapshot | null): QuotaSchedulerSnapshot | undefined {
-		const previous = baseline === undefined ? this.snapshots.get(key) : baseline;
+		const previous = this.getSnapshot(key, receipt.owner, baseline);
 		const state = previous ? this.receipts.get(previous) : undefined;
 		const shared = this.snapshots.get(key);
 		if (!state || state.owner !== receipt.owner || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return undefined;
@@ -392,23 +392,38 @@ export class PreemptiveQuotaScheduler {
 		});
 	}
 
+	/** Read received fields for this owner without treating them as durable settlement. */
+	getSnapshot(key: string, owner?: string, baseline?: QuotaSchedulerSnapshot | null): QuotaSchedulerSnapshot | undefined {
+		const shared = this.snapshots.get(key);
+		let snapshot = baseline === undefined ? shared : baseline;
+		const state = snapshot ? this.receipts.get(snapshot) : undefined;
+		const sharedState = shared ? this.receipts.get(shared) : undefined;
+		if (!snapshot || owner === undefined || state?.owner !== owner || state.epoch !== sharedState?.epoch) return snapshot ?? undefined;
+		if (shared && sharedState === state) snapshot = shared;
+		for (const field of ["primary", "secondary"] as const) {
+			const failed = state[field]?.failed;
+			if (!failed) continue;
+			const prior = failed[field], next = snapshot[field];
+			const priorLeft = typeof prior.usedPercent === "number" && Number.isFinite(prior.usedPercent) ? quotaLeftPercentFromUsed(prior.usedPercent) ?? 100 : failed.status === 429 ? 0 : 100;
+			const nextLeft = typeof next.usedPercent === "number" && Number.isFinite(next.usedPercent) ? quotaLeftPercentFromUsed(next.usedPercent) ?? 100 : snapshot.status === 429 ? 0 : 100;
+			if (priorLeft < nextLeft || priorLeft === nextLeft && (prior.resetAtMs ?? 0) > (next.resetAtMs ?? 0)) {
+				snapshot = mergeQuotaObservations({
+					...snapshot, status: failed.status === 429 ? 429 : snapshot.status,
+					primary: field === "primary" ? prior : {}, secondary: field === "secondary" ? prior : {},
+				}, snapshot);
+				this.receipts.set(snapshot, state);
+			}
+		}
+		return snapshot;
+	}
+
 	getDeferral(key: string, now = Date.now(), owner?: string, baseline?: QuotaSchedulerSnapshot | null): QuotaDeferralDecision {
 		this.maybePrune(now);
 		if (!this.enabled) {
 			return { defer: false, waitMs: 0 };
 		}
 
-		const shared = this.snapshots.get(key);
-		let snapshot = baseline === undefined ? shared : baseline;
-		const state = snapshot ? this.receipts.get(snapshot) : undefined;
-		if (owner !== undefined && state?.owner === owner && state.epoch === (shared ? this.receipts.get(shared)?.epoch : undefined)) {
-			const primary = state.primary?.failed, secondary = state.secondary?.failed;
-			if (primary || secondary) snapshot = mergeQuotaObservations({
-				status: primary?.status ?? secondary?.status ?? 200,
-				updatedAt: Math.max(primary?.updatedAt ?? 0, secondary?.updatedAt ?? 0),
-				primary: primary?.primary ?? {}, secondary: secondary?.secondary ?? {},
-			}, snapshot);
-		}
+		const snapshot = this.getSnapshot(key, owner, baseline);
 		if (!snapshot) return { defer: false, waitMs: 0 };
 
 		// For a 429 deferral, only count a window whose reset is genuinely a
