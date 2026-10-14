@@ -65,6 +65,11 @@ const {
 	}),
 );
 
+vi.mock("../lib/runtime/catalog-client-version.js", async importOriginal => {
+	const actual = await importOriginal<typeof import("../lib/runtime/catalog-client-version.js")>();
+	return {...actual, resolveCatalogClientVersion: (requested?: string) => actual.resolveCatalogClientVersion(requested, async () => "codex-cli 0.160.0")};
+});
+
 vi.mock("../lib/auth/auth.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../lib/auth/auth.js")>();
 	return {
@@ -424,6 +429,7 @@ function textEventStream(body = "data: {}\n\n", headers?: HeadersInit): Response
 
 let storageFixtureDir: string;
 beforeEach(async () => {
+	vi.restoreAllMocks();
 	storageFixtureDir = await fs.mkdtemp(join(tmpdir(), "rotation-proxy-storage-"));
 	setStoragePathDirect(join(storageFixtureDir, "accounts.json"));
 	resetTrackers();
@@ -7384,7 +7390,7 @@ describe("review transport boundary regressions", () => {
 			ws.send(JSON.stringify(terminal()));
 		})});
 		const {fetchImpl} = createRecordingFetch(call => {
-			if (call.url.endsWith("/models")) return Response.json({data: [{id: "shared"}], models: [{slug: "shared"}]});
+			if (new URL(call.url).pathname.endsWith("/models")) return Response.json({data: [{id: "shared"}], models: [{slug: "shared"}]});
 			httpResponses++;
 			creates++;
 			successesAtSend = success.mock.calls.length;
@@ -7783,13 +7789,21 @@ describe("native re-login while router is running", () => {
 });
 
 describe("native catalog client version", () => {
-	it("recovers discovery when a native client supplies its version after an unversioned request", async () => {
+	it.each(["/models", "/models?client_version=bad%20version"])("discovers with the installed version at %s, then respects an explicit version", async path => {
 		const manager = new AccountManager(undefined, createStorage(Date.now()));
-		const { fetchImpl } = createRecordingFetch(call => new URL(call.url).searchParams.get("client_version") === "9.1.0" ? Response.json({ models: [{ slug: "future-model" }] }) : new Response("version required", { status: 400 }));
+		const { fetchImpl, calls } = createRecordingFetch(call => {
+			const version = new URL(call.url).searchParams.get("client_version");
+			return ["0.160.0", "9.1.0"].includes(version ?? "")
+				? Response.json({models: [{slug: version === "9.1.0" ? "future-model" : "current-model"}]})
+				: new Response("version required", {status: 400});
+		});
 		const proxy = await startProxy({ accountManager: manager, fetchImpl, options: { nativeOpenai: true } });
 		const headers = { authorization: "Bearer access-1" };
-		const first = await fetch(`${proxy.baseUrl}/models`, { headers }); expect(first.status).toBe(503); await first.text();
-		const next = await fetch(`${proxy.baseUrl}/models?client_version=9.1.0`, { headers }); expect(next.status).toBe(200); expect((await next.json()).models[0].slug).toBe("future-model");
+		const first = await fetch(`${proxy.baseUrl}${path}`, {headers});
+		expect(first.status).toBe(200); expect((await first.json()).models[0].slug).toBe("current-model");
+		const next = await fetch(`${proxy.baseUrl}/models?client_version=9.1.0`, {headers});
+		expect(next.status).toBe(200); expect((await next.json()).models[0].slug).toBe("future-model");
+		expect(calls.every(call => new URL(call.url).searchParams.has("client_version"))).toBe(true);
 	});
 });
 

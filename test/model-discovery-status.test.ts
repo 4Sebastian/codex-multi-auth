@@ -9,12 +9,14 @@ import { join as isolationJoin } from "node:path";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
 import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
+import * as catalogVersion from "../lib/runtime/catalog-client-version.js";
 import {getPendingAuthPath} from "../lib/storage/pending-auth.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
+	vi.spyOn(catalogVersion, "resolveCatalogClientVersion").mockImplementation(async requested => requested ?? "0.160.0");
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
@@ -70,6 +72,20 @@ it.each(["disabled", "deleted", "invalidated", "credential", "workspace", "journ
 		expect(fetcher).not.toHaveBeenCalled();
 		expect(inventory.entries[0]).toMatchObject({error: true, models: [], visibleModels: []});
 	} finally {release(); await pending;}
+});
+
+it("discovers OAuth catalogs on a first check without a previously stored client version", async () => {
+	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{accountId: "fixture-account", refreshToken: "fixture-refresh", accessToken: "fixture-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+	const fetcher = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+		expect(init?.method ?? "GET").toBe("GET");
+		return new URL(String(input)).searchParams.has("client_version")
+			? Response.json({models: [{slug: "fixture-model"}]})
+			: Response.json({error: {message: "client_version required"}}, {status: 400});
+	});
+	const inventory = await discoverModelInventory(storage, [], {fetchImpl: fetcher});
+	expect(inventory.entries[0]).toMatchObject({error: false, models: ["fixture-model"]});
+	expect(inventory.clientVersion).toBe("0.160.0");
+	expect(fetcher).toHaveBeenCalledTimes(1);
 });
 
 describe("model discovery reporting", () => {
@@ -175,7 +191,7 @@ it("reports per-model speed, reasoning and advertised access programs without pr
 	expect(JSON.stringify(inventory)).not.toContain("private-instructions");
 });
 
-it("refreshes the running native proxy instead of only an independent discovery cache", async () => {
+it("refreshes the running native proxy with the installed version instead of a stale inventory version", async () => {
 	const { refreshAndPrintModelInventory } = await import(
 		"../lib/runtime/model-discovery-status.js"
 	);
@@ -208,7 +224,7 @@ it("refreshes the running native proxy instead of only an independent discovery 
 	});
 	expect(fetcher).toHaveBeenCalledTimes(1);
 	expect(String(fetcher.mock.calls[0]?.[0])).toBe(
-		"http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=1.2.3",
+		"http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=0.160.0",
 	);
 	expect(
 		new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("authorization"),
@@ -505,7 +521,7 @@ it("asks a running proxy to force paid probes only for an explicit capability ch
    loadInventory: load, now: () => 100, forceProbes,
   });
  }
- expect(urls).toEqual(["http://127.0.0.1:12345/models?refresh_capabilities=1", "http://127.0.0.1:12345/models?refresh_capabilities=1&force_probes=1"]);
+ expect(urls).toEqual(["http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=0.160.0", "http://127.0.0.1:12345/models?refresh_capabilities=1&force_probes=1&client_version=0.160.0"]);
 });
 
 it.each(["transport", "server"].flatMap(mode => [2000, 3000, 4000].map(startedAt => ({mode, startedAt}))))

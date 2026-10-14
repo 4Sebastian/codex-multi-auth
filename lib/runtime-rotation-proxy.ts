@@ -20,6 +20,7 @@ import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway, type DispatchAuthorization } from "./runtime/responses-websocket.js";
 import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
 import { saveModelInventory } from "./runtime/model-discovery-status.js";
+import { resolveCatalogClientVersion } from "./runtime/catalog-client-version.js";
 import { loadApiRoutes, updateApiModelDiscovery, getApiRoutesPath, type ApiRouteCredential } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
 import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, isRouteModelEligible, type RouteModel } from "./model-route-policy.js";
@@ -3703,14 +3704,16 @@ async function handleRequestInner(
 		const isPinned = typeof pinnedIndex === "number";
 		if (state.nativeOpenai && (isModelsRequest || (isResponsesRequest && context.model))) {
 			const requestedVersion = incomingUrl.searchParams.get("client_version") ?? incomingHeaders.get("version");
-            const catalogClientVersion = requestedVersion && /^[0-9A-Za-z.+_-]{1,80}$/.test(requestedVersion) ? requestedVersion : undefined;
+            const catalogClientVersion = requestedVersion && /^[0-9A-Za-z.+_-]{1,80}$/.test(requestedVersion)
+				? requestedVersion
+				: await (state.defaultCatalogClientVersion ??= resolveCatalogClientVersion());
             const backoff = state.catalogBackoff ??= new Map();
 			const forceCatalogRefresh = isModelsRequest && incomingUrl.searchParams.get("refresh_capabilities") === "1";
 			// An explicit capability check is a deliberate retry: it must not stay
 			// parked behind an earlier throttle's backoff.
 			if (forceCatalogRefresh) backoff.clear();
 			const catalogsByVersion = state.modelCatalogs ??= new Map();
-			const versionKey = catalogClientVersion ?? "";
+			const versionKey = catalogClientVersion;
 			state.modelCatalog = catalogsByVersion.get(versionKey);
 			if (forceCatalogRefresh) state.modelCatalog?.refresh();
 			state.modelCatalog ??= new AccountModelCatalog(async (key) => {
@@ -3730,8 +3733,7 @@ async function handleRequestInner(
 				if (!accountId) throw new Error("Account identity unavailable");
 				const url = new URL(state.upstreamBaseUrl);
 				url.pathname = url.pathname.replace(/\/+$/, "") + "/codex/models";
-				const clientVersion = catalogClientVersion;
-				if (clientVersion && /^[0-9A-Za-z.+_-]{1,80}$/.test(clientVersion)) url.searchParams.set("client_version", clientVersion);
+				url.searchParams.set("client_version", catalogClientVersion);
 				const binding = captureDispatchBinding(discoveryManager, fresh.account, fresh.accessToken, accountId);
 				const rejection = await validateAccountDispatch(state, context, binding, undefined, undefined, async () => apiKeyClient || await nativeOAuth());
 				if (rejection) throw createRuntimeProxyHttpError("Catalog dispatch eligibility changed.", 503, "routing_configuration_changed");

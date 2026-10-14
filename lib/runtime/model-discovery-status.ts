@@ -22,6 +22,7 @@ import {
 } from "../api-route-store.js";
 import { ApiModelRuntime, boundedJson } from "./api-model-runtime.js";
 import { AccountModelCatalog } from "./account-model-catalog.js";
+import { resolveCatalogClientVersion } from "./catalog-client-version.js";
 import { ensureFreshAccessToken } from "./rotation-token-refresh.js";
 import { createCodexHeaders } from "../request/headers.js";
 import { CODEX_BASE_URL } from "../constants.js";
@@ -123,6 +124,9 @@ export async function discoverModelInventory(
 	);
 	const entries: ModelInventory["entries"] = [];
 	const scopes = manager.getAccountsSnapshot().flatMap(workspaceModelScopes);
+	const clientVersion = scopes.some(scope => scope.enabled)
+		? await resolveCatalogClientVersion(options.clientVersion)
+		: options.clientVersion;
  const catalog = new AccountModelCatalog(async (key) => {
   const scope = scopes.find(item=>item.id===key);
 		const account = scope?.enabled ? manager.getAccountByIndex(scope.accountIndex) : null;
@@ -140,9 +144,7 @@ export async function discoverModelInventory(
 		const id = scope?.accountId;
 		if (!id) throw Error("Identity unavailable");
 		const url = new URL(`${CODEX_BASE_URL}/codex/models`);
-		const version = options.clientVersion;
-		if (version && /^[0-9A-Za-z.+_-]{1,80}$/.test(version))
-			url.searchParams.set("client_version", version);
+		url.searchParams.set("client_version", clientVersion ?? "0.0.0");
 		const binding = {recordId: account.recordId, refreshToken: account.refreshToken, expires: account.expires};
 		const authorityCurrent = captureAuthorityRevision([getStoragePath(), getPendingAuthPath(getStoragePath())], [getIntentionalResetMarkerPath(getStoragePath())]);
 		const snapshot = await manager.readDispatchAccountStorage();
@@ -247,7 +249,7 @@ export async function discoverModelInventory(
 	return {
 		version: 1,
 		checkedAt: now(),
-		clientVersion: options.clientVersion,
+		clientVersion,
 		entries,
 	};
 }
@@ -357,6 +359,7 @@ export async function refreshAndPrintModelInventory(
 		const load = deps.loadInventory ?? loadModelInventory;
 		const previous = await load();
 		const binding = await (deps.getBinding ?? getAppBindStatus)();
+		const clientVersion = await resolveCatalogClientVersion();
 		if (binding.running && binding.state?.nativeOpenai) {
 			const started = (deps.now ?? Date.now)();
 			const url = new URL(binding.state.baseUrl);
@@ -373,8 +376,7 @@ export async function refreshAndPrintModelInventory(
 			url.pathname = "/models";
 			url.searchParams.set("refresh_capabilities", "1");
 			if (deps.forceProbes) url.searchParams.set("force_probes", "1");
-			if (previous?.clientVersion)
-				url.searchParams.set("client_version", previous.clientVersion);
+			url.searchParams.set("client_version", clientVersion);
    const clientApiKey = binding.state.clientApiKey;
    const current = await withCheckProgress("Refreshing workspace catalogs and API/ZDR probes", async () => {
 			const response = await (deps.fetchImpl ?? fetch)(url, {
@@ -406,7 +408,7 @@ export async function refreshAndPrintModelInventory(
 			await loadAccounts(),
 			await loadApiRoutes().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
 			{
-				clientVersion: previous?.clientVersion,
+				clientVersion,
 				updateApiDiscovery: updateApiModelDiscovery,
 				forceProbes: deps.forceProbes === true,
 				persistProbes: true,

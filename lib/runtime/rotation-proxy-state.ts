@@ -82,6 +82,7 @@ export interface RotationProxyState extends RotationProxyStateInit {
 	readonly status: RuntimeRotationProxyStatus;
 	modelCatalog?: AccountModelCatalog;
 	modelCatalogs?: Map<string, AccountModelCatalog>;
+	defaultCatalogClientVersion?: Promise<string>;
     catalogBackoff?: Map<string, number>;
     /** Short-lived per-request file reads (quota cache, reset credits), keyed by source. */
     readCache?: Map<string, { at: number; value: Promise<unknown> }>;
