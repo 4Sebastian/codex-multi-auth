@@ -251,7 +251,8 @@ describe("CircuitBreaker property invariants", () => {
 						now += CONFIG.resetTimeoutMs;
 						vi.setSystemTime(now);
 
-						expect(attemptOutcome(breaker)).toBe("allowed");
+						let receipt: import("../../lib/circuit-breaker.js").CircuitAdmissionReceipt | undefined;
+						expect(breaker.tryCanExecute(admitted => {receipt = admitted;}).ok).toBe(true);
 						for (let i = 0; i < extraAttempts; i += 1) {
 							// While the single probe is outstanding, every further
 							// attempt in the probe window is rejected.
@@ -259,12 +260,12 @@ describe("CircuitBreaker property invariants", () => {
 						}
 
 						if (probeSucceeds) {
-							breaker.recordSuccess();
+							breaker.recordSuccess(receipt);
 							expect(breaker.getState()).toBe("closed");
 							expect(breaker.getFailureCount()).toBe(0);
 							expect(breaker.isAvailable(now)).toBe(true);
 						} else {
-							breaker.recordFailure();
+							breaker.recordFailure(receipt);
 							expect(breaker.getState()).toBe("open");
 							expect(breaker.isAvailable(now)).toBe(false);
 							expect(breaker.getTimeUntilAvailable(now)).toBe(

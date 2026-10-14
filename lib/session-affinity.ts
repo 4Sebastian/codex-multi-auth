@@ -8,7 +8,7 @@ export interface SessionAffinityOptions {
 }
 
 interface SessionAffinityEntry {
-	accountIndex: number;
+	accountIndex: number | null;
 	expiresAt: number;
 	lastResponseId?: string;
 	updatedAt: number;
@@ -61,6 +61,18 @@ export class SessionAffinityStore {
 			return null;
 		}
 		return entry.accountIndex;
+	}
+
+	captureWriteAuthority(sessionKey: string | null | undefined, now = Date.now()): () => boolean {
+		const key = normalizeSessionKey(sessionKey);
+		if (!key) return () => false;
+		let entry = this.entries.get(key);
+		if (!entry || entry.expiresAt <= now) {
+			entry = {accountIndex: null, expiresAt: now + this.ttlMs, updatedAt: now, writeVersion: this.normalizeWriteVersion()};
+			this.setEntry(key, entry);
+		}
+		const captured = entry;
+		return () => this.entries.get(key) === captured && captured.expiresAt > Date.now();
 	}
 
 	remember(sessionKey: string | null | undefined, accountIndex: number, now = Date.now()): void {
@@ -184,7 +196,7 @@ export class SessionAffinityStore {
 		if (!Number.isFinite(removedIndex) || removedIndex < 0) return 0;
 		let shifted = 0;
 		for (const [key, entry] of this.entries.entries()) {
-			if (entry.accountIndex > removedIndex) {
+			if (entry.accountIndex !== null && entry.accountIndex > removedIndex) {
 				this.entries.set(key, { ...entry, accountIndex: entry.accountIndex - 1 });
 				shifted += 1;
 			}

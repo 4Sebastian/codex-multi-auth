@@ -1093,8 +1093,9 @@ describe("AccountManager", () => {
 			const identityKey = getRuntimeTrackerKey(target!);
 			expect(identityKey).toBe("account:acc_stable");
 
-			// Open the breaker before the health failures so removal must clear both
-			// independent identity-keyed runtime trackers.
+			// Record attributable failures while closed, then verify removal clears
+			// both independently keyed health and circuit state.
+			for (let i = 0; i < 5; i++) manager.recordFailure(target!, "codex");
 			const liveStable = manager.getAccountByIndex(0);
 			expect(liveStable?.accountId).toBe("acc_stable");
 			const breakerKey = getAccountIdentityKey(liveStable!)!;
@@ -1104,9 +1105,7 @@ describe("AccountManager", () => {
 			breaker.recordFailure();
 			expect(breaker.getState()).toBe("open");
 
-			// Drive the stable account's health score down via repeated failures.
-			// recordFailure keys health by quotaKey = family ("codex").
-			for (let i = 0; i < 5; i++) manager.recordFailure(target!, "codex");
+			// The same submitted identity owns its health history.
 			const penalized = getHealthTracker().getScore(identityKey, "codex");
 			expect(penalized).toBeLessThan(100);
 

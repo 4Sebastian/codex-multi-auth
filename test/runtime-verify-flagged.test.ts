@@ -15,8 +15,13 @@ afterEach(async () => {
 	setStoragePathDirect(null);
 	await removeWithRetry(fixtureDir, {recursive: true, force: true});
 });
-async function verifyRuntimeFlaggedAccounts(deps: Parameters<typeof verifyActualFlaggedAccounts>[0]) {
-	return verifyActualFlaggedAccounts({...deps, loadFlaggedAccounts: async () => {
+type VerifyDeps = Parameters<typeof verifyActualFlaggedAccounts>[0];
+async function verifyRuntimeFlaggedAccounts(deps: Omit<VerifyDeps, "persistAccountsAndFlagged"> & Partial<Pick<VerifyDeps, "persistAccountsAndFlagged">>) {
+	return verifyActualFlaggedAccounts({...deps, persistAccountsAndFlagged: deps.persistAccountsAndFlagged ?? (async (results, flagged, replaceAll, current) => {
+		if (!current()) throw new Error("Flagged publication authority changed");
+		if (results.length) await deps.persistAccounts(results, replaceAll);
+		await deps.saveFlaggedAccounts(flagged);
+	}), loadFlaggedAccounts: async () => {
 		const flagged = await deps.loadFlaggedAccounts();
 		for (const row of flagged.accounts) row.flaggedAt ??= 1;
 		await fs.writeFile(getFlaggedAccountsPath(), JSON.stringify(flagged));
@@ -45,7 +50,7 @@ describe("verifyRuntimeFlaggedAccounts", () => {
 		expect(showLine).toHaveBeenCalledWith("\nNo flagged accounts to verify.\n");
 	});
 
-	it("restores cached flagged accounts, preserves metadata, and keeps the remainder", async () => {
+	it("keeps future-expiry cached revoked credentials flagged when refresh fails", async () => {
 		const now = 10_000;
 		const persistAccounts = vi.fn(async () => {});
 		const invalidateAccountManagerCache = vi.fn();
@@ -96,24 +101,14 @@ describe("verifyRuntimeFlaggedAccounts", () => {
 			now: () => now,
 		});
 
-		expect(persistAccounts).toHaveBeenCalledWith(
-			[
-				expect.objectContaining({
-					access: "access-1",
-					refresh: "refresh-1b",
-					accountIdOverride: "acct-1",
-					accountLabel: "Resolved",
-				}),
-			],
-			false,
-		);
-		expect(invalidateAccountManagerCache).toHaveBeenCalledTimes(1);
+		expect(persistAccounts).not.toHaveBeenCalled();
+		expect(invalidateAccountManagerCache).not.toHaveBeenCalled();
 		expect(saveFlaggedAccounts).toHaveBeenCalledWith({
 			version: 1,
-			accounts: [expect.objectContaining({ refreshToken: "flagged-refresh" })],
+			accounts: [expect.objectContaining({refreshToken: "cached-refresh"}), expect.objectContaining({refreshToken: "flagged-refresh"})],
 		});
 		expect(showLine).toHaveBeenCalledWith(
-			"[1/2] Work: RESTORED (Codex CLI cache)",
+			"[1/2] Work: STILL FLAGGED (refresh failed)",
 		);
 	});
 
@@ -245,8 +240,7 @@ describe("verifyRuntimeFlaggedAccounts", () => {
 				expiresAt: now + 60_000,
 			}),
 			queuedRefresh: async () => ({
-				type: "failed" as const,
-				reason: "invalid_grant",
+				type: "success" as const, access: "new-access", refresh: "new-refresh", expires: now + 60_000,
 			}),
 			resolveTokenSuccessAccount: () => {
 				throw new Error("selection failed");
@@ -363,6 +357,8 @@ describe("verifyRuntimeFlaggedAccounts", () => {
 				accounts: [],
 			},
 			false,
+			expect.any(Function),
+			[expect.objectContaining({refreshToken: "refresh-token"})],
 		);
 		expect(persistAccounts).not.toHaveBeenCalled();
 		expect(saveFlaggedAccounts).not.toHaveBeenCalled();

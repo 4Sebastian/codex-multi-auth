@@ -1,3 +1,4 @@
+import { PendingAuthLocalError } from "../storage/pending-auth.js";
 import { logDebug, logWarn } from "../logger.js";
 import type { InputItem, RequestBody } from "../types.js";
 import { isRecord } from "../utils.js";
@@ -146,6 +147,7 @@ export async function applyResponseCompaction(
 		});
 		return { body: { ...params.body, input: compactedInput }, mode: "compacted" };
 	} catch (error) {
+		if (error instanceof PendingAuthLocalError) throw error;
 		if (signal.aborted && params.signal?.aborted) {
 			throw params.signal.reason instanceof Error
 				? params.signal.reason

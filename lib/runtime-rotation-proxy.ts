@@ -698,6 +698,7 @@ async function persistRuntimeActiveAccount(
 	isPinned: boolean,
 	schedulingStrategy: string,
 	preserveDesktopLogin = false,
+	submitted?: CurrentAccountCredential,
 ): Promise<void> {
 	if (isPinned) {
 		// When the user has manually pinned an account, the proxy MUST NOT
@@ -734,10 +735,12 @@ async function persistRuntimeActiveAccount(
 			accountManager.getRoutingMutexMode() !== "enabled" &&
 			schedulingStrategy !== "sequential"
 		) {
-			await accountManager.markSwitchedLocked(account, "rotation", family);
+			if (submitted) {
+				if (!await accountManager.withCurrentAccountCredential(account, submitted, () => accountManager.markSwitched(account, "rotation", family), false)) return;
+			} else await accountManager.markSwitchedLocked(account, "rotation", family);
 		}
 		accountManager.saveToDiskDebounced();
-		if (!preserveDesktopLogin) await accountManager.syncCodexCliActiveSelectionForIndex(account.index);
+		if (!preserveDesktopLogin) await accountManager.syncCodexCliActiveSelectionForIndex(account.index, submitted);
 	} catch {
 		// Runtime forwarding must not fail after a valid upstream response just
 		// because the local status mirrors are temporarily locked.
@@ -1174,6 +1177,7 @@ interface PreparedWebSocketRequest {
 }
 
 interface ActiveWebSocketRequest extends AccountDispatchBinding {
+	isPinned: boolean;
 	submittedAccount: ManagedAccount;
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
@@ -1760,13 +1764,15 @@ async function applyWebSocketTerminalAccountSuccess(
 	terminal: WebSocketTerminalEvent,
 ): Promise<void> {
 	if (terminal.record.outcome !== "success") return;
-	await applyDispatchRestriction(state, active, () => {
+	const recovered = await applyDispatchRestriction(state, active, () => {
 		if (!active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model, active.circuitAdmission)) return false;
 		recordRuntimeAccountRecovery(active.account.index);
+		state.sessionAffinityStore?.remember(active.request.context.sessionKey, active.account.index, state.now());
 		state.lastGlobalAccountIndex = active.account.index;
 		state.lastGlobalSwitchAt = state.now();
 		return true;
 	}, false);
+	if (recovered) await persistRuntimeActiveAccount(active.accountManager, active.account, active.request.context.family, active.isPinned, WEBSOCKET_SCHEDULING_STRATEGY, false, active);
 }
 
 function isSendableWebSocketCloseCode(code: number): boolean {
@@ -2194,8 +2200,6 @@ async function connectManagedWebSocket(
 			if (lifecycle.isClosed() || !prepared.tokenRefundable || upstream.readyState !== WebSocket.OPEN) throw new ClientCancellationError();
 			const recovered = await applyDispatchRestriction(state, prepared, () => {
 				if (!prepared.circuitAdmission.breaker.isAdmissionCurrent(prepared.circuitAdmission)) return false;
-				if (!prepared.circuitAdmission.halfOpen && !accountManager.recordSuccess(account, context.family, context.model, prepared.circuitAdmission)) return false;
-				if (!prepared.circuitAdmission.halfOpen) recordRuntimeAccountRecovery(account.index);
 				return true;
 			}, false);
 			if (!recovered) {
@@ -2206,14 +2210,6 @@ async function connectManagedWebSocket(
 				state.status,
 				accountIdentityFromAccount(account, state.now()),
 				accountId,
-			);
-			state.sessionAffinityStore?.remember(context.sessionKey, account.index, state.now());
-			await persistRuntimeActiveAccount(
-				accountManager,
-				account,
-				context.family,
-				isPinned,
-				WEBSOCKET_SCHEDULING_STRATEGY,
 			);
 			if (lifecycle.isClosed() || !prepared.tokenRefundable) {
 				upstream.terminate();
@@ -2291,8 +2287,10 @@ async function connectManagedWebSocket(
 					});
 				}
 			} catch (restrictionError) {
+				if (isRuntimeProxyHttpError(restrictionError)) throw restrictionError;
+				proxyLog.warn("WebSocket handshake restriction could not be observed", {error: restrictionError});
 				await request.usageRecorder.record({outcome: "failure", statusCode: statusCode ?? HTTP_STATUS.BAD_GATEWAY, errorCode: "websocket_handshake_failed", account});
-				throw restrictionError;
+				throw error;
 			} finally {lifecycle.onReleased(prepared);}
 			if (isPinned) break;
 			state.status.retries += 1;
@@ -2309,6 +2307,7 @@ function bridgeWebSocketConnection(
 ): void {
 	const pending: PendingWebSocketFrame[] = [];
 	const activeRequests: ActiveWebSocketRequest[] = [];
+	let boundIsPinned = false;
 	const queuedFrames = new Set<PendingWebSocketFrame>();
 	let queuedBytes = 0;
 	let nextFrameOrder = 0;
@@ -2550,7 +2549,7 @@ function bridgeWebSocketConnection(
 		}
 		if (!admission) throw createRuntimeProxyHttpError("Circuit admission is unavailable.", 503, "routing_configuration_changed");
 		frame.submittedAccount = structuredClone(forwardingAccount);
-		activeRequests.push({...binding, submittedAccount: frame.submittedAccount, circuitAdmission: admission, request});
+		activeRequests.push({...binding, isPinned: preparedHandshake?.isPinned ?? boundIsPinned, submittedAccount: frame.submittedAccount, circuitAdmission: admission, request});
 		try {
 			if (!sendBuffered(forwardingUpstream, frame.data, frame.isBinary)) {
 				if (preparedHandshake) refundPreparedWebSocketToken(preparedHandshake);
@@ -2687,6 +2686,7 @@ function bridgeWebSocketConnection(
 			const connectedUpstream = connected.upstream;
 			boundAccountManager = connected.prepared.accountManager;
 			boundAccount = connected.prepared.account;
+			boundIsPinned = connected.prepared.isPinned;
 			boundAuthority = captureDispatchBinding(connected.prepared.accountManager, connected.prepared.account, connected.prepared.accessToken, connected.prepared.accountId);
 			state.status.streamsStarted += 1;
 			connectedUpstream.on("message", (data, isBinary) => {
@@ -4293,7 +4293,6 @@ async function handleRequestInner(
 			}
 
 			const binding = captureDispatchBinding(accountManager, refreshed.account, refreshed.accessToken, accountId);
-			const requestUsage = usageRecorder;
 			const submittedUsageAccount = structuredClone(refreshed.account);
 			const capabilityScopeId = requestScope?.id ?? workspaceModelScopes(refreshed.account).find(scope => scope.accountId === accountId)?.id ?? catalogAccountKey(refreshed.account);
 			const submittedCapabilityKey = capabilityFailureKey(capabilityScopeId, binding);
@@ -4479,9 +4478,8 @@ async function handleRequestInner(
 						state.networkErrorCooldownMs,
 						"network-error",
 					);
-				}).catch(async restrictionError => {
-					await requestUsage.record({outcome: "failure", statusCode: HTTP_STATUS.BAD_GATEWAY, errorCode: "upstream_transport_error", account: submittedUsageAccount});
-					throw restrictionError;
+				}).catch(restrictionError => {
+					proxyLog.warn("Upstream transport restriction could not be observed", {error: restrictionError});
 				});
 				accountSkipReasons.set(refreshed.account.index, "network-error");
 				exhaustionReason = "network-error";
@@ -4502,7 +4500,11 @@ async function handleRequestInner(
 			let pendingQuota: QuotaObservationReceipt | undefined;
 			let quotaUpdate: Promise<void> | undefined;
 			let restrictionFailure: {error: unknown} | undefined;
-			const captureRestrictionFailure = (error: unknown): void => {restrictionFailure ??= {error};};
+			const captureRestrictionFailure = (error: unknown): void => {
+				if (!restrictionFailure) proxyLog.warn("Submitted response restriction could not be observed", {error});
+				restrictionFailure ??= {error};
+				state.status.lastError = restrictionFailure.error instanceof Error ? restrictionFailure.error.message : String(restrictionFailure.error);
+			};
 			const quotaScopeKey = state.nativeOpenai && requestScope && isResponsesRequest ? JSON.stringify([requestScope.id, context.model]) : undefined;
 			const currentQuotaScope = () => quotaScopeKey ? state.subscriptionQuotaObservations?.get(quotaScopeKey) : undefined;
 			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
@@ -4862,7 +4864,7 @@ async function handleRequestInner(
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
 					res.end(bodyText);
 				}
-				throw restrictionFailure.error;
+				return;
 			}
 
 			// A successful request proves the account is usable, so clear any
@@ -4891,25 +4893,7 @@ async function handleRequestInner(
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				}).catch(captureRestrictionFailure);
-			} else if (!restrictionFailure) {
-				state.sessionAffinityStore?.remember(
-					context.sessionKey,
-					refreshed.account.index,
-					state.now(),
-				);
-				if (refreshed.account.index !== state.lastGlobalAccountIndex) {
-					state.lastGlobalAccountIndex = refreshed.account.index;
-				}
-				state.lastGlobalSwitchAt = state.now();
 			}
-			if (!restrictionFailure) await persistRuntimeActiveAccount(
-				accountManager,
-				refreshed.account,
-				context.family,
-				isPinned && refreshed.account.index === pinnedIndex,
-				state.schedulingStrategy,
-				state.nativeOpenai,
-			).catch(captureRestrictionFailure);
 
 			// Recover the upstream token counts as the body streams past. Without
 			// them every ledger row lands with all-zero tokens and a zero cost, so
@@ -5007,12 +4991,16 @@ async function handleRequestInner(
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			const completion = responseOutcome.finish();
-			if (forwarded && upstream.ok && !restrictionFailure) {
-				await applyDispatchRestriction(state, binding, () => {
+			if (forwarded && upstream.ok && completion.success && !restrictionFailure) {
+				const recovered = await applyDispatchRestriction(state, binding, () => {
 					if (!accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission)) return false;
 					recordRuntimeAccountRecovery(refreshed.account.index);
+					state.sessionAffinityStore?.remember(context.sessionKey, refreshed.account.index, state.now());
+					state.lastGlobalAccountIndex = refreshed.account.index;
+					state.lastGlobalSwitchAt = state.now();
 					return true;
 				}, false).catch(captureRestrictionFailure);
+				if (recovered) await persistRuntimeActiveAccount(accountManager, refreshed.account, context.family, isPinned && refreshed.account.index === pinnedIndex, state.schedulingStrategy, state.nativeOpenai, binding).catch(captureRestrictionFailure);
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
@@ -5046,13 +5034,12 @@ async function handleRequestInner(
 				});
 			}
 			await usageRecorder.record({
-				outcome: forwarded && upstream.ok ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
+				outcome: forwarded && upstream.ok && completion.success ? "success" : clientDisconnected || completion.outcome === "cancelled" ? "cancelled" : "failure",
 				statusCode: nativeTerminal.event?.record.statusCode ?? upstream.status,
 				errorCode: clientDisconnected ? "client_disconnected" : nativeTerminal.event?.record.errorCode ?? completion.errorCode ?? (forwarded ? null : "stream_forward_failed"),
 				account: submittedUsageAccount,
 				...(usageTokens ?? {}),
 			});
-			if (restrictionFailure) throw restrictionFailure.error;
 			return;
 		}
 
@@ -5302,9 +5289,11 @@ async function closeServer(server: Server, sockets: Set<Socket>): Promise<void> 
 			resolve();
 		});
 	});
-	server.closeIdleConnections?.();
-	for (const socket of sockets) {
+	const socketClosures = [...sockets].map(socket => new Promise<void>(resolve => {
+		socket.once("close", resolve);
 		socket.destroy();
-	}
+	}));
+	server.closeIdleConnections?.();
 	await closed;
+	await Promise.all(socketClosures);
 }

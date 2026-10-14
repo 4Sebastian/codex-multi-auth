@@ -4739,7 +4739,7 @@ const accountManager = new AccountManager(undefined, storage);
 
 			expect(response.status).toBe(HTTP_STATUS.OK);
 			expect(await response.text()).toBe("data: served\n\n" + COMPLETED_FRAME);
-			await accountManager.flushPendingSave();
+			await vi.waitFor(async () => {await accountManager.flushPendingSave(); expect(persisted.length).toBeGreaterThan(0);});
 			expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_2");
 			expect(persisted.at(-1)).toMatchObject({
 				activeIndex: 0,
@@ -5408,7 +5408,7 @@ const accountManager = new AccountManager(undefined, storage);
 		]);
 		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("server-error");
 		expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("network-error");
-		expect(saveToDiskDebouncedSpy).toHaveBeenCalled();
+		await vi.waitFor(() => expect(saveToDiskDebouncedSpy).toHaveBeenCalled());
 		expect(proxy.getStatus().retries).toBe(0);
 		// The 5xx is the account's own failure and credits its breaker. The
 		// transport failure on acc_2 is a property of the network path, so it
@@ -6669,6 +6669,7 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 		// Every ledger row used to land with all-zero tokens, so
 		// evaluateBudgetGuard compared `0 >= limit` for maxTokens/maxCostUsd and
 		// those caps never fired — only --requests was enforced.
+		await vi.waitFor(() => expect(recorded.length).toBe(1));
 		expect(recorded.at(-1)).toMatchObject({
 			outcome: "success",
 			inputTokens: 1000,
@@ -7411,7 +7412,7 @@ describe("review transport boundary regressions", () => {
 			const billed = await append.mock.results[0]!.value as Awaited<ReturnType<typeof usageLedger.appendUsageLedgerRow>>;
 			expect(billed.outcome).toBe(status === "failed" ? "failure" : status === "cancelled" ? "cancelled" : "success");
 			expect(billed.tokens).toMatchObject({inputTokens: 10, outputTokens: 2});
-			expect(success).toHaveBeenCalledTimes(status === "failed" || status === "cancelled" ? 1 : 2);
+			expect(success).toHaveBeenCalledTimes(status === "failed" || status === "cancelled" ? 0 : 1);
 			if (status === "failed") {
 				expect(event.error.code).toBe("token_invalidated");
 				expect(manager.getAccountByIndex(0)?.authInvalidationErrorCode).toBe("token_invalidated");
@@ -9014,14 +9015,19 @@ describe("submitted credential generation regressions", () => {
 });
 
 describe("handoff lifecycle regressions", () => {
-	it.each([false, true].flatMap(replacement => ["close", "error", "cancel"].map(event => ({replacement, event}))))("owns sockets throughout selection persistence %j", async ({replacement, event}) => {
+	it.each([false, true].flatMap(replacement => ["close", "error", "cancel"].map(event => ({replacement, event}))))("owns sockets throughout asynchronous final admission %j", async ({replacement, event}) => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow"), failure = vi.spyOn(manager, "recordFailure"), refund = vi.spyOn(manager, "refundToken");
 		const saving = vi.spyOn(manager, "saveToDiskDebounced").mockImplementation(() => undefined);
 		let release!: () => void, entered!: () => void;
 		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
 		let selections = 0;
-		const selection = vi.spyOn(manager, "syncCodexCliActiveSelectionForIndex").mockImplementation(async () => {if (++selections === (replacement ? 2 : 1)) {entered(); await gate;}});
+		const evaluate = runtimePolicy.evaluateRuntimePolicy;
+		const selection = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async input => {
+			const decision = await evaluate(input);
+			if (proxySocket?.readyState === WebSocket.OPEN && sources.length === (replacement ? 2 : 1) && selections++ === 0) {entered(); await gate;}
+			return decision;
+		});
 		const sources: WebSocket[] = [], creates: string[] = [];
 		const upstream = await startTestWebSocketUpstream({onConnection: ws => {sources.push(ws); ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type !== "response.create") return; creates.push(body.input[0]); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0]}}));});}});
 		let proxySocket: WebSocket | undefined;

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import { getCircuitBreaker, clearCircuitBreakers, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
+import { RefreshGuardian } from "../lib/refresh-guardian.js";
+import { ensureFreshAccessToken } from "../lib/runtime/rotation-token-refresh.js";
 import { queuedRefresh, resetRefreshQueue } from "../lib/refresh-queue.js";
 import { loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 import { captureRefreshCredentialAuthority, getPendingAuthPath, withRefreshCredentialRetention } from "../lib/storage/pending-auth.js";
@@ -54,6 +56,28 @@ it.each(["healthy", "removed", "changed", "backup-only", "foreign-token"])("refr
  expect(fetch).toHaveBeenCalledTimes(change === "healthy" ? 1 : 0);
 });
 
+it.each(["guardian", "runtime"])("keeps an inference half-open probe owned during %s OAuth failure", async caller => {
+ const storage = pool(); storage.accounts[0]!.expiresAt = Date.now() + 20000;
+ await fs.writeFile(path, JSON.stringify(storage));
+ const manager = new AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+ manager.getCircuitRecoveryTime(account);
+ const breaker = getCircuitBreaker(account.circuitKeyId!);
+ for (let i = 0; i < 3; i++) breaker.recordFailure();
+ vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31000);
+ let admission: CircuitAdmissionReceipt | undefined;
+ manager.consumeToken(account, "codex", null, {onAdmission: receipt => {admission = receipt;}});
+ if (!admission) throw Error("Missing inference fixture probe");
+ expect(admission.halfOpen).toBe(true); expect(breaker.getState()).toBe("half-open");
+ const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({error: "invalid_grant", error_description: "fixture OAuth refusal"}, {status: 400}));
+ if (caller === "guardian") await new RefreshGuardian(() => manager).tick();
+ else await ensureFreshAccessToken({accountManager: manager, account, family: "codex", model: null, now: Date.now(), tokenRefreshSkewMs: 30000, tokenInvalidationCooldownMs: 300000});
+ expect(fetch).toHaveBeenCalledOnce();
+ expect(breaker.getState()).toBe("half-open"); expect(breaker.isAdmissionCurrent(admission)).toBe(true);
+ manager.recordFailure(account, "codex", null, admission);
+ expect(breaker.getState()).toBe("open");
+ await manager.flushPendingSave();
+});
+
 it("keeps a half-open probe and all healing owned by its admission", async () => {
  const manager = new AccountManager(undefined, await loadAccounts()), account = manager.getAccountByIndex(0)!;
  let old: CircuitAdmissionReceipt | undefined, current: CircuitAdmissionReceipt | undefined;
@@ -66,6 +90,11 @@ it("keeps a half-open probe and all healing owned by its admission", async () =>
  expect(breaker.getState()).toBe("half-open"); account.consecutiveAuthFailures = 2;
  expect(manager.recordSuccess(account, "codex", undefined, old)).toBe(false);
  expect(refreshHealth()).toBe(false);
+ expect(refreshHealth(false)).toBe(false);
+ manager.recordFailure(account, "codex");
+ breaker.recordFailure();
+ breaker.recordSuccess();
+ expect(breaker.isAdmissionCurrent(current!)).toBe(true);
  expect(manager.recordSuccess(account, "codex")).toBe(false);
  expect(account.consecutiveAuthFailures).toBe(2); expect(breaker.getState()).toBe("half-open");
  expect(manager.recordSuccess(account, "codex", undefined, current)).toBe(true);

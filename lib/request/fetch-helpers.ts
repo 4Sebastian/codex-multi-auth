@@ -293,6 +293,7 @@ export async function handleSuccessResponse(
 		 * assembled response on the non-streaming path.
 		 */
 		onUsage?: (usage: UsageTokenCounts) => void;
+		onCompletion?: (completion: import("./response-outcome.js").StreamCompletion) => Promise<void>;
 		streamStallTimeoutMs?: number;
 	},
 ): Promise<Response> {
@@ -312,6 +313,8 @@ export async function handleSuccessResponse(
 		responseHeaders,
 		options?.onResponseId,
 		options?.onUsage,
+		options?.onCompletion,
+		options?.streamStallTimeoutMs,
 	);
 }
 

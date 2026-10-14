@@ -750,6 +750,30 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 	});
 
 	describe('attachResponseIdCapture', () => {
+		it.each(["completed", "failed", "error", "eof"])("settles observed terminal %s without losing bytes or billed tokens", async type => {
+			const usage = vi.fn(), completion = vi.fn(async () => {});
+			const payload = type === "eof" ? 'data: {"type":"response.created","response":{"id":"held"}}\n\n' :
+				`data: ${JSON.stringify({type: type === "error" ? "error" : `response.${type}`, response: {id: "held", status: type, usage: {input_tokens: 7, output_tokens: 3}}})}\n\n`;
+			const response = attachResponseIdCapture(new Response(payload), new Headers(), undefined, usage, completion);
+			expect(completion).not.toHaveBeenCalled();
+			expect(await response.text()).toBe(payload);
+			expect(completion).toHaveBeenCalledOnce();
+			expect(completion.mock.calls[0]).toMatchObject([{success: type === "completed", outcome: type === "completed" ? "success" : "failure"}]);
+			if (type !== "eof") expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+		});
+		it("awaits failure settlement and closes a broken body when settlement rejects", async () => {
+			let release!: () => void;
+			const gate = new Promise<void>(done => {release = done;});
+			const first = new Error("fixture body failed"), settlement = new Error("fixture local settlement failed");
+			const body = new ReadableStream<Uint8Array>({pull() {throw first;}});
+			const completion = vi.fn(async () => {await gate; throw settlement;});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, undefined, completion);
+			let exposed = false;
+			const read = response.text().catch(error => {exposed = true; return error;});
+			await vi.waitFor(() => expect(completion).toHaveBeenCalledOnce());
+			expect(exposed).toBe(false); release();
+			expect(await read).toBe(first); expect(body.locked).toBe(false);
+		});
 		it('should capture response ids while preserving the SSE stream', async () => {
 			const onResponseId = vi.fn();
 			const sseContent = [

@@ -794,10 +794,7 @@ describe("codex manager cli commands", () => {
 			byAccountId: {},
 			byEmail: {},
 		}));
-		storageMocks.loadFlaggedAccounts.mockResolvedValue({
-			version: 1,
-			accounts: [],
-		});
+		storageMocks.loadFlaggedAccounts.mockImplementation(async () => cloneValue(flaggedStorageState ?? {version: 1, accounts: []}));
 		lastAccountStorageSnapshot = null;
 		accountStorageState = null;
 		lastFlaggedStorageSnapshot = {

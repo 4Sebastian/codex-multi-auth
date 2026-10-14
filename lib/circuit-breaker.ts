@@ -136,7 +136,7 @@ export class CircuitBreaker {
 	}
 
 	recordSuccess(receipt?: CircuitAdmissionReceipt): void {
-		if (receipt && !this.isAdmissionCurrent(receipt)) return;
+		if (receipt ? !this.isAdmissionCurrent(receipt) : this.state !== "closed") return;
 		const now = Date.now();
 		if (this.state === "half-open") {
 			this.resetToClosed(now);
@@ -149,7 +149,7 @@ export class CircuitBreaker {
 	}
 
 	recordFailure(receipt?: CircuitAdmissionReceipt): void {
-		if (receipt && !this.isAdmissionCurrent(receipt)) return;
+		if (receipt ? !this.isAdmissionCurrent(receipt) : this.state !== "closed") return;
 		const now = Date.now();
 		this.pruneFailures(now);
 		this.failures.push(now);

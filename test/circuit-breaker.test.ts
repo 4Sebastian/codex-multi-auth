@@ -84,8 +84,10 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
 
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordSuccess();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordSuccess(admission);
     expect(breaker.getState()).toBe("closed");
     expect(breaker.canExecute()).toBe(true);
   });
@@ -97,8 +99,10 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
 
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordFailure();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordFailure(admission);
     expect(breaker.getState()).toBe("open");
   });
 
@@ -158,8 +162,10 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
     breaker.recordFailure();
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordFailure();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordFailure(admission);
     expect(() => breaker.canExecute()).toThrow(CircuitOpenError);
   });
 

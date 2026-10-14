@@ -168,13 +168,23 @@ export class PendingAuthSettlementError extends PendingAuthLocalError {
 type RefreshOwner = ManagedAccount | AccountMetadataV3 | OAuthAuthDetails;
 export type FlaggedRefreshSource = {kind: "flagged"; account: FlaggedAccountMetadataV1};
 
+export function isFlaggedRecoverySourceCurrent(accounts: readonly FlaggedAccountMetadataV1[], source: FlaggedAccountMetadataV1, result?: TokenSuccess): boolean {
+	const matches = accounts.filter(row => source.recordId ? row.recordId === source.recordId :
+		(row.refreshToken === source.refreshToken || row.refreshToken === result?.refresh) && row.accountId === source.accountId && row.email === source.email);
+	const row = matches.length === 1 ? matches[0] : undefined;
+	if (!row) return false;
+	const binding = refreshBinding(row);
+	return binding.every((value, index) => value === refreshBinding(source)[index]) ||
+		!!result && binding.every((value, index) => value === refreshBinding(source, result)[index]);
+}
+
 function refreshBinding(owner: RefreshOwner, result?: TokenSuccess): unknown[] {
 	const replaced = result && !("type" in owner) && (("index" in owner ? owner.access : owner.accessToken) !== result.access || owner.refreshToken !== result.refresh || ("index" in owner ? owner.expires : owner.expiresAt) !== result.expires);
 	return "type" in owner
 		? [owner.type, result?.access ?? owner.access, result?.refresh ?? owner.refresh, result?.expires ?? owner.expires]
 		: [owner.recordId, result?.access ?? ("index" in owner ? owner.access : owner.accessToken), result?.refresh ?? owner.refreshToken,
 			result?.expires ?? ("index" in owner ? owner.expires : owner.expiresAt), owner.accountId, owner.enabled === false,
-			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex, "flaggedAt" in owner ? owner.flaggedAt : undefined];
+			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex, "flaggedAt" in owner ? owner.flaggedAt : undefined, "flaggedReason" in owner ? owner.flaggedReason : undefined];
 }
 
 export function captureRefreshCredentialAuthority(
@@ -196,10 +206,11 @@ export function captureRefreshCredentialAuthority(
 	const walPath = getAccountsWalPath(storagePath);
 	const paths = [storagePath, ...flaggedPaths, ...accountBackups, walPath];
 	try {assertRecoverySourceCount(paths.length);} catch (cause) {throw new PendingAuthAdmissionError(cause);}
-	let revision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
+	const resetPaths = [storagePath, ...(source ? [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].map(name => getFlaggedAccountsPath(storagePath, name)) : [])].map(getIntentionalResetMarkerPath);
+	let revision = captureAuthorityRevision(paths, resetPaths);
 	let revalidated = false;
 	let resultPublicationObserved = false;
-	const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(storagePath)]);
+	const resetCurrent = captureAuthorityRevision([], resetPaths);
 	const matches = (row: AccountMetadataV3, result?: TokenSuccess) => "type" in submitted ? row.refreshToken === submitted.refresh || row.refreshToken === result?.refresh
 		: submitted.recordId && row.recordId ? row.recordId === submitted.recordId : row.refreshToken === submitted.refreshToken || row.refreshToken === result?.refresh;
 	const sample = (path: string, result?: TokenSuccess): AccountMetadataV3 | undefined => {
@@ -284,7 +295,7 @@ export function captureRefreshCredentialAuthority(
 			credentials(published).every((value, index) => value === [result.access, result.refresh, result.expires][index]) &&
 			credentials(submitted).some((value, index) => value !== credentials(published)[index]);
 		if (ownsPublication ? resultPublicationObserved : revalidated) return false;
-		const nextRevision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
+		const nextRevision = captureAuthorityRevision(paths, resetPaths);
 		const valid = sampledRoots.every(({path, row}) => {
 			const disk = sample(path, result);
 			if (!row) {

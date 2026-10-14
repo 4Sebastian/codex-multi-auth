@@ -17,6 +17,7 @@ import {
 	loadAccounts,
 	readPinAndGenFromDisk,
 	saveAccounts,
+	type AccountMetadataV3,
 	type AccountStorageV3,
 	type CooldownReason,
 	type RateLimitStateV3,
@@ -935,19 +936,20 @@ export class AccountManager {
 		return account;
 	}
 
-	async syncCodexCliActiveSelectionForIndex(index: number): Promise<void> {
+	async syncCodexCliActiveSelectionForIndex(index: number, submitted?: CurrentAccountCredential): Promise<void> {
 		if (!Number.isFinite(index)) return;
 		if (index < 0 || index >= this.accounts.length) return;
 		const account = this.accounts[index];
 		if (!account) return;
+		if (submitted && (account.recordId !== submitted.recordId || account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt)) return;
 		const storagePath = this.resolveSelectionStoragePath();
 		await setCodexCliActiveSelection({
-			accountId: codexCliAccountIdFor(account, account.access),
+			accountId: submitted?.accountId ?? codexCliAccountIdFor(account, account.access),
 			email: account.email,
 			accessToken: account.access,
 			refreshToken: account.refreshToken,
 			expiresAt: account.expires,
-		}, {account, storagePath, current: () => this.getCurrentAccount() === account && this.resolveSelectionStoragePath() === storagePath});
+		}, {account, storagePath, current: () => this.getCurrentAccount() === account && this.resolveSelectionStoragePath() === storagePath && (!submitted || account.recordId === submitted.recordId && account.access === submitted.accessToken && account.refreshToken === submitted.refreshToken && account.expires === submitted.expiresAt)});
 	}
 
 	getCurrentAccount(): ManagedAccount | null {
@@ -1207,12 +1209,14 @@ export class AccountManager {
 		return true;
 	}
 
-	captureRefreshHealth(account: ManagedAccount, family: ModelFamily): () => boolean {
+	captureRefreshHealth(account: ManagedAccount, family: ModelFamily, model?: string | null): (success?: boolean) => boolean {
 		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
 		const current = breaker.captureClosedState();
-		return () => {
+		return (success = true) => {
 			if (this.getAccountByIndex(account.index) !== account || getCircuitBreaker(getAccountCircuitKey(account)) !== breaker || !current()) return false;
-			getHealthTracker().recordSuccess(getRuntimeTrackerKey(account), family);
+			const key = model ? `${family}:${model}` : family;
+			if (success) getHealthTracker().recordSuccess(getRuntimeTrackerKey(account), key);
+			else getHealthTracker().recordFailure(getRuntimeTrackerKey(account), key);
 			return true;
 		};
 	}
@@ -1234,7 +1238,7 @@ export class AccountManager {
 		admission?: CircuitAdmissionReceipt,
 	): void {
 		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
-		if (admission && !breaker.isAdmissionCurrent(admission)) return;
+		if (admission ? !breaker.isAdmissionCurrent(admission) : breaker.getState() !== "closed") return;
 		const quotaKey = model ? `${family}:${model}` : family;
 		const healthTracker = getHealthTracker();
 		healthTracker.recordFailure(getRuntimeTrackerKey(account), quotaKey);
@@ -2547,7 +2551,7 @@ export class AccountManager {
 	async withCurrentAccountCredential(
 		account: ManagedAccount,
 		submitted: CurrentAccountCredential,
-		mutate: () => boolean | void,
+		mutate: (row?: AccountMetadataV3) => boolean | void,
 		persistChanges = true,
 	): Promise<boolean> {
 		const storagePath = this.resolveSelectionStoragePath();
@@ -2563,6 +2567,7 @@ export class AccountManager {
 			const primaryExists = existsSync(this.resolveSelectionStoragePath());
 			if (this.hadPersistedStorage && !primaryExists) return false;
 			if (!await this.isAccountJournalEligible(account)) return false;
+			let submittedRow: AccountMetadataV3 | undefined;
 			if (primaryExists) {
 				if (!current) return false;
 				// Normalization drops orphaned revocation codes. They still deny
@@ -2574,6 +2579,7 @@ export class AccountManager {
 					(row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined))) return false;
 				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
 				const row = matches.length === 1 ? matches[0] : undefined;
+				submittedRow = row;
 				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.expiresAt !== submitted.expiresAt || row.enabled === false || row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined ||
 					(submitted.accountId && (row.workspaces?.length
 						? !row.workspaces.some(workspace => workspace.id === submitted.accountId && workspace.enabled !== false)
@@ -2585,7 +2591,7 @@ export class AccountManager {
 			this.syncWorkspaceSelections(current);
 			const enabledBefore = account.enabled, workspacesBefore = structuredClone(account.workspaces);
 			this.runtimeRestrictionMutation = true;
-			try {if (mutate() === false) return false;}
+			try {if (mutate(submittedRow) === false) return false;}
 			finally {this.runtimeRestrictionMutation = false;}
 			const observation = this.runtimeRestrictionOwners.get(account) ?? {credential: {...submitted}, workspaces: new Map<string, {enabled?: boolean; disabledAt?: number}>()};
 			if (account.enabled !== enabledBefore) observation.enabled = account.enabled;

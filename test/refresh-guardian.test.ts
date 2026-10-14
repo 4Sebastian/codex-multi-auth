@@ -9,8 +9,8 @@ import { CodexAuthError } from "../lib/errors.js";
 import { findMatchingAccountIndex, getStoragePath } from "../lib/storage.js";
 import type { OAuthAuthDetails } from "../lib/types.js";
 
-function captureRefreshHealthMock(this: {recordSuccess: (account: ManagedAccount, family: string) => unknown}, account: ManagedAccount, family: string) {
-  return () => { this.recordSuccess(account, family); return true; };
+function captureRefreshHealthMock(this: {recordSuccess: (account: ManagedAccount, family: string) => unknown; recordFailure: (account: ManagedAccount, family: string) => unknown}, account: ManagedAccount, family: string) {
+  return (success = true) => { if (success) this.recordSuccess(account, family); else this.recordFailure(account, family); return true; };
 }
 
 const refreshExpiringAccountsMock = vi.fn();

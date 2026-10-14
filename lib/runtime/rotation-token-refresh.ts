@@ -100,6 +100,7 @@ export async function ensureFreshAccessToken(params: {
 
 	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
 	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
+	const refreshHealth = accountManager.captureRefreshHealth(account, family, model);
 	const refreshResult = await withRefreshCredentialRetention(account,
 		() => queuedRefresh(submittedRefreshToken, storagePath),
 		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath, undefined, storagePath);
@@ -116,7 +117,7 @@ export async function ensureFreshAccessToken(params: {
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
 		const applied = await accountManager.withCurrentAccountCredential(account, submitted, () => {
-			accountManager.recordFailure(account, family, model);
+			refreshHealth(false);
 			accountManager.incrementAuthFailures(account);
 			if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
 			applyMonotonicAuthCooldown(accountManager, account, invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
@@ -158,7 +159,7 @@ export async function ensureFreshAccessToken(params: {
 		if (error instanceof PendingAuthLocalError) throw error;
 		if (account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
 		await accountManager.withCurrentAccountCredential(account, submitted, () => {
-			accountManager.recordFailure(account, family, model);
+			refreshHealth(false);
 			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
 		});
 		return { ok: false, retryable: true };

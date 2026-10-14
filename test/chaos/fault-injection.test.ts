@@ -76,9 +76,9 @@ describe("CircuitBreaker - State Machine Properties", () => {
 			
 			breaker.recordFailure();
 			vi.setSystemTime(new Date(1001));
-			breaker.canExecute();
-			
-			breaker.recordSuccess();
+			let receipt: import("../../lib/circuit-breaker.js").CircuitAdmissionReceipt | undefined;
+			expect(breaker.tryCanExecute(admitted => {receipt = admitted;}).ok).toBe(true);
+			breaker.recordSuccess(receipt);
 			expect(breaker.getState()).toBe("closed");
 		});
 
@@ -90,9 +90,9 @@ describe("CircuitBreaker - State Machine Properties", () => {
 			
 			breaker.recordFailure();
 			vi.setSystemTime(new Date(1001));
-			breaker.canExecute();
-			
-			breaker.recordFailure();
+			let receipt: import("../../lib/circuit-breaker.js").CircuitAdmissionReceipt | undefined;
+			expect(breaker.tryCanExecute(admitted => {receipt = admitted;}).ok).toBe(true);
+			breaker.recordFailure(receipt);
 			expect(breaker.getState()).toBe("open");
 		});
 
@@ -455,8 +455,9 @@ describe("CircuitBreaker - Stress Tests", () => {
 		expect(breaker.getState()).toBe("open");
 		
 		vi.setSystemTime(new Date(1001));
-		breaker.canExecute();
-		breaker.recordSuccess();
+		let receipt: import("../../lib/circuit-breaker.js").CircuitAdmissionReceipt | undefined;
+		expect(breaker.tryCanExecute(admitted => {receipt = admitted;}).ok).toBe(true);
+		breaker.recordSuccess(receipt);
 		
 		expect(breaker.getState()).toBe("closed");
 		expect(breaker.getFailureCount()).toBe(0);

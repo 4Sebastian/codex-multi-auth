@@ -12,6 +12,7 @@ useAccountSourceFixtures();
 import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
 
 function admitFixtureRequest(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}): boolean {
+	if (_account && typeof _account === "object" && (!("expires" in _account) || _account.expires === undefined)) Object.assign(_account, {expires: Date.now() + 60000});
 	return new CircuitBreaker().tryCanExecute(options?.onAdmission).ok;
 }
 
@@ -542,6 +543,8 @@ vi.mock("../lib/accounts.js", async () => {
 
 		recordSuccess() {return true;}
 		recordRateLimit() {}
+		captureRefreshHealth() {return () => true;}
+		getManagedAccountRuntimeSkipReason() {return null;}
 		recordFailure() {}
 
 		toAuthDetails() {
@@ -1808,6 +1811,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -2101,6 +2105,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				accounts[selection++] ?? accounts[1] ?? null,
 		};
 		const responseIdCallbacks: Array<(responseId: string) => void> = [];
+		const completionCallbacks: Array<(completion: import("../lib/request/response-outcome.js").StreamCompletion) => Promise<void>> = [];
 
 		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
 			manager as never,
@@ -2140,6 +2145,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				if (options?.onResponseId) {
 					responseIdCallbacks.push(options.onResponseId);
 				}
+				if (options?.onCompletion) completionCallbacks.push(options.onCompletion);
 				return response;
 			},
 		);
@@ -2171,7 +2177,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		await Promise.all([firstRequest, secondRequest]);
 		expect(responseIdCallbacks).toHaveLength(2);
 		responseIdCallbacks[1]?.("resp_second_456");
+		await completionCallbacks[1]?.({success: true, outcome: "success", missingTerminal: false, errorCode: null});
 		responseIdCallbacks[0]?.("resp_first_123");
+		await completionCallbacks[0]?.({success: true, outcome: "success", missingTerminal: false, errorCode: null});
 
 		await sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
@@ -2373,7 +2381,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			.spyOn(entitlementModule.EntitlementCache.prototype, "isBlocked")
 			.mockImplementation(() => {
 				expect(manager.getAccountsSnapshot()[0]?.email).toBe(
-					"stale@example.com",
+					isBlockedSpy.mock.calls.length === 1 ? "stale@example.com" : "fresh@example.com",
 				);
 				return { blocked: false, waitMs: 0 };
 			});
@@ -2679,7 +2687,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				) {
 					const fallbackSnapshot = manager.getAccountsSnapshot()[1];
 					expect(fallbackSnapshot?.accountId).toBe("workspace-fallback");
-					expect(fallbackSnapshot?.email).toBe("beta-stale@example.com");
+					expect(fallbackSnapshot?.email).toBe(isBlockedSpy.mock.calls.filter(([checked]) => checked === key).length === 1 ? "beta-stale@example.com" : "beta-fresh@example.com");
 				}
 				return { blocked: false, waitMs: 0 };
 			});
@@ -3031,7 +3039,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		const consumeSpy = vi
 			.spyOn(AccountManager.prototype, "consumeToken")
 			.mockReturnValueOnce(false)
-			.mockReturnValueOnce(true);
+			.mockImplementationOnce(admitFixtureRequest);
 		globalThis.fetch = vi.fn().mockResolvedValue(
 			new Response(JSON.stringify({ content: "from-second-account" }), {
 				status: 200,
@@ -3698,6 +3706,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5162,6 +5171,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5274,6 +5284,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5375,6 +5386,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5465,6 +5477,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5591,6 +5604,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5694,6 +5708,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5793,6 +5808,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5887,6 +5903,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -5997,6 +6014,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -6119,6 +6137,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit,
 			getMinWaitTimeForFamily: () => 0,
@@ -6234,6 +6253,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
@@ -6367,6 +6387,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				removeAccount: () => {},
 				recordFailure: () => {},
 				withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+				getManagedAccountRuntimeSkipReason: () => null,
 				recordSuccess: () => true,
 				recordRateLimit: () => {},
 				getMinWaitTimeForFamily: () => 0,
@@ -6542,6 +6563,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure,
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit,
 			getMinWaitTimeForFamily: () => 0,
@@ -6702,6 +6724,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			removeAccount: () => {},
 			recordFailure,
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
 			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,

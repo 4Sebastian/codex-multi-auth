@@ -4,12 +4,13 @@ export interface StreamUsageDeferral<TRow> {
 	/** Latest counts reported by upstream, or null if none have arrived. */
 	captured: () => UsageTokenCounts | null;
 	/** Feed upstream-reported counts. Writes a deferred row immediately. */
-	onUsage: (usage: UsageTokenCounts) => void;
+	onUsage: (usage: UsageTokenCounts, flushPending?: boolean) => void;
 	/**
 	 * Hand over a row to be written once upstream reports its counts, or after
 	 * `fallbackMs` without them. Only the first pending row is held.
 	 */
 	defer: (completion: TRow) => void;
+	complete: (completion: TRow) => void;
 }
 
 /**
@@ -47,6 +48,7 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 
 	let captured: UsageTokenCounts | null = null;
 	let pending: TRow | null = null;
+	let recorded = false;
 	let timer: { cancel: () => void } | null = null;
 
 	const flush = (usage: UsageTokenCounts | null): void => {
@@ -54,22 +56,28 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 		pending = null;
 		timer?.cancel();
 		timer = null;
-		if (!completion) return;
+		if (!completion || recorded) return;
+		recorded = true;
 		options.record(usage ? { ...completion, ...usage } : completion);
 	};
 
 	return {
 		captured: () => captured,
-		onUsage: (usage) => {
+		onUsage: (usage, flushPending = true) => {
 			captured = usage;
-			flush(usage);
+			if (flushPending) flush(usage);
 		},
 		defer: (completion) => {
 			// A second defer would orphan the first row's timer, so keep the row
 			// already in flight and let it settle on its own terms.
-			if (pending) return;
+			if (pending || recorded) return;
 			pending = completion;
-			timer = schedule(() => flush(null), options.fallbackMs);
+			timer = schedule(() => flush(captured), options.fallbackMs);
+		},
+		complete: completion => {
+			if (recorded) return;
+			pending = completion;
+			flush(captured);
 		},
 	};
 }

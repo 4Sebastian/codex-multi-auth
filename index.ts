@@ -182,7 +182,8 @@ import { RefreshGuardian } from "./lib/refresh-guardian.js";
 import type { CircuitAdmissionReceipt } from "./lib/circuit-breaker.js";
 import { isRecord } from "./lib/utils.js";
 import { queuedRefresh } from "./lib/refresh-queue.js";
-import { PendingAuthLocalError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
+import { createAccountDispatch } from "./lib/request/account-dispatch.js";
+import { isFlaggedRecoverySourceCurrent, PendingAuthLocalError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
 import {
 	parseEnvInt,
 	parseFailoverMode,
@@ -322,6 +323,7 @@ import {
 	setStorageBackupEnabled,
 	setStoragePath,
 	withAccountAndFlaggedStorageTransaction,
+	withFlaggedStorageTransaction,
 	withAccountStorageTransaction,
 } from "./lib/storage.js";
 import {
@@ -550,15 +552,27 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 		results: TokenSuccessWithAccount[],
 		flaggedStorage: Parameters<typeof saveFlaggedAccounts>[0],
 		replaceAll: boolean = false,
+		publicationCurrent: () => boolean,
+		recoveredSources: import("./lib/storage.js").FlaggedAccountMetadataV1[],
 	): Promise<void> =>
-		withAccountAndFlaggedStorageTransaction(async (loadedStorage, persist) => {
+		results.length === 0 ? withFlaggedStorageTransaction(async (currentFlagged, persist) => {
+			if (!publicationCurrent()) throw new PendingAuthLocalError("Flagged publication authority changed");
+			const nextFlagged = {...currentFlagged, accounts: currentFlagged.accounts.map(row => flaggedStorage.accounts.find(remaining => remaining.recordId ? remaining.recordId === row.recordId : remaining.refreshToken === row.refreshToken) ?? row)};
+			await persist(nextFlagged);
+		}) : withAccountAndFlaggedStorageTransaction(async (loadedStorage, persist, currentFlagged) => {
+			if (!publicationCurrent() || recoveredSources.some((source, index) => !isFlaggedRecoverySourceCurrent(currentFlagged.accounts, source, results[index]))) throw new PendingAuthLocalError("Flagged publication authority changed");
+			const nextFlagged = {...currentFlagged, accounts: currentFlagged.accounts.filter(row => !recoveredSources.some(source => source.recordId ? source.recordId === row.recordId : (source.refreshToken === row.refreshToken || results[recoveredSources.indexOf(source)]?.refresh === row.refreshToken) && source.accountId === row.accountId && source.email === row.email))};
+			for (const remaining of flaggedStorage.accounts) {
+				const index = nextFlagged.accounts.findIndex(row => row.recordId ? row.recordId === remaining.recordId : row.refreshToken === remaining.refreshToken);
+				if (index >= 0) nextFlagged.accounts[index] = remaining;
+			}
 			await persistAccountPoolResults({
 				results,
 				replaceAll,
 				modelFamilies: MODEL_FAMILIES,
 				withAccountStorageTransaction: async (handler) =>
 					handler(loadedStorage, async (storage) => {
-						await persist(storage, flaggedStorage);
+						await persist(storage, nextFlagged);
 					}),
 				findMatchingAccountIndex,
 				extractAccountId,
@@ -1391,11 +1405,13 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											`Using account ${account.index + 1}/${accountCount}: ${account.email ?? "unknown"} for ${modelFamily}`,
 										);
 
+										let refreshHealth: (success?: boolean) => boolean = () => false;
 										let accountAuth = accountManager.toAuthDetails(
 											account,
 										) as OAuthAuthDetails;
 										try {
 											if (shouldRefreshToken(accountAuth, tokenRefreshSkewMs, accountManager.resolveSelectionStoragePath())) {
+												refreshHealth = accountManager.captureRefreshHealth(account, modelFamily, model);
 												runtimeMetrics.authRefreshRequests += 1;
 												syncRuntimeObservability(requestTraceId);
 												accountAuth = (await refreshAndUpdateToken(
@@ -1434,11 +1450,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													{ networkCooldownMs: networkErrorCooldownMs },
 												);
 												if (retryableRefreshPolicy.recordFailure) {
-													accountManager.recordFailure(
-														account,
-														modelFamily,
-														model,
-													);
+													refreshHealth(false);
 												}
 												if (
 													typeof retryableRefreshPolicy.cooldownMs ===
@@ -1550,6 +1562,34 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											account.email = resolvedEmail;
 										}
 
+										// Consume a token before making the request for proactive rate limiting
+										let primaryAdmission: CircuitAdmissionReceipt | undefined;
+										const tokenConsumed = accountManager.consumeToken(
+											account,
+											modelFamily,
+											model,
+											{onAdmission: receipt => { primaryAdmission = receipt; }},
+										);
+										if (!tokenConsumed) {
+											accountManager.recordRateLimit(
+												account,
+												modelFamily,
+												model,
+											);
+											runtimeMetrics.accountRotations++;
+											runtimeMetrics.lastError = `Local token bucket depleted for account ${account.index + 1} (${modelFamily}${model ? `:${model}` : ""})`;
+											logWarn(
+												`Skipping account ${account.index + 1}: local token bucket depleted for ${modelFamily}${model ? `:${model}` : ""}`,
+											);
+											continue;
+										}
+
+										const primarySubmittedCredential = {recordId: account.recordId, accessToken: accountAuth.access, refreshToken: accountAuth.refresh, expiresAt: account.expires, accountId};
+										const primarySubmittedAccount = structuredClone(account);
+										if (!primaryAdmission) throw new Error("Missing circuit admission");
+										const dispatchPrimary = createAccountDispatch({manager: accountManager, account, submitted: primarySubmittedCredential, admission: primaryAdmission, family: modelFamily, model: model ?? null,
+											eligible: () => !entitlementCache.isBlocked(entitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(`${entitlementAccountKey}:${model ?? modelFamily}`).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
+										});
 										if (
 											accountCount > 1 &&
 											accountManager.shouldShowAccountToast(
@@ -1592,13 +1632,13 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														typeof requestUrl === "string"
 															? requestUrl
 															: String(requestUrl);
-													return fetch(
+													return dispatchPrimary(() => fetch(
 														normalizedCompactionUrl,
 														applyProxyCompatibleInit(
 															normalizedCompactionUrl,
 															requestInit,
 														),
-													);
+													));
 												},
 												signal: abortSignal,
 												timeoutMs: Math.min(fetchTimeoutMs, 4_000),
@@ -1634,36 +1674,22 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											continue;
 										}
 
-										// Consume a token before making the request for proactive rate limiting
-										let primaryAdmission: CircuitAdmissionReceipt | undefined;
-										const tokenConsumed = accountManager.consumeToken(
-											account,
-											modelFamily,
-											model,
-											{onAdmission: receipt => { primaryAdmission = receipt; }},
-										);
-										if (!tokenConsumed) {
-											accountManager.recordRateLimit(
-												account,
-												modelFamily,
-												model,
-											);
-											runtimeMetrics.accountRotations++;
-											runtimeMetrics.lastError = `Local token bucket depleted for account ${account.index + 1} (${modelFamily}${model ? `:${model}` : ""})`;
-											logWarn(
-												`Skipping account ${account.index + 1}: local token bucket depleted for ${modelFamily}${model ? `:${model}` : ""}`,
-											);
-											continue;
-										}
 
 										let shortRateLimitRetryCount = 0;
+										let shortRetryResponse: Response | undefined;
 										let successAccountForResponse = account;
-										let successSubmittedAccount = structuredClone(account);
-										const primarySubmittedCredential = {recordId: account.recordId, accessToken: accountAuth.access, refreshToken: accountAuth.refresh, expiresAt: account.expires, accountId};
+										let successSubmittedAccount = primarySubmittedAccount;
 										let successSubmittedCredential = primarySubmittedCredential;
 										let successAdmission = primaryAdmission;
+										let restrictionObservationFailed = false;
+										const observeRestrictionFailure = (error: unknown) => {
+											restrictionObservationFailed = true;
+											runtimeMetrics.lastError = error instanceof Error ? error.message : String(error);
+											logWarn("Submitted outcome restriction authority could not be observed", {error});
+											return false;
+										};
 										const applySubmittedRestriction = (mutate: () => boolean | void, persistChanges = false) =>
-											accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, mutate, persistChanges);
+											accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, mutate, persistChanges).catch(observeRestrictionFailure);
 										let successEntitlementAccountKey = entitlementAccountKey;
 										while (true) {
 											if (
@@ -1724,15 +1750,19 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												runtimeMetrics.totalRequests++;
 												runtimeMetrics.responsesRequests++;
 												syncRuntimeObservability(requestTraceId);
-												response = await fetch(
+												response = await dispatchPrimary(() => fetch(
 													url,
 													applyProxyCompatibleInit(url, {
 														...requestInit,
 														headers,
 														signal: fetchController.signal,
 													}),
-												);
+												));
 											} catch (networkError) {
+												if (networkError instanceof PendingAuthLocalError) {
+													if (shortRetryResponse) return shortRetryResponse;
+													throw networkError;
+												}
 												const fetchAbortReason = fetchController.signal.reason;
 												const isTimeoutAbort =
 													requestTimedOut ||
@@ -1788,6 +1818,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													}
 												});
 												sessionAffinityStore?.forgetSession(sessionAffinityKey);
+												usageCompletion = {outcome: "failure", errorCode: "upstream_transport_error", account: {index: primarySubmittedAccount.index, accountId: primarySubmittedAccount.accountId, email: primarySubmittedAccount.email}};
 												throw networkError;
 											} finally {
 												clearTimeout(fetchTimeoutId);
@@ -1808,6 +1839,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													response.headers,
 												),
 											});
+											usageCompletion = {outcome: "failure", statusCode: response.status, errorCode: response.ok ? null : `http_${response.status}`, account: {index: primarySubmittedAccount.index, accountId: primarySubmittedAccount.accountId, email: primarySubmittedAccount.email}};
 											const quotaSnapshot = readQuotaSchedulerSnapshot(
 												response.headers,
 												response.status,
@@ -1817,6 +1849,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												await applySubmittedRestriction(() => {
 													preemptiveQuotaScheduler.update(quotaScheduleKey, quotaSnapshot);
 												});
+												if (restrictionObservationFailed) return response;
 											}
 
 											if (!response.ok) {
@@ -1886,6 +1919,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														sessionAffinityStore?.forgetSession(sessionAffinityKey);
 														account.lastSwitchReason = "rotation";
 													});
+													if (restrictionObservationFailed) return errorResponse;
 													runtimeMetrics.lastError = `Unsupported model on account ${account.index + 1}: ${blockedModel}`;
 													logWarn(
 														`Model ${blockedModel} is unsupported for account ${account.index + 1}. Trying next account/workspace before fallback.`,
@@ -1922,6 +1956,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														capabilityPolicyStore.recordUnsupported(entitlementAccountKey, previousModel);
 														accountManager.refundToken(account, previousModelFamily, previousModel);
 													});
+													if (restrictionObservationFailed) return errorResponse;
 
 													model = fallbackModel;
 													modelFamily = getModelFamily(model);
@@ -1985,6 +2020,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														entitlementCache.markBlocked(entitlementAccountKey, blockedModel, "unsupported-model");
 														capabilityPolicyStore.recordUnsupported(entitlementAccountKey, blockedModel);
 													});
+													if (restrictionObservationFailed) return errorResponse;
 													runtimeMetrics.lastError = `Unsupported model (strict): ${blockedModel}`;
 													logWarn(
 														`Model ${blockedModel} is unsupported for this ChatGPT account. Strict policy blocks automatic fallback.`,
@@ -2013,6 +2049,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														entitlementCache.markBlocked(entitlementAccountKey, blockedModel, "unsupported-model");
 														capabilityPolicyStore.recordUnsupported(entitlementAccountKey, blockedModel);
 													});
+													if (restrictionObservationFailed) return errorResponse;
 												}
 												const workspaceErrorCode =
 													(
@@ -2071,6 +2108,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																accountManager.setAccountEnabled(account.index, false);
 															return true;
 														}, true);
+														if (restrictionObservationFailed) return errorResponse;
 														if (!workspaceApplied) return errorResponse;
 
 														if (rotation.workspace) {
@@ -2124,6 +2162,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														entitlementCache.markBlocked(entitlementAccountKey, model ?? modelFamily, "plan-entitlement");
 														capabilityPolicyStore.recordFailure(entitlementAccountKey, capabilityModelKey);
 													});
+													if (restrictionObservationFailed) return errorResponse;
 												}
 
 												if (
@@ -2167,6 +2206,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													);
 													let serverBurstCooldownUntil = 0;
 													await applySubmittedRestriction(() => { serverBurstCooldownUntil = recordServerBurstFailure(account.index); });
+													if (restrictionObservationFailed) return errorResponse;
 													if (serverBurstCooldownUntil > 0) {
 														runtimeMetrics.lastError =
 															"Repeated upstream server errors across the account pool";
@@ -2185,6 +2225,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													) {
 														const cooldownMs = policy.cooldownMs;
 														await applySubmittedRestriction(() => { preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, cooldownMs); });
+														if (restrictionObservationFailed) return errorResponse;
 													}
 													if (policy.refundToken) {
 														accountManager.refundToken(
@@ -2204,6 +2245,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 															accountManager.saveToDiskDebounced();
 														}
 													});
+													if (restrictionObservationFailed) return errorResponse;
 													sessionAffinityStore?.forgetSession(
 														sessionAffinityKey,
 													);
@@ -2247,6 +2289,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 															// the cooldown and the account is re-selected on restart.
 															accountManager.saveToDiskDebounced();
 														});
+														if (restrictionObservationFailed) return errorResponse;
 														if (!restrictionApplied) return errorResponse;
 
 														if (
@@ -2271,6 +2314,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 															),
 														);
 														if (!await applySubmittedRestriction(() => true)) return errorResponse;
+														shortRetryResponse = errorResponse;
 														continue;
 													}
 
@@ -2282,6 +2326,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														runtimeMetrics.accountRotations++;
 														accountManager.saveToDiskDebounced();
 													});
+													if (restrictionObservationFailed) return errorResponse;
 													if (!restrictionApplied) return errorResponse;
 													logWarn(
 														`Rate limited. Rotating account ${account.index + 1} (${account.email ?? "unknown"}).`,
@@ -2312,6 +2357,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													await applySubmittedRestriction(() => {
 														capabilityPolicyStore.recordFailure(entitlementAccountKey, capabilityModelKey);
 													});
+													if (restrictionObservationFailed) return errorResponse;
 												}
 												runtimeMetrics.failedRequests++;
 												runtimeMetrics.lastError = `HTTP ${response.status}`;
@@ -2502,8 +2548,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 															const fallbackSubmittedAccount = structuredClone(fallbackAccount);
 															const fallbackSubmittedCredential = {recordId: fallbackAccount.recordId, accessToken: fallbackAuth.access, refreshToken: fallbackAuth.refresh, expiresAt: fallbackAccount.expires, accountId: fallbackAccountId};
+															if (!fallbackAdmission) throw new Error("Missing circuit admission");
+															const dispatchFallback = createAccountDispatch({manager: accountManager, account: fallbackAccount, submitted: fallbackSubmittedCredential, admission: fallbackAdmission, family: modelFamily, model: model ?? null,
+																eligible: () => !entitlementCache.isBlocked(fallbackEntitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(`${fallbackEntitlementAccountKey}:${model ?? modelFamily}`).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
+															});
 															const applyFallbackRestriction = (mutate: () => boolean | void, persistChanges = false) =>
-																accountManager.withCurrentAccountCredential(fallbackAccount, fallbackSubmittedCredential, mutate, persistChanges);
+																accountManager.withCurrentAccountCredential(fallbackAccount, fallbackSubmittedCredential, mutate, persistChanges).catch(observeRestrictionFailure);
 															const fallbackController = new AbortController();
 															const fallbackTimeoutId = setTimeout(
 																() =>
@@ -2533,14 +2583,14 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																runtimeMetrics.totalRequests++;
 																runtimeMetrics.responsesRequests++;
 																syncRuntimeObservability(requestTraceId);
-																const fallbackResponse = await fetch(
+																const fallbackResponse = await dispatchFallback(() => fetch(
 																	url,
 																	applyProxyCompatibleInit(url, {
 																		...requestInit,
 																		headers: fallbackHeaders,
 																		signal: fallbackController.signal,
 																	}),
-																);
+																));
 																const fallbackSnapshot =
 																	readQuotaSchedulerSnapshot(
 																		fallbackResponse.headers,
@@ -2550,6 +2600,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	await applyFallbackRestriction(() => {
 																		preemptiveQuotaScheduler.update(`${fallbackEntitlementAccountKey}:${model ?? modelFamily}`, fallbackSnapshot);
 																	});
+																	if (restrictionObservationFailed) return fallbackResponse;
 																}
 																if (!fallbackResponse.ok) {
 																	const {
@@ -2593,6 +2644,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																		}
 																		return true;
 																	});
+																	if (restrictionObservationFailed) return handledFallbackResponse;
 																	continue;
 																}
 
@@ -2615,7 +2667,10 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																);
 																return fallbackResponse;
 															} catch (streamFailoverError) {
-															if (streamFailoverError instanceof PendingAuthLocalError) throw streamFailoverError;
+															if (streamFailoverError instanceof PendingAuthLocalError) {
+																observeRestrictionFailure(streamFailoverError);
+																return null;
+															}
 																accountManager.refundToken(
 																	fallbackAccount,
 																	modelFamily,
@@ -2625,6 +2680,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																	accountManager.recordFailure(fallbackAccount, modelFamily, model, fallbackAdmission);
 																	capabilityPolicyStore.recordFailure(fallbackEntitlementAccountKey, capabilityModelKey);
 																});
+																if (restrictionObservationFailed) throw streamFailoverError;
 																logWarn(
 																	`Stream failover attempt ${failoverAttempt} failed for account ${fallbackAccount.index + 1}.`,
 																	{
@@ -2657,134 +2713,75 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													},
 												);
 											}
-											let storedResponseIdForSuccess = false;
+											const affinityCurrent = sessionAffinityStore?.captureWriteAuthority(sessionAffinityKey);
 											let observedResponseIdForSuccess: string | undefined;
-											let successCircuitCurrent: (() => boolean) | undefined;
-											const rememberSuccessResponseId = (responseId: string) => {
-												sessionAffinityStore?.updateLastResponseId(sessionAffinityKey, responseId, Date.now(), sessionAffinityVersion);
-												storedResponseIdForSuccess = true;
+											let acceptedUsage: ReturnType<typeof usageDeferral.captured> = null;
+											let observedCompletion: import("./lib/request/response-outcome.js").StreamCompletion | undefined;
+											const acceptedRow: RuntimeUsageRecordInput = {
+												outcome: "failure", statusCode: responseForSuccess.status, errorCode: "upstream_missing_terminal",
+												account: {index: successSubmittedAccount.index, accountId: successSubmittedAccount.accountId ?? null, email: successSubmittedAccount.email ?? null},
 											};
-											const successResponse = await handleSuccessResponse(
-												responseForSuccess,
-												isStreaming,
-												{
-													onResponseId: (responseId) => {
-														if (!responseContinuationEnabled) return;
-														observedResponseIdForSuccess = responseId;
-														if (successCircuitCurrent) {
-															void accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
-																if (!successCircuitCurrent?.() || sessionAffinityStore?.getPreferredAccountIndex(sessionAffinityKey) !== successAccountForResponse.index) return false;
-																rememberSuccessResponseId(responseId); return true;
-															}, false).catch(error => {
-																runtimeMetrics.lastError = error instanceof Error ? error.message : String(error);
-																logWarn("Accepted stream affinity authority could not be observed", {error});
-															});
+											if (isStreaming) usageDeferral.defer(acceptedRow);
+											const settleAcceptedResponse = async (completion: import("./lib/request/response-outcome.js").StreamCompletion) => {
+												acceptedRow.account = {index: successSubmittedAccount.index, accountId: successSubmittedAccount.accountId ?? null, email: successSubmittedAccount.email ?? null};
+												if (completion.success) {
+													runtimeMetrics.successfulRequests++;
+													runtimeMetrics.lastError = null;
+													let successApplied = false;
+													try {
+														successApplied = await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
+															if (!successAdmission || !accountManager.recordSuccess(successAccountForResponse, modelFamily, model, successAdmission)) return false;
+															resetRateLimitBackoff(successAccountForResponse.index, quotaKey);
+															if (affinityCurrent?.()) {
+																sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, successAccountForResponse.index, Date.now(), sessionAffinityVersion);
+																if (responseContinuationEnabled && observedResponseIdForSuccess) sessionAffinityStore?.updateLastResponseId(sessionAffinityKey, observedResponseIdForSuccess, Date.now(), sessionAffinityVersion);
+															}
+															if (successAccountForResponse !== account) accountManager.markSwitched(successAccountForResponse, "rotation", modelFamily);
+															if (successQuotaSnapshot) preemptiveQuotaScheduler.update(`${successEntitlementAccountKey}:${model ?? modelFamily}`, successQuotaSnapshot);
+															capabilityPolicyStore.recordSuccess(successEntitlementAccountKey, capabilityModelKey);
+															entitlementCache.clear(successEntitlementAccountKey, capabilityModelKey);
+															return true;
+														}, false);
+													} catch (error) {
+														runtimeMetrics.lastError = error instanceof Error ? error.message : String(error);
+														logWarn("Accepted response recovery authority could not be observed", {error});
+													}
+													if (successApplied) {
+														if (lastCodexCliActiveSyncIndex !== successAccountForResponse.index) {
+															void accountManager.syncCodexCliActiveSelectionForIndex(successAccountForResponse.index, successSubmittedCredential);
+															lastCodexCliActiveSyncIndex = successAccountForResponse.index;
 														}
-													},
-													onUsage: (usage) => {
-														usageDeferral.onUsage(usage);
-														// Responses is mostly stateless (store=false): this
-														// turn's input_tokens reflects the full conversation
-														// resent this call, so it doubles as a live read of
-														// the session's current context size. input + output, NOT
-														// total: total_tokens also counts reasoning tokens, which
-														// are not resent as context on the next turn.
-														if (sessionAffinityKey && model) {
-															contextBudgetGuard.update(sessionAffinityKey, {
-																model,
-																contextTokens: usage.inputTokens + usage.outputTokens,
-																updatedAt: Date.now(),
-															});
-														}
-													},
-													streamStallTimeoutMs,
-												},
-											);
-
-
-											runtimeMetrics.successfulRequests++;
-											runtimeMetrics.lastError = null;
-											usageCompletion = {
-												outcome: "success",
-												statusCode: successResponse.status,
-												errorCode: null,
-												account: {
-													index: successAccountForResponse.index,
-													accountId:
-														successSubmittedAccount.accountId ?? null,
-													email: successSubmittedAccount.email ?? null,
-												},
-												// Already known for a non-streaming response, which
-												// reported its usage while the body was being
-												// assembled above.
-												...(usageDeferral.captured() ?? {}),
+														clearPoolExhaustionCooldown();
+														clearServerBurstCooldown();
+													}
+												} else {
+													runtimeMetrics.failedRequests++;
+													runtimeMetrics.lastError = completion.errorCode;
+													await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
+														accountManager.recordFailure(successAccountForResponse, modelFamily, model, successAdmission);
+													}, false).catch(observeRestrictionFailure);
+												}
+												syncRuntimeObservability(requestTraceId);
+												usageDeferral.complete({...acceptedRow, outcome: completion.outcome, errorCode: completion.errorCode, ...(acceptedUsage ?? {})});
 											};
-											if (isStreaming && !usageDeferral.captured()) {
-												// Writing the row in the `finally` below would stamp
-												// zero tokens — the client has not read a byte yet —
-												// and the ledger is append-only, so the real counts
-												// could never correct it. Zero tokens is exactly what
-												// left maxTokens / maxCostUsd unenforceable here.
-												usageDeferral.defer(usageCompletion);
-												usageCompletion = null;
+											const successResponse = await handleSuccessResponse(responseForSuccess, isStreaming, {
+												onResponseId: responseId => {if (responseContinuationEnabled) observedResponseIdForSuccess = responseId;},
+												onUsage: usage => {
+													acceptedUsage = usage;
+													usageDeferral.onUsage(usage, false);
+													if (sessionAffinityKey && model) contextBudgetGuard.update(sessionAffinityKey, {model, contextTokens: usage.inputTokens + usage.outputTokens, updatedAt: Date.now()});
+												},
+												onCompletion: async completion => {
+													observedCompletion = completion;
+													if (isStreaming) await settleAcceptedResponse(completion);
+												},
+												streamStallTimeoutMs,
+											});
+											if (!isStreaming) {
+												acceptedRow.statusCode = successResponse.status;
+												await settleAcceptedResponse(observedCompletion ?? {success: successResponse.ok, outcome: successResponse.ok ? "success" : "failure", errorCode: successResponse.ok ? null : "upstream_response_failed", missingTerminal: false});
 											}
-											let successApplied = false;
-											try {
-												successApplied = await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
-												if (!successAdmission || !accountManager.recordSuccess(successAccountForResponse, modelFamily, model, successAdmission)) return false;
-												resetRateLimitBackoff(successAccountForResponse.index, quotaKey);
-												successCircuitCurrent = successAdmission.breaker.captureClosedState();
-												if (responseContinuationEnabled) sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, successAccountForResponse.index, Date.now(), sessionAffinityVersion);
-												if (observedResponseIdForSuccess) rememberSuccessResponseId(observedResponseIdForSuccess);
-												if (successAccountForResponse.index !== account.index) {
-													accountManager.markSwitched(
-														successAccountForResponse,
-														"rotation",
-														modelFamily,
-													);
-												}
-												const successAccountKey = successEntitlementAccountKey;
-												if (successQuotaSnapshot) preemptiveQuotaScheduler.update(`${successAccountKey}:${model ?? modelFamily}`, successQuotaSnapshot);
-												capabilityPolicyStore.recordSuccess(
-													successAccountKey,
-													capabilityModelKey,
-												);
-												entitlementCache.clear(
-													successAccountKey,
-													capabilityModelKey,
-												);
-												if (
-													!responseContinuationEnabled ||
-													(!isStreaming && !storedResponseIdForSuccess)
-												) {
-													sessionAffinityStore?.rememberWithVersion(
-														sessionAffinityKey,
-														successAccountForResponse.index,
-														Date.now(),
-														sessionAffinityVersion,
-													);
-												}
-													return true;
-												}, false);
-											} catch (error) {
-												runtimeMetrics.lastError = error instanceof Error ? error.message : String(error);
-												logWarn("Accepted response recovery authority could not be observed", {error});
-											}
-											if (
-												successApplied && lastCodexCliActiveSyncIndex !==
-												successAccountForResponse.index
-											) {
-												void accountManager.syncCodexCliActiveSelectionForIndex(
-													successAccountForResponse.index,
-												);
-												lastCodexCliActiveSyncIndex =
-													successAccountForResponse.index;
-											}
-											if (successApplied) {
-												clearPoolExhaustionCooldown();
-												clearServerBurstCooldown();
-											}
-											syncRuntimeObservability(requestTraceId);
+											usageCompletion = null;
 											// Non-blocking: contextBudgetAdvisory reflects usage
 											// observed as of the PRIOR turn (this turn's own usage
 											// isn't known yet for a streaming body), attached as a

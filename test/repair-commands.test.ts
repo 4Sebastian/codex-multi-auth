@@ -259,6 +259,8 @@ describe("repair-commands direct deps coverage", () => {
 
 	it("runVerifyFlagged uses the injected identity resolver in the direct no-restore flow", async () => {
 		const flaggedAccount = {
+			flaggedAt: 1,
+			addedAt: 1,
 			email: "old@example.com",
 			refreshToken: "flagged-refresh",
 			accessToken: "old-access",

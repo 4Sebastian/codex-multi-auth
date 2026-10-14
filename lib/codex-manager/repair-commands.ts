@@ -1,4 +1,4 @@
-import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { captureRefreshCredentialAuthority, isFlaggedRecoverySourceCurrent, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { existsSync, promises as fs } from "node:fs";
 import { ACCOUNT_LIMITS } from "../constants.js";
 import { DEFAULT_DASHBOARD_DISPLAY_SETTINGS } from "../dashboard-settings.js";
@@ -541,32 +541,8 @@ function findMatchingFlaggedAccountIndex(
 	});
 }
 
-function findFlaggedAccountIndexByStableIdentity(
-	accounts: readonly FlaggedAccountMetadataV1[],
-	target: FlaggedAccountMetadataV1,
-): number {
-	const targetEmail = sanitizeEmail(target.email);
-	return accounts.findIndex((account) => {
-		if (target.accountId && account.accountId === target.accountId) {
-			if (!targetEmail) {
-				return true;
-			}
-			return sanitizeEmail(account.email) === targetEmail;
-		}
-		return Boolean(targetEmail) && sanitizeEmail(account.email) === targetEmail;
-	});
-}
-
-function hasFlaggedRefreshTokenDrift(
-	accounts: readonly FlaggedAccountMetadataV1[],
-	target: FlaggedAccountMetadataV1,
-): boolean {
-	const targetIndex = findFlaggedAccountIndexByStableIdentity(accounts, target);
-	if (targetIndex < 0) {
-		return false;
-	}
-	const current = accounts[targetIndex];
-	return current ? current.refreshToken !== target.refreshToken : false;
+function hasFlaggedRefreshTokenDrift(accounts: readonly FlaggedAccountMetadataV1[], target: FlaggedAccountMetadataV1): boolean {
+	return !isFlaggedRecoverySourceCurrent(accounts, target);
 }
 
 function applyFlaggedStorageMutations(
@@ -1091,6 +1067,7 @@ export async function runVerifyFlagged(
 	};
 
 	let remainingFlagged = 0;
+	const publicationCurrent = new Map(flaggedStorage.accounts.map(account => [account, captureRefreshCredentialAuthority(account, undefined, undefined, undefined, {kind: "flagged", account})]));
 	const refreshChecks = await collectRefreshChecks(flaggedStorage.accounts);
 
 	if (options.restore) {
@@ -1106,13 +1083,8 @@ export async function runVerifyFlagged(
 						? structuredClone(loadedStorage)
 						: createEmptyAccountStorage();
 					const nextFlaggedStorage = structuredClone(loadedFlaggedStorage);
-					const staleRefreshChecks = refreshChecks.filter((check) =>
-						hasFlaggedRefreshTokenDrift(nextFlaggedStorage.accounts, check.flagged),
-					);
-					const safeRefreshChecks = refreshChecks.filter(
-						(check) =>
-							!hasFlaggedRefreshTokenDrift(nextFlaggedStorage.accounts, check.flagged),
-					);
+					const safeRefreshChecks = refreshChecks.filter(check => publicationCurrent.get(check.flagged)?.(check.result.type === "success" ? check.result : undefined) && isFlaggedRecoverySourceCurrent(nextFlaggedStorage.accounts, check.flagged, check.result.type === "success" ? check.result : undefined));
+					const staleRefreshChecks = refreshChecks.filter(check => !safeRefreshChecks.includes(check));
 					applyRefreshChecks(nextStorage, safeRefreshChecks);
 					for (const check of staleRefreshChecks) {
 						reports.push({
