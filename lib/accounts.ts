@@ -316,6 +316,14 @@ export interface ManagedAccount {
 
 export class AccountManager {
 	private persistenceBaseline: AccountStorageV3 | null = null;
+	// Runtime restrictions remain attributable while a failed save is retried.
+	// Weak ownership cannot grow beyond the existing live pool.
+	private readonly runtimeRestrictionOwners = new WeakMap<ManagedAccount, {
+		credential: CurrentAccountCredential;
+		enabled?: boolean;
+		workspaces: Map<string, {enabled?: boolean; disabledAt?: number}>;
+	}>();
+	private runtimeRestrictionMutation = false;
 	private accounts: ManagedAccount[] = [];
 	private readonly persistedWorkspaceSelections = new WeakMap<ManagedAccount, string | undefined>();
 	private readonly persistedWorkspaces = new WeakMap<ManagedAccount, Workspace[] | undefined>();
@@ -685,6 +693,18 @@ export class AccountManager {
 			if (candidates.length !== 1) continue;
 			const disk = candidates[0];
 			if (!disk) continue;
+			const runtime = this.runtimeRestrictionOwners.get(account);
+			if (runtime && (disk.recordId !== runtime.credential.recordId || disk.accessToken !== runtime.credential.accessToken ||
+				disk.refreshToken !== runtime.credential.refreshToken || disk.expiresAt !== runtime.credential.expiresAt)) {
+				if (runtime.enabled !== undefined && account.enabled === runtime.enabled) account.enabled = disk.enabled;
+				for (const [id, observation] of runtime.workspaces) {
+					const live = account.workspaces?.find(row => row.id === id), saved = disk.workspaces?.find(row => row.id === id);
+					if (live && live.enabled === observation.enabled && live.disabledAt === observation.disabledAt) {
+						live.enabled = saved?.enabled !== false; live.disabledAt = saved?.disabledAt;
+					}
+				}
+				this.runtimeRestrictionOwners.delete(account);
+			}
 			const localSelectedId = account.workspaces?.[account.currentWorkspaceIndex ?? 0]?.id;
 			const baseline = this.persistedWorkspaces.get(account);
 			if (JSON.stringify(disk.workspaces) !== JSON.stringify(baseline)) {
@@ -2368,6 +2388,9 @@ export class AccountManager {
 		const account = this.accounts[index];
 		if (!account) return null;
 		const wasEnabled = account.enabled !== false;
+		// An explicit caller confirmation supersedes an earlier runtime overlay.
+		const restriction = this.runtimeRestrictionOwners.get(account);
+		if (restriction && !this.runtimeRestrictionMutation) delete restriction.enabled;
 		const prior = this.nativeAuthSnapshots.get(account);
 		if (prior) this.nativeAuthSnapshots.set(account, {...prior, observedAt: performance.now()});
 		account.enabled = enabled;
@@ -2560,7 +2583,17 @@ export class AccountManager {
 				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return false;
 			if (!sourceCurrent() || !revisionCurrent() || this.resolveSelectionStoragePath() !== storagePath) return false;
 			this.syncWorkspaceSelections(current);
-			if (mutate() === false) return false;
+			const enabledBefore = account.enabled, workspacesBefore = structuredClone(account.workspaces);
+			this.runtimeRestrictionMutation = true;
+			try {if (mutate() === false) return false;}
+			finally {this.runtimeRestrictionMutation = false;}
+			const observation = this.runtimeRestrictionOwners.get(account) ?? {credential: {...submitted}, workspaces: new Map<string, {enabled?: boolean; disabledAt?: number}>()};
+			if (account.enabled !== enabledBefore) observation.enabled = account.enabled;
+			for (const workspace of account.workspaces ?? []) {
+				const before = workspacesBefore?.find(row => row.id === workspace.id);
+				if (workspace.enabled !== before?.enabled || workspace.disabledAt !== before?.disabledAt) observation.workspaces.set(workspace.id, {enabled: workspace.enabled, disabledAt: workspace.disabledAt});
+			}
+			if (observation.enabled !== undefined || observation.workspaces.size) this.runtimeRestrictionOwners.set(account, observation);
 			if (!persistChanges) return true;
 			this.reconcileSelectionFromDisk();
 			this.syncWorkspaceSelections(current);

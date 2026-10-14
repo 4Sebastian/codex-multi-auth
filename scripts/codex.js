@@ -3986,6 +3986,9 @@ function sweepStaleShadowHomes(baseEnv) {
 				continue;
 			}
 			try {
+				// Dead processes prove custody, not successful sync-back. Only an
+				// empty owned shell is disposable; retain every unverified state file.
+				if (readdirSync(shadowDir).some(name => name !== SHADOW_HOME_OWNER_FILE)) continue;
 				removeDirectoryWithRetry(shadowDir);
 			} catch {
 				// Best-effort sweep; a busy shadow is retried on the next launch.

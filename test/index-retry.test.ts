@@ -600,6 +600,81 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		}
 	});
 
+	it.each([false, true].flatMap(fallback => ["healthy", "revocation", "circuit", "forget", "replacement"].map(change => ({fallback, change}))))("revalidates delayed stream affinity while preserving original bytes and usage (%j)", async ({fallback, change}) => {
+		const stream = true;
+		const previousThreadId = process.env.CODEX_THREAD_ID;
+		process.env.CODEX_THREAD_ID = "fixture-delayed-affinity";
+		const config = await import("../lib/config.js");
+		vi.spyOn(config, "getResponseContinuation").mockReturnValue(true);
+		const {SessionAffinityStore} = await import("../lib/session-affinity.js");
+		const selectionSpy = vi.spyOn(SessionAffinityStore.prototype, "getPreferredAccountIndex");
+		const updateSpy = vi.spyOn(SessionAffinityStore.prototype, "updateLastResponseId");
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-${change}`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: `fallback-${stream}-${change}`, accountId: "W2", refreshToken: "refresh-outcome-fallback", accessToken: "access-outcome-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 1 : 0)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {getPendingAuthPath} = await import("../lib/storage/pending-auth.js");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const {getCircuitBreaker} = await import("../lib/circuit-breaker.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const logger = await import("../lib/logger.js");
+		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback && bearer === "Bearer access-outcome") return new Response("safe explicit rejection", {status: 429, headers: {"Retry-After": "60"}});
+			expect(bearer).toBe(fallback ? "Bearer access-outcome-fallback" : "Bearer access-outcome");
+			account.consecutiveAuthFailures = 2;
+			return new Response('data: {"type":"response.completed","response":{"id":"accepted-original","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n', {headers: {"Content-Type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream, prompt_cache_key: "fixture-delayed-affinity"})});
+			expect(response.status).toBe(200);
+			const context = selectionSpy.mock.contexts.find(value => value instanceof SessionAffinityStore);
+			if (!(context instanceof SessionAffinityStore)) throw Error("No actual affinity store was consulted");
+			const session = selectionSpy.mock.calls.find(call => call[0])?.[0];
+			expect(session).toBe("fixture-delayed-affinity");
+			account.consecutiveAuthFailures = 2;
+			if (change === "revocation") {storage.accounts[fallback ? 1 : 0]!.authInvalidatedAt = Date.now(); await fs.writeFile(path, JSON.stringify(storage));}
+			if (change === "replacement") {storage.accounts[fallback ? 1 : 0]!.accessToken = "fixture-replaced"; await fs.writeFile(path, JSON.stringify(storage));}
+			if (change === "circuit") for (let i = 0; i < 3; i++) getCircuitBreaker(account.circuitKeyId!).recordFailure();
+			if (change === "forget") context.forgetSession(session);
+			updateSpy.mockClear();
+			expect(await response.text()).toContain("accepted-original");
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			// Drain the same nonreentrant pool lane after the stream callback.
+			await realStorage.withAccountStorageTransaction(async () => undefined);
+			if (change === "healthy") await vi.waitFor(() => expect(context.getLastResponseId(session)).toBe("accepted-original"));
+			else {expect(context.getLastResponseId(session)).toBeNull(); if (change === "forget") expect(context.getPreferredAccountIndex(session)).toBeNull();}
+
+			expect(fetch).toHaveBeenCalledTimes(fallback ? 2 : 1); expect(account.consecutiveAuthFailures).toBe(2);
+			if (change === "circuit") expect(getCircuitBreaker(account.circuitKeyId!).getState()).toBe("open");
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))[0]).toMatchObject({outcome: "success", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: 7, outputTokens: 3, totalTokens: 10}});
+		} finally {
+			if (previousThreadId === undefined) delete process.env.CODEX_THREAD_ID; else process.env.CODEX_THREAD_ID = previousThreadId;
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
 	it.each(["primary", "safe-rejection-fallback", "accepted-empty"])("preserves raw refresh-only plugin accounts at the dispatch boundary (%s)", async route => {
 		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
 		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-first-token-"));

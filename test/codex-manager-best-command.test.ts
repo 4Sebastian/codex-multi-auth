@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import {
 	type BestCliOptions,
 	type BestCommandDeps,
@@ -40,7 +42,7 @@ function createStorage(
 }
 
 function createDeps(overrides: Partial<BestCommandDeps> = {}): BestCommandDeps {
-	return {
+	const deps: BestCommandDeps = {
 		setStoragePath: vi.fn(),
 		loadAccounts: vi.fn(async () => createStorage()),
 		saveAccounts: vi.fn(async () => undefined),
@@ -106,6 +108,7 @@ function createDeps(overrides: Partial<BestCommandDeps> = {}): BestCommandDeps {
 		getNow: vi.fn(() => 1_000),
 		...overrides,
 	};
+	return {...deps, loadAccounts: vi.fn(withAccountSourceFixture(deps.loadAccounts))};
 }
 
 describe("runBestCommand", () => {

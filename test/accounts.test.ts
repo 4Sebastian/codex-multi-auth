@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 import {
 	AccountManager,
 	extractAccountEmail,
@@ -46,10 +50,22 @@ vi.mock("../lib/storage.js", async (importOriginal) => {
 	};
 });
 
+let managedSourceDirectory: string;
+function writeManagedFixtureSource(manager: AccountManager): void {
+	const path = manager.resolveSelectionStoragePath();
+	if (path !== join(managedSourceDirectory, "accounts.json")) throw Error("Expected owned unit fixture source");
+	const storage: AccountStorageV3 = {
+		version: 3, activeIndex: 0,
+		accounts: manager.getAccountsSnapshot().map(account => ({...account, accessToken: account.access, expiresAt: account.expires})),
+	};
+	writeFileSync(path, JSON.stringify(storage));
+}
+
 beforeEach(async () => {
+	managedSourceDirectory = mkdtempSync(join(tmpdir(), "managed-accounts-unit-"));
 	resetTrackers();
 	setStoragePathState({
-		currentStoragePath: null,
+		currentStoragePath: join(managedSourceDirectory, "accounts.json"),
 		currentLegacyProjectStoragePath: null,
 		currentLegacyWorktreeStoragePath: null,
 		currentProjectRoot: null,
@@ -75,7 +91,8 @@ beforeEach(async () => {
 	});
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await removeWithRetry(managedSourceDirectory, {recursive: true, force: true});
 	setStoragePathState({
 		currentStoragePath: null,
 		currentLegacyProjectStoragePath: null,
@@ -1941,6 +1958,7 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			const updated = await manager.commitRefreshedAuth(account, refreshedAuth);
 
 			expect(updated).toBe(account);
@@ -2029,6 +2047,7 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			await manager.commitRefreshedAuth(accountA, refreshedAuth);
 		});
 
@@ -2086,6 +2105,7 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			await manager.commitRefreshedAuth(account, refreshedAuth);
 
 			expect(account.accountId).toBe("matching-account-id");
@@ -2106,6 +2126,7 @@ describe("AccountManager", () => {
 				accounts: [{ refreshToken: "old-refresh", accessToken: "old-access", expiresAt: now, addedAt: now, lastUsed: now }],
 			} as any);
 			const account = manager.getAccountByIndex(0)!;
+			writeManagedFixtureSource(manager);
 			await expect(manager.commitRefreshedAuth(account, { type: "oauth", access: "header.payload.signature", refresh: "new-refresh", expires: now + 3_600_000 })).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, durability: "journal"});
 			expect(account.refreshToken).toBe("new-refresh");
 		});
@@ -2148,6 +2169,7 @@ describe("AccountManager", () => {
 
 			// The refresh already spent old-refresh upstream; dropping new-refresh
 			// would force a re-login, so it is kept (and journaled) for a later save.
+			writeManagedFixtureSource(manager);
 			await expect(manager.commitRefreshedAuth(account, refreshedAuth)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EBUSY"}, durability: "journal"});
 
 			expect(account.refreshToken).toBe("new-refresh");
@@ -2189,6 +2211,7 @@ describe("AccountManager", () => {
 				expires: now + 3_600_000,
 			};
 
+			writeManagedFixtureSource(manager);
 			const error = await manager
 				.commitRefreshedAuth(account, refreshedAuth)
 				.catch((err: unknown) => err);
@@ -2279,6 +2302,7 @@ describe("AccountManager", () => {
 					return result;
 				});
 
+				writeManagedFixtureSource(manager);
 				const commitPromise = manager.commitRefreshedAuth(
 					account,
 					refreshedAuth,
@@ -5095,6 +5119,7 @@ describe("commit and retryable rescue ordering", () => {
 		const gate = new Promise<void>(resolve => {release = resolve;});
 		const ready = new Promise<void>(resolve => {entered = resolve;});
 		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async () => {entered(); await gate; throw Object.assign(Error("load blocked"), {code});});
+		writeManagedFixtureSource(manager);
 		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
 		void refreshing.catch(() => undefined);
 		try {
@@ -5119,6 +5144,7 @@ describe("commit and retryable rescue ordering", () => {
 		let release!: () => void, entered!: () => void;
 		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
 		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => {entered(); await gate; return handler(structuredClone(disk), async next => {disk = structuredClone(next);});});
+		writeManagedFixtureSource(manager);
 		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
 		try {
 			await ready;
@@ -5144,6 +5170,7 @@ describe("commit and retryable rescue ordering", () => {
 		const gate = new Promise<void>(resolve => {release = resolve;});
 		const ready = new Promise<void>(resolve => {writing = resolve;});
 		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => handler(structuredClone(disk), async () => {writing(); await gate; throw Object.assign(Error("write blocked"), {code});}));
+		writeManagedFixtureSource(manager);
 		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
 		try {
 			await ready;
@@ -5201,6 +5228,7 @@ describe("committed authorization observations", () => {
 			disk = structuredClone(committed);
 		}));
 		const account = manager.getAccountByIndex(1)!;
+		writeManagedFixtureSource(manager);
 		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(account, {type: "oauth", access: "rotated-once", refresh: "rotated-once-refresh", expires: Date.now() + 7200000});
 		void saving.catch(() => undefined);
 		try {
@@ -5246,6 +5274,7 @@ describe("workspace preference persistence", () => {
   vi.mocked(withAccountStorageTransaction).mockImplementation(async handler=>handler(structuredClone(disk),async next=>{disk=structuredClone(next);}));
   const account=manager.getAccountByIndex(0)!;
   manager.disableWorkspace(account,"business");
+  writeManagedFixtureSource(manager);
   if(mode==="refresh") await manager.commitRefreshedAuth(account,{type:"oauth",access:"new",refresh:"new-refresh",expires:Date.now()+60_000});
   else await manager.saveToDisk();
   expect(disk.accounts[0]!.currentWorkspaceIndex).toBe(1);

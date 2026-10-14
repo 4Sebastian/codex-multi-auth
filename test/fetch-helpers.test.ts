@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+// Transformation checks use a fixture prompt; prompt fetch/cache behavior has its own suites.
+vi.mock('../lib/prompts/host-codex-prompt.js', () => ({
+    getHostCodexPrompt: vi.fn().mockResolvedValue('You are a coding agent running in the Codex.'),
+}));
 import * as refreshQueueModule from '../lib/refresh-queue.js';
 import { PendingAuthSettlementError } from '../lib/storage/pending-auth.js';
 import {

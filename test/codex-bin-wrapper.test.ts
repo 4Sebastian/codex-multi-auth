@@ -1,4 +1,4 @@
-import { type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
+import { type SpawnSyncReturns, execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
 	chmodSync,
@@ -9673,6 +9673,10 @@ describe("stale shadow-home sweep", () => {
 		const OWNER_FILE = ".codex-multi-auth-owner.json";
 
 		const deadOwnerDir = mkdtempSync(join(shadowRoot, prefix));
+		const unsyncedDirs = ["auth.json", "accounts.json", "session.json"].map(name => {
+			const home = mkdtempSync(join(shadowRoot, prefix));
+			return {home, name};
+		});
 		const liveOwnerDir = mkdtempSync(join(shadowRoot, prefix));
 		const markerlessOldDir = mkdtempSync(join(shadowRoot, prefix));
 		const markerlessFreshDir = mkdtempSync(join(shadowRoot, prefix));
@@ -9691,6 +9695,16 @@ describe("stale shadow-home sweep", () => {
 				JSON.stringify({ pid: deadPid, createdAt: Date.now() - 60_000, childPid: deadChildPid, childRecordedAt: Date.now() - 30_000 }),
 			);
 
+			const childPid = Number(execFileSync(process.execPath, ["-e", `
+				const fs = require('node:fs'), path = require('node:path');
+				for (const {home, name} of JSON.parse(process.argv[1])) {
+					fs.writeFileSync(path.join(home, name), JSON.stringify({fixture: 'child-written-newest-material'}));
+					fs.writeFileSync(path.join(home, '${OWNER_FILE}'), JSON.stringify({pid: Number(process.argv[2]), childPid: process.pid, createdAt: Date.now() - 60000, childRecordedAt: Date.now() - 30000}));
+				}
+				process.stdout.write(String(process.pid));
+			`, JSON.stringify(unsyncedDirs), String(deadPid)], {encoding: "utf8", timeout: 5000}));
+			expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
+			expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({code: "ESRCH"}));
 			const result = runWrapper(fixtureRoot, ["exec", "do"], {
 				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 				CODEX_HOME: codexHome,
@@ -9698,7 +9712,10 @@ describe("stale shadow-home sweep", () => {
 				TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp,
 			});
 			expect(result.status).toBe(0);
-
+			for (const {home, name} of unsyncedDirs) {
+				expect(existsSync(home)).toBe(true);
+				expect(JSON.parse(readFileSync(join(home, name), "utf8"))).toEqual({fixture: "child-written-newest-material"});
+			}
 			expect(existsSync(deadOwnerDir)).toBe(false);
 			expect(existsSync(markerlessOldDir)).toBe(true);
 			expect(existsSync(liveOwnerDir)).toBe(true);

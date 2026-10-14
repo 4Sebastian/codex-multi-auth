@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import {
 	type ForecastCommandDeps,
 	runForecastCommand,
@@ -40,7 +42,7 @@ function createDeps(
 ): ForecastCommandDeps & {
 	formatQuotaSnapshotLine: (snapshot: unknown) => string;
 } {
-	return {
+	const deps: ForecastCommandDeps & {formatQuotaSnapshotLine: (snapshot: unknown) => string} = {
 		setStoragePath: vi.fn(),
 		loadAccounts: vi.fn(async () => createStorage()),
 		saveAccounts: vi.fn(async () => undefined),
@@ -117,9 +119,8 @@ function createDeps(
 		logError: vi.fn(),
 		getNow: vi.fn(() => 1_000),
 		...overrides,
-	} as ForecastCommandDeps & {
-		formatQuotaSnapshotLine: (snapshot: unknown) => string;
 	};
+	return {...deps, loadAccounts: vi.fn(withAccountSourceFixture(deps.loadAccounts))};
 }
 
 describe("runForecastCommand", () => {

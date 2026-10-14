@@ -85,12 +85,11 @@ it.each(["missing-primary", "corrupt-primary", "corrupt-wal", "corrupt-backup", 
 		}) as typeof fs.readFile);
 	}
 	if (mode === "discovery") {
-		const readdir = fs.readdir.bind(fs);
-		let scans = 0;
-		vi.spyOn(fs, "readdir").mockImplementation((async (target, ...args) => {
-			if (String(target) === dir && ++scans % 2 === 0) throw Object.assign(Error("fixture denied"), {code: "EACCES"});
-			return readdir(target, ...args);
-		}) as typeof fs.readdir);
+		const opendir = fs.opendir.bind(fs);
+		vi.spyOn(fs, "opendir").mockImplementation((async (target, ...args) => {
+			if (String(target) === dir) throw Object.assign(Error("fixture denied"), {code: "EACCES"});
+			return opendir(target, ...args);
+		}) as typeof fs.opendir);
 	}
 	if (mode === "changing") {
 		const read = fs.readFile.bind(fs);
@@ -101,9 +100,9 @@ it.each(["missing-primary", "corrupt-primary", "corrupt-wal", "corrupt-backup", 
 		}) as typeof fs.readFile);
 	}
 	const before = await fs.readFile(getPendingAuthPath(path), "utf8");
-	await expect(recordPendingAuth(path, rotation("spent", "fresh"))).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+	await expect(recordPendingAuth(path, rotation("spent", "fresh"))).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY", ...(mode === "discovery" ? {cause: {code: "EACCES"}} : {})});
 	const oauth = vi.fn(async () => {throw Error("must not spend");});
-	await expect(withPendingAuthRefresh(path, "new-0", oauth)).rejects.toMatchObject({code: mode.startsWith("corrupt-") || mode === "changing" ? "EPENDINGAUTHADMISSION" : mode === "discovery" ? "EACCES" : "EPENDINGAUTHCAPACITY"});
+	await expect(withPendingAuthRefresh(path, "new-0", oauth)).rejects.toMatchObject({code: mode.startsWith("corrupt-") || mode === "changing" ? "EPENDINGAUTHADMISSION" : "EPENDINGAUTHCAPACITY", ...(mode === "discovery" ? {cause: {code: "EACCES"}} : {})});
 	expect(oauth).not.toHaveBeenCalled();
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
 });

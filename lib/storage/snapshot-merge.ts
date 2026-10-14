@@ -206,9 +206,10 @@ export function mergeAccountRuntimeObservations(base: AccountStorageV3, current:
         const next = local.accounts.find(row => matches(prior, row));
         if (!next) continue;
         prior.lastUsed = Math.max(prior.lastUsed, next.lastUsed);
-        if (next.enabled === false) prior.enabled = false;
         const disk = current.accounts.find(row => matches(prior, row));
-        if (disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken && next.expiresAt === disk.expiresAt) {
+        const sameGeneration = disk && next.accessToken === disk.accessToken && next.refreshToken === disk.refreshToken && next.expiresAt === disk.expiresAt;
+        if (sameGeneration && next.enabled === false) prior.enabled = false;
+        if (sameGeneration) {
             prior.accessToken = disk.accessToken;
             prior.refreshToken = disk.refreshToken;
             prior.expiresAt = disk.expiresAt;
@@ -220,7 +221,7 @@ export function mergeAccountRuntimeObservations(base: AccountStorageV3, current:
             else Object.assign(prior, { [field]: structuredClone(next[field]) });
         }
         // Preserve runtime workspace disables without committing labels or workspace selection.
-        for (const workspace of prior.workspaces ?? []) {
+        for (const workspace of sameGeneration ? prior.workspaces ?? [] : []) {
             const updated = next.workspaces?.find(row => row.id === workspace.id);
             if (updated) { workspace.enabled = updated.enabled; workspace.disabledAt = updated.disabledAt; }
         }

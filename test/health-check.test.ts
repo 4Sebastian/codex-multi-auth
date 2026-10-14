@@ -3,6 +3,8 @@ const discoveryMocks=vi.hoisted(()=>({resets:vi.fn(),models:vi.fn()}));
 vi.mock("../lib/runtime/account-reset-credits.js",()=>({refreshAndPrintResetCredits:discoveryMocks.resets}));
 vi.mock("../lib/runtime/model-discovery-status.js",()=>({refreshAndPrintModelInventory:discoveryMocks.models}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import type { QuotaCacheData } from "../lib/quota-cache.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../lib/storage.js";
 
@@ -28,7 +30,7 @@ vi.mock("../lib/storage.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../lib/storage.js")>();
 	return {
 		...actual,
-		loadAccounts: loadAccountsMock,
+		loadAccounts: withAccountSourceFixture(loadAccountsMock),
 		saveAccounts: saveAccountsMock,
 		setStoragePath: vi.fn(),
 	};
@@ -416,7 +418,7 @@ it("continues model discovery when reset-credit persistence fails",async()=>{
 });
 
 it.each([false, true])("labels and caches the selected Personal workspace in check (refresh=%s)", async forceRefresh => {
- const a = account("scope", {workspaces: [{id:"org", name:"Business"},{id:"personal", name:"Personal (role:owner)"}], currentWorkspaceIndex:1});
+ const a = account("scope", {workspaces: [{id:"org", name:"Business", enabled:true},{id:"personal", name:"Personal (role:owner)", enabled:true}], currentWorkspaceIndex:1});
  loadAccountsMock.mockResolvedValue(storageWith([a]));
  queuedRefreshMock.mockResolvedValue({type:"success", access:a.accessToken, refresh:a.refreshToken, expires:REAL_NOW+3600000});
  fetchCodexQuotaSnapshotMock.mockResolvedValue({...snapshot(), planType:"promax", primingFailure:"timed out"});

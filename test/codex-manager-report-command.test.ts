@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import {
 	type ReportCommandDeps,
 	runReportCommand,
@@ -32,7 +34,7 @@ function createStorage(
 function createDeps(
 	overrides: Partial<ReportCommandDeps> = {},
 ): ReportCommandDeps {
-	return {
+	const deps: ReportCommandDeps = {
 		setStoragePath: vi.fn(),
 		getStoragePath: vi.fn(() => "/mock/openai-codex-accounts.json"),
 		loadAccounts: vi.fn(async () => createStorage()),
@@ -70,6 +72,7 @@ function createDeps(
 		writeFile: vi.fn(async () => undefined),
 		...overrides,
 	};
+	return {...deps, loadAccounts: vi.fn(withAccountSourceFixture(deps.loadAccounts))};
 }
 
 describe("runReportCommand", () => {

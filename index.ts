@@ -2659,9 +2659,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											}
 											let storedResponseIdForSuccess = false;
 											let observedResponseIdForSuccess: string | undefined;
-											let successAffinityAllowed = false;
+											let successCircuitCurrent: (() => boolean) | undefined;
 											const rememberSuccessResponseId = (responseId: string) => {
-												sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, successAccountForResponse.index, Date.now(), sessionAffinityVersion);
 												sessionAffinityStore?.updateLastResponseId(sessionAffinityKey, responseId, Date.now(), sessionAffinityVersion);
 												storedResponseIdForSuccess = true;
 											};
@@ -2672,7 +2671,15 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													onResponseId: (responseId) => {
 														if (!responseContinuationEnabled) return;
 														observedResponseIdForSuccess = responseId;
-														if (successAffinityAllowed) rememberSuccessResponseId(responseId);
+														if (successCircuitCurrent) {
+															void accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
+																if (!successCircuitCurrent?.() || sessionAffinityStore?.getPreferredAccountIndex(sessionAffinityKey) !== successAccountForResponse.index) return false;
+																rememberSuccessResponseId(responseId); return true;
+															}, false).catch(error => {
+																runtimeMetrics.lastError = error instanceof Error ? error.message : String(error);
+																logWarn("Accepted stream affinity authority could not be observed", {error});
+															});
+														}
 													},
 													onUsage: (usage) => {
 														usageDeferral.onUsage(usage);
@@ -2726,7 +2733,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												successApplied = await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
 												if (!successAdmission || !accountManager.recordSuccess(successAccountForResponse, modelFamily, model, successAdmission)) return false;
 												resetRateLimitBackoff(successAccountForResponse.index, quotaKey);
-												successAffinityAllowed = true;
+												successCircuitCurrent = successAdmission.breaker.captureClosedState();
+												if (responseContinuationEnabled) sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, successAccountForResponse.index, Date.now(), sessionAffinityVersion);
 												if (observedResponseIdForSuccess) rememberSuccessResponseId(observedResponseIdForSuccess);
 												if (successAccountForResponse.index !== account.index) {
 													accountManager.markSwitched(

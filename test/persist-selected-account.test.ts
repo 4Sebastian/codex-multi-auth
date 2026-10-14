@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+import { getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
+useAccountSourceFixtures();
 import { MODEL_FAMILIES } from "../lib/prompts/codex.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../lib/storage.js";
 
@@ -28,7 +31,7 @@ vi.mock("../lib/storage.js", async (importOriginal) => {
 	return {
 		...actual,
 		saveAccounts: saveAccountsMock,
-		getStoragePath: () => "/tmp/accounts.json",
+		getStoragePath: getAuthorityStoragePath,
 		readAffinityGenerationFromDisk: readAffinityGenerationFromDiskMock,
 	};
 });
@@ -62,7 +65,9 @@ function storageWith(
 	activeIndex = 0,
 	activeIndexByFamily: Record<string, number> = {},
 ): AccountStorageV3 {
-	return { version: 3, activeIndex, activeIndexByFamily, accounts };
+	const storage = { version: 3 as const, activeIndex, activeIndexByFamily, accounts };
+	writeAccountSourceFixture(storage);
+	return storage;
 }
 
 // Token inside the 5-minute freshness window forces the validation refresh.
@@ -284,7 +289,7 @@ describe("persistAndSyncSelectedAccount", () => {
 
 		expect(storage.affinityGeneration).toBe(8);
 		expect(readAffinityGenerationFromDiskMock).toHaveBeenCalledWith(
-			"/tmp/accounts.json",
+			getAuthorityStoragePath(),
 		);
 	});
 

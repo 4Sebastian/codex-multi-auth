@@ -1,4 +1,4 @@
-import { promises as fs, readdirSync, type Dirent } from "node:fs";
+import { promises as fs, opendirSync, type Dirent } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createLogger } from "../logger.js";
 import { isRecord } from "../utils.js";
@@ -6,9 +6,17 @@ import { captureAuthorityRevision } from "./authority-revision.js";
 import { getAccountsBackupRecoveryCandidates, getAccountsWalPath, ACCOUNTS_WAL_SUFFIX, RESET_MARKER_SUFFIX } from "./backup-paths.js";
 import { isCacheLikeBackupArtifactName } from "./cache-artifacts.js";
 import type { AccountMetadataV3 } from "./public-types.js";
-import { FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME, getFlaggedAccountsPath, getFlaggedBackupPaths } from "./file-paths.js";
+import { FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME, getFlaggedAccountsPath, getFlaggedBackupPaths, getAutomaticCheckHistoryPath } from "./file-paths.js";
 
 const log = createLogger("storage");
+export const MAX_RECOVERY_SOURCES = 1000;
+export class RecoverySourceCapacityError extends Error {
+	readonly code = "ERECOVERYSOURCECAPACITY";
+	constructor() {super("Account recovery proof exceeds its 1000-source bound");}
+}
+export function assertRecoverySourceCount(count: number): void {
+	if (count > MAX_RECOVERY_SOURCES) throw new RecoverySourceCapacityError();
+}
 export type PendingAuthRecoveryCredential = Pick<AccountMetadataV3,
 	"refreshToken" | "accessToken" | "expiresAt" | "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled" | "cooldownReason">;
 
@@ -16,7 +24,7 @@ export function getPendingAuthPath(storagePath: string): string {
 	return `${storagePath}.pending-auth.json`;
 }
 
-function backupRecoveryCandidates(path: string, entries: readonly Dirent[]): string[] {
+function backupRecoveryScan(path: string) {
 	const knownCandidates = getAccountsBackupRecoveryCandidates(
 		path,
 		3,
@@ -26,42 +34,45 @@ function backupRecoveryCandidates(path: string, entries: readonly Dirent[]): str
 	const knownCandidateSet = new Set(knownCandidates);
 	const directoryPath = dirname(path);
 
-	for (const entry of entries) {
-			if (!entry.isFile()) continue;
-			if (!entry.name.startsWith(candidatePrefix)) continue;
-			if (isCacheLikeBackupArtifactName(entry.name)) continue;
-			if (entry.name.endsWith(RESET_MARKER_SUFFIX)) continue;
-			if (entry.name.endsWith(".tmp")) continue;
-			if (entry.name.includes(".rotate.")) continue;
-			if (entry.name.endsWith(ACCOUNTS_WAL_SUFFIX)) continue;
+	return {
+		add(entry: Dirent): void {
+			if (!entry.isFile() || !entry.name.startsWith(candidatePrefix) || isCacheLikeBackupArtifactName(entry.name) ||
+				entry.name.endsWith(RESET_MARKER_SUFFIX) || entry.name.endsWith(".tmp") || entry.name.includes(".rotate.") || entry.name.endsWith(ACCOUNTS_WAL_SUFFIX)) return;
 			const candidatePath = join(directoryPath, entry.name);
-			if (candidatePath === getPendingAuthPath(path)) continue;
-			if (knownCandidateSet.has(candidatePath)) continue;
+			if (candidatePath === getPendingAuthPath(path) || candidatePath === getAutomaticCheckHistoryPath(path) || knownCandidateSet.has(candidatePath)) return;
 			discoveredCandidates.add(candidatePath);
-	}
-
-	const discoveredOrdered = Array.from(discoveredCandidates).sort((a, b) =>
-		a.localeCompare(b, undefined, { sensitivity: "base" }),
-	);
-	return [...knownCandidates, ...discoveredOrdered];
+			// Reserve primary, canonical/legacy flagged chains and WAL as well.
+			assertRecoverySourceCount(knownCandidates.length + discoveredCandidates.size + 10);
+		},
+		result(): string[] {
+			return [...knownCandidates, ...Array.from(discoveredCandidates).sort((a, b) => a.localeCompare(b, undefined, {sensitivity: "base"}))];
+		},
+	};
 }
 
 export function getAccountsBackupRecoveryCandidatesWithDiscoverySync(path: string): string[] {
-	try { return backupRecoveryCandidates(path, readdirSync(dirname(path), {withFileTypes: true})); }
-	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return backupRecoveryCandidates(path, []);
+	const scan = backupRecoveryScan(path);
+	try {
+		const directory = opendirSync(dirname(path));
+		try {let entry: Dirent | null; while ((entry = directory.readSync())) scan.add(entry);}
+		finally {directory.closeSync();}
+		return scan.result();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return scan.result();
 		throw error;
 	}
 }
 
 export async function getAccountsBackupRecoveryCandidatesWithDiscovery(path: string, strict = false): Promise<string[]> {
+	const scan = backupRecoveryScan(path);
 	try {
-		return backupRecoveryCandidates(path, await fs.readdir(dirname(path), {withFileTypes: true}));
+		for await (const entry of await fs.opendir(dirname(path))) scan.add(entry);
+		return scan.result();
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (strict) throw error;
+		if (strict || error instanceof RecoverySourceCapacityError) throw error;
 		if (code !== "ENOENT") log.warn("Failed to discover account backup candidates", {path, error: String(error)});
-		return backupRecoveryCandidates(path, []);
+		return backupRecoveryScan(path).result();
 	}
 }
 
@@ -71,8 +82,9 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 	const flagged = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME]
 		.flatMap(name => {const source = getFlaggedAccountsPath(path, name); return [source, ...getFlaggedBackupPaths(source)];});
 	const sources = [...(includePrimary ? [path] : []), ...candidates, ...flagged, getAccountsWalPath(path)];
+	assertRecoverySourceCount(sources.length);
 	const sourcesCurrent = captureAuthorityRevision(sources);
-	const tokens: PendingAuthRecoveryCredential[] = [];
+	const tokens = new Map<string, PendingAuthRecoveryCredential>();
 	const collectContent = (raw: string): void => {
 		let parsed: unknown;
 		try {
@@ -87,7 +99,7 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 				typeof account.refreshToken === "string" &&
 				account.refreshToken.length > 0
 			) {
-				tokens.push({
+				const credential: PendingAuthRecoveryCredential = {
 					refreshToken: account.refreshToken,
 					accessToken: typeof account.accessToken === "string" ? account.accessToken : undefined,
 					expiresAt: typeof account.expiresAt === "number" ? account.expiresAt : undefined,
@@ -95,7 +107,9 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 					authInvalidationErrorCode: typeof account.authInvalidationErrorCode === "string" ? account.authInvalidationErrorCode : undefined,
 					enabled: account.enabled === false ? false : undefined,
 					cooldownReason: account.cooldownReason === "auth-failure" ? "auth-failure" : undefined,
-				});
+				};
+				tokens.set(JSON.stringify(credential), credential);
+				assertRecoverySourceCount(tokens.size);
 			} else throw new Error("Invalid account recovery credential");
 		}
 	};
@@ -117,6 +131,6 @@ export async function collectRestorableCredentials(path: string, includePrimary 
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	if (!directoryCurrent() || !sourcesCurrent()) throw new Error("Account recovery sources changed during scan");
-	return tokens;
+	return [...tokens.values()];
 }
 

@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
 	shouldRefreshProactively,
 	getTimeUntilExpiry,
-	proactiveRefreshAccount,
+	proactiveRefreshAccount as refreshActualAccount,
 	refreshExpiringAccounts,
 	applyRefreshResult,
 	DEFAULT_PROACTIVE_BUFFER_MS,
@@ -12,6 +12,15 @@ import type { ManagedAccount } from "../lib/accounts.js";
 import * as logger from "../lib/logger.js";
 import * as refreshQueue from "../lib/refresh-queue.js";
 import { getStoragePath } from "../lib/storage.js";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+function writeSource(accounts: ManagedAccount[]): void {
+	writeAccountSourceFixture({version: 3, activeIndex: 0, accounts: accounts.map(account => ({...account, accessToken: account.access, expiresAt: account.expires}))});
+}
+const proactiveRefreshAccount: typeof refreshActualAccount = (account, ...args) => {
+	writeSource([account]);
+	return refreshActualAccount(account, ...args);
+};
 
 vi.mock("../lib/refresh-queue.js", async importOriginal => ({
 	...await importOriginal<typeof import("../lib/refresh-queue.js")>(),
@@ -310,6 +319,7 @@ describe("proactive-refresh", () => {
 				result: Awaited<ReturnType<typeof proactiveRefreshAccount>>,
 			) => Promise<void> | void,
 		): Promise<Map<number, Awaited<ReturnType<typeof proactiveRefreshAccount>>>> {
+			writeSource(accounts);
 			const pending = refreshExpiringAccounts(accounts, bufferMs, onResult);
 			await vi.runAllTimersAsync();
 			return pending;

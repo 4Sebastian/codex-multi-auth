@@ -15,7 +15,7 @@ import { withFileTransactionLock } from "./file-lock.js";
 import { getAccountsWalPath, getIntentionalResetMarkerPath } from "./backup-paths.js";
 import type { ManagedAccount } from "../accounts.js";
 import type { AccountMetadataV3, AccountStorageV3, FlaggedAccountMetadataV1 } from "./public-types.js";
-import { collectRestorableCredentials, getAccountsBackupRecoveryCandidatesWithDiscoverySync, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
+import { assertRecoverySourceCount, collectRestorableCredentials, getAccountsBackupRecoveryCandidatesWithDiscoverySync, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 export { getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 
 /**
@@ -195,8 +195,10 @@ export function captureRefreshCredentialAuthority(
 	catch (error) { throw new PendingAuthAdmissionError(error); }
 	const walPath = getAccountsWalPath(storagePath);
 	const paths = [storagePath, ...flaggedPaths, ...accountBackups, walPath];
+	try {assertRecoverySourceCount(paths.length);} catch (cause) {throw new PendingAuthAdmissionError(cause);}
 	let revision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
 	let revalidated = false;
+	let resultPublicationObserved = false;
 	const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(storagePath)]);
 	const matches = (row: AccountMetadataV3, result?: TokenSuccess) => "type" in submitted ? row.refreshToken === submitted.refresh || row.refreshToken === result?.refresh
 		: submitted.recordId && row.recordId ? row.recordId === submitted.recordId : row.refreshToken === submitted.refreshToken || row.refreshToken === result?.refresh;
@@ -206,9 +208,14 @@ export function captureRefreshCredentialAuthority(
 			if (!flaggedPaths.includes(path)) {
 				if (path === walPath) value = JSON.parse(AccountsJournalEntrySchema.pick({version: true, content: true}).parse(value).content);
 				const storage = AnyAccountStorageSchema.parse(value);
-				return (storage.version === 3 ? storage : migrateV1ToV3(storage)).accounts.find(row => matches(row, result));
+				const rows = (storage.version === 3 ? storage : migrateV1ToV3(storage)).accounts.filter(row => matches(row, result));
+				const selected = rows.length > 1 && !("type" in submitted)
+					? rows.filter(row => row.email === submitted.email && row.accountId === submitted.accountId) : rows;
+				if (selected.length > 1) throw Object.assign(Error("Ambiguous recovery owner"), {code: "ESTALE"});
+				return selected[0];
 			}
-			return FlaggedAccountStorageV1Schema.parse(value).accounts.find(row => matches(row, result));
+			const flagged = FlaggedAccountStorageV1Schema.parse(value);
+			return flagged.accounts.find(row => matches(row, result));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw new PendingAuthAdmissionError(error);
@@ -220,7 +227,7 @@ export function captureRefreshCredentialAuthority(
 		? sampledRoots.find(root => flaggedPrimaries.includes(root.path) && existsSync(root.path))
 		: sampledRoots[0];
 	const roots = authoritative?.row ? [authoritative] : [];
-	if (!roots.length && (source || existsSync(storagePath) || sampledRoots.some(root => root.row))) {
+	if (!roots.length && (source || !("type" in submitted) || existsSync(storagePath) || sampledRoots.some(root => root.row))) {
 		throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is not in its current source"), {code: "ESTALE"}));
 	}
 	if (source && (!authoritative?.row || !("flaggedAt" in authoritative.row) || authoritative.row.flaggedAt !== source.account.flaggedAt)) {
@@ -269,7 +276,14 @@ export function captureRefreshCredentialAuthority(
 			}
 		}
 		if (revision()) return true;
-		if (!roots.length || revalidated) return false;
+		if (!roots.length) return false;
+		// One same-binding metadata reconciliation is independent of the one
+		// observed publication of this owned OAuth result into its primary.
+		const published = result && authoritative && sample(authoritative.path, result);
+		const ownsPublication = !!result && !!published &&
+			credentials(published).every((value, index) => value === [result.access, result.refresh, result.expires][index]) &&
+			credentials(submitted).some((value, index) => value !== credentials(published)[index]);
+		if (ownsPublication ? resultPublicationObserved : revalidated) return false;
 		const nextRevision = captureAuthorityRevision(paths, [getIntentionalResetMarkerPath(storagePath)]);
 		const valid = sampledRoots.every(({path, row}) => {
 			const disk = sample(path, result);
@@ -292,7 +306,8 @@ export function captureRefreshCredentialAuthority(
 		});
 		if (!valid || !nextRevision()) return false;
 		revision = nextRevision;
-		revalidated = true;
+		if (ownsPublication) resultPublicationObserved = true;
+		else revalidated = true;
 		return true;
 	};
 }

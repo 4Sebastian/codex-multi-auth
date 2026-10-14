@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+import { readFileSync } from "node:fs";
+import { getStoragePath } from "../lib/storage/file-paths.js";
+import { AccountStorageV3Schema } from "../lib/schemas.js";
+function readSource(): AccountStorageV3 {return AccountStorageV3Schema.parse(JSON.parse(readFileSync(getStoragePath(), "utf8")));}
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 const { queuedRefreshMock, saveAccountsMock, withAccountStorageTransactionMock } =
@@ -72,10 +78,9 @@ function managerWith(
 	expiresAt: number,
 	accountOverrides: Partial<AccountStorageV3["accounts"][number]> = {},
 ): AccountManager {
-	const accountManager = new AccountManager(
-		undefined,
-		storageWith(expiresAt, accountOverrides),
-	);
+	const storage = storageWith(expiresAt, accountOverrides);
+	writeAccountSourceFixture(storage);
+	const accountManager = new AccountManager(undefined, storage);
 	openManagers.push(accountManager);
 	return accountManager;
 }
@@ -99,7 +104,7 @@ beforeEach(() => {
 	AccountManager.resetVolatileRuntimeState();
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(null, async () => undefined),
+		handler(readSource(), async (next: AccountStorageV3) => writeAccountSourceFixture(next)),
 	);
 });
 
@@ -196,7 +201,7 @@ describe("ensureFreshAccessToken", () => {
 		});
 		withAccountStorageTransactionMock.mockImplementation(async (handler) => {
 			await commitGate;
-			return handler(null, async () => undefined);
+			return handler(readSource(), async (next: AccountStorageV3) => writeAccountSourceFixture(next));
 		});
 		const params = refreshParams(accountManager);
 
@@ -279,7 +284,8 @@ describe("ensureFreshAccessToken", () => {
 	it("persists the invalidation marker until a successful refresh clears it", async () => {
 		let persisted: AccountStorageV3 | undefined;
 		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-			handler(null, async (nextStorage: AccountStorageV3) => {
+			handler(readSource(), async (nextStorage: AccountStorageV3) => {
+				writeAccountSourceFixture(nextStorage);
 				persisted = structuredClone(nextStorage);
 			}),
 		);

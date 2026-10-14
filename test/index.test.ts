@@ -2,6 +2,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { CircuitBreaker, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { setImmediate as yieldForIo } from "node:timers/promises";
+async function awaitIoAdmission(admitted: () => boolean): Promise<void> {
+	for (let spin = 0; spin < 200; spin++) {if (admitted()) return; await yieldForIo();}
+	throw Error("Request did not reach its injected admission boundary");
+}
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
 
 function admitFixtureRequest(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}): boolean {
@@ -1418,7 +1425,8 @@ describe("OpenAIOAuthPlugin", () => {
 			mockStorage.accounts = [
 				{ refreshToken: "r1", email: "user@example.com" },
 			];
-			const result = await plugin.tool["codex-health"].execute();
+			writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-health"].execute();
 			expect(result).toContain("Health Check");
 			expect(result).toContain("Healthy");
 		});
@@ -1468,7 +1476,8 @@ describe("OpenAIOAuthPlugin", () => {
 			mockStorage.accounts = [
 				{ refreshToken: "r1", email: "user@example.com" },
 			];
-			const result = await plugin.tool["codex-refresh"].execute();
+			writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 			expect(result).toContain("Refreshing");
 			expect(result).toContain("Refreshed");
 		});
@@ -1585,7 +1594,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-health"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-health"].execute();
 		expect(result).toContain("Error");
 		expect(result).toContain("0 healthy, 1 unhealthy");
 	});
@@ -1607,7 +1617,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-refresh"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 		expect(result).toContain("Failed");
 	});
 
@@ -1626,7 +1637,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-refresh"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 		expect(result).toContain("Error");
 		expect(result).toContain("Network timeout");
 	});
@@ -5198,6 +5210,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
+		await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > 0);
 		await vi.advanceTimersByTimeAsync(1000);
 		const response = await responsePromise;
 
@@ -6154,7 +6167,10 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
-		await vi.advanceTimersByTimeAsync(4_000);
+		for (let attempt = 0; attempt < 4; attempt++) {
+			await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > attempt);
+			await vi.advanceTimersByTimeAsync(1000);
+		}
 		const response = await responsePromise;
 
 		expect(response.status).toBe(503);
@@ -6268,6 +6284,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
+		await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > 0);
 		await vi.advanceTimersByTimeAsync(2000);
 		const response = await responsePromise;
 
@@ -6367,7 +6384,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 					if (rateLimitCallCount > 1) {
 						return;
 					}
-					await Promise.resolve();
+					await yieldForIo();
 				}
 				throw new Error(
 					"second overlapping request never reached the rate-limit handler",

@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import { hydrateRuntimeEmails } from "../lib/runtime/hydrate-emails.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 import type { TokenResult } from "../lib/types.js";
@@ -32,15 +34,18 @@ async function withTestEnv<T>(fn: () => Promise<T> | T): Promise<T> {
 function makeStorage(
 	accounts: Array<Partial<AccountStorageV3["accounts"][number]>>,
 ): AccountStorageV3 {
-	return {
+	const storage: AccountStorageV3 = {
 		version: 3,
 		accounts: accounts.map((a) => ({
+			addedAt: 1, lastUsed: 1,
 			refreshToken: "rt",
 			...a,
 		})) as AccountStorageV3["accounts"],
 		activeIndex: 0,
 		activeIndexByFamily: {},
 	};
+	writeAccountSourceFixture(storage);
+	return storage;
 }
 
 function tokenSuccess(overrides: Partial<TokenResult & { type: "success" }>): TokenResult {

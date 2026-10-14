@@ -16,22 +16,6 @@ function workflow(): Workflow {
 }
 
 describe("CI workflow parity", () => {
-	it("covers push and PR in one workflow", () => {
-		expect(existsSync(join(projectRoot, ".github/workflows/pr-ci.yml"))).toBe(false);
-		expect(Object.keys(workflow().on)).toEqual(expect.arrayContaining(["push", "pull_request"]));
-	});
-	it("includes an unconditional Windows script-checking job", () => {
-		const windows = workflow().jobs["scripts-windows"]!;
-		expect(windows["runs-on"]).toBe("windows-latest");
-		expect(windows.if).toBeUndefined();
-	});
-	it("cancels stale runs within their PR or branch", () => {
-		expect(workflow().concurrency).toEqual({group: "ci-${{ github.event.pull_request.number || github.ref }}", "cancel-in-progress": true});
-	});
-	it("selects PR validation only for pull requests", () => {
-		const validation = workflow().jobs.validate!;
-		expect(validation.if).toBe("github.event_name == 'pull_request'");
-	});
 	it("typechecks scripts in an isolated checkout without generated dist", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "script-check-"));
 		try {

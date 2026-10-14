@@ -1,6 +1,6 @@
 import { getStoragePathState, runWithStoragePathState } from "../storage/path-state.js";
 import { AccountManager, resolveAccountRecordId } from "../accounts.js";
-import { getAccountPolicyKey, loadAccountPolicyStore } from "../account-policy.js";
+import { getAccountPolicyKey, getAccountPolicyPath, loadAccountPolicyStore } from "../account-policy.js";
 import { getStoragePath, type AccountMetadataV3 } from "../storage.js";
 import { fetchCodexQuotaSnapshot, type CodexQuotaSnapshot } from "../quota-probe.js";
 import { loadQuotaCache, saveQuotaCache } from "../quota-cache.js";
@@ -9,6 +9,8 @@ import { createNativeAccountStorageReader } from "./native-account-storage.js";
 import { ensureFreshAccessToken } from "./rotation-token-refresh.js";
 import { automaticCheckWorkspaceId, runAutomaticAccountChecks } from "./automatic-account-checks.js";
 import { logWarn } from "../logger.js";
+import { getAutomaticCheckHistoryPath } from "../storage/file-paths.js";
+import { captureAuthorityRevision } from "../storage/authority-revision.js";
 type Observer = (account: AccountMetadataV3, snapshot: CodexQuotaSnapshot, accounts: AccountMetadataV3[], workspaceId: string) => Promise<void> | void;
 /** Captures this router's pool; reads only verified primary credentials, never API/ZDR entries. */
 export function createAutomaticSubscriptionCheck(observe?: Observer) {
@@ -21,7 +23,7 @@ export function createAutomaticSubscriptionCheck(observe?: Observer) {
         await saveQuotaCache(cache, baseline);
     });
     return (signal: AbortSignal) => runWithStoragePathState(storageState, () => runAutomaticAccountChecks({
-        path: `${path}.automatic-checks.json`, signal, loadPolicies: loadAccountPolicyStore,
+        path: getAutomaticCheckHistoryPath(path), signal, loadPolicies: loadAccountPolicyStore,
         loadAccounts: async () => { const snapshot = await read(); return snapshot.verified ? snapshot.storage : null; },
         check: async (storage, index) => {
             const manager = new AccountManager(undefined, storage);
@@ -42,7 +44,18 @@ export function createAutomaticSubscriptionCheck(observe?: Observer) {
                     return;
                 if (automaticCheckWorkspaceId(current) !== targetId || signal.aborted)
                     return;
-                const snapshot = await fetchCodexQuotaSnapshot({ accountId: targetId, accessToken: fresh.accessToken, primeUnusedSubscription: true, signal });
+                const submitted = {recordId: fresh.account.recordId, accessToken: fresh.accessToken, refreshToken: fresh.account.refreshToken, expiresAt: fresh.account.expires, accountId: targetId};
+                const authorityCurrent = async () => {
+                    const policyCurrent = captureAuthorityRevision([getAccountPolicyPath()]);
+                    const latest = (await loadAccountPolicyStore()).accounts[getAccountPolicyKey(current)];
+                    return manager.withCurrentAccountCredential(fresh.account, submitted, () =>
+                        !signal.aborted && policyCurrent() && !!latest?.autoPrime && !latest.paused && !latest.drained &&
+                        fresh.account.enabled !== false && automaticCheckWorkspaceId({ ...current, accountId: fresh.account.accountId,
+                            workspaces: fresh.account.workspaces, currentWorkspaceIndex: fresh.account.currentWorkspaceIndex }) === targetId &&
+                        (fresh.account.coolingDownUntil ?? 0) <= Date.now(), false);
+                };
+                const snapshot = await fetchCodexQuotaSnapshot({ accountId: targetId, accessToken: fresh.accessToken, primeUnusedSubscription: true, signal, authorityCurrent });
+                if (!await authorityCurrent()) return;
                 if (snapshot.primingFailure)
                     logWarn("Automatic first-use completion was not confirmed; retry deferred until the next check.");
                 await onQuota(current, snapshot, disk.storage.accounts, targetId);

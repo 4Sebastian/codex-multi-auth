@@ -2,6 +2,8 @@ vi.mock("../lib/runtime/account-reset-credits.js", async original => ({...await 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import {
@@ -472,6 +474,7 @@ function updateLastAccountStorageSnapshot(snapshot: unknown): void {
 		return;
 	}
 	const cloned = cloneValue(snapshot);
+	writeAccountSourceFixture(cloned);
 	lastAccountStorageSnapshot = cloned;
 	accountStorageState = cloneValue(cloned);
 }
@@ -740,6 +743,7 @@ describe("codex manager cli commands", () => {
 		);
 		resetActiveAccountSyncMetaForTests();
 		storageMocks.loadAccounts.mockReset();
+		storageMocks.getStoragePath.mockImplementation(getAuthorityStoragePath);
 		storageMocks.loadFlaggedAccounts.mockReset();
 		storageMocks.saveAccounts.mockReset();
 		storageMocks.saveFlaggedAccounts.mockReset();

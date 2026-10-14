@@ -1,8 +1,9 @@
 import { once } from "node:events";
-import { promises as fs } from "node:fs";
+import { promises as fs, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
+import { writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
 import { createServer, ServerResponse } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
@@ -434,7 +435,7 @@ beforeEach(async () => {
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockReset();
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(null, async () => undefined),
+		handler(existsSync(getStoragePath()) ? await loadAccounts() : null, async () => undefined),
 	);
 });
 
@@ -1553,7 +1554,8 @@ describe("runtime rotation proxy", () => {
 			statusCode: HTTP_STATUS.UNAUTHORIZED,
 			message: "Your authentication token has been invalidated.",
 		});
-		const accountManager = new AccountManager(undefined, storage);
+		writeAccountSourceFixture(storage);
+const accountManager = new AccountManager(undefined, storage);
 		const consumed = vi.spyOn(accountManager, "consumeToken");
 		const usageRecords: unknown[] = [];
 		const usageRecorder = vi
@@ -2857,7 +2859,8 @@ describe("runtime rotation proxy", () => {
 		const storage = createStorage(now, 1);
 		storage.accounts[0].expiresAt = now - 60_000;
 		refreshAccessTokenMock.mockResolvedValueOnce({ type: "success", access: "fresh-image-access", refresh: "refresh-1", expires: now + 3_600_000 });
-		const accountManager = new AccountManager(undefined, storage);
+		writeAccountSourceFixture(storage);
+const accountManager = new AccountManager(undefined, storage);
 		const { calls, fetchImpl } = createRecordingFetch(() => new Response('{"data":[]}', { headers: { "content-type": "application/json" } }));
 		const proxy = await startProxy({ accountManager, fetchImpl });
 		const response = await postResponses(proxy, { model: "gpt-image-2" }, "/images/edits");
@@ -5466,7 +5469,8 @@ describe("runtime rotation proxy", () => {
 		account.expiresAt = now - 60_000;
 		const persisted: AccountStorageV3[] = [];
 		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-			handler(null, async (nextStorage: AccountStorageV3) => {
+			handler(await loadAccounts(), async (nextStorage: AccountStorageV3) => {
+				writeAccountSourceFixture(nextStorage);
 				persisted.push(structuredClone(nextStorage));
 				await saveAccountsMock(nextStorage);
 			}),
@@ -5484,7 +5488,8 @@ describe("runtime rotation proxy", () => {
 				expires: now + 3_600_000,
 			};
 		});
-		const accountManager = new AccountManager(undefined, storage);
+		writeAccountSourceFixture(storage);
+const accountManager = new AccountManager(undefined, storage);
 		vi.spyOn(accountManager, "saveToDiskDebounced").mockImplementation(() => undefined);
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
 			textEventStream(`data: refreshed-${attempt}\n\n`),
@@ -6127,7 +6132,8 @@ describe("runtime rotation proxy", () => {
 			statusCode: 401,
 			message: "Your authentication token has been invalidated.",
 		});
-		const accountManager = new AccountManager(undefined, storage);
+		writeAccountSourceFixture(storage);
+const accountManager = new AccountManager(undefined, storage);
 		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream("data: ok\n\n"));
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
@@ -6697,6 +6703,7 @@ describe("commit-window and receipt cancellation regressions", () => {
 		const readGate = new Promise<void>(resolve => {releaseRead = resolve;});
 		const readReady = new Promise<void>(resolve => {reading = resolve;});
 		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async committed => {writing(); await writeGate; disk = structuredClone(committed);}));
+		writeAccountSourceFixture(disk, manager.resolveSelectionStoragePath());
 		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "new-access-2", refresh: "new-refresh-2", expires: Date.now() + 7200000});
 		await writeReady;
 		const apply = pendingAuth.applyPendingAuth;
@@ -6780,6 +6787,7 @@ describe("committed authorization and receive-order regressions", () => {
 		if (target === "turn") client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", "access-1");
 		disk.accounts[0]!.enabled = false;
 		if (rebuild) {disk.accounts.push(createStorage(Date.now(), 3).accounts[2]!); disk.accounts.reverse();}
+		writeAccountSourceFixture(disk, manager.resolveSelectionStoragePath());
 		let release!: () => void, captured!: () => void;
 		const barrier = new Promise<void>(resolve => {release = resolve;});
 		const ready = new Promise<void>(resolve => {captured = resolve;});
@@ -7602,7 +7610,7 @@ describe("review transport boundary regressions", () => {
 			const result = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "shared", input: []})); await result;
 			expect(connections).toBe(1);
 			expect(turns).toBe(2);
-			expect(breaker.getState()).toBe("closed");
+			await vi.waitFor(() => expect(breaker.getState()).toBe("closed"));
 			expect(account.cooldownReason).toBe("network-error");
 		} finally {client.terminate(); await upstream.close();}
 	});
@@ -7916,7 +7924,8 @@ describe("PR review regressions", () => {
   const started=new Promise<void>(resolve=>{refreshStarted=resolve;});
   const gate=new Promise<void>(resolve=>{release=resolve;});
   refreshAccessTokenMock.mockImplementation(async()=>{refreshStarted();await gate;return {type:'success',access:'renewed',refresh:'renewed-refresh',expires:now+3600_000};});
-  const manager=new AccountManager(undefined,storage);
+  writeAccountSourceFixture(storage);
+const manager=new AccountManager(undefined,storage);
   const {fetchImpl,calls}=createRecordingFetch(call=>Response.json({models:[{slug:`model-${new URL(call.url).searchParams.get('client_version')}`}]}));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
   const refreshCalls=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken");
@@ -8769,7 +8778,7 @@ describe("final asynchronous admission", () => {
 		expect(response.status).toBe(200);
 		expect(calls).toHaveLength(1);
 		expect(consume).toHaveBeenCalledTimes(1);
-		expect(breaker.getState()).toBe("closed");
+		await vi.waitFor(() => expect(breaker.getState()).toBe("closed"));
 		clock.mockRestore();
 	});
 });

@@ -2308,7 +2308,14 @@ export async function runDoctor(
 							message: `Prepared active-account token refresh for account ${activeIndex + 1} (dry-run)`,
 						});
 					} else {
-						const refreshResult = await withRefreshCredentialRetention(activeAccount, () => queuedRefresh(activeAccount.refreshToken), () => !!storageForChecks?.accounts.includes(activeAccount));
+						// Doctor may have locally repaired enabled/index fields already. OAuth
+						// still belongs to the original durable member, not that proposal.
+						const owners = loadedStorage?.accounts.filter(row => row.recordId && activeAccount.recordId
+							? row.recordId === activeAccount.recordId
+							: row.refreshToken === activeAccount.refreshToken && row.email === activeAccount.email) ?? [];
+						const owner = owners.length === 1 ? owners[0] : undefined;
+						if (!owner) throw new Error("Doctor refresh owner is ambiguous or missing");
+						const refreshResult = await withRefreshCredentialRetention(owner, () => queuedRefresh(owner.refreshToken), () => !!loadedStorage?.accounts.includes(owner) && !!storageForChecks?.accounts.includes(activeAccount));
 						if (refreshResult.type === "success") {
 							const refreshedEmail = sanitizeEmail(
 								extractAccountEmail(refreshResult.access, refreshResult.idToken),

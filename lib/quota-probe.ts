@@ -1,3 +1,4 @@
+import { PendingAuthAdmissionError, PendingAuthLocalError } from "./storage/pending-auth.js";
 import { CODEX_BASE_URL, MAX_RATE_LIMIT_DELAY_MS } from "./constants.js";
 import { createCodexHeaders, getUnsupportedCodexModelInfo } from "./request/fetch-helpers.js";
 import {
@@ -358,6 +359,8 @@ export function formatQuotaSnapshotLine(snapshot: CodexQuotaSnapshot): string {
 }
 
 export interface ProbeCodexQuotaOptions {
+	/** Managed callers keep the original owner through prompt preparation and fallbacks. */
+	authorityCurrent?: () => boolean | Promise<boolean>;
 	signal?: AbortSignal;
 	primeUnusedSubscription?: boolean;
 	accountId: string;
@@ -428,6 +431,8 @@ export async function fetchCodexQuotaSnapshot(
 			const timeout = setTimeout(() => controller.abort(), timeoutMs);
 			let response: Response;
 			try {
+				if (options.authorityCurrent && !await options.authorityCurrent()) throw new PendingAuthAdmissionError(Object.assign(Error("Probe owner changed before send"), {code: "ESTALE"}));
+				options.signal?.throwIfAborted();
 				mutateRuntimeObservabilitySnapshot((snapshot) => {
 					snapshot.diagnosticProbeRequests += 1;
 					snapshot.runtimeMetrics.diagnosticProbeRequests += 1;
@@ -496,7 +501,7 @@ export async function fetchCodexQuotaSnapshot(
 			lastError = new Error("Codex response did not include quota headers");
 		} catch (error) {
 			options.signal?.throwIfAborted();
-			if (error instanceof FirstUseProbeError) throw error;
+			if (error instanceof FirstUseProbeError || error instanceof PendingAuthLocalError) throw error;
 			sawOtherFailure = true;
 			lastError = error instanceof Error ? error : new Error(String(error));
 		}

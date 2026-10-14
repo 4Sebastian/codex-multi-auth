@@ -20,6 +20,10 @@ export function getStoragePath(): string {
 export const FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-flagged-accounts.json";
 export const LEGACY_FLAGGED_ACCOUNTS_FILE_NAME = "openai-codex-blocked-accounts.json";
 
+export function getAutomaticCheckHistoryPath(storagePath: string): string {
+	return `${storagePath}.automatic-checks.json`;
+}
+
 export {
 	ACCOUNTS_BACKUP_SUFFIX,
 	ACCOUNTS_WAL_SUFFIX,
