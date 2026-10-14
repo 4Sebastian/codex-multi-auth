@@ -157,7 +157,7 @@ export async function forwardStreamingResponse(
 	onChunk?: (chunk: Uint8Array) => void,
 	/** Additional response headers, applied after (so they can override) the forwarded upstream ones. */
 	extraHeaders?: Record<string, string>,
-	completion?: () => StreamCompletion,
+	completion?: () => StreamCompletion | Promise<StreamCompletion>,
 ): Promise<boolean> {
 	status.streamsStarted += 1;
 	res.writeHead(upstream.status, {
@@ -165,9 +165,9 @@ export async function forwardStreamingResponse(
 		...extraHeaders,
 	});
 	let clientDisconnected = false;
-	const finish = (): boolean => {
+	const finish = async (): Promise<boolean> => {
 		if (clientDisconnected || res.destroyed) return false;
-		const result = completion?.();
+		const result = await completion?.();
 		// Already ended by a concurrent close path: never write after end.
 		if (res.writableEnded) return false;
 		if (result && !result.success) {
@@ -212,7 +212,7 @@ export async function forwardStreamingResponse(
 				}
 			}
 		}
-		return finish();
+		return await finish();
 	} catch (error) {
         if (clientDisconnected || res.destroyed || (error instanceof ClientCancellationError)) {
             if (!res.destroyed) res.destroy();

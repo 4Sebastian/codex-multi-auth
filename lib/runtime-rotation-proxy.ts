@@ -2230,7 +2230,11 @@ async function connectManagedWebSocket(
 			const handshakeError = error instanceof WebSocketHandshakeError ? error : null;
 			const statusCode = handshakeError?.statusCode ?? null;
 			const bodyText = handshakeError?.bodyText ?? "";
-			state.sessionAffinityStore?.forgetSession(context.sessionKey);
+			await applyDispatchRestriction(state, prepared, () => {
+				if (!account.circuitKeyId || !getCircuitBreaker(account.circuitKeyId).isAdmissionCurrent(prepared.circuitAdmission)) return false;
+				state.sessionAffinityStore?.forgetSession(context.sessionKey);
+				return true;
+			}, false).catch(observationError => proxyLog.warn("Handshake affinity authority could not be observed", {error: observationError}));
 			try {
 				if (statusCode === HTTP_STATUS.UNAUTHORIZED) {
 					const invalidated = isTokenInvalidationError(bodyText);
@@ -4984,7 +4988,26 @@ async function handleRequestInner(
 				state.streamStallTimeoutMs,
 				usageScanner.push,
 				{...(budgetAdvisory.level === "soft" ? buildContextBudgetHeaders(budgetAdvisory) : {}),...(state.catalogEtag ? {"x-models-etag":state.catalogEtag} : {})},
-				() => {usageScanner.result();return responseOutcome.finish();},
+				async () => {
+					usageScanner.result();
+					const completed = responseOutcome.finish();
+					if (!completed.success) await responseRestriction?.catch(captureRestrictionFailure);
+					if (!completed.success && !restrictionFailure) {
+				await applyDispatchRestriction(state, binding, () => {
+					if (!circuitAdmission || !refreshed.account.circuitKeyId || !getCircuitBreaker(refreshed.account.circuitKeyId).isAdmissionCurrent(circuitAdmission)) return false;
+					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
+					if (rejection && context.model) {
+						const body = parseRequestBody(context.body);
+						const effort = isRecord(body?.reasoning) && typeof body.reasoning.effort === "string" ? body.reasoning.effort : undefined;
+						const tier = typeof body?.service_tier === "string" ? body.service_tier : undefined;
+						(state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now)).record(submittedCapabilityKey, context.model, rejection, effort, tier);
+					}
+					return true;
+				}, false).catch(captureRestrictionFailure);
+					}
+					return completed;
+				},
 			);
 			await Promise.all([responseRestriction?.catch(captureRestrictionFailure), quotaUpdate?.catch(captureRestrictionFailure)]);
 			// The client went away mid-stream: no upstream error, and the response was
@@ -5001,15 +5024,6 @@ async function handleRequestInner(
 					return true;
 				}, false).catch(captureRestrictionFailure);
 				if (recovered) await persistRuntimeActiveAccount(accountManager, refreshed.account, context.family, isPinned && refreshed.account.index === pinnedIndex, state.schedulingStrategy, state.nativeOpenai, binding).catch(captureRestrictionFailure);
-			} else if (!clientDisconnected) {
-				state.sessionAffinityStore?.forgetSession(context.sessionKey);
-				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
-				if (rejection && context.model) {
-					const body = parseRequestBody(context.body);
-					const effort = isRecord(body?.reasoning) && typeof body.reasoning.effort === "string" ? body.reasoning.effort : undefined;
-					const tier = typeof body?.service_tier === "string" ? body.service_tier : undefined;
-					(state.capabilityFailures ??= new RuntimeCapabilityFailures(state.now)).record(submittedCapabilityKey, context.model, rejection, effort, tier);
-				}
 			}
 			// A stream that broke mid-flight still bills for whatever the upstream
 			// reported before the break, so record the counts on both outcomes.

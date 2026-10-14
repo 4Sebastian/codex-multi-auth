@@ -6642,6 +6642,43 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 		expect(selected).toBeNull();
 	});
 
+	it("does not let a delayed failed stream erase another account's current affinity", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		let affinity: SessionAffinityStore | undefined;
+		const remember = SessionAffinityStore.prototype.remember;
+		vi.spyOn(SessionAffinityStore.prototype, "remember").mockImplementation(function (this: SessionAffinityStore, ...args) {
+			affinity = this;
+			return remember.apply(this, args);
+		});
+		const encoder = new TextEncoder();
+		let release!: () => void, released = false;
+		const firstBody = new ReadableStream<Uint8Array>({start(controller) {
+			controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"older-response"}}\n\n'));
+			release = () => {if (released) return; released = true; controller.enqueue(encoder.encode('data: {"type":"response.failed","response":{"status":"failed","error":{"code":"fixture_failure"},"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n')); controller.close();};
+		}});
+		const fetchImpl = vi.fn(async () => fetchImpl.mock.calls.length === 1
+			? new Response(firstBody, {headers: {"Content-Type": "text/event-stream"}})
+			: textEventStream(COMPLETED_FRAME));
+		const proxy = await startProxy({accountManager: manager, fetchImpl});
+		const body = {model: "gpt-5-codex", stream: true, prompt_cache_key: "fixture-late-affinity"};
+		const older = await postResponses(proxy, body);
+		try {
+			expect(older.status).toBe(200);
+			manager.setAccountEnabled(0, false);
+			await manager.saveToDisk();
+			const newer = await postResponses(proxy, body);
+			expect(newer.status).toBe(200);
+			await newer.text();
+			await vi.waitFor(() => expect(affinity?.getPreferredAccountIndex("fixture-late-affinity")).toBe(1));
+			release();
+			expect(await older.text()).toContain("response.failed");
+			await manager.flushPendingSave();
+			expect(affinity?.getPreferredAccountIndex("fixture-late-affinity")).toBe(1);
+			expect(manager.getAccountByIndex(1)?.enabled).toBe(true);
+			expect(fetchImpl).toHaveBeenCalledTimes(2);
+		} finally {release(); await older.body?.cancel().catch(() => {});}
+	});
+
 	it("records upstream token usage so the cost and token budget caps can fire", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
@@ -7645,7 +7682,7 @@ describe("native OpenAI catalog routing", () => {
 		const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,forcedAccountIndex:0}});
 		const response=await postResponses(proxy,{model:"shared",input:"hello",stream:true});const text=await response.text();
 		expect(text).toContain("response.incomplete");expect(text).not.toContain("upstream_response_incomplete");
-		expect(success).toHaveBeenCalledTimes(1);expect(failure).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(success).toHaveBeenCalledTimes(1));expect(failure).not.toHaveBeenCalled();
 		expect(proxy.getStatus().lastError).toBeNull();
 	});
 	it("authenticates managed OAuth and unions account catalogs without returning credentials", async () => {
