@@ -6,7 +6,7 @@ import {
 	isTokenInvalidationError,
 	isTokenRefreshRetryable,
 } from "../request/rate-limit-decision.js";
-import type { OAuthAuthDetails } from "../types.js";
+import type { OAuthAuthDetails, TokenSuccess } from "../types.js";
 
 /** @internal */
 export const DEFAULT_AUTH_FAILURE_COOLDOWN_MS = 30_000;
@@ -87,18 +87,20 @@ export async function ensureFreshAccessToken(params: {
 	now: number;
 	tokenRefreshSkewMs: number;
 	tokenInvalidationCooldownMs: number;
+	authorityCurrent?: (result?: TokenSuccess) => boolean;
 }): Promise<
 	| { ok: true; accessToken: string; account: ManagedAccount }
 	| { ok: false; retryable: boolean; invalidated?: boolean }
 > {
 	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
 		params;
+	if (params.authorityCurrent && !params.authorityCurrent()) return {ok: false, retryable: true};
 	const storagePath = accountManager.resolveSelectionStoragePath();
 	const retainedBinding = {recordId: account.recordId, access: account.access, refresh: account.refreshToken, expires: account.expires};
 	const persistenceRetry = getRefreshQueue().retrySettlement(storagePath, retainedBinding);
 	if (persistenceRetry) {
 		const result = await persistenceRetry;
-		if (result.type !== "success" || accountManager.resolveSelectionStoragePath() !== storagePath ||
+		if (result.type !== "success" || (params.authorityCurrent && !params.authorityCurrent(result)) || accountManager.resolveSelectionStoragePath() !== storagePath ||
 			accountManager.getAccountByIndex(account.index) !== account || account.recordId !== retainedBinding.recordId ||
 			account.access !== retainedBinding.access || account.refreshToken !== retainedBinding.refresh || account.expires !== retainedBinding.expires ||
 			account.enabled === false || accountManager.isAccountAuthInvalidated(account) ||
@@ -118,9 +120,10 @@ export async function ensureFreshAccessToken(params: {
 	const refreshResult = await withRefreshCredentialRetention(account,
 		() => queuedRefresh(submittedRefreshToken, storagePath),
 		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath, undefined, storagePath);
+	if (params.authorityCurrent && !params.authorityCurrent(refreshResult.type === "success" ? refreshResult : undefined)) return {ok: false, retryable: true};
 	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
 		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
-		return accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
+		return !params.authorityCurrent && accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
 			? {ok: true, accessToken: account.access ?? "", account}
 			: {ok: false, retryable: true};
 	}
@@ -159,6 +162,7 @@ export async function ensureFreshAccessToken(params: {
 		// fall back to the original account object but always use refreshResult.access:
 		// the original account may carry an expired token, and using that would
 		// cause a downstream 401 and incorrectly trigger invalidation-cooldown logic.
+		if (params.authorityCurrent && (!params.authorityCurrent(refreshResult) || !updatedAccount || updatedAccount.access !== refreshResult.access || updatedAccount.refreshToken !== refreshResult.refresh || updatedAccount.expires !== refreshResult.expires)) return {ok: false, retryable: true};
 		const resolvedAccount = updatedAccount ?? account;
 		const accessToken =
 			updatedAccount !== null

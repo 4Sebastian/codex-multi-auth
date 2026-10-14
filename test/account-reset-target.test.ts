@@ -1,4 +1,5 @@
 import { expect,it } from 'vitest';
+import { writeAccountSourceFixture } from './helpers/account-source-fixture.js';
 import { resetTargetForStoredAccount, resetAccountLabel } from '../lib/runtime/account-reset-credits.js';
 it('uses the native credential binding, not an organization display alias',()=>{
  const account={recordId:'r',accountId:'native-workspace',refreshToken:'secret',addedAt:1,lastUsed:1,workspaces:[{id:'native-workspace',name:'Token account'},{id:'org-personal',name:'Personal'}],currentWorkspaceIndex:1};
@@ -45,7 +46,8 @@ it.each([
  const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation((auth,method,params)=>real(auth,method,params,{command:[process.execPath,script],tempRoot:dir}));
  try{
   const row={recordId:'r',accountId:'refused-explicit',codexCliMirror:{forAccountId:'refused-explicit',accountId:'native-default'},refreshToken:'refresh-fixture',accessToken:'access-fixture',expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1};
-  const manager=new AccountManager(undefined,{version:3,activeIndex:0,accounts:[row]});
+  const source={version:3 as const,activeIndex:0,accounts:[row]};writeAccountSourceFixture(source);
+  const manager=new AccountManager(undefined,source);
   const target=resetTargetForStoredAccount(row)!;
   expect(target.accountId).toBe('refused-explicit');
   const service=createResetCreditService(manager);

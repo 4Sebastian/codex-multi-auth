@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { accessSync, constants, existsSync, promises as fs, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, promises as fs, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { isAbsolute, join } from 'node:path';
 import { codexCliAccountIdFor } from '../auth/token-utils.js';
@@ -7,7 +7,7 @@ import type { CodexCliMirror } from '../storage/public-types.js';
 import { getCodexMultiAuthDir } from '../runtime-paths.js';
 import { isRecord } from '../utils.js';
 
-export interface NativeUsageAuth {accessToken:string;accountId:string;expiresAt:number;idToken?:string;codexCliMirror?:CodexCliMirror}
+export interface NativeUsageAuth {accessToken:string;accountId:string;expiresAt:number;idToken?:string;codexCliMirror?:CodexCliMirror;withAuthority?:(accept:()=>void)=>Promise<void>}
 /** Longer than any live session (15s timeout), so only crash leftovers are swept. */
 const STALE_HOME_MS=10*60_000;
 async function sweepStaleHomes(root:string):Promise<void>{
@@ -40,6 +40,7 @@ export function resolveNativeUsageCommand(platform:NodeJS.Platform=process.platf
 /** One bounded native RPC session in an isolated home. No refresh token, API key,
  * global configuration, or desktop auth changes are available to this process. */
 export async function nativeRateLimitsRpc(auth:NativeUsageAuth,method:Method,params:Record<string,unknown>,options:{command?:string[];tempRoot?:string;timeoutMs?:number}={}):Promise<unknown>{
+ const authorize=auth.withAuthority??((accept:()=>void)=>Promise.resolve().then(accept));
  if(!auth.accessToken||!auth.accountId||auth.expiresAt<=Date.now()+30000)throw Error('Native usage requires a fresh account access token');
  const command=options.command??resolveNativeUsageCommand();const executable=command[0];if(!executable)throw Error('Native usage backend unavailable');
  // The home briefly holds an access token: keep it in the user-private multi-auth
@@ -51,18 +52,25 @@ export async function nativeRateLimitsRpc(auth:NativeUsageAuth,method:Method,par
  let stop:()=>Promise<void>=async()=>{};
  try{
   await fs.chmod(dir,0o700);
-  await fs.writeFile(join(dir,'auth.json'),JSON.stringify({auth_mode:'chatgpt',OPENAI_API_KEY:null,tokens:{access_token:auth.accessToken,id_token:auth.idToken??auth.accessToken,refresh_token:'',account_id:codexCliAccountIdFor(auth,auth.accessToken,auth.idToken)},last_refresh:new Date().toISOString()}),{mode:0o600});
+  await authorize(()=>writeFileSync(join(dir,'auth.json'),JSON.stringify({auth_mode:'chatgpt',OPENAI_API_KEY:null,tokens:{access_token:auth.accessToken,id_token:auth.idToken??auth.accessToken,refresh_token:'',account_id:codexCliAccountIdFor(auth,auth.accessToken,auth.idToken)},last_refresh:new Date().toISOString()}),{mode:0o600}));
   await fs.writeFile(join(dir,'config.toml'),'cli_auth_credentials_store = "file"\n',{mode:0o600});
   const env:NodeJS.ProcessEnv={...process.env,CODEX_HOME:dir};
   // A native backend must not inherit API authentication or our own proxy route.
   for(const key of ['NODE_OPTIONS','OPENAI_API_KEY','OPENAI_BASE_URL','CODEX_API_KEY'])delete env[key];
-  const child=spawn(executable,[...command.slice(1),'app-server'],{env,cwd:dir,stdio:['pipe','pipe','pipe'],windowsHide:true});
-  const exited=new Promise<void>(resolve=>{child.once('exit',()=>resolve());child.once('error',()=>resolve());});
-  stop=async()=>{if(child.exitCode===null&&child.signalCode===null&&child.pid){child.kill('SIGTERM');const timer=setTimeout(()=>{if(child.pid&&child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');},1000);try{await exited;}finally{clearTimeout(timer);}}};
+  const launch=()=>spawn(executable,[...command.slice(1),'app-server'],{env,cwd:dir,stdio:['pipe','pipe','pipe'],windowsHide:true});
+  let launched:ReturnType<typeof launch>|undefined;
+  let launchError:Error|undefined;
+  await authorize(()=>{
+   const child=launch();launched=child;
+   const exited=new Promise<void>(resolve=>{child.once('exit',()=>resolve());child.once('error',error=>{launchError=error;resolve();});});
+   stop=async()=>{if(child.exitCode===null&&child.signalCode===null&&child.pid){child.kill('SIGTERM');const timer=setTimeout(()=>{if(child.pid&&child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');},1000);try{await exited;}finally{clearTimeout(timer);}}};
+  });
+  if(!launched||launchError||launched.exitCode!==null||launched.signalCode!==null)throw Error('Native usage backend failed to start');
+  const child=launched;
   return await new Promise<unknown>((resolve,reject)=>{
    let buffer='';let phase=0;let done=false;
    const timer=setTimeout(()=>fail('timed out'),options.timeoutMs??15000);
-   const fail=(reason:string)=>{if(done)return;done=true;clearTimeout(timer);reject(Error('Native usage '+reason));};
+   const fail=(reason:string|Error)=>{if(done)return;done=true;clearTimeout(timer);reject(reason instanceof Error?reason:Error('Native usage '+reason));};
    const send=(value:unknown)=>child.stdin.write(JSON.stringify(value)+'\n');
    child.on('error',()=>fail('backend failed to start'));child.on('exit',()=>fail('backend exited before replying'));child.stdin.on('error',()=>fail('backend pipe closed'));child.stderr.resume();
    child.stdout.setEncoding('utf8');child.stdout.on('data',(data:string)=>{
@@ -73,8 +81,15 @@ export async function nativeRateLimitsRpc(auth:NativeUsageAuth,method:Method,par
      try{reply=JSON.parse(line)}catch{fail('reply was invalid');return;}
      if(!isRecord(reply)||reply.id!==phase+1)continue;
      if(reply.error){fail('operation rejected by backend');return;}
-     if(phase===0){phase=1;send({method:'initialized'});send({id:2,method,params});}
-     else{done=true;clearTimeout(timer);resolve(reply.result);return;}
+     if(phase===0){
+      phase=-1;
+      void authorize(()=>{if(done)return;phase=1;send({method:'initialized'});send({id:2,method,params});}).catch(error=>fail(error));
+     }
+     else if(phase===1){
+      phase=-1;
+      void authorize(()=>{if(done)return;done=true;clearTimeout(timer);resolve(reply.result);}).catch(error=>fail(error));
+      return;
+     }
     }
    });
    send({id:1,method:'initialize',params:{clientInfo:{name:'multi-auth-usage',version:'1.0'},capabilities:{experimentalApi:true}}});

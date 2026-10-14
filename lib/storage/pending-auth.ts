@@ -184,7 +184,7 @@ function refreshBinding(owner: RefreshOwner, result?: TokenSuccess): unknown[] {
 		? [owner.type, result?.access ?? owner.access, result?.refresh ?? owner.refresh, result?.expires ?? owner.expires]
 		: [owner.recordId, result?.access ?? ("index" in owner ? owner.access : owner.accessToken), result?.refresh ?? owner.refreshToken,
 			result?.expires ?? ("index" in owner ? owner.expires : owner.expiresAt), owner.accountId, owner.enabled === false,
-			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex, "flaggedAt" in owner ? owner.flaggedAt : undefined, "flaggedReason" in owner ? owner.flaggedReason : undefined];
+			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex ?? 0, "flaggedAt" in owner ? owner.flaggedAt : undefined, "flaggedReason" in owner ? owner.flaggedReason : undefined];
 }
 
 export function captureRefreshCredentialAuthority(
@@ -262,7 +262,7 @@ export function captureRefreshCredentialAuthority(
 		if (!rawMatches && !credentials(effective).every((value, index) => value === credentials(submitted)[index]) ||
 			!("type" in submitted) && ((row.recordId && row.recordId !== submitted.recordId) || (row.enabled === false) !== (submitted.enabled === false) ||
 				authorization.authInvalidatedAt !== submitted.authInvalidatedAt || authorization.authInvalidationErrorCode !== submitted.authInvalidationErrorCode ||
-				row.accountId !== submitted.accountId || JSON.stringify(row.workspaces) !== JSON.stringify(submitted.workspaces) || row.currentWorkspaceIndex !== submitted.currentWorkspaceIndex)) {
+				row.accountId !== submitted.accountId || JSON.stringify(row.workspaces) !== JSON.stringify(submitted.workspaces) || (row.currentWorkspaceIndex ?? 0) !== (submitted.currentWorkspaceIndex ?? 0))) {
 			throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is no longer current"), {code: "ESTALE"}));
 		}
 	}

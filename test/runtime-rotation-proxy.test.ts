@@ -9017,7 +9017,8 @@ describe('earned reset last-resort integration',()=>{
   const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-pin-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
   const service=createResetCreditService();await service.setPolicy('last-resort');
   try{
-   const manager=new AccountManager(undefined,createStorage(Date.now()));
+   const disk=createStorage(Date.now());writeAccountSourceFixture(disk);
+   const manager=new AccountManager(undefined,disk);
    const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'chat-fixture'}]}):textEventStream());
    const quota={updatedAt:Date.now(),status:200,model:'chat-fixture',planType:'pro',primary:{usedPercent:100},secondary:{usedPercent:0}};
    const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readSubscriptionQuota:async()=>({byAccountId:{acc_1:quota,acc_2:quota},byEmail:{}})}});
@@ -9038,7 +9039,7 @@ describe('earned reset last-resort integration',()=>{
   const fs=await import('node:fs/promises');const os=await import('node:os');const path=await import('node:path');const originalDir=process.env.CODEX_MULTI_AUTH_DIR;const testDir=await fs.mkdtemp(path.join(os.tmpdir(),'reset-route-integration-'));process.env.CODEX_MULTI_AUTH_DIR=testDir;
   const service=createResetCreditService();await service.setPolicy('last-resort');
   try{
-   const disk=createStorage(Date.now());const stored=await import("../lib/storage.js");const diskSpy=vi.spyOn(stored,"loadAccounts").mockResolvedValue(disk);
+   const disk=createStorage(Date.now());writeAccountSourceFixture(disk);const stored=await import("../lib/storage.js");const diskSpy=vi.spyOn(stored,"loadAccounts").mockResolvedValue(disk);
    const manager=new AccountManager(undefined,disk);
    const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:'chat-fixture'}]}):textEventStream());
    const quota={updatedAt:Date.now(),status:200,model:'chat-fixture',planType:'pro',primary:{usedPercent:100},secondary:{usedPercent:0}};

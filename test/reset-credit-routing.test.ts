@@ -2,14 +2,19 @@ import { expect, it, vi } from 'vitest';
 import { recoverResetQuota } from '../lib/runtime/reset-credit-routing.js';
 import { AccountManager } from '../lib/accounts.js';
 import { workspaceModelScopes } from '../lib/runtime/workspace-model-scopes.js';
+import { resetCredentialOwner } from '../lib/runtime/reset-credits.js';
+import { useAccountSourceFixtures, writeAccountSourceFixture } from './helpers/account-source-fixture.js';
+useAccountSourceFixtures();
 function fixture(){
- const manager=new AccountManager(undefined,{version:3,activeIndex:0,accounts:[{recordId:'first',accountId:'workspace',refreshToken:'r',addedAt:1,lastUsed:1}]});
+ const storage={version:3 as const,activeIndex:0,accounts:[{recordId:'first',accountId:'workspace',refreshToken:'r',accessToken:'fixture-access',expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1}]};
+ writeAccountSourceFixture(storage);
+ const manager=new AccountManager(undefined,storage);
  // Recovery schedules a debounced save; never let it write the shared test store after the test.
  const save=vi.spyOn(manager,'saveToDiskDebounced').mockImplementation(()=>{});
  const account=manager.getAccountByIndex(0)!;const scope=workspaceModelScopes(account)[0]!;
- const automatic=vi.fn(async()=>null);const status=vi.fn(async()=>({snapshots:{[scope.id]:{updatedAt:1000,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}}}}));
+ const automatic=vi.fn(async()=>null);const status=vi.fn(async()=>({snapshots:{[scope.id]:{credentialOwner:resetCredentialOwner(account,scope.accountId),updatedAt:1000,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}}}}));
  const service={automatic,status};const observations=new Map();const clear=vi.fn();
- return {manager,account,scope,service,observations,clear,save,args:{model:'chat-test',native:true,pinned:false,manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:900,status:200,model:'chat-test',planType:'pro',primary:{usedPercent:100},secondary:{}}),service,observations,clearQuotaScheduler:clear,now:()=>1000}};
+ return {storage,manager,account,scope,service,observations,clear,save,args:{model:'chat-test',native:true,pinned:false,manager,scopes:new Map([[0,[scope]]]),quotaForScope:()=>({updatedAt:900,status:200,model:'chat-test',planType:'pro',primary:{usedPercent:100},secondary:{}}),service,observations,clearQuotaScheduler:clear,now:()=>1000}};
 }
 it.each(['api/chat-test','zdr/chat-test'])('never redeems across the %s privacy pool',async model=>{const f=fixture();await recoverResetQuota({...f.args,model});expect(f.service.automatic).not.toHaveBeenCalled();});
 it.each([5,50,94,99])('uses remaining subscription quota at %s%% used without spending a reset',async used=>{const f=fixture();await recoverResetQuota({...f.args,quotaForScope:()=>({...f.args.quotaForScope(),primary:{usedPercent:used}})});expect(f.service.automatic).not.toHaveBeenCalled();});
@@ -21,10 +26,10 @@ it('requires positive native permission before clearing blockers',async()=>{cons
 it('applies a manual redemption once, without erasing a later failure',async()=>{
  const {applyConfirmedReset}=await import('../lib/runtime/reset-credit-routing.js');const f=fixture();const now=Date.now();
  f.account.lastRateLimitReason='quota';f.account.rateLimitResetTimes={codex:now+90000};
- const snapshot={updatedAt:now,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}};
+ const snapshot={credentialOwner:resetCredentialOwner(f.account,f.scope.accountId),updatedAt:now,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}};
  const apply=()=>applyConfirmedReset({account:f.account,scope:f.scope,model:'chat-test',family:'codex',manager:f.manager,snapshot,lastRedemptionAt:now-1000,previous:f.observations.get(JSON.stringify([f.scope.id,'chat-test'])),observations:f.observations,clearQuotaScheduler:f.clear,now});
- expect(apply()).toBe(true);expect(f.account.rateLimitResetTimes).toEqual({});
- f.account.rateLimitResetTimes={codex:now+90000};expect(apply()).toBe(false);expect(f.account.rateLimitResetTimes.codex).toBe(now+90000);
+ expect(await apply()).toBe(true);expect(f.account.rateLimitResetTimes).toEqual({});
+ f.account.rateLimitResetTimes={codex:now+90000};expect(await apply()).toBe(false);expect(f.account.rateLimitResetTimes.codex).toBe(now+90000);
 });
 
 it('checks capacity in every eligible scope before excluding unsupported redemption targets',async()=>{
@@ -36,7 +41,7 @@ it('checks capacity in every eligible scope before excluding unsupported redempt
 it("excludes invalidated credentials from last-resort capacity gating",async()=>{
  const f=fixture();
  const manager=new AccountManager(undefined,{version:3,activeIndex:0,accounts:[
-  {recordId:"first",accountId:"workspace",refreshToken:"r",addedAt:1,lastUsed:1},
+  f.storage.accounts[0]!,
   {recordId:"invalid",accountId:"invalid",refreshToken:"bad",addedAt:1,lastUsed:1,authInvalidatedAt:1},
  ]});
  vi.spyOn(manager,"saveToDiskDebounced").mockImplementation(()=>{});

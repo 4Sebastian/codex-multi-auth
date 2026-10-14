@@ -2024,7 +2024,7 @@ export class AccountManager {
 						await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
 						if (!publicationCurrent() || this.getAccountByIdentity(source, currentAuth) !== liveAccount || this.resolveSelectionStoragePath() !== storagePath ||
 							(["recordId", "access", "refreshToken", "expires", "accountId", "enabled", "authInvalidatedAt", "authInvalidationErrorCode"] as const).some(field => liveAccount[field] !== attemptedState[field]) ||
-							JSON.stringify(liveAccount.workspaces) !== JSON.stringify(attemptedState.workspaces) || liveAccount.currentWorkspaceIndex !== attemptedState.currentWorkspaceIndex) {
+							JSON.stringify(liveAccount.workspaces) !== JSON.stringify(attemptedState.workspaces) || (liveAccount.currentWorkspaceIndex ?? 0) !== (attemptedState.currentWorkspaceIndex ?? 0)) {
 							throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during commit"), {code: "ESTALE"}));
 						}
 					} catch (error) {

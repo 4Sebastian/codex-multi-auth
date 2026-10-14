@@ -6,6 +6,7 @@ import * as storage from '../lib/storage.js';
 import * as native from '../lib/runtime/native-rate-limits.js';
 import { AccountManager } from '../lib/accounts.js';
 import { createResetCreditService, resetTargetForStoredAccount } from '../lib/runtime/account-reset-credits.js';
+import { writeAccountSourceFixture } from './helpers/account-source-fixture.js';
 import { runResetsCommand } from '../lib/codex-manager/commands/resets.js';
 let dir: string;
 beforeEach(async () => {
@@ -20,6 +21,7 @@ function imported(duplicate=true) {
  const accounts=['one','two'].map((id,index)=>({recordId:duplicate?'shared':id,accountId:'workspace',email:`${id}@example.test`,refreshToken:`refresh-${id}`,accessToken:`access-${id}`,expiresAt:Date.now()+3600000,addedAt:index+1,lastUsed:1}));
  const normalized=storage.normalizeAccountStorage({version:3,activeIndex:0,accounts});
  expect(normalized?.accounts).toHaveLength(2);
+ writeAccountSourceFixture(normalized);
  vi.spyOn(storage,'loadAccounts').mockResolvedValue(normalized);
  return normalized!;
 }
@@ -58,7 +60,6 @@ it('does not attribute a cached snapshot to duplicate identities',async()=>{
 it('revalidates identity uniqueness on disk before consuming',async()=>{
  const data=imported();
  const service=createResetCreditService(new AccountManager(undefined,{...data,accounts:[data.accounts[0]!]}));
- await expect(service.redeem(resetTargetForStoredAccount(data.accounts[0]!)!)).rejects.toThrow(/ambiguous/);
- expect(native.nativeRateLimitsRpc).toHaveBeenCalledTimes(1);
- expect(native.nativeRateLimitsRpc).toHaveBeenCalledWith(expect.anything(),'account/rateLimits/read',expect.anything());
+ await expect(service.redeem(resetTargetForStoredAccount(data.accounts[0]!)!)).rejects.toMatchObject({code:'EPENDINGAUTHADMISSION',cause:{code:'ESTALE'}});
+ expect(native.nativeRateLimitsRpc).not.toHaveBeenCalled();
 });

@@ -6,7 +6,7 @@ import { createNativeAccountStorageReader } from "./runtime/native-account-stora
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
 import { PendingAuthObservationError, getPendingAuthPath } from "./storage/pending-auth.js";
-import { resetSnapshotQuota } from "./runtime/reset-credits.js";
+import { resetSnapshotQuota, resetCredentialOwner } from "./runtime/reset-credits.js";
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
 import { recoverResetQuota, applyConfirmedReset } from "./runtime/reset-credit-routing.js";
 import { readSubscriptionQuotaEvent } from "./runtime/subscription-quota-event.js";
@@ -3715,7 +3715,7 @@ async function handleRequestInner(
    const cached = findQuotaCacheEntryForAccount(subscriptionQuotaCache,account,accountManager.getAccountsSnapshot(),undefined,scope.accountId);
    const observed = state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id,context.model]));
    const reset=resetCreditState?.snapshots[scope.id];
-   if(reset && reset.updatedAt > Math.max(cached?.updatedAt??0,observed?.updatedAt??0) && reset.updatedAt <= state.now() && state.now()-reset.updatedAt<=60000)return resetSnapshotQuota(reset);
+   if(reset && reset.credentialOwner===resetCredentialOwner(account,scope.accountId) && reset.updatedAt > Math.max(cached?.updatedAt??0,observed?.updatedAt??0) && reset.updatedAt <= state.now() && state.now()-reset.updatedAt<=60000)return resetSnapshotQuota(reset);
    const baseline = observed && observed.updatedAt >= (cached?.updatedAt ?? 0) ? observed : cached;
    const received = state.preemptiveQuotaScheduler.getSnapshot(buildQuotaScheduleKey(account, context.family, context.model),
     quotaReceiptOwner(captureDispatchBinding(accountManager, account, account.access ?? "", scope.accountId)), baseline ?? null);
@@ -3977,7 +3977,7 @@ async function handleRequestInner(
 
   if (state.nativeOpenai && isResponsesRequest && context.model && resetCreditState?.lastRedemptionAt !== undefined) {
    for(const [index,scopes] of workspaceCandidates){const account=accountManager.getAccountByIndex(index);if(!account)continue;
-    for(const scope of scopes)applyConfirmedReset({account,scope,model:context.model,family:context.family,manager:accountManager,snapshot:resetCreditState.snapshots[scope.id],lastRedemptionAt:resetCreditState.lastRedemptionAt,
+    for(const scope of scopes)await applyConfirmedReset({account,scope,model:context.model,family:context.family,manager:accountManager,snapshot:resetCreditState.snapshots[scope.id],lastRedemptionAt:resetCreditState.lastRedemptionAt,
      previous:state.subscriptionQuotaObservations?.get(JSON.stringify([scope.id,context.model])) ?? findQuotaCacheEntryForAccount(subscriptionQuotaCache,account,accountManager.getAccountsSnapshot(),undefined,scope.accountId),
      observations:state.subscriptionQuotaObservations ??=new Map(),now:state.now(),clearQuotaScheduler:a=>state.preemptiveQuotaScheduler.clear(buildQuotaScheduleKey(a,context.family,context.model))});
    }

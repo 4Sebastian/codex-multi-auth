@@ -108,13 +108,8 @@ function ownerRecord(pid: number, token = `token-${pid}`) {
 	})}\n`;
 }
 
-// Windows draws PIDs from a shared pool and hands a just-reaped one straight
-// back out, so any other process on the machine can take a "dead" fixture PID
-// while a test runs. unbind then finds that PID live, keeps its files, and
-// logs that it did. A kept file is excused only by that log line naming the
-// PID; every PID that stayed dead must still be cleaned up.
 function preservedAsLive(warnings: readonly string[], pid: number): boolean {
-	return warnings.some(
+	return isPidAliveNow(pid) && warnings.some(
 		(w) =>
 			w.includes(`(pid ${pid}) did not stop`) ||
 			w.includes(`(pid ${pid}) has no status record but its PID is live`),
@@ -137,6 +132,33 @@ function isPidAliveNow(pid: number): boolean {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
+
+describe("cleanup exemption evidence", () => {
+	it("detects retained dead fixture files despite false liveness warnings", async () => {
+		const baseDir = await createRoot("cma-false-live-");
+		await withDeadPids(1, async ([pid]) => {
+			expect(pid).toBeDefined();
+			if (pid === undefined) throw Error("Missing owned PID");
+			await writeFile(statusPathFor(baseDir, pid), statusRecord(pid));
+			await writeFile(ownerPathFor(baseDir, pid), ownerRecord(pid));
+			const warnings = [`Helper (pid ${pid}) did not stop`, `Helper (pid ${pid}) has no status record but its PID is live`];
+			expect(isPidAliveNow(pid)).toBe(false);
+			expect(preservedAsLive(warnings, pid)).toBe(false);
+			expect(remainingHelperFiles(baseDir, warnings).sort()).toEqual([statusPathFor(baseDir, pid), ownerPathFor(baseDir, pid)].map(path => path.slice(baseDir.length + 1)).sort());
+		});
+	});
+	it("preserves an independently live owned fixture", async () => {
+		const baseDir = await createRoot("cma-true-live-");
+		await withLivePids(1, async ([pid]) => {
+			if (pid === undefined) throw Error("Missing owned PID");
+			await writeFile(ownerPathFor(baseDir, pid), ownerRecord(pid));
+			const warnings = [`Helper (pid ${pid}) has no status record but its PID is live`];
+			expect(preservedAsLive(warnings, pid)).toBe(true);
+			expect(remainingHelperFiles(baseDir, warnings)).toEqual([]);
+			expect(existsSync(ownerPathFor(baseDir, pid))).toBe(true);
+		});
+	});
+});
 
 describe("stress: unbind at the scale the leak report described", () => {
 	it("reclaims hundreds of dead records and orphaned owner files in one pass", async () => {
