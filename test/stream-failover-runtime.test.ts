@@ -211,6 +211,30 @@ describe("readErrorBody", () => {
 });
 
 describe("forwardStreamingResponse", () => {
+	it.each(["completed", "done", "incomplete", "failed", "error"].flatMap(type => ["open", "reject-next"].map(transport => ({type, transport}))))("ends an owned terminal without reading the remaining transport (%j)", async ({type, transport}) => {
+		const delta = 'data: {"type":"response.output_text.delta","delta":"visible"}\n\n';
+		const terminal = `data: ${JSON.stringify({type: type === "error" ? "error" : `response.${type}`, response: {status: type === "done" ? "completed" : type, usage: {input_tokens: 17, output_tokens: 4}}})}\n\n`;
+		let entered!: () => void, release!: () => void;
+		const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+		const cancel = vi.fn(), pull = vi.fn(() => {if (transport === "reject-next") throw Error("fixture post-terminal read failed");});
+		const upstream = new Response(new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(Buffer.from(delta + terminal));}, pull, cancel}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream"}});
+		const res = new FakeServerResponse(), status = createStatus(), onError = vi.fn();
+		const success = ["completed", "done", "incomplete"].includes(type);
+		const completion = vi.fn(async () => {entered(); await gate; return {success, outcome: success ? "success" as const : "failure" as const, errorCode: success ? null : "upstream_response_failed", missingTerminal: false};});
+		const pending = forwardStreamingResponse(upstream, res.asServerResponse(), status, onError, 1000, undefined, undefined, completion);
+		try {
+			await ready;
+			expect(Buffer.concat(res.chunks).toString()).toBe(delta);
+			expect(res.ended).toBe(false);
+			release();
+			expect(await pending).toBe(success);
+			expect(Buffer.concat(res.chunks).toString()).toBe(delta + terminal);
+			expect(res.ended).toBe(true); expect(res.destroyed).toBe(false);
+			expect(onError).not.toHaveBeenCalled(); expect(pull).not.toHaveBeenCalled();
+			expect(completion).toHaveBeenCalledOnce(); expect(cancel).toHaveBeenCalledOnce();
+			expect(upstream.body?.locked).toBe(false);
+		} finally {release(); await pending;}
+	});
 	it.each(["mixed", "bytewise", "crlf", "multiline"])("withholds terminal bytes behind owned settlement (%s)", async encoding => {
 		const delta = 'data: {"type":"response.output_text.delta","delta":"é"}\n\n';
 		let terminal = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":17,"output_tokens":4}}}\n\n';

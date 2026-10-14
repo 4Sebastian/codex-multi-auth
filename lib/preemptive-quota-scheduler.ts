@@ -26,30 +26,38 @@ export function mergeQuotaObservations(snapshot: QuotaSchedulerSnapshot, previou
 export interface QuotaObservationReceipt {
 	snapshot: QuotaSchedulerSnapshot;
 	owner: string;
+	position: number;
+	epoch: QuotaReceiptEpoch;
 	primary?: symbol;
 	secondary?: symbol;
 	planType?: symbol;
 }
 
+interface QuotaReceiptEpoch {
+	retainUntil: number;
+	position: number;
+}
+
 interface QuotaReceiptField {
 	received: symbol;
+	position: number;
 	applied?: symbol;
 	failed?: QuotaSchedulerSnapshot;
 }
 
 interface QuotaReceiptState {
 	owner: string;
-	epoch: {retainUntil: number};
+	epoch: QuotaReceiptEpoch;
 	primary?: QuotaReceiptField;
 	secondary?: QuotaReceiptField;
 	planType?: QuotaReceiptField;
 }
 
 export function mergeQuotaReceipts(receipt: QuotaObservationReceipt, previous?: QuotaObservationReceipt): QuotaObservationReceipt {
-	if (previous?.owner !== receipt.owner) return receipt;
+	if (previous?.owner !== receipt.owner || previous.epoch !== receipt.epoch) return receipt;
 	return {
 		...receipt,
-		snapshot: mergeQuotaObservations(receipt.snapshot, previous.snapshot),
+		snapshot: {...mergeQuotaObservations(receipt.snapshot, previous.snapshot), status: receipt.primary ? receipt.snapshot.status : previous.snapshot.status},
 		primary: receipt.primary ?? previous.primary,
 		secondary: receipt.secondary ?? previous.secondary,
 		planType: receipt.planType ?? previous.planType,
@@ -283,7 +291,7 @@ export class PreemptiveQuotaScheduler {
 	update(key: string, snapshot: QuotaSchedulerSnapshot): void {
 		if (!key) return;
 		this.maybePrune(snapshot.updatedAt || Date.now());
-		if (!this.receipts.has(snapshot)) this.receipts.set(snapshot, {owner: "", epoch: {retainUntil: 0}});
+		if (!this.receipts.has(snapshot)) this.receipts.set(snapshot, {owner: "", epoch: {retainUntil: 0, position: 0}});
 		this.snapshots.set(key, snapshot);
 	}
 
@@ -299,12 +307,12 @@ export class PreemptiveQuotaScheduler {
 		let shared = this.snapshots.get(key);
 		if (!shared) {
 			shared = baseline ?? {status: 200, updatedAt: 0, primary: {}, secondary: {}};
-			this.receipts.set(shared, {owner: "", epoch: {retainUntil: 0}});
+			this.receipts.set(shared, {owner: "", epoch: {retainUntil: 0, position: 0}});
 			if (key) this.snapshots.set(key, shared);
 		}
 		let epoch = this.receipts.get(shared)?.epoch;
 		if (!epoch) {
-			epoch = {retainUntil: 0};
+			epoch = {retainUntil: 0, position: 0};
 			this.receipts.set(shared, {owner: "", epoch});
 		}
 		const current = baseline ?? shared;
@@ -313,13 +321,13 @@ export class PreemptiveQuotaScheduler {
 			state = {owner, epoch};
 			this.receipts.set(current, state);
 		}
-		const receipt: QuotaObservationReceipt = {snapshot, owner};
+		const receipt: QuotaObservationReceipt = {snapshot, owner, epoch, position: ++epoch.position};
 		for (const field of ["primary", "secondary", "planType"] as const) {
 			const supplied = field === "planType" ? Boolean(snapshot.planType?.trim()) : snapshot[field].usedPercent !== undefined || snapshot[field].resetAtMs !== undefined;
 			if (!supplied) continue;
 			const token = Symbol();
 			receipt[field] = token;
-			state[field] = {received: token, applied: state[field]?.applied, failed: state[field]?.failed};
+			state[field] = {received: token, position: receipt.position, applied: state[field]?.applied, failed: state[field]?.failed};
 		}
 		return receipt;
 	}
@@ -328,13 +336,22 @@ export class PreemptiveQuotaScheduler {
 		const previous = this.getSnapshot(key, receipt.owner, baseline);
 		const state = previous ? this.receipts.get(previous) : undefined;
 		const shared = this.snapshots.get(key);
-		if (!state || state.owner !== receipt.owner || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return undefined;
+		if (!previous || !state || state.owner !== receipt.owner || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return undefined;
+		if (receipt.epoch !== state.epoch) return undefined;
+		for (const field of ["primary", "secondary", "planType"] as const) {
+			const supplied = field === "planType" ? Boolean(receipt.snapshot.planType?.trim()) : receipt.snapshot[field].usedPercent !== undefined || receipt.snapshot[field].resetAtMs !== undefined;
+			if (!supplied || receipt[field] || (state[field]?.position ?? 0) > receipt.position) continue;
+			const token = Symbol();
+			receipt[field] = token;
+			state[field] = {received: token, position: receipt.position, applied: state[field]?.applied, failed: state[field]?.failed};
+		}
 		const primary = receipt.primary !== undefined && receipt.primary === state.primary?.received;
 		const secondary = receipt.secondary !== undefined && receipt.secondary === state.secondary?.received;
 		const planType = receipt.planType !== undefined && receipt.planType === state.planType?.received;
 		if (!primary && !secondary && !planType) return undefined;
 		const merged = mergeQuotaObservations({
 			...receipt.snapshot,
+			status: primary ? receipt.snapshot.status : previous.status,
 			primary: primary ? receipt.snapshot.primary : {},
 			secondary: secondary ? receipt.snapshot.secondary : {},
 			planType: planType ? receipt.snapshot.planType : undefined,
@@ -348,7 +365,7 @@ export class PreemptiveQuotaScheduler {
 		const current = baseline ?? this.snapshots.get(key);
 		const state = current ? this.receipts.get(current) : undefined;
 		const shared = this.snapshots.get(key);
-		if (!state || state.owner !== receipt.owner || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return;
+		if (!state || state.owner !== receipt.owner || state.epoch !== receipt.epoch || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return;
 		for (const field of ["primary", "secondary", "planType"] as const) {
 			const token = receipt[field], owned = state[field];
 			if (!token || !owned) continue;

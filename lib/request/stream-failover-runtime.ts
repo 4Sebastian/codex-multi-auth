@@ -235,6 +235,10 @@ export async function forwardStreamingResponse(
 								const frame = Buffer.concat(pending);
 								pending = []; pendingSize = 0; start = index + 1;
 								await write(frame);
+								if (terminal.hasTerminal()) {
+									if (start < value.length && !clientDisconnected && !res.destroyed && !res.writableEnded && !res.write(Buffer.from(value.subarray(start)))) await waitForDrain(res);
+									return await finish();
+								}
 							}
 						} else lineSize += 1;
 						lastByte = byte;

@@ -9382,6 +9382,54 @@ describe("unversioned catalog requests", () => {
 
 
 describe("owned terminal settlement regressions", () => {
+ it.each(["http", "api", "zdr"].flatMap(mode => ["completed", "done", "incomplete", "failed"].flatMap(type => ["open", "reject-next"].map(transport => ({mode, type, transport})))))("ends settled HTTP bodies without transport failure or replay (%j)", async ({mode, type, transport}) => {
+  const previousDir = process.env.CODEX_MULTI_AUTH_DIR; process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
+  const budgets = await import("../lib/budget-guard.js");
+  const store = await budgets.loadBudgetGuardStore(); budgets.upsertBudgetLimit(store, {key: "global", window: "day", maxRequests: 1}); await budgets.saveBudgetGuardStore(store);
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(resolve => {entered = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+  const appendRow = usageLedger.appendUsageLedgerRow;
+  const append = vi.spyOn(usageLedger, "appendUsageLedgerRow").mockImplementation(async row => {entered(); await gate; return appendRow(row);});
+  const delta = 'data: {"type":"response.output_text.delta","delta":"visible"}\n\n';
+  const terminal = `data: ${JSON.stringify({type: `response.${type}`, response: {id: "owned-open", status: type === "done" ? "completed" : type, ...(type === "failed" ? {error: {code: "invalid_prompt"}} : {}), usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}})}\n\n`;
+  const cancel = vi.fn(), pull = vi.fn(() => {if (transport === "reject-next") throw Error("fixture post-terminal rejection");});
+  let upstreamBody: ReadableStream<Uint8Array> | undefined, sends = 0;
+  const {fetchImpl} = createRecordingFetch(call => {
+   if (call.url.includes("/models")) return Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]});
+   sends++;
+   upstreamBody = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(Buffer.from(delta + terminal));}, pull, cancel}, {highWaterMark: 0});
+   return new Response(upstreamBody, {headers: {"content-type": "text/event-stream"}});
+  });
+  const storage = createStorage(Date.now(), 1); writeAccountSourceFixture(storage);
+  const manager = new AccountManager(undefined, storage);
+  const proxy = await startProxy({accountManager: manager, fetchImpl, options: {
+   nativeOpenai: mode !== "http",
+   readApiRoutes: async () => [{id: "owned-open-api", label: "Fixture", kind: mode === "zdr" ? "zdr" : "api", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["shared"]}],
+  }});
+  const body = {model: mode === "http" ? "shared" : `${mode}/shared`, input: [], stream: true};
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+   const response = await postResponses(proxy, body); expect(response.status).toBe(200);
+   reader = response.body!.getReader();
+   expect(Buffer.from((await reader.read()).value!).toString()).toBe(delta);
+   let exposed = false;
+   const terminalRead = reader.read().then(result => {exposed = true; return result;});
+   await ready;
+   expect(exposed).toBe(false); expect(await usageLedger.readUsageLedgerRows()).toEqual([]);
+   release();
+   expect(Buffer.from((await terminalRead).value!).toString()).toBe(terminal);
+   expect((await reader.read()).done).toBe(true);
+   const success = type !== "failed";
+   expect(await usageLedger.readUsageLedgerRows()).toEqual([expect.objectContaining({outcome: success ? "success" : "failure", tokens: expect.objectContaining({inputTokens: 17, outputTokens: 4, totalTokens: 21})})]);
+   expect(manager.getAccountByIndex(0)?.cooldownReason).not.toBe("network-error");
+   await vi.waitFor(() => {expect(cancel).toHaveBeenCalledOnce(); expect(upstreamBody?.locked).toBe(false);});
+   expect(pull).not.toHaveBeenCalled(); expect(sends).toBe(1);
+   const blocked = await postResponses(proxy, body); expect(blocked.status).toBe(429); expect(await blocked.text()).toContain("budget_blocked"); expect(sends).toBe(1);
+  } finally {
+   release(); await reader?.cancel().catch(() => undefined); append.mockRestore();
+   if (previousDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR; else process.env.CODEX_MULTI_AUTH_DIR = previousDir;
+  }
+ });
  it.each(["http", "native", "api", "zdr"])("settles the persisted ledger before exposing completion and the next budget turn (%s)", async mode => {
   const previousDir = process.env.CODEX_MULTI_AUTH_DIR; process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
   const budgets = await import("../lib/budget-guard.js");

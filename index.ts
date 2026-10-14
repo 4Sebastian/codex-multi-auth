@@ -1576,7 +1576,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 										const primarySubmittedCredential = {recordId: account.recordId, accessToken: accountAuth.access, refreshToken: accountAuth.refresh, expiresAt: account.expires, accountId};
 										const primarySubmittedAccount = structuredClone(account);
 										const quotaOwner = modelScopeId(primarySubmittedCredential.recordId ?? "", primarySubmittedCredential.accessToken, primarySubmittedCredential.refreshToken, String(primarySubmittedCredential.expiresAt), primarySubmittedCredential.accountId);
-										const quotaScheduleKey = `${entitlementAccountKey}:${model ?? modelFamily}:${quotaOwner}`;
+										const quotaScheduleKey = `${quotaOwner}:${model ?? modelFamily}`;
 										if (!primaryAdmission) throw new Error("Missing circuit admission");
 										const dispatchPrimary = createAccountDispatch({manager: accountManager, account, submitted: primarySubmittedCredential, admission: primaryAdmission, family: modelFamily, model: model ?? null,
 											eligible: () => !entitlementCache.isBlocked(entitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, Date.now(), quotaOwner).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
@@ -1709,9 +1709,10 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												if (planType) snapshot = {...(snapshot ?? {status: received.status, updatedAt: now, primary: {}, secondary: {}}), planType};
 												const overload = [502, 503, 529].includes(received.status);
 												const waitMs = received.status === 429 ? parseRetryAfterHintMs(received.headers) ?? 60_000 : overload ? evaluateFailurePolicy({kind: "server", failoverMode, serverRetryAfterMs: parseRetryAfterHintMs(received.headers) ?? undefined}, {serverCooldownMs: serverErrorCooldownMs}).cooldownMs : undefined;
+												const previous = preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, quotaOwner);
+												rateLimitResetFloor = Math.max((snapshot?.primary.usedPercent ?? 0) >= 100 ? snapshot?.primary.resetAtMs ?? 0 : 0, (previous?.primary.usedPercent ?? 0) >= 100 ? previous?.primary.resetAtMs ?? 0 : 0);
+												if (received.status === 404) snapshot ??= {status: received.status, updatedAt: now, primary: {}, secondary: {}};
 												if (typeof waitMs === "number") {
-													const previous = preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, quotaOwner);
-													rateLimitResetFloor = Math.max((snapshot?.primary.usedPercent ?? 0) >= 100 ? snapshot?.primary.resetAtMs ?? 0 : 0, (previous?.primary.usedPercent ?? 0) >= 100 ? previous?.primary.resetAtMs ?? 0 : 0);
 													snapshot = {...(snapshot ?? {status: received.status, updatedAt: now, secondary: {}}), status: 429, primary: {usedPercent: 100, resetAtMs: Math.max(rateLimitResetFloor, now + waitMs)}};
 												}
 												if (snapshot) {
@@ -1720,10 +1721,10 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												}
 												return received;
 											};
-											const applyReceivedRateLimit = (mutate: () => number) => applySubmittedRestriction(() => {
+											const applyReceivedRateLimit = (retryAfterMs: number, mutate: () => number) => applySubmittedRestriction(() => {
 												if (!quotaReceipt) return false;
-												const primaryReceipt = {...quotaReceipt, secondary: undefined, planType: undefined};
-												if (!preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, primaryReceipt)) return false;
+												const primaryReceipt = {...quotaReceipt, secondary: undefined, planType: undefined, snapshot: {...quotaReceipt.snapshot, status: 429, secondary: {}, planType: undefined, primary: {usedPercent: 100, resetAtMs: Math.max(rateLimitResetFloor, quotaReceipt.snapshot.updatedAt + retryAfterMs)}}};
+												if (!preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, primaryReceipt)) return preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, Date.now(), quotaOwner).defer;
 												const waitMs = mutate();
 												primaryReceipt.snapshot = {...primaryReceipt.snapshot, primary: {usedPercent: 100, resetAtMs: Math.max(rateLimitResetFloor, primaryReceipt.snapshot.updatedAt + waitMs)}};
 												preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, primaryReceipt);
@@ -2237,7 +2238,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														typeof policy.cooldownMs === "number"
 													) {
 														const cooldownMs = policy.cooldownMs;
-														await applyReceivedRateLimit(() => cooldownMs);
+														await applyReceivedRateLimit(cooldownMs, () => cooldownMs);
 														if (restrictionObservationFailed) return errorResponse;
 													}
 													if (policy.refundToken) {
@@ -2269,8 +2270,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													runtimeMetrics.rateLimitedResponses++;
 													const retryAfterMs =
 														rateLimit?.retryAfterMs ?? 60_000;
-													let cooldownMs = 0;
-													if (!await applyReceivedRateLimit(() => {
+													let cooldownMs: number | undefined;
+													if (!await applyReceivedRateLimit(retryAfterMs, () => {
 														const {delayMs} = getRateLimitBackoff(account.index, quotaKey, retryAfterMs, primarySubmittedCredential.accountId ?? primarySubmittedAccount.email ?? null);
 														cooldownMs = Math.max(delayMs, retryAfterMs);
 														accountManager.markRateLimitedWithReason(account, cooldownMs, modelFamily, parseRateLimitReason(rateLimit?.code), model);
@@ -2278,12 +2279,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														accountManager.saveToDiskDebounced();
 														return cooldownMs;
 													})) return errorResponse;
-													const waitLabel = formatWaitTime(cooldownMs);
+													const waitLabel = formatWaitTime(cooldownMs ?? retryAfterMs);
 													const shortRetryThresholdMs =
 														getConfiguredRateLimitShortRetryThresholdMs();
 
 													if (
-														cooldownMs <= shortRetryThresholdMs &&
+														cooldownMs !== undefined && cooldownMs <= shortRetryThresholdMs &&
 														shortRateLimitRetryCount < MAX_SHORT_RETRY_ATTEMPTS
 													) {
 														shortRateLimitRetryCount += 1;

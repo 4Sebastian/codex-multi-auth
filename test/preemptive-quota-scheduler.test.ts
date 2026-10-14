@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	PreemptiveQuotaScheduler,
+	mergeQuotaReceipts,
 	readQuotaSchedulerSnapshot,
 } from "../lib/preemptive-quota-scheduler.js";
 
@@ -485,6 +486,51 @@ it.each(["clear", "clearAll", "clearByPrefix", "full-replacement", "prune"])("do
 	expect(scheduler.getDeferral("account:model", later).defer).toBe(false);
 });
 
+it.each(["forward", "reverse"])("orders delayed body-classified primary fields independently of completion (%s)", order => {
+	const scheduler = new PreemptiveQuotaScheduler();
+	const first = scheduler.receive("account:model", {status: 404, updatedAt: 1000, primary: {}, secondary: {usedPercent: 40}, planType: "plus"}, "A");
+	scheduler.observeReceipt("account:model", first);
+	const second = scheduler.receive("account:model", {status: 404, updatedAt: 900, primary: {}, secondary: {}}, "A");
+	const classify = (receipt: typeof first, resetAtMs: number) => ({...receipt, snapshot: {...receipt.snapshot, status: 429, primary: {usedPercent: 100, resetAtMs}}});
+	const earlier = classify(first, 3000), later = classify(second, 6000);
+	if (order === "forward") expect(scheduler.observeReceipt("account:model", earlier)).toBeDefined();
+	expect(scheduler.observeReceipt("account:model", later)?.primary.resetAtMs).toBe(6000);
+	if (order === "reverse") expect(scheduler.observeReceipt("account:model", earlier)).toMatchObject({primary: {resetAtMs: 6000}, secondary: {usedPercent: 40}});
+	scheduler.settleReceipt("account:model", later, true);
+	expect(scheduler.getSnapshot("account:model", "A")).toMatchObject({primary: {usedPercent: 100, resetAtMs: 6000}, secondary: {usedPercent: 40}, planType: "plus"});
+	expect(scheduler.getDeferral("account:model", 1000, "A").defer).toBe(true);
+});
+it("keeps rate-limit status with its primary field across pending partial merges", () => {
+	const scheduler = new PreemptiveQuotaScheduler();
+	const primary = scheduler.receive("account:model", {status: 429, updatedAt: 1000, primary: {usedPercent: 100, resetAtMs: 6000}, secondary: {}}, "A");
+	scheduler.observeReceipt("account:model", primary);
+	const secondary = scheduler.receive("account:model", {status: 200, updatedAt: 1000, primary: {}, secondary: {usedPercent: 40}}, "A");
+	expect(scheduler.observeReceipt("account:model", secondary)).toMatchObject({status: 429, primary: {usedPercent: 100}, secondary: {usedPercent: 40}});
+	const merged = mergeQuotaReceipts(secondary, primary);
+	expect(scheduler.observeReceipt("account:model", merged)).toMatchObject({status: 429, primary: {usedPercent: 100}, secondary: {usedPercent: 40}});
+	scheduler.settleReceipt("account:model", merged, true);
+	expect(scheduler.getDeferral("account:model", 1000, "A")).toMatchObject({defer: true, waitMs: 5000, reason: "rate-limit"});
+});
+it("does not let an unrelated body arrival consume supplied primary authority", () => {
+	const scheduler = new PreemptiveQuotaScheduler();
+	const supplied = scheduler.receive("account:model", {status: 200, updatedAt: 1000, primary: {usedPercent: 20}, secondary: {}}, "A");
+	scheduler.receive("account:model", {status: 404, updatedAt: 1000, primary: {}, secondary: {}}, "A");
+	expect(scheduler.observeReceipt("account:model", supplied)?.primary.usedPercent).toBe(20);
+	scheduler.settleReceipt("account:model", supplied, true);
+	expect(scheduler.getDeferral("account:model", 1000, "A").defer).toBe(false);
+});
+it("cannot promote a retired body receipt into a replacement epoch", () => {
+	const scheduler = new PreemptiveQuotaScheduler();
+	const receipt = scheduler.receive("account:model", {status: 404, updatedAt: 1000, primary: {}, secondary: {}}, "A");
+	const classified = {...receipt, snapshot: {...receipt.snapshot, status: 429, primary: {usedPercent: 100, resetAtMs: 6000}}};
+	scheduler.observeReceipt("account:model", classified);
+	scheduler.clear("account:model");
+	const healthy = scheduler.receive("account:model", {status: 200, updatedAt: 1000, primary: {usedPercent: 20}, secondary: {}}, "A");
+	scheduler.observeReceipt("account:model", healthy);
+	scheduler.settleReceipt("account:model", classified, false);
+	expect(scheduler.observeReceipt("account:model", classified)).toBeUndefined();
+	expect(scheduler.getDeferral("account:model", 1000, "A").defer).toBe(false);
+});
 it("retains a rate-limit window during unrelated partial observations", () => {
 	const scheduler = new PreemptiveQuotaScheduler(), now = 1_000_000;
 	scheduler.markRateLimited("account:model", 60000, now);

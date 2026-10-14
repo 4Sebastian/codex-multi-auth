@@ -905,7 +905,105 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 	});
 
 
-	it.each(["healthy-exhausted", "exhausted-healthy", "independent", "held-error", "locked-error", "held-429", "later-429", "replacement", "expiry", "workspace"])("orders actual plugin quota receipts across overlapping turns (%s)", async mode => {
+	it.each(["none", "secondary", "plan"].flatMap(headers => [
+		...["usage_limit_reached", "rate_limit_exceeded"].flatMap(code => ["rotate", "older-body", "newer-body", "older-auth"].map(mode => ({headers, code, mode}))),
+		...["unrelated", "entitlement404", "entitlement403"].map(mode => ({headers, code: mode === "unrelated" ? "not_found" : "usage_not_included", mode})),
+	]))("preserves real body-classified quota order and rotation (%j)", async ({headers, code, mode}) => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-classified-quota-")), path = join(dir, "accounts.json"), now = Date.now();
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "classified-A", accountId: "W1", refreshToken: "refresh-classified", accessToken: "access-classified", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (mode === "rotate") storage.accounts.push({...storage.accounts[0]!, recordId: "classified-B", accountId: "W2", refreshToken: "refresh-B", accessToken: "access-B"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		for (const method of ["handleErrorResponse", "handleSuccessResponse", "createCodexHeaders"] as const) vi.spyOn(helpers, method).mockImplementation(actualHelpers[method] as never);
+		vi.spyOn(await import("../lib/request/rate-limit-backoff.js"), "getRateLimitShortRetryThresholdMs").mockReturnValue(0);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js"), receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const terminal = 'data: {"type":"response.completed","response":{"id":"classified-control","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const healthy = () => new Response(terminal, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20", "x-codex-primary-reset-after-seconds": "3600"}});
+		const sent: Array<(response: Response) => void> = [], bearers: Array<string | null> = [];
+		const overlapping = mode.includes("body") || mode === "older-auth";
+		globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			bearers.push(new Headers(init?.headers).get("authorization"));
+			if (sent.length >= (overlapping ? 2 : 1)) return healthy();
+			return new Promise<Response>(resolve => {sent.push(resolve);});
+		});
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		const quotaHeaders: Record<string, string> = headers === "secondary" ? {"x-codex-secondary-used-percent": "40", "x-codex-secondary-reset-after-seconds": "7200"} : headers === "plan" ? {"x-codex-plan-type": "plus"} : {};
+		const payload = JSON.stringify({error: {code, message: mode.startsWith("entitlement") ? "Model not available for your plan" : code}});
+		const rejected = () => mode.includes("body") ? new Response(new ReadableStream<Uint8Array>({async pull(controller) {entered(); await gate; controller.enqueue(Buffer.from(payload)); controller.close();}}, {highWaterMark: 0}), {status: 404, headers: quotaHeaders}) : new Response(payload, {status: mode === "entitlement403" ? 403 : 404, headers: quotaHeaders});
+		let ordinary!: ReadableStreamDefaultController<Uint8Array>, reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-classified", refresh: "refresh-classified", expires: now + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			const first = turn(); await vi.waitFor(() => expect(sent).toHaveLength(1));
+			const second = overlapping ? turn() : undefined;
+			if (second) await vi.waitFor(() => expect(sent).toHaveLength(2));
+			if (mode === "older-auth") {
+				const authorize = manager.withCurrentAccountCredential.bind(manager); let held = false;
+				vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (!held) {held = true; entered(); await gate;} return authorize(...args);});
+			}
+			if (mode === "newer-body") {
+				sent[0]!(new Response(new ReadableStream<Uint8Array>({start(controller) {ordinary = controller; controller.enqueue(Buffer.from(': ordinary\n\n'));}}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20"}}));
+				reader = (await first).body!.getReader(); await reader.read();
+				vi.spyOn(Date, "now").mockReturnValue(now - 1000); sent[1]!(rejected()); await ready;
+				ordinary.enqueue(Buffer.from(terminal)); ordinary.close();
+				expect(Buffer.from((await reader.read()).value!).toString()).toBe(terminal); expect((await reader.read()).done).toBe(true);
+				release();
+				const response = await second!; expect(response.ok).toBe(false); await response.text();
+			} else {
+				sent[0]!(rejected());
+				if (second) {
+					await ready;
+					vi.spyOn(Date, "now").mockReturnValue(now - 1000); sent[1]!(healthy());
+					expect(await (await second).text()).toBe(terminal);
+					release();
+				}
+				const response = await first;
+				if (mode === "rotate") {expect(response.status).toBe(200); expect(await response.text()).toBe(terminal); expect(bearers).toEqual(["Bearer access-classified", "Bearer access-B"]);}
+				else {expect(response.status).toBe(mode.startsWith("entitlement") ? 403 : mode === "unrelated" ? 404 : 429); await response.text();}
+			}
+			const restricted = mode === "rotate" || mode === "newer-body";
+			expect((account.rateLimitResetTimes["gpt-5.2:gpt-5.1"] ?? 0) > Date.now()).toBe(restricted);
+			await manager.flushPendingSave();
+			expect(((await realStorage.loadAccounts())?.accounts[0]?.rateLimitResetTimes?.["gpt-5.2:gpt-5.1"] ?? 0) > Date.now()).toBe(restricted);
+			const firstReceipt = receive.mock.calls.find(([, , owner]) => owner === receive.mock.calls[0]?.[2]);
+			const scheduler = receive.mock.contexts[0];
+			if (firstReceipt && scheduler instanceof PreemptiveQuotaScheduler) {
+				const snapshot = scheduler.getSnapshot(firstReceipt[0], firstReceipt[2]);
+				if (headers === "secondary") expect(snapshot?.secondary.usedPercent).toBe(40);
+				if (headers === "plan") expect(snapshot?.planType).toBe("plus");
+				if (mode === "unrelated" || mode.startsWith("entitlement")) expect(scheduler.getDeferral(firstReceipt[0]).defer).toBe(false);
+			}
+			if (!mode.startsWith("entitlement")) {
+				const count = bearers.length, probe = await turn();
+				if (mode === "newer-body") {expect(probe.ok).toBe(false); expect(bearers).toHaveLength(count);}
+				else {expect(await probe.text()).toBe(terminal); expect(bearers).toHaveLength(count + 1);}
+				if (mode === "rotate") expect(bearers.at(-1)).toBe("Bearer access-B");
+			}
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id) && row.tokens.totalTokens === 21);
+			expect(rows).toHaveLength(mode.startsWith("entitlement") ? 0 : mode === "newer-body" || mode === "unrelated" ? 1 : 2);
+			for (const row of rows) expect(row).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+		} finally {
+			release(); await reader?.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["healthy-exhausted", "exhausted-healthy", "independent", "held-error", "locked-error", "held-429", "later-429", "replacement", "expiry", "workspace", "metadata"])("orders actual plugin quota receipts across overlapping turns (%s)", async mode => {
 		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
 		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-quota-order-")), path = join(dir, "accounts.json");
 		const now = Date.now();
@@ -970,7 +1068,8 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 				reader = (await first).body!.getReader();
 				await reader.read();
 			} else await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1));
-			if (changedOwner) {
+			if (changedOwner || mode === "metadata") {
+				if (mode === "metadata") {account.email = "renamed@example.com"; storage.accounts[0]!.email = account.email;}
 				if (mode === "replacement") {account.access = "access-replaced"; storage.accounts[0]!.accessToken = account.access;}
 				if (mode === "expiry") {account.expires = now + 7200000; storage.accounts[0]!.expiresAt = account.expires;}
 				if (mode === "workspace") {account.accountId = "W2"; storage.accounts[0]!.accountId = "W2";}
@@ -979,7 +1078,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			const next = second ?? turn();
 			await vi.waitFor(() => expect(sends).toHaveLength(2));
 			vi.spyOn(Date, "now").mockReturnValue(now - 1000);
-			const exhausted = ["healthy-exhausted", "held-error", "locked-error", "later-429"].includes(mode);
+			const exhausted = ["healthy-exhausted", "held-error", "locked-error", "later-429", "metadata"].includes(mode);
 			sends[1]!(mode === "later-429" ? Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}}) : new Response(completed, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": exhausted ? "100" : "20", "x-codex-primary-reset-after-seconds": "3600"}}));
 			if (mode === "locked-error") {
 				await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(2));

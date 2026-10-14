@@ -3303,94 +3303,28 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		dateNowSpy.mockRestore();
 	});
 
-	it("notifies preemptive quota scheduler on 503 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("service unavailable", { status: 503 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("notifies preemptive quota scheduler on 502 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("bad gateway", { status: 502 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("notifies preemptive quota scheduler on 529 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("overloaded", { status: 529 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("does not notify preemptive quota scheduler on generic 500 server errors", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(
-				new Response("internal server error", { status: 500 }),
-			);
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).not.toHaveBeenCalled();
-		schedulerSpy.mockRestore();
+	it.each([503, 502, 529, 500])("defers overloads but not generic server errors in the quota scheduler (%s)", async status => {
+		vi.spyOn(await import("../lib/config.js"), "getServerErrorCooldownMs").mockReturnValue(30_000);
+		const {AccountManager} = await import("../lib/accounts.js");
+		const manager = await AccountManager.loadFromDisk();
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js");
+		const admission = vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral");
+		globalThis.fetch = vi.fn().mockResolvedValue(new Response("server error", {status}));
+		const {sdk} = await setupPlugin();
+		const turn = () => sdk.fetch!("https://api.openai.com/v1/chat", {method: "POST", body: JSON.stringify({model: "gpt-5.1"})});
+		expect((await turn()).status).toBe(status);
+		const [key, , owner] = admission.mock.calls[0]!;
+		const scheduler = admission.mock.contexts[0];
+		if (!(scheduler instanceof PreemptiveQuotaScheduler)) throw Error("No quota scheduler checked admission");
+		const decision = scheduler.getDeferral(key, Date.now(), owner);
+		expect(decision.defer).toBe(status !== 500);
+		if (status !== 500) {
+			expect(decision.waitMs).toBeGreaterThan(0);
+			const sends = vi.mocked(globalThis.fetch).mock.calls.length;
+			expect((await turn()).ok).toBe(false);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(sends);
+		}
 	});
 
 	it("falls back from gpt-5.3-codex to gpt-5.2-codex when unsupported fallback is enabled", async () => {
@@ -6407,9 +6341,12 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				) as Record<string, number>,
 			} as never);
 			const requestAccount = actualManager.getCurrentAccount()!;
-			const markRateLimitedWithReason = vi.fn(
-				actualManager.markRateLimitedWithReason.bind(actualManager),
-			);
+			let releaseShortResponse!: () => void;
+			const longPublished = new Promise<void>(resolve => {releaseShortResponse = resolve;});
+			const markRateLimitedWithReason = vi.fn((...args: Parameters<typeof actualManager.markRateLimitedWithReason>) => {
+				actualManager.markRateLimitedWithReason(...args);
+				releaseShortResponse();
+			});
 			const manager = {
 				getAccountCount: () => 1,
 				getCurrentOrNextForFamilyHybrid: () => requestAccount,
@@ -6454,17 +6391,6 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			);
 
 			let rateLimitCallCount = 0;
-			const waitForSecondRateLimitCall = async () => {
-				for (let spin = 0; spin < 200; spin += 1) {
-					if (rateLimitCallCount > 1) {
-						return;
-					}
-					await yieldForIo();
-				}
-				throw new Error(
-					"second overlapping request never reached the rate-limit handler",
-				);
-			};
 			vi.mocked(fetchHelpersModule.handleErrorResponse).mockImplementation(
 				async () => {
 					const callIndex = rateLimitCallCount++;
@@ -6483,12 +6409,6 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 						errorBody: "rate limited",
 					};
 
-					if (callIndex === 0) {
-						await waitForSecondRateLimitCall();
-						return result as never;
-					}
-
-					await Promise.resolve();
 					return result as never;
 				},
 			);
@@ -6497,13 +6417,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				delayMs: 60_000,
 			});
 
-			let upstreamCallCount = 0;
+			let upstreamCallCount = 0, releaseAdmissions!: () => void;
+			const bothAdmitted = new Promise<void>(resolve => {releaseAdmissions = resolve;});
 			globalThis.fetch = vi.fn(async () => {
-				upstreamCallCount += 1;
-				if (upstreamCallCount <= 2) {
-					return new Response("rate limited", { status: 429 });
-				}
-				return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
+				const attempt = ++upstreamCallCount;
+				if (attempt === 2) releaseAdmissions();
+				await bothAdmitted;
+				if (attempt === 2) await longPublished;
+				if (attempt <= 2) return new Response("rate limited", {status: 429, headers: {"retry-after": String((attempt === 1 ? longCooldownMs : shortCooldownMs) / 1000)}});
+				return new Response(JSON.stringify({content: "ok"}), {status: 200});
 			});
 
 			const mockClient = createMockClient();
@@ -6527,6 +6449,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				}),
 			]);
 
+			expect(upstreamCallCount).toBe(2);
 			expect(markRateLimitedWithReason).toHaveBeenCalledTimes(2);
 			const familyKey = markRateLimitedWithReason.mock.calls[0]?.[2] as string;
 			expect(requestAccount.rateLimitResetTimes[familyKey]).toBe(
