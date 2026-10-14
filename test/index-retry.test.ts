@@ -763,7 +763,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 	});
 
 
-	it.each(["active", "abandoned", "partial-abandoned", "never-consumed", "cancelled", "reader-error", "ledger-held", "ledger-failed", "fallback-429", "fallback-500"])("settles actual plugin stream lifecycle once (%s)", async mode => {
+	it.each(["active", "abandoned", "partial-abandoned", "never-consumed", "cancelled", "reader-error", "ledger-held", "ledger-open", "ledger-mixed", "ledger-split", "ledger-multiline", "ledger-failed", "fallback-429", "fallback-500"])("settles actual plugin stream lifecycle once (%s)", async mode => {
 		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
 		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-stream-lifecycle-")), path = join(dir, "accounts.json");
 		const fallback = mode.startsWith("fallback-");
@@ -786,7 +786,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		const ledgerReady = new Promise<void>(resolve => {enteredLedger = resolve;});
 		const ledgerError = Error("fixture original ledger failure");
 		const ledgerWarning = vi.spyOn(await import("../lib/logger.js"), "logWarn");
-		if (mode === "ledger-held" || mode === "ledger-failed") {
+		if (mode.startsWith("ledger-")) {
 			const append = usageModule.appendUsageLedgerRow;
 			vi.spyOn(usageModule, "appendUsageLedgerRow").mockImplementation(async row => {
 				enteredLedger(); await ledgerGate;
@@ -845,20 +845,29 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 						await reader.read();
 					}
 					expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
-					controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"id":"long-lived","status":"completed","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n'));
-					controller.close();
-					const drain = (async () => {
-						let next = await reader!.read();
-						while (!next.done) next = await reader!.read();
-					})();
+					const terminal = mode === "ledger-multiline" ? 'data: {"type":"response.completed",\r\ndata: "response":{"id":"long-lived","status":"completed","text":"é","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\r\n\r\n' : 'data: {"type":"response.completed","response":{"id":"long-lived","status":"completed","text":"é","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+					const bytes = new TextEncoder().encode(terminal);
+					if (mode === "ledger-mixed") {
+						controller.enqueue(new TextEncoder().encode(': ordinary progress\n\n' + terminal));
+						expect(new TextDecoder().decode((await reader.read()).value)).toBe(': ordinary progress\n\n');
+					} else if (mode === "ledger-split") {
+						const split = bytes.indexOf(0xc3) + 1;
+						controller.enqueue(bytes.subarray(0, split));
+						controller.enqueue(bytes.subarray(split));
+					} else controller.enqueue(bytes);
+					const open = ["ledger-open", "ledger-mixed", "ledger-split", "ledger-multiline"].includes(mode);
+					if (!open) controller.close();
+					let exposed = false;
+					const terminalRead = reader.read().then(next => {exposed = true; return next;});
 					if (mode.startsWith("ledger-")) {
 						await ledgerReady;
-						let drained = false; void drain.then(() => {drained = true;});
-						expect(drained).toBe(false);
+						expect(exposed).toBe(false);
 						expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
 						releaseLedger();
 					}
-					await drain;
+					expect(new TextDecoder().decode((await terminalRead).value)).toBe(terminal);
+					expect((await reader.read()).done).toBe(true);
+					if (open) expect(cancel).toHaveBeenCalledOnce();
 				} else if (mode === "cancelled") await reader.cancel();
 				else if (mode === "reader-error") {
 					controller.error(originalError);
@@ -880,7 +889,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 				return;
 			}
 			expect(rows).toHaveLength(1);
-			expect(rows[0]).toMatchObject({outcome: mode === "active" || mode === "ledger-held" ? "success" : mode === "cancelled" ? "cancelled" : "failure", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 17 : 0, outputTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 4 : 0, totalTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 21 : 0}});
+			expect(rows[0]).toMatchObject({outcome: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") ? "success" : mode === "cancelled" ? "cancelled" : "failure", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 17 : 0, outputTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 4 : 0, totalTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 21 : 0}});
 			const summary = summarizeUsageRows(rows);
 			expect(evaluateBudgetGuard({key: "*", window: "day", maxRequests: 1, updatedAt: 1}, summary).allowed).toBe(false);
 			if (mode === "active") expect(evaluateBudgetGuard({key: "*", window: "day", maxTokens: 21, updatedAt: 1}, summary).allowed).toBe(false);
@@ -888,6 +897,132 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			vi.useRealTimers();
 			releaseLedger();
 			await reader?.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+
+	it.each(["healthy-exhausted", "exhausted-healthy", "independent", "held-error", "locked-error", "held-429", "later-429", "replacement", "expiry", "workspace"])("orders actual plugin quota receipts across overlapping turns (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-quota-order-")), path = join(dir, "accounts.json");
+		const now = Date.now();
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "quota-owner", accountId: "W1", refreshToken: "refresh-quota", accessToken: "access-quota", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js");
+		const receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const completed = 'data: {"type":"response.completed","response":{"id":"quota-original","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const sends: Array<(response: Response) => void> = [];
+		globalThis.fetch = vi.fn(async () => {
+			if (sends.length >= 2) return new Response(completed, {headers: {"content-type": "text/event-stream"}});
+			return new Promise<Response>(resolve => {sends.push(resolve);});
+		});
+		let firstController!: ReadableStreamDefaultController<Uint8Array>;
+		const firstBody = new ReadableStream<Uint8Array>({start(controller) {
+			firstController = controller;
+			controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"quota-original"}}\n\n'));
+		}}, {highWaterMark: 0});
+		let release: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		let lock: Promise<void> | undefined;
+		const changedOwner = ["replacement", "expiry", "workspace"].includes(mode);
+		const firstError = ["held-error", "locked-error", "held-429"].includes(mode);
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-quota", refresh: "refresh-quota", expires: now + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			const first = turn();
+			await vi.waitFor(() => expect(sends).toHaveLength(1));
+			const second = changedOwner ? undefined : turn();
+			if (second) await vi.waitFor(() => expect(sends).toHaveLength(2));
+			if (mode === "locked-error") {
+				let entered!: () => void;
+				const ready = new Promise<void>(resolve => {entered = resolve;});
+				lock = realStorage.withAccountStorageTransaction(async () => {entered(); await gate;});
+				await ready;
+			} else if (firstError) {
+				const authorize = manager.withCurrentAccountCredential.bind(manager);
+				let held = false;
+				vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+					if (!held) {held = true; await gate;}
+					return authorize(...args);
+				});
+			}
+			const firstUsed = mode === "exhausted-healthy" || changedOwner ? 100 : 10;
+			const firstHeaders = {"content-type": firstError ? "application/json" : "text/event-stream", "x-codex-primary-used-percent": String(firstUsed), "x-codex-primary-reset-after-seconds": "3600", "x-codex-plan-type": "plus", ...(mode === "independent" ? {"x-codex-secondary-used-percent": "100", "x-codex-secondary-reset-after-seconds": "7200"} : {})};
+			sends[0]!(firstError ? Response.json({error: {code: mode === "held-429" ? "usage_limit_reached" : "bad_request"}}, {status: mode === "held-429" ? 429 : 400, headers: {...firstHeaders, "retry-after": "60"}}) : new Response(firstBody, {headers: firstHeaders}));
+			if (!firstError) {
+				reader = (await first).body!.getReader();
+				await reader.read();
+			} else await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1));
+			if (changedOwner) {
+				if (mode === "replacement") {account.access = "access-replaced"; storage.accounts[0]!.accessToken = account.access;}
+				if (mode === "expiry") {account.expires = now + 7200000; storage.accounts[0]!.expiresAt = account.expires;}
+				if (mode === "workspace") {account.accountId = "W2"; storage.accounts[0]!.accountId = "W2";}
+				await fs.writeFile(path, JSON.stringify(storage));
+			}
+			const next = second ?? turn();
+			await vi.waitFor(() => expect(sends).toHaveLength(2));
+			vi.spyOn(Date, "now").mockReturnValue(now - 1000);
+			const exhausted = ["healthy-exhausted", "held-error", "locked-error", "later-429"].includes(mode);
+			sends[1]!(mode === "later-429" ? Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}}) : new Response(completed, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": exhausted ? "100" : "20", "x-codex-primary-reset-after-seconds": "3600"}}));
+			if (mode === "locked-error") {
+				await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(2));
+				release(); await lock;
+			}
+			const later = await next;
+			expect(later.status).toBe(mode === "later-429" ? 429 : 200);
+			if (mode !== "later-429") expect(await later.text()).toBe(completed);
+			if (firstError) {
+				release();
+				const original = await first;
+				expect(original.status).toBe(mode === "held-429" ? 429 : 400);
+				await original.text();
+			} else {
+				firstController.enqueue(new TextEncoder().encode(completed)); firstController.close();
+				expect(new TextDecoder().decode((await reader!.read()).value)).toBe(completed);
+				expect((await reader!.read()).done).toBe(true);
+			}
+			const last = receive.mock.calls.at(-1)!;
+			const scheduler = receive.mock.contexts.at(-1)!;
+			if (!(scheduler instanceof PreemptiveQuotaScheduler)) throw Error("No quota scheduler received the provider headers");
+			const snapshot = scheduler.getSnapshot(last[0], last[2]);
+			expect(snapshot?.primary.usedPercent).toBe(exhausted ? 100 : 20);
+			if (mode === "independent") expect(snapshot).toMatchObject({planType: "plus", secondary: {usedPercent: 100}});
+			if (changedOwner) expect(receive.mock.calls[0]![2]).not.toBe(last[2]);
+			const blocked = exhausted || mode === "independent";
+			const count = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+			const probe = await turn();
+			if (blocked) {expect(probe.ok).toBe(false); expect(globalThis.fetch).toHaveBeenCalledTimes(count);}
+			else {expect(probe.status).toBe(200); expect(await probe.text()).toBe(completed); expect(globalThis.fetch).toHaveBeenCalledTimes(count + 1);}
+			if (mode === "held-429") expect(account.rateLimitResetTimes["gpt-5.2:gpt-5.1"] ?? 0).toBe(0);
+			if (mode === "later-429") {
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+				const {getRateLimitBackoff} = await import("../lib/request/rate-limit-backoff.js");
+				expect(getRateLimitBackoff(0, "gpt-5.2:gpt-5.1", 60000, "W1").attempt).toBe(2);
+			}
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+			expect(rows.filter(row => row.tokens.totalTokens === 21)).toHaveLength((firstError ? 0 : 1) + (mode === "later-429" ? 0 : 1) + (blocked ? 0 : 1));
+			for (const row of rows.filter(row => row.tokens.totalTokens === 21)) expect(row).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+		} finally {
+			release(); await lock;
+			await reader?.cancel().catch(() => undefined);
+			await firstBody.cancel().catch(() => undefined);
 			await (await import("../lib/shutdown.js")).runCleanup();
 			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
 			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);

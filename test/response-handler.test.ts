@@ -782,7 +782,77 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 		});
 	});
 
+	it("converts a terminal response without waiting for an open transport", async () => {
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {entered = resolve;});
+		const cancel = vi.fn(), usage = vi.fn();
+		const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"id":"open-terminal","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'));}, cancel});
+		let exposed = false;
+		const pending = convertSseToJson(new Response(body), new Headers(), {onUsage: usage, onCompletion: async () => {entered(); await gate;}}).then(response => {exposed = true; return response;});
+		try {
+			await ready;
+			expect(exposed).toBe(false);
+			expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+			release();
+			expect(await (await pending).json()).toMatchObject({id: "open-terminal", status: "completed"});
+			expect(cancel).toHaveBeenCalledOnce();
+			expect(body.locked).toBe(false);
+		} finally {release(); await pending;}
+	});
+
 	describe('attachResponseIdCapture', () => {
+		it("preserves usage and terminal bytes when response-ID observation throws", async () => {
+			const payload = 'data: {"type":"response.completed","response":{"id":"observer-error","usage":{"input_tokens":7,"output_tokens":3}}}\n\n';
+			const usage = vi.fn(), completion = vi.fn(async () => {});
+			const response = attachResponseIdCapture(new Response(payload), new Headers(), () => {throw Error("fixture response-ID observer failed");}, usage, completion);
+			expect(await response.text()).toBe(payload);
+			expect(usage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+			expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: true}));
+		});
+		it("keeps buffered ordinary frames alive through ongoing consumer progress", async () => {
+			vi.useFakeTimers();
+			const terminal = 'data: {"type":"response.completed","response":{"id":"buffered-progress"}}\n\n';
+			const completion = vi.fn(async () => {});
+			const response = attachResponseIdCapture(new Response(': progress\n\n'.repeat(97) + terminal), new Headers(), undefined, undefined, completion, 1000, 900000);
+			const reader = response.body!.getReader();
+			try {
+				for (let index = 0; index < 97; index++) {
+					await vi.advanceTimersByTimeAsync(10000);
+					expect(new TextDecoder().decode((await reader.read()).value)).toBe(': progress\n\n');
+				}
+				expect(new TextDecoder().decode((await reader.read()).value)).toBe(terminal);
+				expect((await reader.read()).done).toBe(true);
+				expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: true}));
+			} finally {await reader.cancel().catch(() => undefined); vi.useRealTimers();}
+		});
+		it.each(["completed", "done", "incomplete", "failed", "error"])('withholds split multiline terminal %s until settlement on an open transport', async type => {
+			let release!: () => void, entered!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const ready = new Promise<void>(resolve => {entered = resolve;});
+			const cancel = vi.fn(), usage = vi.fn();
+			const payload = `data: {"type":"${type === "error" ? "error" : `response.${type}`}",\r\ndata: "response":{"id":"é","status":"${type === "done" ? "completed" : type}","usage":{"input_tokens":7,"output_tokens":3}}}\r\n\r\n`;
+			const bytes = new TextEncoder().encode(payload), split = bytes.indexOf(0xc3) + 1;
+			const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode(': progress\r\n\r\n')); controller.enqueue(bytes.subarray(0, split)); controller.enqueue(bytes.subarray(split));}, cancel}, {highWaterMark: 0});
+			const completion = vi.fn(async () => {entered(); await gate; if (type === "done") throw Error("fixture local settlement failed");});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, usage, completion);
+			const reader = response.body!.getReader();
+			try {
+				expect(new TextDecoder().decode((await reader.read()).value)).toBe(': progress\r\n\r\n');
+				let exposed = false;
+				const terminal = reader.read().then(result => {exposed = true; return result;});
+				await ready;
+				expect(exposed).toBe(false);
+				expect(cancel).not.toHaveBeenCalled();
+				release();
+				expect(new TextDecoder().decode((await terminal).value)).toBe(payload);
+				expect((await reader.read()).done).toBe(true);
+				expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: ["completed", "done", "incomplete"].includes(type), missingTerminal: false}));
+				expect(usage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+				expect(cancel).toHaveBeenCalledOnce();
+				expect(body.locked).toBe(false);
+			} finally {release(); await reader.cancel().catch(() => undefined);}
+		});
 		it("cancels an abandoned reader after owned settlement even when it rejects", async () => {
 			vi.useFakeTimers();
 			let release!: () => void;

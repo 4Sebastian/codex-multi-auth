@@ -842,6 +842,7 @@ export async function convertSseToJson(
 			if (value) scanner.push(value);
 			chunks.push(decoded);
 			totalSize += decodedBytes;
+			if (outcome.hasTerminal()) break;
 		}
 
 		const fullText = chunks.join("");
@@ -926,7 +927,7 @@ export async function convertSseToJson(
 		}
 		throw error;
 	} finally {
-		// Release the reader lock to prevent resource leaks
+		if (typeof reader?.cancel === "function") await reader.cancel().catch(() => undefined);
 		reader?.releaseLock();
 	}
 }
@@ -942,31 +943,26 @@ function createResponseIdCapturingStream(
 	const reader = body.getReader();
 	const state = createParsedResponseState();
 	const outcome = new ResponseOutcome(true);
-	const decoder = new TextDecoder();
-	let buffered = "", droppingLine = false, warned = false;
-	const captureLines = (chunk?: Uint8Array): void => {
-		const lines = (buffered + decoder.decode(chunk, {stream: !!chunk})).split(/\r?\n/);
-		buffered = chunk ? lines.pop() ?? "" : "";
-		for (const raw of lines) {
-			if (droppingLine) {droppingLine = false; continue;}
-			if (state.encounteredError) continue;
-			const line = raw.trim();
-			if (!line.startsWith("data:")) continue;
-			const payload = line.slice(5).trim();
-			if (!payload || payload === "[DONE]" || payload.length > MAX_SSE_SIZE) continue;
-			try {
-				const event: unknown = JSON.parse(payload);
-				outcome.observe(event);
-				if (isRecord(event)) maybeCaptureResponseEvent(state, event as SSEEventData, onResponseId);
-				const usage = extractResponsesUsage(event);
-				if (usage && !onCompletion) onUsage?.(usage);
-			} catch (error) {
-				if (!warned) {warned = true; log.warn("SSE malformed JSON chunk in stream passthrough", {reason: String(error), sample: payload.slice(0, 120)});}
-			}
-		}
-		if (buffered.length > MAX_SSE_SIZE) {buffered = ""; droppingLine = true;}
+	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => {
+		outcome.observe(event);
+		try {
+			if (!state.encounteredError && isRecord(event)) maybeCaptureResponseEvent(state, event as SSEEventData, onResponseId);
+			const usage = extractResponsesUsage(event);
+			if (usage && !onCompletion) onUsage?.(usage);
+		} catch (error) {log.warn("Accepted stream observation could not be captured", {error});}
+	}});
+	let pending: Uint8Array[] = [], pendingSize = 0, lineSize = 0, lastByte = 0;
+	let currentChunk: Uint8Array | undefined, currentOffset = 0;
+	const retain = (value: Uint8Array) => {
+		pendingSize += value.byteLength;
+		if (pendingSize > 64 * 1024 * 1024) throw Error("upstream response frame exceeds size limit");
+		pending.push(value);
 	};
-	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => outcome.observe(event)});
+	const takePending = () => {
+		const frame = Buffer.concat(pending);
+		pending = []; pendingSize = 0;
+		return frame;
+	};
 	let finished = false;
 	let finishing: Promise<void> | undefined;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -981,7 +977,8 @@ function createResponseIdCapturingStream(
 		finished = true;
 		clearTimeout(idleTimer);
 		finishing = (async () => {
-			captureLines();
+			if (pendingSize) scanner.push(takePending());
+			if (failure && currentChunk) scanner.push(currentChunk.subarray(currentOffset));
 			const usage = scanner.result();
 			try {if (usage && onCompletion) onUsage?.(usage);}
 			catch (error) {log.warn("Accepted stream usage could not be settled", {error});}
@@ -1011,17 +1008,53 @@ function createResponseIdCapturingStream(
 		start(controller) {armIdleTimeout(controller);},
 		async pull(controller) {
 			try {
-				const {done, value} = await readWithTimeout(reader, streamStallTimeoutMs);
-				if (finished) return;
-				if (done) {
-					await finish();
-					release();
-					controller.close();
-				} else if (value) {
-					captureLines(value);
-					scanner.push(value);
-					if (value.byteLength > 0) armIdleTimeout(controller);
-					controller.enqueue(value);
+				while (!finished) {
+					if (!currentChunk) {
+						const {done, value} = await readWithTimeout(reader, streamStallTimeoutMs);
+						if (finished) return;
+						if (done) {
+							const tail = takePending();
+							if (tail.byteLength) scanner.push(tail);
+							await finish();
+							release();
+							if (tail.byteLength) controller.enqueue(tail);
+							controller.close();
+							return;
+						}
+						if (!value?.byteLength) continue;
+						armIdleTimeout(controller);
+						currentChunk = value; currentOffset = 0;
+					}
+					const value = currentChunk, start = currentOffset;
+					for (let index = start; index < value.length; index++) {
+						const byte = value[index];
+						if (byte === 10) {
+							const boundary = lineSize === 0 || (lineSize === 1 && lastByte === 13);
+							lineSize = 0;
+							if (boundary) {
+								retain(value.subarray(start, index + 1));
+								const frame = takePending();
+								currentOffset = index + 1; lastByte = byte;
+								if (currentOffset === value.length) currentChunk = undefined;
+								scanner.push(frame);
+								if (onCompletion && outcome.hasTerminal()) {
+									await finish();
+									await reader.cancel().catch(() => undefined);
+									release();
+									controller.enqueue(frame);
+									if (currentOffset < value.length) controller.enqueue(value.subarray(currentOffset));
+									currentChunk = undefined;
+									controller.close();
+									return;
+								}
+								armIdleTimeout(controller);
+								controller.enqueue(frame);
+								return;
+							}
+						} else lineSize += 1;
+						lastByte = byte;
+					}
+					retain(value.subarray(start)); currentChunk = undefined;
 				}
 			} catch (error) {
 				if (finished) return;

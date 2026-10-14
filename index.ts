@@ -140,7 +140,9 @@ import {
 import {
 	PreemptiveQuotaScheduler,
 	readQuotaSchedulerSnapshot,
+	type QuotaObservationReceipt,
 } from "./lib/preemptive-quota-scheduler.js";
+import { modelScopeId } from "./lib/runtime/workspace-model-scopes.js";
 import {
 	createRuntimeUsageRecorder,
 	evaluateRuntimePolicy,
@@ -1573,9 +1575,11 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 										const primarySubmittedCredential = {recordId: account.recordId, accessToken: accountAuth.access, refreshToken: accountAuth.refresh, expiresAt: account.expires, accountId};
 										const primarySubmittedAccount = structuredClone(account);
+										const quotaOwner = modelScopeId(primarySubmittedCredential.recordId ?? "", primarySubmittedCredential.accessToken, primarySubmittedCredential.refreshToken, String(primarySubmittedCredential.expiresAt), primarySubmittedCredential.accountId);
+										const quotaScheduleKey = `${entitlementAccountKey}:${model ?? modelFamily}:${quotaOwner}`;
 										if (!primaryAdmission) throw new Error("Missing circuit admission");
 										const dispatchPrimary = createAccountDispatch({manager: accountManager, account, submitted: primarySubmittedCredential, admission: primaryAdmission, family: modelFamily, model: model ?? null,
-											eligible: () => !entitlementCache.isBlocked(entitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(`${entitlementAccountKey}:${model ?? modelFamily}`).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
+											eligible: () => !entitlementCache.isBlocked(entitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, Date.now(), quotaOwner).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
 										});
 										if (
 											accountCount > 1 &&
@@ -1638,10 +1642,9 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												};
 											}
 										}
-										const quotaScheduleKey = `${entitlementAccountKey}:${model ?? modelFamily}`;
 										const capabilityModelKey = model ?? modelFamily;
 										const quotaDeferral =
-											preemptiveQuotaScheduler.getDeferral(quotaScheduleKey);
+											preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, Date.now(), quotaOwner);
 										if (quotaDeferral.defer && quotaDeferral.waitMs > 0) {
 											accountManager.markRateLimitedWithReason(
 												account,
@@ -1697,6 +1700,36 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											}
 
 											let response: Response;
+											let quotaReceipt: QuotaObservationReceipt | undefined;
+											let rateLimitResetFloor = 0;
+											const receiveQuota = (received: Response): Response => {
+												const now = Date.now();
+												let snapshot = readQuotaSchedulerSnapshot(received.headers, received.status, now);
+												const planType = received.headers.get("x-codex-plan-type")?.trim();
+												if (planType) snapshot = {...(snapshot ?? {status: received.status, updatedAt: now, primary: {}, secondary: {}}), planType};
+												const overload = [502, 503, 529].includes(received.status);
+												const waitMs = received.status === 429 ? parseRetryAfterHintMs(received.headers) ?? 60_000 : overload ? evaluateFailurePolicy({kind: "server", failoverMode, serverRetryAfterMs: parseRetryAfterHintMs(received.headers) ?? undefined}, {serverCooldownMs: serverErrorCooldownMs}).cooldownMs : undefined;
+												if (typeof waitMs === "number") {
+													const previous = preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, quotaOwner);
+													rateLimitResetFloor = Math.max((snapshot?.primary.usedPercent ?? 0) >= 100 ? snapshot?.primary.resetAtMs ?? 0 : 0, (previous?.primary.usedPercent ?? 0) >= 100 ? previous?.primary.resetAtMs ?? 0 : 0);
+													snapshot = {...(snapshot ?? {status: received.status, updatedAt: now, secondary: {}}), status: 429, primary: {usedPercent: 100, resetAtMs: Math.max(rateLimitResetFloor, now + waitMs)}};
+												}
+												if (snapshot) {
+													quotaReceipt = preemptiveQuotaScheduler.receive(quotaScheduleKey, snapshot, quotaOwner);
+													preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, quotaReceipt);
+												}
+												return received;
+											};
+											const applyReceivedRateLimit = (mutate: () => number) => applySubmittedRestriction(() => {
+												if (!quotaReceipt) return false;
+												const primaryReceipt = {...quotaReceipt, secondary: undefined, planType: undefined};
+												if (!preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, primaryReceipt)) return false;
+												const waitMs = mutate();
+												primaryReceipt.snapshot = {...primaryReceipt.snapshot, primary: {usedPercent: 100, resetAtMs: Math.max(rateLimitResetFloor, primaryReceipt.snapshot.updatedAt + waitMs)}};
+												preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, primaryReceipt);
+												preemptiveQuotaScheduler.settleReceipt(quotaScheduleKey, primaryReceipt, true);
+												return true;
+											});
 											const fetchStart = performance.now();
 
 											// Merge user AbortSignal with timeout without AbortSignal.any (keeps listeners bounded)
@@ -1739,7 +1772,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														headers,
 														signal: fetchController.signal,
 													}),
-												));
+												).then(receiveQuota));
 											} catch (networkError) {
 												if (networkError instanceof PendingAuthLocalError) {
 													if (shortRetryResponse) return shortRetryResponse;
@@ -1822,15 +1855,14 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												),
 											});
 											usageCompletion = {outcome: "failure", statusCode: response.status, errorCode: response.ok ? null : `http_${response.status}`, account: {index: primarySubmittedAccount.index, accountId: primarySubmittedAccount.accountId, email: primarySubmittedAccount.email}};
-											const quotaSnapshot = readQuotaSchedulerSnapshot(
-												response.headers,
-												response.status,
-											);
-											if (quotaSnapshot && !response.ok) {
-												await applySubmittedRestriction(() => {
-													preemptiveQuotaScheduler.update(quotaScheduleKey, quotaSnapshot);
+											if (quotaReceipt) {
+												const receipt = quotaReceipt;
+												const applied = await applySubmittedRestriction(() => {
+													preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt);
+													return true;
 												});
-												if (restrictionObservationFailed) return response;
+												preemptiveQuotaScheduler.settleReceipt(quotaScheduleKey, receipt, applied);
+												if (restrictionObservationFailed && !response.ok) return response;
 											}
 
 											if (!response.ok) {
@@ -2205,7 +2237,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														typeof policy.cooldownMs === "number"
 													) {
 														const cooldownMs = policy.cooldownMs;
-														await applySubmittedRestriction(() => { preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, cooldownMs); });
+														await applyReceivedRateLimit(() => cooldownMs);
 														if (restrictionObservationFailed) return errorResponse;
 													}
 													if (policy.refundToken) {
@@ -2238,10 +2270,13 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													const retryAfterMs =
 														rateLimit?.retryAfterMs ?? 60_000;
 													let cooldownMs = 0;
-													if (!await applySubmittedRestriction(() => {
+													if (!await applyReceivedRateLimit(() => {
 														const {delayMs} = getRateLimitBackoff(account.index, quotaKey, retryAfterMs, primarySubmittedCredential.accountId ?? primarySubmittedAccount.email ?? null);
 														cooldownMs = Math.max(delayMs, retryAfterMs);
-														preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, cooldownMs);
+														accountManager.markRateLimitedWithReason(account, cooldownMs, modelFamily, parseRateLimitReason(rateLimit?.code), model);
+														accountManager.recordRateLimit(account, modelFamily, model);
+														accountManager.saveToDiskDebounced();
+														return cooldownMs;
 													})) return errorResponse;
 													const waitLabel = formatWaitTime(cooldownMs);
 													const shortRetryThresholdMs =
@@ -2260,19 +2295,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														// throttling pressure instead of spreading load.
 														// The current request will continue after the sleep
 														// regardless of the cooldown mark (AUDIT-H3 / D-07).
-														const restrictionApplied = await applySubmittedRestriction(() => {
-															accountManager.markRateLimitedWithReason(account, cooldownMs, modelFamily, parseRateLimitReason(rateLimit?.code), model);
-															accountManager.recordRateLimit(account, modelFamily, model);
-															// Persist the rate-limit window like the full-rotation
-															// branch below (line ~2327). markRateLimitedWithReason
-															// mutates `rateLimitResetTimes`, which is serialized to
-															// disk; without this a crash during the retry sleep loses
-															// the cooldown and the account is re-selected on restart.
-															accountManager.saveToDiskDebounced();
-														});
-														if (restrictionObservationFailed) return errorResponse;
-														if (!restrictionApplied) return errorResponse;
-
 														if (
 															accountManager.shouldShowAccountToast(
 																account.index,
@@ -2300,8 +2322,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													}
 
 													const restrictionApplied = await applySubmittedRestriction(() => {
-														accountManager.markRateLimitedWithReason(account, cooldownMs, modelFamily, parseRateLimitReason(rateLimit?.code), model);
-														accountManager.recordRateLimit(account, modelFamily, model);
 														account.lastSwitchReason = "rate-limit";
 														sessionAffinityStore?.forgetSession(sessionAffinityKey);
 														runtimeMetrics.accountRotations++;
@@ -2368,13 +2388,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													let successApplied = false;
 													try {
 														successApplied = await accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, () => {
-															if (!primaryAdmission || !accountManager.recordSuccess(account, modelFamily, model, primaryAdmission)) return false;
-															resetRateLimitBackoff(account.index, quotaKey);
+															if (restrictionObservationFailed || !primaryAdmission || !accountManager.recordSuccess(account, modelFamily, model, primaryAdmission)) return false;
+															if (!preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, Date.now(), quotaOwner).defer) resetRateLimitBackoff(account.index, quotaKey, primarySubmittedCredential.accountId ?? primarySubmittedAccount.email ?? null);
 															if (affinityCurrent?.()) {
 																sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, account.index, Date.now(), sessionAffinityVersion);
 																if (responseContinuationEnabled && observedResponseIdForSuccess) sessionAffinityStore?.updateLastResponseId(sessionAffinityKey, observedResponseIdForSuccess, Date.now(), sessionAffinityVersion);
 															}
-															if (quotaSnapshot) preemptiveQuotaScheduler.update(`${entitlementAccountKey}:${model ?? modelFamily}`, quotaSnapshot);
 															capabilityPolicyStore.recordSuccess(entitlementAccountKey, capabilityModelKey);
 															entitlementCache.clear(entitlementAccountKey, capabilityModelKey);
 															return true;
