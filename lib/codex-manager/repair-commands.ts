@@ -948,7 +948,7 @@ export async function runVerifyFlagged(
 				index: i,
 				flagged,
 				label: formatAccountLabel(flagged, i),
-				result: await withRefreshCredentialRetention(flagged, () => queuedRefresh(flagged.refreshToken), () => flaggedStorage.accounts.includes(flagged)),
+				result: await withRefreshCredentialRetention(flagged, () => queuedRefresh(flagged.refreshToken, undefined, {kind: "flagged", account: flagged}), () => flaggedStorage.accounts.includes(flagged), undefined, undefined, {kind: "flagged", account: flagged}),
 			});
 		}
 		return refreshChecks;
@@ -1371,18 +1371,13 @@ export async function runFix(
 			let refreshAfterLiveProbeFailure = false;
 			if (options.live) {
 				const currentAccessToken = account.accessToken;
-				if (
-					currentAccessToken &&
-					(await deps.reboundUnauthorizedAccountIdentity(
-						account,
-						currentAccessToken,
-					))
-				) {
-					noteRebound(i);
-				}
+				// Probe a proposed identity without changing the refresh owner.
+				// If the probe fails, OAuth still binds to the original durable row.
+				const probeAccount = structuredClone(account);
+				const proposedRebound = currentAccessToken && await deps.reboundUnauthorizedAccountIdentity(probeAccount, currentAccessToken);
 				if (currentAccessToken) await checkMirror(i, currentAccessToken);
 				const probeAccountId = currentAccessToken
-					? account.accountId ?? extractAccountId(currentAccessToken)
+					? probeAccount.accountId ?? extractAccountId(currentAccessToken)
 					: undefined;
 				if (probeAccountId && currentAccessToken) {
 					try {
@@ -1391,6 +1386,10 @@ export async function runFix(
 							accessToken: currentAccessToken,
 							model: probeModel,
 						});
+						if (proposedRebound) {
+							Object.assign(account, probeAccount);
+							noteRebound(i);
+						}
 						if (workingQuotaCache) {
 							quotaCacheChanged =
 								deps.updateQuotaCacheForAccount(

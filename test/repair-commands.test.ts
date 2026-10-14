@@ -1,4 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
+import { setStoragePathDirectState } from "../lib/storage/path-state.js";
+function setStoragePathDirect(path: string | null) {
+	setStoragePathDirectState({currentStoragePath: path, currentLegacyProjectStoragePath: null, currentLegacyWorktreeStoragePath: null, currentProjectRoot: null});
+}
+import { getFlaggedAccountsPath as getAuthorityFlaggedPath } from "../lib/storage/file-paths.js";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 
 import type { RepairCommandDeps } from "../lib/codex-manager/repair-commands.js";
 import { CodexUnavailableError } from "../lib/errors.js";
@@ -65,7 +75,10 @@ vi.mock("node:fs", async importOriginal => {
 	return {
 		...actual,
 		existsSync: (path: Parameters<typeof actual.existsSync>[0]) => String(path).startsWith("/mock/") ? existsSyncMock(path) : actual.existsSync(path),
-		promises: {...actual.promises, stat: statMock, readFile: readFileMock},
+		promises: {...actual.promises,
+			stat: (path: Parameters<typeof actual.promises.stat>[0], ...args: unknown[]) => String(path).startsWith("/mock/") ? statMock(path, ...args) : actual.promises.stat(path),
+			readFile: (path: Parameters<typeof actual.promises.readFile>[0], ...args: unknown[]) => String(path).startsWith("/mock/") ? readFileMock(path, ...args) : actual.promises.readFile(path, args[0] as BufferEncoding),
+		},
 	};
 });
 
@@ -110,11 +123,27 @@ vi.mock("../lib/refresh-queue.js", async () =>
 	),
 );
 
-vi.mock("../lib/storage.js", async () =>
-	(await import("./helpers/cli-test-fixtures.js")).storageModuleMock(
-		storageMocks,
-	),
-);
+vi.mock("../lib/storage.js", async () => {
+	const storage = await (await import("./helpers/cli-test-fixtures.js")).storageModuleMock(storageMocks);
+	return {...storage,
+		loadAccounts: async (...args: unknown[]) => {
+			const data = await storageMocks.loadAccounts(...args);
+			if (data) {
+				for (const row of data.accounts) {row.addedAt ??= 1; row.lastUsed ??= 1;}
+				writeFileSync(getAuthorityStoragePath(), JSON.stringify(data));
+			}
+			return data;
+		},
+		loadFlaggedAccounts: async (...args: unknown[]) => {
+			const data = await storageMocks.loadFlaggedAccounts(...args);
+			if (data) {
+				for (const row of data.accounts) {row.flaggedAt ??= 1; row.addedAt ??= 1; row.lastUsed ??= 1;}
+				writeFileSync(getAuthorityFlaggedPath(getAuthorityStoragePath(), "openai-codex-flagged-accounts.json"), JSON.stringify(data));
+			}
+			return data;
+		},
+	};
+});
 
 vi.mock("../lib/codex-cli/state.js", async () =>
 	(await import("./helpers/cli-test-fixtures.js")).codexCliStateModuleMock(
@@ -169,7 +198,10 @@ function createDeps(
 }
 
 describe("repair-commands direct deps coverage", () => {
+	let authorityDir: string;
 	beforeEach(() => {
+		authorityDir = mkdtempSync(join(tmpdir(), "repair-owner-"));
+		setStoragePathDirect(join(authorityDir, "accounts.json"));
 		vi.clearAllMocks();
 		// clearAllMocks wipes call history but keeps mockImplementation, so the
 		// transaction mocks set inline by individual tests must be reset here or
@@ -190,8 +222,10 @@ describe("repair-commands direct deps coverage", () => {
 		});
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		setStoragePathDirect(null);
+		await removeWithRetry(authorityDir, {recursive: true, force: true});
 	});
 
 	it("parseFixArgs rejects a flag-like value after --model instead of consuming it", () => {

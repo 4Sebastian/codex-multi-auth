@@ -385,7 +385,7 @@ it("recovers flagged rotations through the shared journal and retains their requ
 	const flagged = {version: 1, accounts: pool(["flagged"]).accounts.map(row => ({...row, enabled: false, flaggedAt: 1}))};
 	await fs.writeFile(flaggedPath, JSON.stringify(flagged));
 	const fetch = injectRefresh();
-	expect(await queue().refresh("flagged", path)).toMatchObject({type: "success", refresh: "flagged-next"});
+	expect(await queue().refresh("flagged", path, {kind: "flagged", account: flagged.accounts[0]!})).toMatchObject({type: "success", refresh: "flagged-next"});
 	expect((await loadFlaggedAccounts()).accounts[0]).toMatchObject({refreshToken: "flagged-next", enabled: false, flaggedAt: 1});
 	const saved = (await loadAccounts())!;
 	await saveAccounts(saved);
@@ -425,7 +425,7 @@ it.each(["corrupt-journal", "corrupt-primary", "locked"])("denies admission befo
 	const fetch = injectRefresh();
 	if (failure === "locked") {
 		await withFileTransactionLock(path, async () => {
-			const waiting = await worker("B");
+			const waiting = await worker("A");
 			await waiting.next(["blocked"]);
 			await expect(waiting.next(["settled"])).rejects.toThrow("admission");
 			expect(waiting.messages.some(row => row.event === "spend")).toBe(false);
@@ -474,12 +474,12 @@ it.each(["openai-codex-flagged-accounts.json", "openai-codex-blocked-accounts.js
 	spy.mockRestore();
 	await fs.writeFile(source, "{");
 	const fetch = injectRefresh();
-	expect(await queue().refresh("A", path)).toMatchObject({type: "success"});
 	const bytes = await fs.readFile(getPendingAuthPath(path), "utf8");
-	await expect(queue().refresh("B", path)).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+	await expect(queue().refresh("A", path)).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
+	await expect(queue().refresh("B", path)).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
 	await prunePendingAuth(path, pool(["A-next", "B"]), () => collectRestorableCredentials(path));
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(bytes);
-	expect(fetch).toHaveBeenCalledTimes(1);
+	expect(fetch).not.toHaveBeenCalled();
 });
 
 it.each(["proactive", "request", "selected"])("retains new credentials and first error in the real %s consumer", async consumer => {

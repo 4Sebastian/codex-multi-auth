@@ -1,5 +1,8 @@
 vi.mock("../lib/runtime/account-reset-credits.js", async original => ({...await original<typeof import("../lib/runtime/account-reset-credits.js")>(),refreshAndPrintResetCredits:vi.fn(async()=>{})}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import {
 	DEFAULT_MODEL,
@@ -477,6 +480,8 @@ function updateLastFlaggedStorageSnapshot(snapshot: unknown): void {
 	if (snapshot == null) {
 		return;
 	}
+	mkdirSync(dirname(getAuthorityStoragePath()), {recursive: true});
+	writeFileSync(getAuthorityFlaggedPath(getAuthorityStoragePath(), "openai-codex-flagged-accounts.json"), JSON.stringify(snapshot));
 	const cloned = cloneValue(snapshot);
 	lastFlaggedStorageSnapshot = cloned;
 	flaggedStorageState = cloneValue(cloned);
@@ -3039,6 +3044,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-a-next",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -3741,6 +3747,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Switched to best account 2"),
@@ -3891,6 +3898,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-next",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Switched to best account 2"),
@@ -4202,6 +4210,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(
 			logSpy.mock.calls.some((call) =>
@@ -4277,6 +4286,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
 			message: string;
@@ -4645,6 +4655,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-a-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		extractAccountIdMock.mockImplementation(() => "acc_test");
 	});
@@ -4725,6 +4736,7 @@ describe("codex manager cli commands", () => {
 				accessToken: "access-a",
 				refreshToken: "refresh-a",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -4786,6 +4798,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-a-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		extractAccountIdMock.mockImplementation(() => "acc_test");
 	});
@@ -5793,6 +5806,7 @@ describe("codex manager cli commands", () => {
 					accountId: "acc_restored",
 					email: "restored@example.com",
 				}),
+						  expect.objectContaining({account: expect.any(Object)}),
 			);
 			expect(logSpy).toHaveBeenCalledWith(
 				"Loaded last-good.json (2 accounts).",
@@ -6116,6 +6130,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_warn",
 				email: "warn@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Codex auth sync did not complete"),
@@ -6897,6 +6912,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_manual",
 				email: "manual@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(promptLoginModeMock).toHaveBeenCalledTimes(1);
 	});
@@ -6969,6 +6985,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_selected",
 				email: "selected@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -8246,6 +8263,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-b",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		const syncCallOrder =
 			codexCliWriterMocks.setCodexCliActiveSelection.mock.invocationCallOrder[0];

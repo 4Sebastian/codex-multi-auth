@@ -14,7 +14,7 @@ import { captureAuthorityRevision } from "./authority-revision.js";
 import { withFileTransactionLock } from "./file-lock.js";
 import { getAccountsWalPath, getIntentionalResetMarkerPath } from "./backup-paths.js";
 import type { ManagedAccount } from "../accounts.js";
-import type { AccountMetadataV3, AccountStorageV3 } from "./public-types.js";
+import type { AccountMetadataV3, AccountStorageV3, FlaggedAccountMetadataV1 } from "./public-types.js";
 import { collectRestorableCredentials, getAccountsBackupRecoveryCandidatesWithDiscoverySync, getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 export { getPendingAuthPath, type PendingAuthRecoveryCredential } from "./recovery-credentials.js";
 
@@ -62,7 +62,7 @@ function isNewerCredential(candidate: Credential, current: Credential): boolean 
 
 type Authorization = Pick<PendingAuth, "authInvalidatedAt" | "authInvalidationErrorCode" | "enabled">;
 function mergeAuthorization(credential: Credential, sources: Array<Authorization & Partial<Credential>>): Authorization {
-	const invalidated = sources.filter(source => source.authInvalidatedAt && source.accessToken === credential.accessToken && source.refreshToken === credential.refreshToken && source.expiresAt === credential.expiresAt)
+	const invalidated = sources.filter(source => (source.authInvalidatedAt !== undefined || source.authInvalidationErrorCode !== undefined) && source.accessToken === credential.accessToken && source.refreshToken === credential.refreshToken && source.expiresAt === credential.expiresAt)
 		.sort((a, b) => (b.authInvalidatedAt ?? 0) - (a.authInvalidatedAt ?? 0))[0];
 	return {
 		authInvalidatedAt: invalidated?.authInvalidatedAt,
@@ -116,8 +116,8 @@ export class PendingAuthAdmissionError extends PendingAuthLocalError {
 export class PendingAuthObservationError extends PendingAuthLocalError {
 	readonly code = "EPENDINGAUTHUNREADABLE";
 	readonly statusCode = 503;
-	constructor() {
-		super("Failed to observe pending account recovery");
+	constructor(cause?: unknown) {
+		super("Failed to observe pending account recovery", {cause});
 		this.name = "PendingAuthObservationError";
 	}
 }
@@ -126,7 +126,7 @@ export async function capturePendingAuth(storagePath: string, accounts: readonly
 	const entries = await read(getPendingAuthPath(storagePath)).catch(error => {
 		const code = typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH";
 		log.warn("Failed to capture pending rotated credentials", {code});
-		throw new PendingAuthObservationError();
+		throw new PendingAuthObservationError(error);
 	});
 	return {entries, accounts: structuredClone(accounts ?? [])};
 }
@@ -166,6 +166,7 @@ export class PendingAuthSettlementError extends PendingAuthLocalError {
 }
 
 type RefreshOwner = ManagedAccount | AccountMetadataV3 | OAuthAuthDetails;
+export type FlaggedRefreshSource = {kind: "flagged"; account: FlaggedAccountMetadataV1};
 
 function refreshBinding(owner: RefreshOwner, result?: TokenSuccess): unknown[] {
 	const replaced = result && !("type" in owner) && (("index" in owner ? owner.access : owner.accessToken) !== result.access || owner.refreshToken !== result.refresh || ("index" in owner ? owner.expires : owner.expiresAt) !== result.expires);
@@ -173,7 +174,7 @@ function refreshBinding(owner: RefreshOwner, result?: TokenSuccess): unknown[] {
 		? [owner.type, result?.access ?? owner.access, result?.refresh ?? owner.refresh, result?.expires ?? owner.expires]
 		: [owner.recordId, result?.access ?? ("index" in owner ? owner.access : owner.accessToken), result?.refresh ?? owner.refreshToken,
 			result?.expires ?? ("index" in owner ? owner.expires : owner.expiresAt), owner.accountId, owner.enabled === false,
-			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex];
+			replaced ? undefined : owner.authInvalidatedAt, replaced ? undefined : owner.authInvalidationErrorCode, JSON.stringify(owner.workspaces), owner.currentWorkspaceIndex, "flaggedAt" in owner ? owner.flaggedAt : undefined];
 }
 
 export function captureRefreshCredentialAuthority(
@@ -181,6 +182,7 @@ export function captureRefreshCredentialAuthority(
 	current: () => boolean = () => true,
 	retainAccount: () => RefreshOwner | null = () => account,
 	storagePath = getStoragePath(),
+	source?: FlaggedRefreshSource,
 ): (result?: TokenSuccess) => boolean {
 	const submitted = structuredClone(account);
 	const ambientPath = getStoragePath();
@@ -213,9 +215,17 @@ export function captureRefreshCredentialAuthority(
 		}
 	};
 	const sampledRoots = paths.map(path => ({path, row: sample(path)}));
-	// The primary owns the current generation; older backups remain revision proofs.
-	const roots = sampledRoots.filter(root => root.row).slice(0, 1);
-	if (existsSync(storagePath) && !roots.some(root => root.row)) throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is not in the current pool"), {code: "ESTALE"}));
+	const flaggedPrimaries = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].map(name => getFlaggedAccountsPath(storagePath, name));
+	const authoritative = source
+		? sampledRoots.find(root => flaggedPrimaries.includes(root.path) && existsSync(root.path))
+		: sampledRoots[0];
+	const roots = authoritative?.row ? [authoritative] : [];
+	if (!roots.length && (source || existsSync(storagePath) || sampledRoots.some(root => root.row))) {
+		throw new PendingAuthAdmissionError(Object.assign(Error("Submitted account is not in its current source"), {code: "ESTALE"}));
+	}
+	if (source && (!authoritative?.row || !("flaggedAt" in authoritative.row) || authoritative.row.flaggedAt !== source.account.flaggedAt)) {
+		throw new PendingAuthAdmissionError(Object.assign(Error("Flagged account source changed"), {code: "ESTALE"}));
+	}
 	const journalRevision = captureAuthorityRevision([getPendingAuthPath(storagePath)]);
 	const journal = (): PendingAuth[] => {
 		try {return fileSchema.parse(JSON.parse(readFileSync(getPendingAuthPath(storagePath), "utf8"))).entries;}
@@ -266,12 +276,19 @@ export function captureRefreshCredentialAuthority(
 			if (!row) {
 				if (!disk) return true;
 				const actual = refreshBinding(disk);
-				return actual.every((value, index) => value === refreshBinding(submitted)[index]) ||
+				// A normal primary write can create a previously absent backup of
+				// the captured predecessor. It proves lineage, not new ownership.
+				return sampledRoots.some(({row: captured}) => captured && actual.every((value, index) => value === refreshBinding(captured)[index])) ||
+					actual.every((value, index) => value === refreshBinding(submitted)[index]) ||
 					!!result && actual.every((value, index) => value === refreshBinding(submitted, result)[index]);
 			}
 			if (!disk) return false;
 			const expected = refreshBinding(row), actual = refreshBinding(disk);
-			return actual.every((value, index) => value === expected[index]) || !!result && actual.every((value, index) => value === refreshBinding(row, result)[index]);
+			return actual.every((value, index) => value === expected[index]) ||
+				!!result && actual.every((value, index) => value === refreshBinding(row, result)[index]) ||
+				// Backup rotation may copy the already captured authoritative row.
+				// It cannot change that row or introduce an unknown generation.
+				path !== authoritative?.path && sampledRoots.some(({row: captured}) => captured && actual.every((value, index) => value === refreshBinding(captured)[index]));
 		});
 		if (!valid || !nextRevision()) return false;
 		revision = nextRevision;
@@ -286,8 +303,9 @@ export async function withRefreshCredentialRetention<T extends TokenResult>(
 	current: () => boolean = () => true,
 	retainAccount: () => typeof account | null = () => account,
 	storagePath = getStoragePath(),
+	source?: FlaggedRefreshSource,
 ): Promise<T> {
-	const authorityCurrent = captureRefreshCredentialAuthority(account, current, retainAccount, storagePath);
+	const authorityCurrent = captureRefreshCredentialAuthority(account, current, retainAccount, storagePath, source);
 	try {
 		const result = await operation();
 		const tokenResult: TokenResult = result;
@@ -317,12 +335,45 @@ export async function withRefreshCredentialRetention<T extends TokenResult>(
 	}
 }
 
+export function captureQueuedRefreshAuthority(storagePath: string, refreshToken: string, source?: FlaggedRefreshSource, settlement?: PendingAuthSettlementError): (result?: TokenSuccess) => boolean {
+	if (source) {
+		if (source.account.refreshToken !== refreshToken) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh token does not belong to the flagged source"), {code: "ESTALE"}));
+		return captureRefreshCredentialAuthority(source.account, undefined, undefined, storagePath, source);
+	}
+	let owner: AccountMetadataV3 | undefined;
+	try {
+		const value = AnyAccountStorageSchema.parse(JSON.parse(readFileSync(storagePath, "utf8")));
+		const primary = value.version === 3 ? value : migrateV1ToV3(value);
+		let entries: PendingAuth[] = [];
+		try { entries = fileSchema.parse(JSON.parse(readFileSync(getPendingAuthPath(storagePath), "utf8"))).entries; }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		const retained = entries.find(entry => entry.prior === hash(refreshToken));
+		owner = overlayPendingAuth(structuredClone(primary), entries).accounts.find(row => row.refreshToken === refreshToken) ??
+			primary.accounts.find(row => row.refreshToken === refreshToken || !!retained &&
+				(retained.recordId ? row.recordId === retained.recordId : row.refreshToken === retained.refreshToken));
+		if (!owner && settlement?.owner) {
+			const captured = settlement.owner;
+			const expected = refreshBinding(captured, settlement.result);
+			owner = primary.accounts.find(row => {
+				const actual = refreshBinding(row);
+				return actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+			});
+		}
+		if (!owner) throw Object.assign(Error("Refresh owner is absent from the primary pool"), {code: "ESTALE"});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new PendingAuthAdmissionError(error);
+	}
+	return captureRefreshCredentialAuthority(owner ?? {type: "oauth", refresh: refreshToken, access: "", expires: 0}, undefined, undefined, storagePath);
+}
+
 export async function withPendingAuthRefresh(
 	storagePath: string,
 	refreshToken: string,
 	refresh: () => Promise<TokenResult>,
 	settlement?: PendingAuthSettlementError,
+	source?: FlaggedRefreshSource,
 ): Promise<TokenResult> {
+	const ownerCurrent = captureQueuedRefreshAuthority(storagePath, refreshToken, source, settlement);
 	const current = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
 	return withFileTransactionLock(storagePath, () => withFileTransactionLock(getPendingAuthPath(storagePath), async () => {
 		if (!current()) throw Object.assign(Error("Account pool was reset"), {code: "ESTALE"});
@@ -335,7 +386,7 @@ export async function withPendingAuthRefresh(
 		}
 		const entries = await read(getPendingAuthPath(storagePath));
 		const effective = await applyPendingAuth(storagePath, primary, entries);
-		const owner = effective?.accounts.find(row => row.refreshToken === refreshToken);
+		const owner = effective?.accounts.find(row => row.refreshToken === refreshToken) ?? source?.account;
 		if (settlement && !settlement.authorityCurrent()) {
 			const captured = settlement.owner;
 			const row = captured && primary?.accounts.find(account => captured.recordId
@@ -348,14 +399,17 @@ export async function withPendingAuthRefresh(
 		}
 		const prior = hash(refreshToken);
 		const retained = entries.find(entry => entry.prior === prior && entry.refreshToken !== refreshToken);
-		if (!current()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+		if (!current() || !ownerCurrent()) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"}));
 		if (retained) return {type: "success", access: retained.accessToken, refresh: retained.refreshToken, expires: retained.expiresAt};
 		await trimToCapacity(storagePath, entries, prior, entries.some(entry => entry.prior === prior) ? 0 : 1);
-		if (!current()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+		if (!current() || !ownerCurrent()) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"}));
 		const result = await refresh();
-		if (result.type !== "success") return result;
+		if (result.type !== "success") {
+			if (!ownerCurrent()) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during refresh"), {code: "ESTALE"}));
+			return result;
+		}
 		try {
-			if (!current()) throw Object.assign(Error("Account authority changed during refresh"), {code: "ESTALE"});
+			if (!current() || !ownerCurrent(result)) throw Object.assign(Error("Account authority changed during refresh"), {code: "ESTALE"});
 			const journaled = await recordPendingAuthLocked(storagePath, {
 				priorRefreshToken: refreshToken,
 				recordId: owner?.recordId,
@@ -461,7 +515,7 @@ export async function applyPendingAuth(
 			path: getPendingAuthPath(storagePath),
 			code: typeof (error as NodeJS.ErrnoException).code === "string" && /^[A-Z_]{1,40}$/.test((error as NodeJS.ErrnoException).code ?? "") ? (error as NodeJS.ErrnoException).code : "INVALID_PENDING_AUTH",
 		});
-		throw new PendingAuthObservationError();
+		throw new PendingAuthObservationError(error);
 	}
 	return overlayPendingAuth(storage, entries, options);
 }

@@ -1151,12 +1151,11 @@ function isDispatchBindingCurrent(state: RotationProxyState, binding: AccountDis
 		account.expires === binding.expiresAt && workspaceModelScopes(account).some(scope => scope.accountId === binding.accountId && scope.routable);
 }
 
-async function applyDispatchRestriction(state: RotationProxyState, binding: AccountDispatchBinding, mutate: () => void, persistChanges = true): Promise<boolean> {
+async function applyDispatchRestriction(state: RotationProxyState, binding: AccountDispatchBinding, mutate: () => boolean | void, persistChanges = true): Promise<boolean> {
 	return binding.accountManager.withCurrentAccountCredential(binding.account, binding, () => {
 		if (state.activeAccountManager !== binding.accountManager ||
 			!workspaceModelScopes(binding.account).some(scope => scope.accountId === binding.accountId && scope.routable)) return false;
-		mutate();
-		return true;
+		return mutate() !== false;
 	}, persistChanges);
 }
 
@@ -1762,10 +1761,11 @@ async function applyWebSocketTerminalAccountSuccess(
 ): Promise<void> {
 	if (terminal.record.outcome !== "success") return;
 	await applyDispatchRestriction(state, active, () => {
-		active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model, active.circuitAdmission);
+		if (!active.accountManager.recordSuccess(active.account, active.request.context.family, active.request.context.model, active.circuitAdmission)) return false;
 		recordRuntimeAccountRecovery(active.account.index);
 		state.lastGlobalAccountIndex = active.account.index;
 		state.lastGlobalSwitchAt = state.now();
+		return true;
 	}, false);
 }
 
@@ -2193,8 +2193,10 @@ async function connectManagedWebSocket(
 			await validateWebSocketRequestForAccount(state, request, prepared, prepared.circuitAdmission);
 			if (lifecycle.isClosed() || !prepared.tokenRefundable || upstream.readyState !== WebSocket.OPEN) throw new ClientCancellationError();
 			const recovered = await applyDispatchRestriction(state, prepared, () => {
-				if (!prepared.circuitAdmission.halfOpen) accountManager.recordSuccess(account, context.family, context.model, prepared.circuitAdmission);
-				recordRuntimeAccountRecovery(account.index);
+				if (!prepared.circuitAdmission.breaker.isAdmissionCurrent(prepared.circuitAdmission)) return false;
+				if (!prepared.circuitAdmission.halfOpen && !accountManager.recordSuccess(account, context.family, context.model, prepared.circuitAdmission)) return false;
+				if (!prepared.circuitAdmission.halfOpen) recordRuntimeAccountRecovery(account.index);
+				return true;
 			}, false);
 			if (!recovered) {
 				upstream.terminate();
@@ -5007,8 +5009,9 @@ async function handleRequestInner(
 			const completion = responseOutcome.finish();
 			if (forwarded && upstream.ok && !restrictionFailure) {
 				await applyDispatchRestriction(state, binding, () => {
-					accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission);
+					if (!accountManager.recordSuccess(refreshed.account, context.family, context.model, circuitAdmission)) return false;
 					recordRuntimeAccountRecovery(refreshed.account.index);
+					return true;
 				}, false).catch(captureRestrictionFailure);
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);

@@ -119,6 +119,7 @@ export class RefreshGuardian {
 		>
 			? TValue
 			: never,
+		refreshHealth: () => boolean,
 	): Promise<boolean> {
 		switch (result.reason) {
 			case "success": {
@@ -168,7 +169,7 @@ export class RefreshGuardian {
 					}
 					await manager.withCurrentAccountCredential(committedAccount, {
 						recordId: committedAccount.recordId, accessToken: refreshedAuth.access, refreshToken: refreshedAuth.refresh, expiresAt: refreshedAuth.expires,
-					}, () => manager.recordSuccess(committedAccount, REFRESH_HEALTH_FAMILY), false);
+					}, refreshHealth, false);
 				} catch (error) {
 					log.warn("Refresh guardian commit failed", {
 						sourceIndex: sourceAccount.index,
@@ -284,6 +285,10 @@ export class RefreshGuardian {
 
 			let requiresSave = false;
 			const storagePath = manager.resolveSelectionStoragePath();
+			const refreshHealth = new Map(eligibleSnapshot.map(source => {
+				const account = manager.getAccountByIdentity(source);
+				return [source.index, account ? manager.captureRefreshHealth(account, REFRESH_HEALTH_FAMILY) : () => false] as const;
+			}));
 			const refreshResults = await refreshExpiringAccounts(
 				eligibleSnapshot,
 				this.bufferMs,
@@ -292,6 +297,7 @@ export class RefreshGuardian {
 						manager,
 						sourceAccount,
 						result,
+						refreshHealth.get(sourceAccount.index) ?? (() => false),
 					);
 					if (saveNeeded) {
 						requiresSave = true;

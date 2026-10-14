@@ -21,6 +21,7 @@ import {
 import { PendingAuthSettlementError } from "../lib/storage/pending-auth.js";
 import {
 	clearCircuitBreakers,
+	type CircuitAdmissionReceipt,
 	DEFAULT_CIRCUIT_BREAKER_CONFIG,
 	getCircuitBreaker,
 } from "../lib/circuit-breaker.js";
@@ -4025,8 +4026,10 @@ describe("AccountManager", () => {
 				vi.advanceTimersByTime(
 					DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1,
 				);
-				expect(manager.consumeToken(account, "codex")).toBe(true);
-				manager.recordSuccess(account, "codex");
+				let admission: CircuitAdmissionReceipt | undefined;
+				expect(manager.consumeToken(account, "codex", undefined, {onAdmission: receipt => {admission = receipt;}})).toBe(true);
+				expect(admission).toBeDefined();
+				expect(manager.recordSuccess(account, "codex", undefined, admission)).toBe(true);
 				expect(breaker.getState()).toBe("closed");
 			} finally {
 				vi.useRealTimers();

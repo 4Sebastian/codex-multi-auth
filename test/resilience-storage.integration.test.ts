@@ -11,6 +11,19 @@ import { AccountManager, AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
 import { saveAccounts, loadAccounts, getStoragePath, clearAccounts, setStoragePathDirect, cloneTrackedAccountStorage, withAccountAndFlaggedStorageTransaction } from "../lib/storage.js";
 import { withRetry } from "../lib/fs-retry.js";
 const dirs: string[] = [];
+async function retainAfterRejectedJournalPublication(manager: AccountManager, source: Parameters<AccountManager["commitRefreshedAuth"]>[0], auth: Parameters<AccountManager["commitRefreshedAuth"]>[1], code: string) {
+ const error = await manager.commitRefreshedAuth(source, auth).catch((value: unknown) => value);
+ expect(error).toBeInstanceOf(pendingAuth.PendingAuthSettlementError);
+ if (!(error instanceof pendingAuth.PendingAuthSettlementError)) throw Error("Expected rejected publication");
+ expect(error.durability).toBe("journal");
+ expect(error.result).toMatchObject({access: auth.access, refresh: auth.refresh, expires: auth.expires});
+ const cause = error.cause as {code?: string; cause?: {code?: string}};
+ expect(cause.code === code || cause.cause?.code === code).toBe(true);
+ const retained = manager.getAccountByIndex(source.index);
+ expect(retained).toMatchObject({access: auth.access, refreshToken: auth.refresh, expires: auth.expires});
+ expect((await pendingAuth.capturePendingAuth(manager.resolveSelectionStoragePath(), [])).entries).toEqual(expect.arrayContaining([expect.objectContaining({accessToken: auth.access, refreshToken: auth.refresh, expiresAt: auth.expires})]));
+ return retained;
+}
 afterEach(async () => { setStoragePathDirect(null); for (const dir of dirs.splice(0))
     await withRetry(() => rm(dir, { recursive: true, force: true }), { maxAttempts: 6, backoffMs: 25 }); });
 async function setup() {
@@ -366,6 +379,7 @@ it("rescues a refreshed legacy record after matched fallback token replacement",
  await setup();const initial=(await loadAccounts())!;delete initial.accounts[0]!.recordId;await saveAccounts(initial);
  const access=`fixture.${Buffer.from(JSON.stringify({"https://api.openai.com/auth":{chatgpt_account_id:"first"}})).toString("base64url")}.signature`;
  const manager=new AccountManager({type:"oauth",access,refresh:"fixture-fallback",expires:Date.now()+3600000},await loadAccounts());
+ await manager.saveToDisk();
  manager.getAccountByIndex(0)!.accountLabel="Local";
  const disk=(await loadAccounts())!;disk.accounts[0]!.accountLabel="External";await saveAccounts(disk);
  await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!,{type:"oauth",access,refresh:"fixture-rotated",expires:Date.now()+3600000});
@@ -532,16 +546,18 @@ it("merges a transaction against a recoverable journal when the primary is missi
  expect((await loadAccounts())?.accounts.map(a => a.recordId)).toEqual(["first", "journal-only", "new"]);
 });
 
-it("keeps a rotated refresh token live instead of dropping it when the primary is corrupt", async () => {
+it("denies publication without an authoritative primary and accepts a later explicit recovery",  async () => {
  const manager = await setup();
  const path = getStoragePath();
  await writeFile(path + ".bak", await readFile(path, "utf8"));
  await writeFile(path, "{corrupt");
- const committed = await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 });
- expect(committed?.refreshToken).toBe("fixture-rotated");
+ await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 })).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION", cause: expect.any(SyntaxError)});
+ expect(manager.getAccountByIndex(0)?.refreshToken).toBe("fixture-first");
+ expect((await pendingAuth.capturePendingAuth(path, [])).entries).toEqual([]);
  // A torn/corrupt primary is never replaced from an older backup behind the user's back.
  expect(await readFile(path, "utf8")).toBe("{corrupt");
  await writeFile(path, await readFile(path + ".bak", "utf8"));
+ await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "fixture-recovered", refresh: "fixture-rotated", expires: Date.now() + 3600000});
  await manager.flushPendingSave();
  expect((await loadAccounts())?.accounts.map(a => a.refreshToken)).toEqual(["fixture-rotated"]);
 });
@@ -557,7 +573,7 @@ it("keeps a rotated refresh token while the primary stays locked and saves it on
   return (original as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
  }) as typeof fs.readFile);
  try {
-  const committed = await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 });
+  const committed = await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }, "EBUSY");
   expect(committed?.refreshToken).toBe("fixture-rotated");
   expect(manager.getAccountByIndex(0)?.refreshToken).toBe("fixture-rotated");
  } finally { locked.mockRestore(); }
@@ -576,7 +592,7 @@ it("recovers a rotated refresh token in a new process when the old one exits bef
   return (original as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
  }) as typeof fs.readFile);
  try {
-  await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 });
+  await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }, "EBUSY");
  } finally { locked.mockRestore(); }
  // The first process dies here: its debounced save never runs.
  expect(JSON.parse(await readFile(path, "utf8")).accounts[0].refreshToken).toBe("fixture-first");
@@ -609,7 +625,7 @@ async function withAccountsWriteLocked<T>(path: string, run: () => Promise<T>): 
 it("journals a rotated token when the accounts write keeps failing with EBUSY", async () => {
  const manager = await setup();
  const path = getStoragePath();
- const committed = await withAccountsWriteLocked(path, () => manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }));
+ const committed = await withAccountsWriteLocked(path, () => retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }, "EBUSY"));
  expect(committed?.refreshToken).toBe("fixture-rotated");
  expect(manager.getAccountByIndex(0)?.refreshToken).toBe("fixture-rotated");
  // A new process recovers it even though this one never saved.
@@ -622,8 +638,8 @@ it("chains a second rotation of the same account while the first is only journal
  const manager = await setup();
  const path = getStoragePath();
  await withAccountsWriteLocked(path, async () => {
-  await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh-1", refresh: "fixture-rotated-1", expires: Date.now() + 3600000 });
-  await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh-2", refresh: "fixture-rotated-2", expires: Date.now() + 7200000 });
+  await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh-1", refresh: "fixture-rotated-1", expires: Date.now() + 3600000 }, "EBUSY");
+  await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh-2", refresh: "fixture-rotated-2", expires: Date.now() + 7200000 }, "EBUSY");
  });
  expect(JSON.parse(await readFile(path, "utf8")).accounts[0].refreshToken).toBe("fixture-first");
  const next = new AccountManager(undefined, await loadAccounts());
@@ -638,7 +654,7 @@ it("keeps a journaled rotated token live when a native request re-reads the unch
  const path = getStoragePath();
  const readNative = createNativeAccountStorageReader(undefined, path);
  await readNative();
- await withAccountsWriteLocked(path, () => manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }));
+ await withAccountsWriteLocked(path, () => retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, { type: "oauth", access: "fixture-fresh", refresh: "fixture-rotated", expires: Date.now() + 3600000 }, "EBUSY"));
  // The deferred save has not run; the primary still holds the spent token.
  expect(JSON.parse(await readFile(path, "utf8")).accounts[0].refreshToken).toBe("fixture-first");
  const snapshot = await readNative();
@@ -659,7 +675,7 @@ it("keeps a journaled rotated token live when a native request re-reads the unch
   return original(from, to);
  });
  try {
-  const result = await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type:"oauth",access:"fixture-fresh",refresh:"fixture-rotated",expires:Date.now()+3600000});
+  const result = await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!, {type:"oauth",access:"fixture-fresh",refresh:"fixture-rotated",expires:Date.now()+3600000}, "EACCES");
   expect(result?.refreshToken).toBe("fixture-rotated");
   expect(new AccountManager(undefined,await loadAccounts()).getAccountByIndex(0)?.refreshToken).toBe("fixture-rotated");
  } finally {rename.mockRestore();await manager.flushPendingSave();}
@@ -693,7 +709,7 @@ it("journals a spent rotation after account lock acquisition times out",async()=
   if(target===path)throw Object.assign(Error("busy"),{code:"ELOCKED"});
   return original(target,action,options);
  });
- try {expect(await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!,{type:"oauth",access:"fixture-new",refresh:"fixture-rotated",expires:Date.now()+3600000})).toMatchObject({refreshToken:"fixture-rotated"});}
+ try {expect(await retainAfterRejectedJournalPublication(manager, manager.getAccountByIndex(0)!,{type:"oauth",access:"fixture-new",refresh:"fixture-rotated",expires:Date.now()+3600000}, "ELOCKED")).toMatchObject({refreshToken:"fixture-rotated"});}
  finally {lock.mockRestore();}
  expect(new AccountManager(undefined,await loadAccounts()).getAccountByIndex(0)?.refreshToken).toBe("fixture-rotated");
  await manager.flushPendingSave();
@@ -708,7 +724,7 @@ it("preserves a live network cooldown while rescuing a journaled rotation",async
   return original(target,action,options);
  });
  try {
-  await manager.commitRefreshedAuth(live,{type:"oauth",access:"fixture-new",refresh:"fixture-rotated",expires:Date.now()+3600000});
+  await retainAfterRejectedJournalPublication(manager, live,{type:"oauth",access:"fixture-new",refresh:"fixture-rotated",expires:Date.now()+3600000}, "ELOCKED");
   expect(live).toMatchObject({coolingDownUntil:until,cooldownReason:"network-error"});
  } finally {lock.mockRestore();await manager.flushPendingSave();}
 });

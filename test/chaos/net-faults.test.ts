@@ -248,7 +248,7 @@ function coolingReason(
 }
 
 describe("network fault injection through the runtime proxy", () => {
-	it("abrupt socket close before headers cools the account and rotates the request", async () => {
+	it("does not replay an ambiguously sent request after abrupt close and routes a later request safely", async () => {
 		const upstream = await startUpstream((hit) =>
 			hit === 1 ? "destroy" : "ok",
 		);
@@ -256,8 +256,12 @@ describe("network fault injection through the runtime proxy", () => {
 
 		const started = Date.now();
 		const response = await postResponses(proxy, "req-destroy");
-		expect(response.status).toBe(200);
-
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.reason).toBe("network-error");
+		expect(upstream.hits).toHaveLength(1);
+		expect(proxy.getStatus().upstreamRequests).toBe(1);
+		const later = await postResponses(proxy, "req-after-destroy");
+		expect(later.status).toBe(200); await later.text();
 		expect(upstream.hits).toHaveLength(2);
 		expect(upstream.hits[0]!.accountIndex).not.toBeNull();
 		expect(upstream.hits[1]!.accountIndex).not.toBe(
@@ -267,24 +271,28 @@ describe("network fault injection through the runtime proxy", () => {
 		expect(coolingReason(manager, upstream.hits[0]!.accountIndex!)).toBe(
 			"cooling-down:network-error",
 		);
-		// The request completed only because the proxy rotated; bound sanity.
+		// The independent later request routes around the timed cooldown.
 		expect(Date.now() - started).toBeLessThan(5_000);
 		expect(proxy.getStatus().upstreamRequests).toBe(2);
 	});
 
-	it("a hung upstream is bounded by fetchTimeoutMs and then fails over", async () => {
+	it("bounds a hung upstream without replay and admits an independent later request", async () => {
 		const upstream = await startUpstream((hit) => (hit === 1 ? "hang" : "ok"));
 		const { proxy, manager } = await startProxyStack(upstream.port);
 
 		const started = Date.now();
 		const response = await postResponses(proxy, "req-hang");
-		expect(response.status).toBe(200);
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.reason).toBe("network-error");
+		expect(upstream.hits).toHaveLength(1);
 		const elapsed = Date.now() - started;
 
 		// Without the proxy's 400ms fetch timeout this request would sit on
 		// undici's default headers timeout (~5 minutes); a sub-3s completion
 		// proves the configured bound actually fired.
 		expect(elapsed).toBeLessThan(3_000);
+		const later = await postResponses(proxy, "req-after-hang");
+		expect(later.status).toBe(200); await later.text();
 		expect(upstream.hits).toHaveLength(2);
 		expect(upstream.hits[1]!.accountIndex).not.toBe(
 			upstream.hits[0]!.accountIndex,
@@ -369,7 +377,11 @@ describe("network fault injection through the runtime proxy", () => {
 		};
 		expect(body.error?.code).toBe("codex_runtime_rotation_pool_exhausted");
 		expect(body.error?.reason).toBe("network-error");
-		// Both accounts were genuinely attempted against the dead upstream.
+		// Each independently submitted request is sent only once.
+		expect(upstream.hits).toHaveLength(1);
+		const later = await postResponses(proxy, "req-dead-independent");
+		expect(later.status).toBe(503);
+		expect((await later.json()).error.reason).toBe("network-error");
 		expect(upstream.hits).toHaveLength(2);
 		expect(new Set(upstream.hits.map((hit) => hit.accountIndex)).size).toBe(2);
 	});

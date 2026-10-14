@@ -9,6 +9,10 @@ import { CodexAuthError } from "../lib/errors.js";
 import { findMatchingAccountIndex, getStoragePath } from "../lib/storage.js";
 import type { OAuthAuthDetails } from "../lib/types.js";
 
+function captureRefreshHealthMock(this: {recordSuccess: (account: ManagedAccount, family: string) => unknown}, account: ManagedAccount, family: string) {
+  return () => { this.recordSuccess(account, family); return true; };
+}
+
 const refreshExpiringAccountsMock = vi.fn();
 const applyRefreshResultMock = vi.fn();
 
@@ -99,6 +103,7 @@ function createManagerMock(accounts: ManagedAccount[]): AccountManager {
   return {
     getAccountsSnapshot: vi.fn(() => accounts),
     resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
     getAccountByIndex: vi.fn(
       (index: number) =>
         accounts.find((account) => account.index === index) ?? null,
@@ -384,6 +389,7 @@ describe("refresh-guardian", () => {
     let readCount = 0;
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -465,6 +471,7 @@ describe("refresh-guardian", () => {
     let readCount = 0;
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -548,6 +555,7 @@ describe("refresh-guardian", () => {
     let readCount = 0;
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -629,6 +637,7 @@ describe("refresh-guardian", () => {
     let readCount = 0;
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(
         () => snapshots[Math.min(readCount++, snapshots.length - 1)],
       ),
@@ -811,6 +820,7 @@ describe("refresh-guardian", () => {
 
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(() => {
         if (snapshotReads === 0) {
           snapshotReads += 1;
@@ -1194,6 +1204,7 @@ describe("refresh-guardian", () => {
 
     const manager = {
       resolveSelectionStoragePath: vi.fn(() => getStoragePath()),
+    captureRefreshHealth: vi.fn(captureRefreshHealthMock),
       getAccountsSnapshot: vi.fn(() => {
         snapshotReads += 1;
         if (snapshotReads === 1) return [originalA, originalB];

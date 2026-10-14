@@ -203,7 +203,8 @@ it("saves recovered legacy credentials without changing the original record iden
     const manager = new AccountManager(undefined, await storageModule.loadAccounts());
     const transaction = vi.spyOn(storageModule, "withAccountStorageTransaction").mockRejectedValueOnce(Object.assign(new Error("busy"), {code:"EBUSY"}));
     try {
-        await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type:"oauth",refresh:"rotated",access:"access-rotated",expires:Date.now()+3600000});
+        await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type:"oauth",refresh:"rotated",access:"access-rotated",expires:Date.now()+3600000})).rejects.toMatchObject({code:"EPENDINGAUTHSETTLEMENT", durability:"journal", cause:{code:"EBUSY"}});
+        expect(manager.getAccountByIndex(0)?.refreshToken).toBe("rotated");
     } finally { transaction.mockRestore(); }
     await manager.flushPendingSave();
     const saved = await storageModule.loadAccounts();

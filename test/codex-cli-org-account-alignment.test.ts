@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clearCodexCliStateCache } from "../lib/codex-cli/state.js";
 import { setCodexCliActiveSelection } from "../lib/codex-cli/writer.js";
 import { syncCodexCliActiveSelectionIfDrifted } from "../lib/codex-manager/login-menu-data.js";
-import type { AccountStorageV3 } from "../lib/storage.js";
+import { setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 
 // #700: the writer maps a stored "org-..." id to the token's
 // chatgpt_account_id. The drift check has to apply the same mapping, or every
@@ -49,10 +49,14 @@ describe("org-sourced account alignment with Codex auth.json (#700)", () => {
 		process.env.CODEX_CLI_CONFIG_PATH = join(tempDir, "config.toml");
 		process.env.CODEX_MULTI_AUTH_SYNC_CODEX_CLI = "1";
 		process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE = "0";
+		const poolPath = join(tempDir, "managed-pool.json");
+		setStoragePathDirect(poolPath);
+		await writeFile(poolPath, JSON.stringify(storage()));
 		clearCodexCliStateCache();
 	});
 
 	afterEach(async () => {
+		setStoragePathDirect(null);
 		clearCodexCliStateCache();
 		for (const key of ENV_KEYS) {
 			if (previousEnv[key] === undefined) delete process.env[key];

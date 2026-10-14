@@ -328,20 +328,27 @@ describe("live proxy concurrency (routing-mutex enabled)", () => {
 				postResponses(proxy, `req-fail-${i}`),
 			),
 		);
+		const failed = responses.filter(response => response.status === 503);
 		for (const response of responses) {
-			expect(response.status, response.status === 200 ? undefined : await response.text()).toBe(200);
+			if (response.status === 503) expect((await response.json()).error.reason).toBe("network-error");
+			else {expect(response.status).toBe(200); await response.text();}
 		}
 
 		const attemptsOnVictim = upstream.hits.filter(
 			(hit) => hit.accountIndex === 0,
 		).length;
 		const served = upstream.hits.filter((hit) => hit.accountIndex !== 0);
-		// Every request was served by a healthy account; the victim saw at least
-		// one real attempt (it is the freshest pick) and never served a response.
-		expect(served).toHaveLength(TOTAL);
+		// Ambiguously sent victim requests fail once; only independent requests
+		// can route to healthy accounts. None of the original twelve is replayed.
+		expect(failed).toHaveLength(attemptsOnVictim);
+		expect(served).toHaveLength(TOTAL - attemptsOnVictim);
 		expect(attemptsOnVictim).toBeGreaterThanOrEqual(1);
 		expect(attemptsOnVictim).toBeLessThanOrEqual(TOTAL);
-		expect(upstream.hits).toHaveLength(TOTAL + attemptsOnVictim);
+		expect(upstream.hits).toHaveLength(TOTAL);
+		const later = await postResponses(proxy, "req-independent-after-failure");
+		expect(later.status).toBe(200); await later.text();
+		expect(upstream.hits).toHaveLength(TOTAL + 1);
+		expect(upstream.hits.at(-1)?.accountIndex).not.toBe(0);
 		expect(
 			manager.getManagedAccountRuntimeSkipReason(
 				manager.getAccountByIndex(0)!,

@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { AnyAccountStorageSchema } from "../lib/schemas.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,7 @@ import {
 	startRuntimeRotationProxy,
 	type RuntimeRotationProxyServer,
 } from "../lib/runtime-rotation-proxy.js";
-import { setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
+import { getStoragePath, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 
 const { saveAccountsMock, withAccountStorageTransactionMock } = vi.hoisted(
 	() => ({
@@ -65,10 +66,10 @@ const CAPACITY_BODY = JSON.stringify({
 	},
 });
 
-function capacityResponse(status: number): Response {
+function capacityResponse(status: number, retryAfter?: string): Response {
 	return new Response(CAPACITY_BODY, {
 		status,
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...(retryAfter ? {"retry-after-ms": retryAfter} : {}) },
 	});
 }
 
@@ -117,7 +118,7 @@ beforeEach(() => {
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockReset();
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(null, async () => undefined),
+		handler(AnyAccountStorageSchema.parse(JSON.parse(readFileSync(getStoragePath(), "utf8"))), async () => undefined),
 	);
 	delete process.env.CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS;
 });
@@ -287,8 +288,8 @@ describe("runtime proxy waits out a model-capacity response", () => {
 
 		const accountManager = new AccountManager(undefined, storage);
 		const { fetchImpl, calls } = scriptedFetch([
-			() => capacityResponse(429),
-			() => capacityResponse(503),
+			() => capacityResponse(429, "1"),
+			() => capacityResponse(503, "1"),
 			() => streamResponse(),
 		]);
 
@@ -302,7 +303,6 @@ describe("runtime proxy waits out a model-capacity response", () => {
 		openServers.push(proxy);
 
 		const response = await postResponses(proxy);
-
 		expect(response.status).toBe(200);
 		expect(calls()).toBe(3);
 		for (const account of accountManager.getAccountsSnapshot()) {

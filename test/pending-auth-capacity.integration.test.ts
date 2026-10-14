@@ -46,7 +46,8 @@ it("recovers oldest primary, WAL and backup roots after 1002 failed-primary rota
 		if (String(to) === path) throw Object.assign(Error("fixture locked primary"), {code: "EACCES"});
 		return rename(from, to);
 	});
-	await manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "access-token-1", refresh: "token-1", expires: 1});
+	await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "access-token-1", refresh: "token-1", expires: 1})).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", durability: "journal", cause: {cause: {code: "EACCES"}}});
+	expect(manager.getAccountByIndex(0)?.refreshToken).toBe("token-1");
 	await fs.writeFile(`${path}.wal`, JSON.stringify({version: 1, content: JSON.stringify(pool(["token-1"]))}));
 	await fs.writeFile(`${path}.bak.2`, JSON.stringify(pool(["token-2"])));
 	await fs.writeFile(`${path}.snapshot-old`, JSON.stringify(pool(["token-3"])));
@@ -101,7 +102,9 @@ it.each(["missing-primary", "corrupt-primary", "corrupt-wal", "corrupt-backup", 
 	}
 	const before = await fs.readFile(getPendingAuthPath(path), "utf8");
 	await expect(recordPendingAuth(path, rotation("spent", "fresh"))).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
-	await expect(withPendingAuthRefresh(path, "spent", async () => {throw Error("must not spend");})).rejects.toMatchObject({code: mode === "discovery" ? "EACCES" : mode === "changing" ? "ESTALE" : "EPENDINGAUTHCAPACITY"});
+	const oauth = vi.fn(async () => {throw Error("must not spend");});
+	await expect(withPendingAuthRefresh(path, "new-0", oauth)).rejects.toMatchObject({code: mode.startsWith("corrupt-") || mode === "changing" ? "EPENDINGAUTHADMISSION" : mode === "discovery" ? "EACCES" : "EPENDINGAUTHCAPACITY"});
+	expect(oauth).not.toHaveBeenCalled();
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
 });
 
@@ -124,7 +127,7 @@ it("denies upstream refresh at required-root capacity and retains an already-spe
 	await expect(manager.commitRefreshedAuth(manager.getAccountByIndex(0)!, {type: "oauth", access: "access-newest", refresh: "newest", expires: 2})).rejects.toMatchObject({cause: {cause: firstError}});
 	expect(manager.getAccountByIndex(0)?.refreshToken).toBe("newest");
 	expect(await fs.readFile(getPendingAuthPath(path), "utf8")).toBe(before);
-	await expect(queuedRefresh("newest")).rejects.toMatchObject({code: "EPENDINGAUTHCAPACITY"});
+	await expect(queuedRefresh("newest")).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION", cause: {code: "ESTALE"}});
 	expect(upstream).not.toHaveBeenCalled();
 });
 
@@ -216,7 +219,12 @@ fs.rename = async (from, to) => {
   if (String(to) === path) throw Object.assign(Error("fixture failed primary"), {code: "EACCES"});
   return rename(from, to);
 };
-await manager.commitRefreshedAuth(manager.getAccountByIndex(0), {type: "oauth", access: "access-rotated", refresh: "rotated", expires: 1});
+try {
+ await manager.commitRefreshedAuth(manager.getAccountByIndex(0), {type: "oauth", access: "access-rotated", refresh: "rotated", expires: 1});
+ throw Error("Failed primary publication must not report success");
+} catch (error) {
+ if (error.code !== "EPENDINGAUTHSETTLEMENT" || error.durability !== "journal" || error.cause.cause.code !== "EACCES") throw error;
+}
 process.send({event: "recovered", token: (await loadAccounts()).accounts[0].refreshToken});
 process.disconnect();
 `, resolveDir: process.cwd()}, bundle: true, format: "esm", platform: "node", outfile: workerPath, logLevel: "silent"});

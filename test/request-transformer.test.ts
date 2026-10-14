@@ -23,6 +23,11 @@ const capabilityOverride = vi.hoisted(() => ({
 	model: undefined as string | undefined,
 }));
 
+// Transformation fixtures must not wait for a live GitHub prompt on a cold cache.
+vi.mock('../lib/prompts/host-codex-prompt.js', () => ({
+	getHostCodexPrompt: vi.fn().mockResolvedValue('You are a coding agent running in the Codex.'),
+}));
+
 vi.mock('../lib/request/helpers/model-map.js', async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import('../lib/request/helpers/model-map.js')>();

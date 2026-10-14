@@ -1,5 +1,28 @@
-import { describe, expect, it, vi } from "vitest";
-import { verifyRuntimeFlaggedAccounts } from "../lib/runtime/verify-flagged.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { verifyRuntimeFlaggedAccounts as verifyActualFlaggedAccounts } from "../lib/runtime/verify-flagged.js";
+import { getFlaggedAccountsPath, setStoragePathDirect } from "../lib/storage.js";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
+
+let fixtureDir: string;
+beforeEach(async () => {
+	fixtureDir = await fs.mkdtemp(join(tmpdir(), "runtime-flagged-owner-"));
+	setStoragePathDirect(join(fixtureDir, "accounts.json"));
+});
+afterEach(async () => {
+	setStoragePathDirect(null);
+	await removeWithRetry(fixtureDir, {recursive: true, force: true});
+});
+async function verifyRuntimeFlaggedAccounts(deps: Parameters<typeof verifyActualFlaggedAccounts>[0]) {
+	return verifyActualFlaggedAccounts({...deps, loadFlaggedAccounts: async () => {
+		const flagged = await deps.loadFlaggedAccounts();
+		for (const row of flagged.accounts) row.flaggedAt ??= 1;
+		await fs.writeFile(getFlaggedAccountsPath(), JSON.stringify(flagged));
+		return flagged;
+	}});
+}
 
 describe("verifyRuntimeFlaggedAccounts", () => {
 	it("reports when there are no flagged accounts to verify", async () => {
@@ -129,7 +152,7 @@ describe("verifyRuntimeFlaggedAccounts", () => {
 			showLine: vi.fn(),
 		});
 
-		expect(queuedRefresh).toHaveBeenCalledWith("flagged-refresh");
+		expect(queuedRefresh).toHaveBeenCalledWith("flagged-refresh", undefined, {kind: "flagged", account: expect.objectContaining({refreshToken: "flagged-refresh", flaggedAt: 1})});
 		expect(persistAccounts).toHaveBeenCalledWith(
 			[
 				expect.objectContaining({

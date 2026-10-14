@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { CircuitBreaker, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
+
+function admitFixtureRequest(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}): boolean {
+	return new CircuitBreaker().tryCanExecute(options?.onAdmission).ok;
+}
 
 process.env.CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS = "1";
 
@@ -525,7 +533,7 @@ vi.mock("../lib/accounts.js", async () => {
 
 		async withCurrentAccountCredential(_account: unknown, _submitted: unknown, mutate: () => boolean | void) { return mutate() !== false; }
 
-		recordSuccess() {}
+		recordSuccess() {return true;}
 		recordRateLimit() {}
 		recordFailure() {}
 
@@ -552,8 +560,8 @@ vi.mock("../lib/accounts.js", async () => {
 		markAccountCoolingDown() {}
 		markRateLimited() {}
 		markRateLimitedWithReason() {}
-		consumeToken() {
-			return true;
+		consumeToken(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}) {
+			return admitFixtureRequest(_account, _family, _model, options);
 		}
 		refundToken() {}
 		syncCodexCliActiveSelectionForIndex(index: number) {
@@ -953,6 +961,8 @@ describe("OpenAIOAuthPlugin", () => {
 				],
 			};
 			let loadFlaggedCallCount = 0;
+			mkdirSync(dirname(getAuthorityStoragePath()), {recursive: true});
+			writeFileSync(getAuthorityFlaggedPath(getAuthorityStoragePath(), "openai-codex-flagged-accounts.json"), JSON.stringify(flaggedStorage));
 
 			vi.mocked(cliModule.promptLoginMode)
 				.mockResolvedValueOnce({ mode: "verify-flagged" } as never)
@@ -1778,7 +1788,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async (index: number) =>
 				syncCodexCliSelectionMock(index),
@@ -1786,7 +1796,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -3668,7 +3678,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimitedWithReason: () => {},
 			recordRateLimit: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			getCurrentWorkspace: () => null,
 			syncCodexCliActiveSelectionForIndex: async () => {},
@@ -3676,7 +3686,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
 			markToastShown: () => {},
@@ -5133,14 +5143,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5244,14 +5254,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5345,14 +5355,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5435,14 +5445,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5561,14 +5571,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5664,14 +5674,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5763,14 +5773,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5857,14 +5867,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5967,14 +5977,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -6089,14 +6099,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -6201,14 +6211,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -6333,14 +6343,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				markAccountCoolingDown: () => {},
 				markRateLimited: () => {},
 				markRateLimitedWithReason,
-				consumeToken: () => true,
+				consumeToken: admitFixtureRequest,
 				refundToken: () => {},
 				syncCodexCliActiveSelectionForIndex: async () => {},
 				markSwitched: () => {},
 				removeAccount: () => {},
 				recordFailure: () => {},
 				withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-				recordSuccess: () => {},
+				recordSuccess: () => true,
 				recordRateLimit: () => {},
 				getMinWaitTimeForFamily: () => 0,
 				shouldShowAccountToast: () => false,
@@ -6508,14 +6518,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure,
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -6668,14 +6678,14 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure,
 			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
-			recordSuccess: () => {},
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -6746,6 +6756,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			fallbackAccount,
 			"gpt-5.1",
 			"gpt-5.1",
+			expect.objectContaining({breaker: expect.any(CircuitBreaker), epoch: 0, halfOpen: false}),
 		);
 		expect(capabilityFailureSpy).toHaveBeenCalledTimes(1);
 		expect(capabilityFailureSpy.mock.calls[0]?.[0]).toMatch(

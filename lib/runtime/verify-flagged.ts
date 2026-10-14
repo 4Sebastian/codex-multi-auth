@@ -1,4 +1,4 @@
-import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention, type FlaggedRefreshSource } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
 import type { TokenResult } from "../types.js";
 import type { FlaggedAccountMetadataV1 } from "../storage.js";
@@ -28,7 +28,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		| null
 		| undefined
 	>;
-	queuedRefresh: (refreshToken: string) => Promise<TokenResult>;
+	queuedRefresh: (refreshToken: string, storagePath?: string, source?: FlaggedRefreshSource) => Promise<TokenResult>;
 	resolveTokenSuccessAccount: (
 		tokens: SuccessfulAccountTokens,
 	) => TokenSuccessWithAccount<SuccessfulAccountTokens>;
@@ -103,7 +103,8 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 				}
 			}
 
-			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken), () => flaggedStorage.accounts.includes(flagged));
+			const source: FlaggedRefreshSource = {kind: "flagged", account: flagged};
+			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken, undefined, source), () => flaggedStorage.accounts.includes(flagged), undefined, undefined, source);
 			if (refreshResult.type !== "success") {
 				deps.showLine(
 					`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: STILL FLAGGED (${refreshResult.message ?? refreshResult.reason ?? "refresh failed"})`,

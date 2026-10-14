@@ -1949,7 +1949,7 @@ it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native 
 	expect(native ? f.creates.length : f.fetched.length).toBe(1);
 });
 
-it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credential", "expiry", "disable", "workspace", "reset", "journal"].map(change => ({transport, change}))))
+it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credential", "expiry", "disable", "workspace", "revocation", "revocation-code", "reset", "journal"].map(change => ({transport, change}))))
 ("validates durable submitted ownership before terminal healing (%j)", async ({transport, change}) => {
  const f = await fixture(transport === "native"), entered = deferred();
  const account = f.manager.getAccountByIndex(0)!;
@@ -1970,7 +1970,9 @@ it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credentia
  if (change === "expiry") disk.accounts[0]!.expiresAt = (disk.accounts[0]!.expiresAt ?? 0) + 1;
  if (change === "disable") disk.accounts[0]!.enabled = false;
  if (change === "workspace") disk.accounts[0]!.workspaces![0]!.enabled = false;
- if (["credential", "expiry", "disable", "workspace"].includes(change)) await fs.writeFile(f.path, JSON.stringify(disk));
+ if (change === "revocation") Object.assign(disk.accounts[0]!, {authInvalidatedAt: Date.now(), authInvalidationErrorCode: "token_invalidated"});
+ if (change === "revocation-code") disk.accounts[0]!.authInvalidationErrorCode = "token_invalidated";
+ if (["credential", "expiry", "disable", "workspace", "revocation", "revocation-code"].includes(change)) await fs.writeFile(f.path, JSON.stringify(disk));
  if (change === "reset") await fs.writeFile(`${f.path}.reset-intent`, "{}");
  if (change === "journal") await fs.writeFile(getPendingAuthPath(f.path), "{");
  if (socket) socket.send(JSON.stringify(completed));

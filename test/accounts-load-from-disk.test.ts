@@ -223,6 +223,7 @@ describe("AccountManager loadFromDisk", () => {
         email: "one@example.com",
         refreshToken: "refresh-1",
       }),
+          expect.objectContaining({account: expect.any(Object)}),
     );
   });
 
@@ -415,6 +416,7 @@ describe("AccountManager and the Codex CLI mirror", () => {
 
     expect(codexCliWriterMocks.setCodexCliActiveSelection).toHaveBeenLastCalledWith(
       expect.objectContaining({ accountId: "ws-authorized" }),
+          expect.objectContaining({account: expect.any(Object)}),
     );
   });
 });

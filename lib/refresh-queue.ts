@@ -14,7 +14,7 @@ import type { TokenResult } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
-import { MAX_PENDING_AUTH_ENTRIES, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthCapacityError, PendingAuthSettlementError, withPendingAuthRefresh } from "./storage/pending-auth.js";
+import { MAX_PENDING_AUTH_ENTRIES, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthCapacityError, PendingAuthSettlementError, withPendingAuthRefresh, captureQueuedRefreshAuthority, type FlaggedRefreshSource } from "./storage/pending-auth.js";
 import { getStoragePath } from "./storage.js";
 import { captureAuthorityRevision } from "./storage/authority-revision.js";
 import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
@@ -127,7 +127,7 @@ export class RefreshQueue {
    * @param refreshToken - The refresh token to use
    * @returns Token result (success with new tokens, or failure)
    */
-  async refresh(refreshToken: string, storagePath = getStoragePath()): Promise<TokenResult> {
+  async refresh(refreshToken: string, storagePath = getStoragePath(), source?: FlaggedRefreshSource): Promise<TokenResult> {
     this.cleanup();
     let token = refreshToken;
     refreshToken = `${storagePath}\0${token}`;
@@ -137,6 +137,9 @@ export class RefreshQueue {
     if (unsettled) {
       token = unsettled.token;
     }
+    let ownerCurrent: ReturnType<typeof captureQueuedRefreshAuthority>;
+    try { ownerCurrent = captureQueuedRefreshAuthority(storagePath, existing ? refreshToken.slice(storagePath.length + 1) : token, source, unsettled?.error); }
+    catch (error) { throw unsettled?.error ?? error; }
 
     // Check for existing in-flight refresh (direct match)
     if (existing && !unsettled) {
@@ -144,7 +147,9 @@ export class RefreshQueue {
         tokenSuffix: tokenFingerprint(refreshToken),
         waitingMs: Date.now() - existing.startedAt,
       });
-      return existing.promise;
+      const result = await existing.promise;
+      if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh follower authority changed"), {code: "ESTALE"}));
+      return result;
     }
 
     if (!existing && this.pending.size >= MAX_PENDING_AUTH_ENTRIES) throw new PendingAuthCapacityError();
@@ -195,7 +200,8 @@ export class RefreshQueue {
         const cached = unsettled?.error.result ?? (lease?.role === "follower" ? lease.result : undefined);
         if (!authorityCurrent()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
         const result = await withPendingAuthRefresh(storagePath, token, () =>
-          cached ? Promise.resolve(cached) : this.executeRefreshWithRotationTracking(token, storagePath), unsettled?.error);
+          cached ? Promise.resolve(cached) : this.executeRefreshWithRotationTracking(token, storagePath), unsettled?.error, source);
+        if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh publication authority changed"), {code: "ESTALE"}));
         try {
           await lease?.release(result);
         } catch (error) {
@@ -235,7 +241,9 @@ export class RefreshQueue {
     });
 
     try {
-      return await promise;
+      const result = await promise;
+      if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh owner authority changed"), {code: "ESTALE"}));
+      return result;
     } finally {
       const entry = this.pending.get(refreshToken);
       if (!entry || (entry.generation === generation && entry.stage !== "unsettled")) {
@@ -453,6 +461,6 @@ export function resetRefreshQueue(): void {
  * @param refreshToken - The refresh token to use
  * @returns Token result
  */
-export async function queuedRefresh(refreshToken: string, storagePath = getStoragePath()): Promise<TokenResult> {
-  return getRefreshQueue().refresh(refreshToken, storagePath);
+export async function queuedRefresh(refreshToken: string, storagePath = getStoragePath(), source?: FlaggedRefreshSource): Promise<TokenResult> {
+  return getRefreshQueue().refresh(refreshToken, storagePath, source);
 }

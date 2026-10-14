@@ -106,6 +106,12 @@ export class CircuitBreaker {
 			(receipt.halfOpen ? this.state === "half-open" : this.state === "closed");
 	}
 
+	captureClosedState(): () => boolean {
+		const epoch = this.epoch;
+		const closed = this.state === "closed";
+		return () => closed && this.state === "closed" && this.epoch === epoch;
+	}
+
 	canExecute(): boolean {
 		const result = this.tryCanExecute();
 		if (result.ok) return true;

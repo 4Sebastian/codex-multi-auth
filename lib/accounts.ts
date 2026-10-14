@@ -2,7 +2,9 @@ import { mergeAccountCooldown, mergeAccountRateLimits, mergeAccountSnapshot, mer
 import type { Auth } from "@codex-ai/sdk";
 import { deriveAccountRecordId, resolveAccountRecordId } from "./storage/record-identity.js";
 export { resolveAccountRecordId } from "./storage/record-identity.js";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { AnyAccountStorageSchema } from "./schemas.js";
+import { migrateV1ToV3 } from "./storage/migrations.js";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
 import { applyPendingAuth, captureRefreshCredentialAuthority, getPendingAuthPath, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthSettlementError, withRefreshCredentialRetention } from "./storage/pending-auth.js";
 import { isSameNativeAccount } from "./runtime/native-account-sync.js";
@@ -1155,9 +1157,9 @@ export class AccountManager {
 		family: ModelFamily,
 		model?: string | null,
 		admission?: CircuitAdmissionReceipt,
-	): void {
+	): boolean {
 		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
-		if (admission && !breaker.isAdmissionCurrent(admission)) return;
+		if (admission ? !breaker.isAdmissionCurrent(admission) : breaker.getState() !== "closed") return false;
 		const quotaKey = model ? `${family}:${model}` : family;
 		const healthTracker = getHealthTracker();
 		healthTracker.recordSuccess(getRuntimeTrackerKey(account), quotaKey);
@@ -1181,7 +1183,18 @@ export class AccountManager {
 		if (healed) {
 			this.saveToDiskDebounced();
 		}
-		breaker.recordSuccess(admission);
+		if (admission) breaker.recordSuccess(admission);
+		return true;
+	}
+
+	captureRefreshHealth(account: ManagedAccount, family: ModelFamily): () => boolean {
+		const breaker = getCircuitBreaker(getAccountCircuitKey(account));
+		const current = breaker.captureClosedState();
+		return () => {
+			if (this.getAccountByIndex(account.index) !== account || getCircuitBreaker(getAccountCircuitKey(account)) !== breaker || !current()) return false;
+			getHealthTracker().recordSuccess(getRuntimeTrackerKey(account), family);
+			return true;
+		};
 	}
 
 	recordRateLimit(
@@ -2515,23 +2528,38 @@ export class AccountManager {
 		persistChanges = true,
 	): Promise<boolean> {
 		const storagePath = this.resolveSelectionStoragePath();
+		if (this.hadPersistedStorage && !existsSync(storagePath)) return false;
+		// The queued transaction may follow a metadata-only pool publication.
+		// Validate the submitted binding against its one fresh locked snapshot;
+		// a reset across that wait is never a metadata revalidation.
+		const sourceCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(storagePath)]);
 		return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
+			if (!sourceCurrent()) return false;
 			const revisionCurrent = captureAuthorityRevision([storagePath, getPendingAuthPath(storagePath)], [getIntentionalResetMarkerPath(storagePath)]);
 			if (!revisionCurrent()) return false;
 			const primaryExists = existsSync(this.resolveSelectionStoragePath());
 			if (this.hadPersistedStorage && !primaryExists) return false;
 			if (!await this.isAccountJournalEligible(account)) return false;
-			if (current && primaryExists) {
+			if (primaryExists) {
+				if (!current) return false;
+				// Normalization drops orphaned revocation codes. They still deny
+				// healing of that exact durable generation, never a recovered one.
+				const stored = AnyAccountStorageSchema.parse(JSON.parse(readFileSync(storagePath, "utf8")));
+				const primary = stored.version === 3 ? stored : migrateV1ToV3(stored);
+				if (primary.accounts.some(row => isSameNativeAccount(account, row) &&
+					row.accessToken === submitted.accessToken && row.refreshToken === submitted.refreshToken && row.expiresAt === submitted.expiresAt &&
+					(row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined))) return false;
 				const matches = current.accounts.filter(row => isSameNativeAccount(account, row));
 				const row = matches.length === 1 ? matches[0] : undefined;
-				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.expiresAt !== submitted.expiresAt || row.enabled === false ||
+				if (!row || row.accessToken !== submitted.accessToken || row.refreshToken !== submitted.refreshToken || row.expiresAt !== submitted.expiresAt || row.enabled === false || row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined ||
 					(submitted.accountId && (row.workspaces?.length
 						? !row.workspaces.some(workspace => workspace.id === submitted.accountId && workspace.enabled !== false)
 						: (row.accountId?.trim() || extractAccountId(row.accessToken)?.trim()) !== submitted.accountId))) return false;
 			}
 			if (this.getAccountByIndex(account.index) !== account || account.recordId !== submitted.recordId ||
 				account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return false;
-			if (!revisionCurrent() || this.resolveSelectionStoragePath() !== storagePath) return false;
+			if (!sourceCurrent() || !revisionCurrent() || this.resolveSelectionStoragePath() !== storagePath) return false;
+			this.syncWorkspaceSelections(current);
 			if (mutate() === false) return false;
 			if (!persistChanges) return true;
 			this.reconcileSelectionFromDisk();
