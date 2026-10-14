@@ -6723,7 +6723,10 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 describe("commit-window and receipt cancellation regressions", () => {
 	it.each(["shared", "api/shared", "zdr/shared", "catalog", "upgrade", "turn"].flatMap(target => ["save", "refresh"].map(mode => ({target, mode}))))("rejects a snapshot captured inside the write window %j", async ({target, mode}) => {
 		let disk = createStorage(Date.now(), 2);
+		writeAccountSourceFixture(disk);
+		const actualStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
 		const manager = new AccountManager(undefined, structuredClone(disk));
+		const sourcePath = manager.resolveSelectionStoragePath();
 		const {calls, fetchImpl} = createRecordingFetch(() => Response.json({models: [{slug: "shared"}], data: [{id: "shared"}]}));
 		const NativeGateway = websocketTransport.ResponsesWebSocketGateway;
 		const transport = vi.spyOn(websocketTransport, "ResponsesWebSocketGateway").mockImplementation(function(...args) {
@@ -6740,7 +6743,11 @@ describe("commit-window and receipt cancellation regressions", () => {
 		const writeReady = new Promise<void>(resolve => {writing = resolve;});
 		const readGate = new Promise<void>(resolve => {releaseRead = resolve;});
 		const readReady = new Promise<void>(resolve => {reading = resolve;});
-		withAccountStorageTransactionMock.mockImplementation(async handler => handler(structuredClone(disk), async committed => {writing(); await writeGate; disk = structuredClone(committed);}));
+		withAccountStorageTransactionMock.mockImplementation(async handler => {
+			// Retired managers may still flush another fixture's path. They cannot write this fixture's injected store.
+			if (getStoragePath() !== sourcePath) return actualStorage.withAccountStorageTransaction(handler);
+			return handler(structuredClone(disk), async committed => {writing(); await writeGate; disk = structuredClone(committed);});
+		});
 		writeAccountSourceFixture(disk, manager.resolveSelectionStoragePath());
 		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(manager.getAccountByIndex(1)!, {type: "oauth", access: "new-access-2", refresh: "new-refresh-2", expires: Date.now() + 7200000});
 		await writeReady;
@@ -6765,27 +6772,34 @@ describe("commit-window and receipt cancellation regressions", () => {
 	});
 
 	it("cancels an unsent B during policy preparation and preserves D", async () => {
+		const actualStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		withAccountStorageTransactionMock.mockImplementation(actualStorage.withAccountStorageTransaction);
 		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow");
 		let release!: () => void, preparing!: () => void;
 		const gate = new Promise<void>(resolve => {release = resolve;});
-		const ready = new Promise<void>(resolve => {preparing = resolve;});
+		let preparingB = false;
+		const ready = new Promise<void>(resolve => {preparing = () => {preparingB = true; resolve();};});
 		const evaluate = runtimePolicy.evaluateRuntimePolicy;
 		const policy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockImplementation(async input => {const result = await evaluate(input); if (input.model === "B-model") {preparing(); await gate;} return result;});
 		const sent: string[] = [], completed: string[] = [];
 		const upstream = await startTestWebSocketUpstream({onConnection: ws => ws.on("message", raw => {const body = JSON.parse(raw.toString()); if (body.type !== "response.create") return; sent.push(body.input[0]); ws.send(JSON.stringify({type: "response.completed", response: {id: body.input[0], usage: {input_tokens: 10, output_tokens: 2}}}));})});
-		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const storage = createStorage(Date.now(), 1);
+		writeAccountSourceFixture(storage);
+		const manager = new AccountManager(undefined, storage);
 		const proxy = await startProxy({accountManager: manager, fetchImpl: fetch, options: {upstreamBaseUrl: upstream.baseUrl}});
 		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
 		try {
 			client.on("message", raw => {const event = JSON.parse(raw.toString()); if (event.type === "response.completed") completed.push(event.response.id);});
 			client.send(JSON.stringify({type: "response.create", model: "A-model", input: ["A"]}));
 			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
-			client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]})); await ready;
+			client.send(JSON.stringify({type: "response.create", model: "B-model", input: ["B"]}));
+			await vi.waitFor(() => expect(preparingB, JSON.stringify({sent, completed, status: proxy.getStatus(), accounts: manager.getAccountsSnapshot(), rows: append.mock.calls})).toBe(true));
+			await ready;
 			client.send(JSON.stringify({type: "response.cancel"}));
 			client.send(JSON.stringify({type: "response.create", model: "D-model", input: ["D"]}));
 			await vi.waitFor(() => expect(append.mock.calls.filter(([row]) => row.model === "B-model").map(([row]) => row.outcome)).toEqual(["cancelled"]));
 			release();
-			await vi.waitFor(() => expect(completed).toEqual(["A", "D"]));
+			await vi.waitFor(() => expect(completed, JSON.stringify({sent, status: proxy.getStatus(), accounts: manager.getAccountsSnapshot()})).toEqual(["A", "D"]));
 			expect(sent).toEqual(["A", "D"]);
 			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(3));
 		} finally {client.terminate(); release(); await upstream.close(); append.mockRestore(); policy.mockRestore();}

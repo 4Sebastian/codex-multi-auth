@@ -307,13 +307,13 @@ export function withStreamingFailover(
 		pull() {
 			signalDemand();
 		},
-		cancel() {
+		async cancel() {
 			closed = true;
 			// Release a parked pump so it observes `closed` and unwinds instead
 			// of holding the upstream reader open for a demand that never comes.
 			signalDemand();
 			if (releaseCurrentReaderForCancel) {
-				void releaseCurrentReaderForCancel();
+				await releaseCurrentReaderForCancel();
 			}
 		},
 	});

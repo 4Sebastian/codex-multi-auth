@@ -10,7 +10,7 @@ export interface StreamUsageDeferral<TRow> {
 	 * `fallbackMs` without them. Only the first pending row is held.
 	 */
 	defer: (completion: TRow) => void;
-	complete: (completion: TRow) => void;
+	complete: (completion: TRow) => Promise<void>;
 }
 
 /**
@@ -32,7 +32,7 @@ export interface StreamUsageDeferral<TRow> {
  * importing the policy layer that imports it back.
  */
 export function createStreamUsageDeferral<TRow extends object>(options: {
-	record: (completion: TRow & Partial<UsageTokenCounts>) => void;
+	record: (completion: TRow & Partial<UsageTokenCounts>) => void | Promise<void>;
 	fallbackMs: number;
 	/** Injectable for tests; defaults to an unref'd setTimeout. */
 	schedule?: (run: () => void, ms: number) => { cancel: () => void };
@@ -49,6 +49,7 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 	let captured: UsageTokenCounts | null = null;
 	let pending: TRow | null = null;
 	let recorded = false;
+	let settlement = Promise.resolve();
 	let timer: { cancel: () => void } | null = null;
 
 	const flush = (usage: UsageTokenCounts | null): void => {
@@ -58,7 +59,7 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 		timer = null;
 		if (!completion || recorded) return;
 		recorded = true;
-		options.record(usage ? { ...completion, ...usage } : completion);
+		settlement = Promise.resolve(options.record(usage ? { ...completion, ...usage } : completion));
 	};
 
 	return {
@@ -75,9 +76,11 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 			timer = schedule(() => flush(captured), options.fallbackMs);
 		},
 		complete: completion => {
-			if (recorded) return;
-			pending = completion;
-			flush(captured);
+			if (!recorded) {
+				pending = completion;
+				flush(captured);
+			}
+			return settlement;
 		},
 	};
 }

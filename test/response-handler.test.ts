@@ -783,6 +783,25 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 	});
 
 	describe('attachResponseIdCapture', () => {
+		it("cancels an abandoned reader after owned settlement even when it rejects", async () => {
+			vi.useFakeTimers();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const cancel = vi.fn();
+			const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'));}, cancel});
+			const usage = vi.fn(), completion = vi.fn(async () => {await gate; throw Error("fixture settlement rejected");});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, usage, completion, 1000, 100);
+			try {
+				await vi.advanceTimersByTimeAsync(101);
+				expect(completion).toHaveBeenCalledOnce();
+				expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+				expect(cancel).not.toHaveBeenCalled();
+				release();
+				await expect(response.text()).rejects.toThrow(/abandoned/);
+				expect(cancel).toHaveBeenCalledOnce();
+				expect(body.locked).toBe(false);
+			} finally {release(); vi.useRealTimers();}
+		});
 		it.each(["completed", "failed", "error", "eof"])("settles observed terminal %s without losing bytes or billed tokens", async type => {
 			const usage = vi.fn(), completion = vi.fn(async () => {});
 			const payload = type === "eof" ? 'data: {"type":"response.created","response":{"id":"held"}}\n\n' :

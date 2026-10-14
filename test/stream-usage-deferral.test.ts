@@ -46,6 +46,22 @@ function harness() {
 }
 
 describe("createStreamUsageDeferral", () => {
+	it("awaits the same owned ledger write on repeated completion", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const record = vi.fn(() => gate);
+		const deferral = createStreamUsageDeferral<Row>({record, fallbackMs: 900000});
+		const first = deferral.complete(ROW), second = deferral.complete(ROW);
+		expect(first).toBe(second);
+		let settled = false;
+		void first.then(() => {settled = true;});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		expect(record).toHaveBeenCalledOnce();
+		release(); await second;
+		expect(settled).toBe(true);
+	});
+
 	it("writes the deferred row with token counts once usage arrives", () => {
 		const { deferral, record, cancel } = harness();
 

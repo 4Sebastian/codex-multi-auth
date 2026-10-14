@@ -206,7 +206,7 @@ export async function discoverModelInventory(
 				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
 				if (loss !== undefined && (value.observedLossAt ?? -Infinity) < loss && value.at > loss) continue;
 				const disk = merged.get(key);
-				if (!disk || disk.at <= value.at) merged.set(key, value);
+				if (!disk || disk.at <= value.at || (loss !== undefined && (value.observedLossAt ?? -Infinity) >= loss && (disk.observedLossAt ?? -Infinity) < loss)) merged.set(key, value);
 			}
 			for (const value of merged.values()) {
 				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;

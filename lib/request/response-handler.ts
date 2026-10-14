@@ -937,6 +937,7 @@ function createResponseIdCapturingStream(
 	onUsage?: (usage: UsageTokenCounts) => void,
 	onCompletion?: (completion: StreamCompletion) => Promise<void>,
 	streamStallTimeoutMs = DEFAULT_STREAM_STALL_TIMEOUT_MS,
+	streamIdleTimeoutMs?: number,
 ): ReadableStream<Uint8Array> {
 	const reader = body.getReader();
 	const state = createParsedResponseState();
@@ -967,35 +968,67 @@ function createResponseIdCapturingStream(
 	};
 	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => outcome.observe(event)});
 	let finished = false;
-	const finish = async (failure?: "failure" | "cancelled") => {
-		if (finished) return;
+	let finishing: Promise<void> | undefined;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	let released = false;
+	const release = () => {
+		if (released) return;
+		released = true;
+		reader.releaseLock();
+	};
+	const finish = (failure?: "failure" | "cancelled"): Promise<void> => {
+		if (finishing) return finishing;
 		finished = true;
-		captureLines();
-		const usage = scanner.result();
-		try {if (usage && onCompletion) onUsage?.(usage);}
-		catch (error) {log.warn("Accepted stream usage could not be settled", {error});}
-		const completion = outcome.finish();
-		try {await onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
-		catch (error) {log.warn("Accepted stream completion could not be settled", {error});}
+		clearTimeout(idleTimer);
+		finishing = (async () => {
+			captureLines();
+			const usage = scanner.result();
+			try {if (usage && onCompletion) onUsage?.(usage);}
+			catch (error) {log.warn("Accepted stream usage could not be settled", {error});}
+			const completion = outcome.finish();
+			try {await onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
+			catch (error) {log.warn("Accepted stream completion could not be settled", {error});}
+		})();
+		return finishing;
+	};
+	const armIdleTimeout = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+		clearTimeout(idleTimer);
+		if (streamIdleTimeoutMs === undefined || finished) return;
+		idleTimer = setTimeout(() => {
+			const error = Error("Accepted stream abandoned without read progress");
+			void (async () => {
+				try {await finish("failure");}
+				finally {
+					await reader.cancel(error).catch(() => undefined);
+					release();
+					controller.error(error);
+				}
+			})();
+		}, streamIdleTimeoutMs);
+		idleTimer.unref?.();
 	};
 	return new ReadableStream<Uint8Array>({
+		start(controller) {armIdleTimeout(controller);},
 		async pull(controller) {
 			try {
 				const {done, value} = await readWithTimeout(reader, streamStallTimeoutMs);
+				if (finished) return;
 				if (done) {
 					await finish();
-					reader.releaseLock();
+					release();
 					controller.close();
 				} else if (value) {
 					captureLines(value);
 					scanner.push(value);
+					if (value.byteLength > 0) armIdleTimeout(controller);
 					controller.enqueue(value);
 				}
 			} catch (error) {
+				if (finished) return;
 				try {await finish("failure");}
 				finally {
 					await reader.cancel(error).catch(() => undefined);
-					reader.releaseLock();
+					release();
 					controller.error(error);
 				}
 			}
@@ -1004,7 +1037,7 @@ function createResponseIdCapturingStream(
 			try {await finish("cancelled");}
 			finally {
 				await reader.cancel(reason).catch(() => undefined);
-				reader.releaseLock();
+				release();
 			}
 		},
 	});
@@ -1109,6 +1142,7 @@ export function attachResponseIdCapture(
 	onUsage?: (usage: UsageTokenCounts) => void,
 	onCompletion?: (completion: StreamCompletion) => Promise<void>,
 	streamStallTimeoutMs?: number,
+	streamIdleTimeoutMs?: number,
 ): Response {
 	if (!response.body || (!onResponseId && !onUsage && !onCompletion)) {
 		return new Response(response.body, {
@@ -1119,7 +1153,7 @@ export function attachResponseIdCapture(
 	}
 
 	return new Response(
-		createResponseIdCapturingStream(response.body, onResponseId, onUsage, onCompletion, streamStallTimeoutMs),
+		createResponseIdCapturingStream(response.body, onResponseId, onUsage, onCompletion, streamStallTimeoutMs, streamIdleTimeoutMs),
 		{
 			status: response.status,
 			statusText: response.statusText,

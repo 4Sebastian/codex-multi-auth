@@ -16,7 +16,7 @@ import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import * as refreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import * as refreshQueue from "../lib/refresh-queue.js";
 import {getPendingAuthPath, recordPendingAuth} from "../lib/storage/pending-auth.js";
-import {loadAccounts, setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
+import {loadAccounts, setStoragePathDirect, withAccountStorageTransaction, type AccountStorageV3} from "../lib/storage.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
 import {getAccountPolicyKey, getAccountPolicyPath, upsertAccountPolicy, updateAccountPolicyStore} from "../lib/account-policy.js";
 import {getBudgetGuardPath} from "../lib/budget-guard.js";
@@ -1280,12 +1280,17 @@ it("does not drain a closing channel before its terminal restriction settles", a
 	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (args[3] === false) return restrict(...args); entered.resolve(); await release.promise; return restrict(...args);});
 	f.setReply(ws => {ws.send(JSON.stringify({type: "response.failed", status: 503, response: {id: "A", status: "failed", error: {code: "server_error"}}})); ws.close();});
 	const ws = await f.connect(), first = turn(ws);
-	await entered.promise; await first;
-	const queued = turn(ws);
+	let exposed = false; void first.then(() => {exposed = true;});
+	await entered.promise;
+	const closed = once(ws, "close");
+	ws.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
 	await new Promise(resolve => setTimeout(resolve, 20));
+	expect(exposed).toBe(false);
 	expect(f.connections()).toBe(1);
 	release.resolve();
-	expect(await queued).toMatchObject({type: "error"});
+	expect(await first).toMatchObject({type: "response.failed"});
+	await closed;
+	expect(f.connections()).toBe(1);
 	expect(f.creates).toHaveLength(1);
 });
 
@@ -1947,6 +1952,50 @@ it.each(["primary", "secondary"].flatMap(window => [false, true].flatMap(native 
 	const next = await f.post(); const text = await next.text();
 	expect(next.status, text).not.toBe(200);
 	expect(native ? f.creates.length : f.fetched.length).toBe(1);
+});
+
+it.each(["success", "failure", "journal", "primary", "trailing"])("holds custom terminal bytes until owned settlement (%s)", async mode => {
+	const f = await fixture(false), ready = deferred(), entered = deferred(), release = deferred();
+	cleanups.push(async () => {release.resolve();});
+	let upstream: WebSocket | undefined;
+	f.setReply(ws => {upstream = ws; ready.resolve();});
+	const client = await f.connect();
+	const received: string[] = [];
+	client.on("message", data => received.push(String(data)));
+	client.send(JSON.stringify({type: "response.create", model: "shared", input: []}));
+	await ready.promise;
+	const account = f.manager.getAccountByIndex(0)!;
+	account.consecutiveAuthFailures = 2;
+	const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+	const locked = withAccountStorageTransaction(async () => {entered.resolve(); await release.promise;});
+	await entered.promise;
+	const transactionEntered = deferred();
+	const original = f.manager.withCurrentAccountCredential.bind(f.manager);
+	vi.spyOn(f.manager, "withCurrentAccountCredential").mockImplementation((...args) => {transactionEntered.resolve(); return original(...args);});
+	const terminal = JSON.stringify({type: mode === "success" ? "response.completed" : "response.failed", status: mode === "success" ? 200 : 503, response: {id: "held-terminal", status: mode === "success" ? "completed" : "failed", error: mode === "success" ? undefined : {code: "server_error"}, usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}}});
+	upstream!.send(terminal);
+	const trailing = JSON.stringify({type: "fixture.trailing", value: "original bytes"});
+	if (mode === "trailing") upstream!.send(trailing);
+	await transactionEntered.promise;
+	await new Promise(resolve => setTimeout(resolve, 20));
+	expect(received).toEqual([]);
+	expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
+	if (mode === "journal") await fs.writeFile(getPendingAuthPath(f.path), "{");
+	if (mode === "primary") await fs.writeFile(f.path, "{");
+	release.resolve(); await locked;
+	await vi.waitFor(() => expect(received).toEqual(mode === "trailing" ? [terminal, trailing] : [terminal]));
+	const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+	expect(rows).toHaveLength(1);
+	expect(rows[0]).toMatchObject({outcome: mode === "success" ? "success" : "failure", account: {index: 0}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+	if (mode === "success") expect(account.consecutiveAuthFailures).toBe(0);
+	if (mode === "failure") expect(account.cooldownReason).toBe("server-error");
+	if (mode === "journal" || mode === "primary") {
+		expect(f.proxy.getStatus().lastError).not.toBeNull();
+		expect(account.cooldownReason).toBeUndefined();
+	}
+	expect(f.creates).toHaveLength(1);
+	if (mode === "journal") await fs.unlink(getPendingAuthPath(f.path));
+	if (mode === "primary") await fs.writeFile(f.path, JSON.stringify(f.pool));
 });
 
 it.each(["http", "custom", "native"].flatMap(transport => ["healthy", "credential", "expiry", "disable", "workspace", "revocation", "revocation-code", "reset", "journal"].map(change => ({transport, change}))))

@@ -2693,15 +2693,28 @@ function bridgeWebSocketConnection(
 			boundIsPinned = connected.prepared.isPinned;
 			boundAuthority = captureDispatchBinding(connected.prepared.accountManager, connected.prepared.account, connected.prepared.accessToken, connected.prepared.accountId);
 			state.status.streamsStarted += 1;
-			connectedUpstream.on("message", (data, isBinary) => {
+			const heldMessages: Array<{data: RawData; isBinary: boolean}> = [];
+			let heldBytes = 0;
+			const forwardMessage = (data: RawData, isBinary: boolean): void => {
 				if (closed || upstream !== connectedUpstream) return;
+				if (settlingTurn) {
+					const bytes = rawDataToBuffer(data).byteLength;
+					if (heldMessages.length >= MAX_QUEUED_WEBSOCKET_FRAMES || heldBytes + bytes > state.maxRequestBodyBytes) {
+						heldMessages.length = 0;
+						heldBytes = 0;
+						rejectConnection(new Error("WebSocket buffer exceeded during terminal settlement"));
+						return;
+					}
+					heldMessages.push({data, isBinary});
+					heldBytes += bytes;
+					return;
+				}
 				const terminal = websocketTerminalUsage(data);
 				if (terminal) {
 					const settled = activeRequests.shift();
 					if (settled) {
-						const restriction = terminal.record.outcome === "success"
-							? applyWebSocketTerminalAccountSuccess(state, settled, terminal)
-							: applyWebSocketTerminalAccountFailure(state, settled, terminal);
+						settlingTurn = true;
+						connectedUpstream.pause();
 						if (
 							settled.request.context.stableSessionKey &&
 							settled.request.context.model &&
@@ -2718,27 +2731,46 @@ function bridgeWebSocketConnection(
 								},
 							);
 						}
-						settlingTurn = true;
 						void (async () => {
+							let failure: {error: unknown} | undefined;
 							try {
-								await restriction;
-							} finally {
-								await settled.request.usageRecorder.record({...terminal.record, account: settled.submittedAccount});
-								settlingTurn = false;
+								if (terminal.record.outcome === "success") await applyWebSocketTerminalAccountSuccess(state, settled, terminal);
+								else await applyWebSocketTerminalAccountFailure(state, settled, terminal);
+							} catch (error) {failure = {error};}
+							try {await settled.request.usageRecorder.record({...terminal.record, account: settled.submittedAccount});}
+							catch (error) {failure ??= {error};}
+							if (failure) {
+								state.status.lastError = failure.error instanceof Error ? failure.error.message : String(failure.error);
+								proxyLog.warn("WebSocket terminal settlement could not be observed", {error: failure.error});
 							}
+							if (client.readyState === WebSocket.OPEN) {
+								if (terminal.tokenInvalidated) sendBuffered(client, JSON.stringify({type: "error", status: 401, error: {code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}}));
+								sendBuffered(client, data, isBinary);
+							}
+							if (terminal.tokenInvalidated) {
+								await settleAll("failure", "token_invalidated");
+								settlePending("failure", "token_invalidated");
+								closeBoth(WEBSOCKET_CLOSE_POLICY_VIOLATION, "OAuth token invalidated");
+							} else if (failure) {
+								settlePending("failure", "websocket_proxy_failed");
+								closeBoth(WEBSOCKET_CLOSE_TRY_AGAIN_LATER, "WebSocket terminal settlement unavailable");
+							}
+							settlingTurn = false;
+							while (!settlingTurn && heldMessages.length > 0) {
+								const held = heldMessages.shift();
+								if (!held) break;
+								heldBytes -= rawDataToBuffer(held.data).byteLength;
+								forwardMessage(held.data, held.isBinary);
+							}
+							if (!settlingTurn) connectedUpstream.resume();
 							drainPending();
 						})().catch(rejectConnection);
+						return;
 					}
 				}
-				if (terminal?.record.outcome === "failure" && terminal.tokenInvalidated) {
-					if (client.readyState === WebSocket.OPEN) sendBuffered(client, JSON.stringify({type: "error", status: 401, error: {code: "token_invalidated", message: "OAuth token has been invalidated. Please re-login."}}));
-					void settleAll("failure", "token_invalidated").catch(rejectConnection);
-					settlePending("failure", "token_invalidated");
-					closeBoth(WEBSOCKET_CLOSE_POLICY_VIOLATION, "OAuth token invalidated");
-					return;
-				}
 				if (client.readyState === WebSocket.OPEN) sendBuffered(client, data, isBinary);
-			});
+			};
+			connectedUpstream.on("message", forwardMessage);
 			connectedUpstream.on("close", () => {
 				void (async () => {
 					if (closed || upstream !== connectedUpstream) return;

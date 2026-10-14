@@ -763,6 +763,138 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 	});
 
 
+	it.each(["active", "abandoned", "partial-abandoned", "never-consumed", "cancelled", "reader-error", "ledger-held", "ledger-failed", "fallback-429", "fallback-500"])("settles actual plugin stream lifecycle once (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-stream-lifecycle-")), path = join(dir, "accounts.json");
+		const fallback = mode.startsWith("fallback-");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "stream-owner", accountId: "W1", refreshToken: "refresh-stream", accessToken: "access-stream", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: "stream-fallback", accountId: "W2", refreshToken: "refresh-fallback", accessToken: "access-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 1 : 0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const usageModule = await import("../lib/usage/index.js");
+		const {readUsageLedgerRows, summarizeUsageRows} = usageModule;
+		let releaseLedger: () => void = () => undefined, enteredLedger: () => void = () => undefined;
+		const ledgerGate = new Promise<void>(resolve => {releaseLedger = resolve;});
+		const ledgerReady = new Promise<void>(resolve => {enteredLedger = resolve;});
+		const ledgerError = Error("fixture original ledger failure");
+		const ledgerWarning = vi.spyOn(await import("../lib/logger.js"), "logWarn");
+		if (mode === "ledger-held" || mode === "ledger-failed") {
+			const append = usageModule.appendUsageLedgerRow;
+			vi.spyOn(usageModule, "appendUsageLedgerRow").mockImplementation(async row => {
+				enteredLedger(); await ledgerGate;
+				if (mode === "ledger-failed") throw ledgerError;
+				return append(row);
+			});
+		}
+		const {evaluateBudgetGuard} = await import("../lib/budget-guard.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const rateLimit = vi.spyOn(manager, "recordRateLimit"), failure = vi.spyOn(manager, "recordFailure");
+		const capability = vi.spyOn((await import("../lib/capability-policy.js")).CapabilityPolicyStore.prototype, "recordFailure");
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const cancel = vi.fn();
+		const originalError = Error("fixture original streaming reader error");
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback) {
+				if (bearer === "Bearer access-stream") return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"Retry-After": "60"}});
+				expect(bearer).toBe("Bearer access-fallback");
+				return Response.json({error: {code: mode === "fallback-429" ? "usage_limit_reached" : "server_error"}}, {status: mode === "fallback-429" ? 429 : 500, headers: {"Retry-After": "60"}});
+			}
+			vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "Date"]});
+			return new Response(new ReadableStream<Uint8Array>({start(value) {
+				controller = value;
+				value.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({type: "response.created", response: {id: "long-lived", ...(mode === "partial-abandoned" ? {usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}} : {})}})}\n\n`));
+			}, cancel}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-stream", refresh: "refresh-stream", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			if (fallback) {
+				expect(response.status).toBe(mode === "fallback-429" ? 429 : 500);
+				await response.text();
+				expect(fetch).toHaveBeenCalledTimes(2);
+				if (mode === "fallback-429") {
+					expect(rateLimit.mock.calls.filter(([owner]) => owner === account)).toHaveLength(1);
+					expect(account.rateLimitResetTimes["gpt-5.2:gpt-5.1"]).toBeGreaterThan(Date.now());
+					expect(failure).not.toHaveBeenCalled();
+					expect(capability).not.toHaveBeenCalled();
+				} else {
+					expect(failure).toHaveBeenCalledWith(account, "gpt-5.2", "gpt-5.1", expect.objectContaining({halfOpen: false}));
+					expect(capability).toHaveBeenCalledTimes(1);
+					expect(account.cooldownReason).toBe("server-error");
+				}
+			} else {
+				reader = response.body!.getReader();
+				if (mode !== "never-consumed") await reader.read();
+				if (mode === "active" || mode.startsWith("ledger-")) {
+					for (let i = 0; i < (mode === "active" ? 96 : 0); i++) {
+						await vi.advanceTimersByTimeAsync(10000);
+						controller.enqueue(new TextEncoder().encode(': real progress\n\n'));
+						await reader.read();
+					}
+					expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
+					controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"id":"long-lived","status":"completed","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n'));
+					controller.close();
+					const drain = (async () => {
+						let next = await reader!.read();
+						while (!next.done) next = await reader!.read();
+					})();
+					if (mode.startsWith("ledger-")) {
+						await ledgerReady;
+						let drained = false; void drain.then(() => {drained = true;});
+						expect(drained).toBe(false);
+						expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
+						releaseLedger();
+					}
+					await drain;
+				} else if (mode === "cancelled") await reader.cancel();
+				else if (mode === "reader-error") {
+					controller.error(originalError);
+					await expect(reader.read()).rejects.toBe(originalError);
+				} else {
+					await vi.advanceTimersByTimeAsync(900001);
+					vi.useRealTimers();
+					await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+					await expect((async () => {while (!(await reader!.read()).done) { /* Drain any prefetched bytes before the settled error. */ }})()).rejects.toThrow(/abandoned|stalled/);
+				}
+				expect(fetch).toHaveBeenCalledOnce();
+				if (mode !== "active" && !mode.startsWith("ledger-")) expect(cancel).toHaveBeenCalledTimes(mode === "reader-error" ? 0 : 1);
+			}
+			vi.useRealTimers();
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+			if (mode === "ledger-failed") {
+				expect(rows).toEqual([]);
+				expect(ledgerWarning).toHaveBeenCalledWith("Usage ledger settlement failed", {error: ledgerError});
+				return;
+			}
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({outcome: mode === "active" || mode === "ledger-held" ? "success" : mode === "cancelled" ? "cancelled" : "failure", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 17 : 0, outputTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 4 : 0, totalTokens: mode === "active" || mode === "ledger-held" || mode === "partial-abandoned" ? 21 : 0}});
+			const summary = summarizeUsageRows(rows);
+			expect(evaluateBudgetGuard({key: "*", window: "day", maxRequests: 1, updatedAt: 1}, summary).allowed).toBe(false);
+			if (mode === "active") expect(evaluateBudgetGuard({key: "*", window: "day", maxTokens: 21, updatedAt: 1}, summary).allowed).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			releaseLedger();
+			await reader?.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
 	it.each([false, true].flatMap(fallback => [false, true].flatMap(stream => ["healthy", "journal", "primary", "revocation", "circuit", "failed", "error", "eof", ...(!stream ? ["reader", "stall"] : [])].map(change => ({fallback, stream, change})))) )("preserves accepted plugin outcomes without unauthorized healing (%j)", async ({fallback, stream, change}) => {
 		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
 		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");

@@ -295,6 +295,7 @@ export async function handleSuccessResponse(
 		onUsage?: (usage: UsageTokenCounts) => void;
 		onCompletion?: (completion: import("./response-outcome.js").StreamCompletion) => Promise<void>;
 		streamStallTimeoutMs?: number;
+		streamIdleTimeoutMs?: number;
 	},
 ): Promise<Response> {
     // Check for deprecation headers (RFC 8594) — see logDeprecationHeaders.
@@ -307,6 +308,7 @@ export async function handleSuccessResponse(
 		return await convertSseToJson(response, responseHeaders, options);
 	}
 
+	if (!response.body) await options?.onCompletion?.({success: false, outcome: "failure", errorCode: "upstream_missing_terminal", missingTerminal: true});
 	// For streaming requests (streamText), return stream as-is
 	return attachResponseIdCapture(
 		response,
@@ -315,6 +317,7 @@ export async function handleSuccessResponse(
 		options?.onUsage,
 		options?.onCompletion,
 		options?.streamStallTimeoutMs,
+		options?.streamIdleTimeoutMs,
 	);
 }
 

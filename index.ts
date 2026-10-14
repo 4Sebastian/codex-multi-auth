@@ -151,13 +151,7 @@ import {
 } from "./lib/policy/runtime-policy.js";
 import { createStreamUsageDeferral } from "./lib/usage/stream-usage-deferral.js";
 
-/**
- * How long a streaming request's usage-ledger row may wait for the upstream
- * `usage` event before it is written without token counts. Long enough not to
- * truncate a genuinely slow completion; the timer is unref'd so it never holds
- * the process open. See createStreamUsageDeferral.
- */
-const USAGE_STREAM_RECORD_FALLBACK_MS = 15 * 60_000;
+const USAGE_STREAM_IDLE_TIMEOUT_MS = 15 * 60_000;
 import {
 	getModelFamily,
 	MODEL_FAMILIES,
@@ -180,7 +174,6 @@ import {
 } from "./lib/recovery.js";
 import { RefreshGuardian } from "./lib/refresh-guardian.js";
 import type { CircuitAdmissionReceipt } from "./lib/circuit-breaker.js";
-import { isRecord } from "./lib/utils.js";
 import { queuedRefresh } from "./lib/refresh-queue.js";
 import { createAccountDispatch } from "./lib/request/account-dispatch.js";
 import { isFlaggedRecoverySourceCurrent, PendingAuthLocalError, withRefreshCredentialRetention } from "./lib/storage/pending-auth.js";
@@ -194,7 +187,6 @@ import {
 } from "./lib/request/request-attempt-budget.js";
 import {
 	armPoolExhaustionCooldown,
-	buildAdaptiveStreamFailoverCandidateOrder,
 	clearPoolExhaustionCooldown,
 	clearServerBurstCooldown,
 	getPoolExhaustionCooldownRemaining,
@@ -991,18 +983,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 						): Promise<Response> {
 							let usageRecorder: RuntimeUsageRecorder | null = null;
 							let usageCompletion: RuntimeUsageRecordInput | null = null;
-							// A non-streaming response reports its token counts while
-							// handleSuccessResponse is still assembling the body, so they
-							// are folded straight into usageCompletion below. A streaming
-							// one reports them only as the client drains the body, long
-							// after the `finally` that writes the row — so that row is
-							// handed to the deferral instead of written empty.
 							const usageDeferral = createStreamUsageDeferral<RuntimeUsageRecordInput>(
 								{
-									record: (completion) => {
-										void usageRecorder?.record(completion);
+									record: async (completion) => {
+										await usageRecorder?.record(completion);
 									},
-									fallbackMs: USAGE_STREAM_RECORD_FALLBACK_MS,
+									fallbackMs: USAGE_STREAM_IDLE_TIMEOUT_MS,
 								},
 							);
 							try {
@@ -1678,10 +1664,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 										let shortRateLimitRetryCount = 0;
 										let shortRetryResponse: Response | undefined;
-										let successAccountForResponse = account;
-										let successSubmittedAccount = primarySubmittedAccount;
-										let successSubmittedCredential = primarySubmittedCredential;
-										let successAdmission = primaryAdmission;
 										let restrictionObservationFailed = false;
 										const observeRestrictionFailure = (error: unknown) => {
 											restrictionObservationFailed = true;
@@ -1691,7 +1673,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 										};
 										const applySubmittedRestriction = (mutate: () => boolean | void, persistChanges = false) =>
 											accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, mutate, persistChanges).catch(observeRestrictionFailure);
-										let successEntitlementAccountKey = entitlementAccountKey;
 										while (true) {
 											if (
 												!tryConsumeOutboundRequestAttempt(
@@ -1845,7 +1826,6 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												response.headers,
 												response.status,
 											);
-											let successQuotaSnapshot = quotaSnapshot;
 											if (quotaSnapshot && !response.ok) {
 												await applySubmittedRestriction(() => {
 													preemptiveQuotaScheduler.update(quotaScheduleKey, quotaSnapshot);
@@ -2090,7 +2070,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														}
 														return errorResponse;
 													} else {
-														const submittedWorkspace = successSubmittedAccount.workspaces?.find(workspace => workspace.id === primarySubmittedCredential.accountId);
+														const submittedWorkspace = primarySubmittedAccount.workspaces?.find(workspace => workspace.id === primarySubmittedCredential.accountId);
 														const workspaceName = submittedWorkspace?.name ?? primarySubmittedCredential.accountId ?? "unknown";
 
 														logWarn(
@@ -2259,7 +2239,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														rateLimit?.retryAfterMs ?? 60_000;
 													let cooldownMs = 0;
 													if (!await applySubmittedRestriction(() => {
-														const {delayMs} = getRateLimitBackoff(account.index, quotaKey, retryAfterMs, primarySubmittedCredential.accountId ?? successSubmittedAccount.email ?? null);
+														const {delayMs} = getRateLimitBackoff(account.index, quotaKey, retryAfterMs, primarySubmittedCredential.accountId ?? primarySubmittedAccount.email ?? null);
 														cooldownMs = Math.max(delayMs, retryAfterMs);
 														preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, cooldownMs);
 													})) return errorResponse;
@@ -2366,381 +2346,37 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											}
 
 											runtimeMetrics.cumulativeLatencyMs += fetchLatencyMs;
-											let responseForSuccess = response;
-											if (isStreaming) {
-												const streamFallbackCandidateOrder =
-													buildAdaptiveStreamFailoverCandidateOrder(
-														account.index,
-														accountSnapshotList as Array<
-															Pick<
-																import("./lib/accounts.js").ManagedAccount,
-																| "index"
-																| "lastUsed"
-																| "enabled"
-																| "coolingDownUntil"
-																| "rateLimitResetTimes"
-															>
-														>,
-													);
-												runtimeMetrics.lastStreamFailoverCandidateCount =
-													streamFallbackCandidateOrder.length;
-												runtimeMetrics.streamFailoverCandidatesConsidered +=
-													streamFallbackCandidateOrder.length;
-												logDebug("Prepared stream failover candidates.", {
-													requestTraceId,
-													primaryAccountIndex: account.index,
-													candidateCount: streamFallbackCandidateOrder.length,
-													candidateIndices: streamFallbackCandidateOrder,
-												});
-												syncRuntimeObservability(requestTraceId);
-												responseForSuccess = withStreamingFailover(
-													response,
-													async (failoverAttempt, emittedBytes) => {
-														if (abortSignal?.aborted) {
-															return null;
-														}
-														runtimeMetrics.streamFailoverAttempts += 1;
-
-														for (const candidateIndex of streamFallbackCandidateOrder) {
-															if (abortSignal?.aborted) {
-																return null;
-															}
-															if (
-																!accountManager.isAccountAvailableForFamily(
-																	candidateIndex,
-																	modelFamily,
-																	model,
-																)
-															) {
-																continue;
-															}
-
-															const fallbackAccount =
-																accountManager.getAccountByIndex(
-																	candidateIndex,
-																);
-															if (!fallbackAccount) continue;
-
-															let fallbackAuth = accountManager.toAuthDetails(
-																fallbackAccount,
-															) as OAuthAuthDetails;
-															try {
-																if (
-																	shouldRefreshToken(
-																		fallbackAuth,
-																		tokenRefreshSkewMs,
-																		accountManager.resolveSelectionStoragePath(),
-																	)
-																) {
-																	runtimeMetrics.authRefreshRequests += 1;
-																	syncRuntimeObservability(requestTraceId);
-																	fallbackAuth = (await refreshAndUpdateToken(
-																		fallbackAuth,
-																		client,
-																		{accountManager, account: fallbackAccount},
-																	)) as OAuthAuthDetails;
-																	await accountManager.commitRefreshedAuth(
-																		fallbackAccount,
-																		fallbackAuth,
-																	);
-																}
-															} catch (refreshError) {
-																if (refreshError instanceof PendingAuthLocalError) throw refreshError;
-																logWarn(
-																	`Stream failover refresh failed for account ${fallbackAccount.index + 1}.`,
-																	{
-																		error:
-																			refreshError instanceof Error
-																				? refreshError.message
-																				: String(refreshError),
-																	},
-																);
-																continue;
-															}
-
-															const fallbackStoredAccountId =
-																fallbackAccount.accountId;
-															const fallbackStoredAccountIdSource =
-																fallbackAccount.accountIdSource;
-															const fallbackStoredEmail = fallbackAccount.email;
-															const hadFallbackAccountId =
-																!!fallbackStoredAccountId;
-															const fallbackRuntimeIdentity =
-																resolveRuntimeRequestIdentity({
-																	storedAccountId: fallbackStoredAccountId,
-																	source: fallbackStoredAccountIdSource,
-																	storedEmail: fallbackStoredEmail,
-																	accessToken: fallbackAuth.access,
-																	idToken: fallbackAuth.idToken,
-																});
-															const fallbackTokenAccountId =
-																fallbackRuntimeIdentity.tokenAccountId;
-															const fallbackAccountId =
-																fallbackRuntimeIdentity.accountId;
-															if (!fallbackAccountId) {
-																continue;
-															}
-															const fallbackResolvedEmail =
-																fallbackRuntimeIdentity.email;
-															const fallbackEntitlementAccountKey =
-																resolveEntitlementAccountKey({
-																	accountId:
-																		fallbackStoredAccountId ??
-																		fallbackAccountId,
-																	email: fallbackResolvedEmail,
-																	refreshToken: fallbackAccount.refreshToken,
-																	index: fallbackAccount.index,
-																});
-															const fallbackEntitlementBlock =
-																entitlementCache.isBlocked(
-																	fallbackEntitlementAccountKey,
-																	model ?? modelFamily,
-																);
-															if (fallbackEntitlementBlock.blocked) {
-																runtimeMetrics.accountRotations++;
-																runtimeMetrics.lastError = `Entitlement cached block for account ${fallbackAccount.index + 1}`;
-																logWarn(
-																	`Skipping account ${fallbackAccount.index + 1} due to cached entitlement block (${formatWaitTime(fallbackEntitlementBlock.waitMs)} remaining).`,
-																);
-																continue;
-															}
-
-															if (
-																!tryConsumeOutboundRequestAttempt(
-																	"stream-failover",
-																	fallbackAccount.index,
-																)
-															) {
-																return null;
-															}
-															let fallbackAdmission: CircuitAdmissionReceipt | undefined;
-															if (
-																!accountManager.consumeToken(
-																	fallbackAccount,
-																	modelFamily,
-																	model,
-																	{onAdmission: receipt => { fallbackAdmission = receipt; }},
-																)
-															) {
-																continue;
-															}
-															fallbackAccount.accountId = fallbackAccountId;
-															if (
-																!hadFallbackAccountId &&
-																fallbackTokenAccountId &&
-																fallbackAccountId === fallbackTokenAccountId
-															) {
-																fallbackAccount.accountIdSource =
-																	fallbackStoredAccountIdSource ?? "token";
-															}
-															if (fallbackResolvedEmail) {
-																fallbackAccount.email = fallbackResolvedEmail;
-															}
-
-															const fallbackHeaders = createCodexHeaders(
-																requestInit,
-																fallbackAccountId,
-																fallbackAuth.access,
-																{
-																	model,
-																	promptCacheKey: effectivePromptCacheKey,
-																},
-															);
-
-															const fallbackSubmittedAccount = structuredClone(fallbackAccount);
-															const fallbackSubmittedCredential = {recordId: fallbackAccount.recordId, accessToken: fallbackAuth.access, refreshToken: fallbackAuth.refresh, expiresAt: fallbackAccount.expires, accountId: fallbackAccountId};
-															if (!fallbackAdmission) throw new Error("Missing circuit admission");
-															const dispatchFallback = createAccountDispatch({manager: accountManager, account: fallbackAccount, submitted: fallbackSubmittedCredential, admission: fallbackAdmission, family: modelFamily, model: model ?? null,
-																eligible: () => !entitlementCache.isBlocked(fallbackEntitlementAccountKey, model ?? modelFamily).blocked && !preemptiveQuotaScheduler.getDeferral(`${fallbackEntitlementAccountKey}:${model ?? modelFamily}`).defer && contextBudgetGuard.getAdvisory(sessionAffinityKey ?? "", Date.now(), model).level !== "hard",
-															});
-															const applyFallbackRestriction = (mutate: () => boolean | void, persistChanges = false) =>
-																accountManager.withCurrentAccountCredential(fallbackAccount, fallbackSubmittedCredential, mutate, persistChanges).catch(observeRestrictionFailure);
-															const fallbackController = new AbortController();
-															const fallbackTimeoutId = setTimeout(
-																() =>
-																	fallbackController.abort(
-																		new Error("Request timeout"),
-																	),
-																fetchTimeoutMs,
-															);
-															const onFallbackAbort = abortSignal
-																? () =>
-																		fallbackController.abort(
-																			abortSignal.reason ??
-																				new Error("Aborted by user"),
-																		)
-																: null;
-															if (abortSignal && onFallbackAbort) {
-																abortSignal.addEventListener(
-																	"abort",
-																	onFallbackAbort,
-																	{
-																		once: true,
-																	},
-																);
-															}
-
-															try {
-																runtimeMetrics.totalRequests++;
-																runtimeMetrics.responsesRequests++;
-																syncRuntimeObservability(requestTraceId);
-																const fallbackResponse = await dispatchFallback(() => fetch(
-																	url,
-																	applyProxyCompatibleInit(url, {
-																		...requestInit,
-																		headers: fallbackHeaders,
-																		signal: fallbackController.signal,
-																	}),
-																));
-																const fallbackSnapshot =
-																	readQuotaSchedulerSnapshot(
-																		fallbackResponse.headers,
-																		fallbackResponse.status,
-																	);
-																if (fallbackSnapshot && !fallbackResponse.ok) {
-																	await applyFallbackRestriction(() => {
-																		preemptiveQuotaScheduler.update(`${fallbackEntitlementAccountKey}:${model ?? modelFamily}`, fallbackSnapshot);
-																	});
-																	if (restrictionObservationFailed) return fallbackResponse;
-																}
-																if (!fallbackResponse.ok) {
-																	const {
-																		response: handledFallbackResponse,
-																		rateLimit: fallbackRateLimit,
-																	errorBody: fallbackErrorBody,
-																	} =
-																		await handleErrorResponse(fallbackResponse);
-																	try {
-																		await fallbackResponse.body?.cancel();
-																	} catch {
-																		// Best-effort only; the error body has already been read.
-																	}
-																	await applyFallbackRestriction(() => {
-																		const fallbackError = isRecord(fallbackErrorBody) && isRecord(fallbackErrorBody.error) ? fallbackErrorBody.error : undefined;
-																		const fallbackWorkspaceError = isWorkspaceDisabledError(handledFallbackResponse.status, typeof fallbackError?.code === "string" ? fallbackError.code : "", typeof fallbackError?.message === "string" ? fallbackError.message : "");
-																		if (fallbackWorkspaceError && fallbackSubmittedCredential.accountId && fallbackAccount.workspaces?.length) {
-																			if (!accountManager.disableWorkspace(fallbackAccount, fallbackSubmittedCredential.accountId))
-																				return false;
-																			if (accountManager.getCurrentWorkspace(fallbackAccount)?.id === fallbackSubmittedCredential.accountId)
-																				accountManager.rotateToNextWorkspace(fallbackAccount);
-																			if (!fallbackAccount.workspaces.some(workspace => workspace.enabled !== false))
-																				accountManager.setAccountEnabled(fallbackAccount.index, false);
-																			accountManager.saveToDiskDebounced();
-																		}
-																		else if (handledFallbackResponse.status === 429) {
-																			const retryAfterMs = fallbackRateLimit?.retryAfterMs ?? 60000;
-																			const fallbackQuotaKey = model
-																				? `${modelFamily}:${model}`
-																				: modelFamily;
-																			const { delayMs } = getRateLimitBackoff(fallbackAccount.index, fallbackQuotaKey, retryAfterMs);
-																			const cooldownMs = Math.max(delayMs, retryAfterMs);
-																			preemptiveQuotaScheduler.markRateLimited(`${fallbackEntitlementAccountKey}:${model ?? modelFamily}`, cooldownMs);
-																			accountManager.markRateLimitedWithReason(fallbackAccount, cooldownMs, modelFamily, "quota", model);
-																			accountManager.recordRateLimit(fallbackAccount, modelFamily, model);
-																			accountManager.saveToDiskDebounced();
-																		}
-																		else {
-																			accountManager.recordFailure(fallbackAccount, modelFamily, model, fallbackAdmission);
-																			capabilityPolicyStore.recordFailure(fallbackEntitlementAccountKey, capabilityModelKey);
-																		}
-																		return true;
-																	});
-																	if (restrictionObservationFailed) return handledFallbackResponse;
-																	continue;
-																}
-
-																successAccountForResponse = fallbackAccount;
-																successSubmittedAccount = fallbackSubmittedAccount;
-																successQuotaSnapshot = fallbackSnapshot;
-																successSubmittedCredential = fallbackSubmittedCredential;
-																successAdmission = fallbackAdmission;
-																successEntitlementAccountKey =
-																	fallbackEntitlementAccountKey;
-																runtimeMetrics.streamFailoverRecoveries += 1;
-																if (fallbackAccount.index !== account.index) {
-																	runtimeMetrics.streamFailoverCrossAccountRecoveries += 1;
-																	runtimeMetrics.accountRotations += 1;
-																}
-
-																logInfo(
-																	`Recovered stream via failover attempt ${failoverAttempt} using account ${fallbackAccount.index + 1}.`,
-																	{ emittedBytes },
-																);
-																return fallbackResponse;
-															} catch (streamFailoverError) {
-															if (streamFailoverError instanceof PendingAuthLocalError) {
-																observeRestrictionFailure(streamFailoverError);
-																return null;
-															}
-																accountManager.refundToken(
-																	fallbackAccount,
-																	modelFamily,
-																	model,
-																);
-																await applyFallbackRestriction(() => {
-																	accountManager.recordFailure(fallbackAccount, modelFamily, model, fallbackAdmission);
-																	capabilityPolicyStore.recordFailure(fallbackEntitlementAccountKey, capabilityModelKey);
-																});
-																if (restrictionObservationFailed) throw streamFailoverError;
-																logWarn(
-																	`Stream failover attempt ${failoverAttempt} failed for account ${fallbackAccount.index + 1}.`,
-																	{
-																		emittedBytes,
-																		error:
-																			streamFailoverError instanceof Error
-																				? streamFailoverError.message
-																				: String(streamFailoverError),
-																	},
-																);
-															} finally {
-																clearTimeout(fallbackTimeoutId);
-																if (abortSignal && onFallbackAbort) {
-																	abortSignal.removeEventListener(
-																		"abort",
-																		onFallbackAbort,
-																	);
-																}
-															}
-														}
-
-														return null;
-													},
-													{
-														maxFailovers: streamFailoverMax,
-														softTimeoutMs: streamFailoverSoftTimeoutMs,
-														hardTimeoutMs: streamFailoverHardTimeoutMs,
-														requestInstanceId:
-															requestCorrelationId ?? undefined,
-													},
-												);
-											}
+											const responseForSuccess = isStreaming ? withStreamingFailover(response, () => Promise.resolve(null), {
+												maxFailovers: streamFailoverMax,
+												softTimeoutMs: streamFailoverSoftTimeoutMs,
+												hardTimeoutMs: streamFailoverHardTimeoutMs,
+												requestInstanceId: requestCorrelationId ?? undefined,
+											}) : response;
 											const affinityCurrent = sessionAffinityStore?.captureWriteAuthority(sessionAffinityKey);
 											let observedResponseIdForSuccess: string | undefined;
 											let acceptedUsage: ReturnType<typeof usageDeferral.captured> = null;
 											let observedCompletion: import("./lib/request/response-outcome.js").StreamCompletion | undefined;
 											const acceptedRow: RuntimeUsageRecordInput = {
 												outcome: "failure", statusCode: responseForSuccess.status, errorCode: "upstream_missing_terminal",
-												account: {index: successSubmittedAccount.index, accountId: successSubmittedAccount.accountId ?? null, email: successSubmittedAccount.email ?? null},
+												account: {index: primarySubmittedAccount.index, accountId: primarySubmittedAccount.accountId ?? null, email: primarySubmittedAccount.email ?? null},
 											};
-											if (isStreaming) usageDeferral.defer(acceptedRow);
 											const settleAcceptedResponse = async (completion: import("./lib/request/response-outcome.js").StreamCompletion) => {
-												acceptedRow.account = {index: successSubmittedAccount.index, accountId: successSubmittedAccount.accountId ?? null, email: successSubmittedAccount.email ?? null};
+												acceptedRow.account = {index: primarySubmittedAccount.index, accountId: primarySubmittedAccount.accountId ?? null, email: primarySubmittedAccount.email ?? null};
 												if (completion.success) {
 													runtimeMetrics.successfulRequests++;
 													runtimeMetrics.lastError = null;
 													let successApplied = false;
 													try {
-														successApplied = await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
-															if (!successAdmission || !accountManager.recordSuccess(successAccountForResponse, modelFamily, model, successAdmission)) return false;
-															resetRateLimitBackoff(successAccountForResponse.index, quotaKey);
+														successApplied = await accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, () => {
+															if (!primaryAdmission || !accountManager.recordSuccess(account, modelFamily, model, primaryAdmission)) return false;
+															resetRateLimitBackoff(account.index, quotaKey);
 															if (affinityCurrent?.()) {
-																sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, successAccountForResponse.index, Date.now(), sessionAffinityVersion);
+																sessionAffinityStore?.rememberWithVersion(sessionAffinityKey, account.index, Date.now(), sessionAffinityVersion);
 																if (responseContinuationEnabled && observedResponseIdForSuccess) sessionAffinityStore?.updateLastResponseId(sessionAffinityKey, observedResponseIdForSuccess, Date.now(), sessionAffinityVersion);
 															}
-															if (successAccountForResponse !== account) accountManager.markSwitched(successAccountForResponse, "rotation", modelFamily);
-															if (successQuotaSnapshot) preemptiveQuotaScheduler.update(`${successEntitlementAccountKey}:${model ?? modelFamily}`, successQuotaSnapshot);
-															capabilityPolicyStore.recordSuccess(successEntitlementAccountKey, capabilityModelKey);
-															entitlementCache.clear(successEntitlementAccountKey, capabilityModelKey);
+															if (quotaSnapshot) preemptiveQuotaScheduler.update(`${entitlementAccountKey}:${model ?? modelFamily}`, quotaSnapshot);
+															capabilityPolicyStore.recordSuccess(entitlementAccountKey, capabilityModelKey);
+															entitlementCache.clear(entitlementAccountKey, capabilityModelKey);
 															return true;
 														}, false);
 													} catch (error) {
@@ -2748,9 +2384,9 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														logWarn("Accepted response recovery authority could not be observed", {error});
 													}
 													if (successApplied) {
-														if (lastCodexCliActiveSyncIndex !== successAccountForResponse.index) {
-															void accountManager.syncCodexCliActiveSelectionForIndex(successAccountForResponse.index, successSubmittedCredential);
-															lastCodexCliActiveSyncIndex = successAccountForResponse.index;
+														if (lastCodexCliActiveSyncIndex !== account.index) {
+															void accountManager.syncCodexCliActiveSelectionForIndex(account.index, primarySubmittedCredential);
+															lastCodexCliActiveSyncIndex = account.index;
 														}
 														clearPoolExhaustionCooldown();
 														clearServerBurstCooldown();
@@ -2758,12 +2394,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												} else {
 													runtimeMetrics.failedRequests++;
 													runtimeMetrics.lastError = completion.errorCode;
-													await accountManager.withCurrentAccountCredential(successAccountForResponse, successSubmittedCredential, () => {
-														accountManager.recordFailure(successAccountForResponse, modelFamily, model, successAdmission);
+													await accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, () => {
+														accountManager.recordFailure(account, modelFamily, model, primaryAdmission);
 													}, false).catch(observeRestrictionFailure);
 												}
 												syncRuntimeObservability(requestTraceId);
-												usageDeferral.complete({...acceptedRow, outcome: completion.outcome, errorCode: completion.errorCode, ...(acceptedUsage ?? {})});
+												await usageDeferral.complete({...acceptedRow, outcome: completion.outcome, errorCode: completion.errorCode, ...(acceptedUsage ?? {})});
 											};
 											const successResponse = await handleSuccessResponse(responseForSuccess, isStreaming, {
 												onResponseId: responseId => {if (responseContinuationEnabled) observedResponseIdForSuccess = responseId;},
@@ -2780,6 +2416,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													}
 												},
 												streamStallTimeoutMs,
+												streamIdleTimeoutMs: USAGE_STREAM_IDLE_TIMEOUT_MS,
 											});
 											if (!isStreaming) {
 												acceptedRow.statusCode = successResponse.status;

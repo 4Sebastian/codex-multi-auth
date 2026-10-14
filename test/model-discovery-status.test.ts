@@ -466,6 +466,33 @@ it("persists attributed loss timestamps over a concurrent older positive and pre
 	for (const [, result] of entries.filter(([, result]) => result.status.responses === "unverified")) expect(result.at).toBe(3000);
 });
 
+it.each([1000, 900])("accepts observed-loss forced recovery despite clock ordering (%s)", async recoveryClock => {
+	const route: ApiRouteCredential = {id: "clock-recovery", kind: "api", label: "Recovery", apiKey: "fixture-clock-secret", enabled: true, priority: 0, visibleModels: ["X"], probeCapabilities: true};
+	const options = {updateApiDiscovery: async (credential: ApiRouteCredential) => credential, persistProbes: true, forceProbes: true};
+	const denied: typeof fetch = async (url, init) => init?.method === "POST" ? Response.json({error: {code: "invalid_api_key"}}, {status: 401}) : String(url).endsWith("/models") ? Response.json({data: [{id: "X"}]}) : new Response("missing", {status: 404});
+	for (let i = 0; i < 2; i++) await discoverModelInventory(null, [route], {...options, fetchImpl: denied, now: () => 1000});
+	const path = isolationJoin(multiAuthDir, "api-capability-probes.json");
+	expect(JSON.parse(await isolationFs.readFile(path, "utf8")).ownerLosses[0][1]).toBe(1001);
+	let posts = 0;
+	const healthy: typeof fetch = async (url, init) => {
+		if (init?.method !== "POST") return String(url).endsWith("/models") ? Response.json({data: [{id: "X"}]}) : new Response("missing", {status: 404});
+		posts++;
+		const body = JSON.parse(String(init.body));
+		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+	};
+	const recovered = await discoverModelInventory(null, [route], {...options, fetchImpl: healthy, now: () => recoveryClock});
+	expect(posts).toBeGreaterThan(0);
+	expect(recovered.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+	expect(recovered.entries[0]?.entitlements?.[0]?.serviceTiers).toContainEqual(expect.objectContaining({id: "priority"}));
+	expect(recovered.entries[0]?.entitlements?.[0]?.probes?.fast).toBe("verified");
+	const persisted = JSON.parse(await isolationFs.readFile(path, "utf8"));
+	expect(persisted.entries[0][1]).toMatchObject({observedLossAt: 1001, status: {responses: "verified"}});
+	posts = 0;
+	const reloaded = await discoverModelInventory(null, [route], {...options, forceProbes: false, fetchImpl: healthy, now: () => recoveryClock});
+	expect(posts).toBe(0);
+	expect(reloaded.entries[0]?.entitlements?.[0]?.probes?.responses).toBe("verified");
+});
+
 it("asks a running proxy to force paid probes only for an explicit capability check", async () => {
  const { refreshAndPrintModelInventory } = await import("../lib/runtime/model-discovery-status.js");
  const urls: string[] = [];

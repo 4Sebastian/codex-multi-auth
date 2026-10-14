@@ -1,3 +1,4 @@
+import { logWarn } from "../logger.js";
 import { captureAuthorityRevision } from "../storage/authority-revision.js";
 import type { CapabilityPolicyStore } from "../capability-policy.js";
 import { resolveEntitlementAccountKey } from "../entitlement-cache.js";
@@ -328,12 +329,13 @@ export function createRuntimeUsageRecorder(input: {
 	append?: typeof appendUsageLedgerRow;
 }): RuntimeUsageRecorder {
 	let recorded = false;
+	let settlement: Promise<void> | undefined;
 	const startedAt = input.startedAt ?? Date.now();
 	const append = input.append ?? appendUsageLedgerRow;
 	return {
 		hasRecorded: () => recorded,
 		record: async (recordInput) => {
-			if (recorded) return;
+			if (recorded) return settlement;
 			recorded = true;
 			const account = recordInput.account;
 			const row: UsageLedgerAppendInput = {
@@ -356,7 +358,8 @@ export function createRuntimeUsageRecorder(input: {
 				totalTokens: recordInput.totalTokens,
 				serviceTier: recordInput.serviceTier,
 			};
-			await append(row).catch(() => undefined);
+			settlement = append(row).then(() => undefined).catch(error => logWarn("Usage ledger settlement failed", {error}));
+			await settlement;
 		},
 	};
 }
