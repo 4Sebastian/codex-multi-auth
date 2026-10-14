@@ -1,6 +1,7 @@
 import { captureRefreshCredentialAuthority, isFlaggedRecoverySourceCurrent, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { existsSync, promises as fs } from "node:fs";
 import { ACCOUNT_LIMITS } from "../constants.js";
+import { recoveredFlaggedAccountMetadata } from "../runtime/account-pool.js";
 import { DEFAULT_DASHBOARD_DISPLAY_SETTINGS } from "../dashboard-settings.js";
 import {
 	evaluateForecastAccounts,
@@ -498,6 +499,8 @@ function findExistingAccountIndexForFlagged(
 	nextAccountId: string | undefined,
 	nextEmail: string | undefined,
 ): number {
+	const sourceIndex = flagged.recordId ? storage.accounts.findIndex(row => row.recordId === flagged.recordId) : -1;
+	if (sourceIndex >= 0) return sourceIndex;
 	const flaggedEmail = sanitizeEmail(flagged.email);
 	const candidateAccountId = nextAccountId ?? flagged.accountId;
 	const candidateEmail = sanitizeEmail(nextEmail) ?? flaggedEmail;
@@ -595,7 +598,34 @@ function upsertRecoveredFlaggedAccount(
 		if (!existing) {
 			return { restored: false, changed: false, message: "existing account entry is missing" };
 		}
+		if (flagged.recordId && existing.recordId && flagged.recordId !== existing.recordId) {
+			return {restored: false, changed: false, message: "cannot replace another primary record"};
+		}
 		let changed = false;
+		if (flagged.recordId && existing.recordId !== flagged.recordId) {
+			existing.recordId = flagged.recordId;
+			changed = true;
+		}
+		if (existing.addedAt !== flagged.addedAt) {
+			existing.addedAt = flagged.addedAt;
+			changed = true;
+		}
+		const metadata = recoveredFlaggedAccountMetadata(flagged);
+		for (const field of ["workspaces", "currentWorkspaceIndex", "codexCliMirror", "lastSwitchReason", "rateLimitResetTimes", "coolingDownUntil", "cooldownReason"] as const) {
+			if (existing[field] === undefined && metadata[field] !== undefined) {
+				Object.assign(existing, {[field]: metadata[field]});
+				changed = true;
+			}
+		}
+		if (existing.authInvalidatedAt !== undefined || existing.authInvalidationErrorCode !== undefined || existing.cooldownReason === "auth-failure") {
+			delete existing.authInvalidatedAt;
+			delete existing.authInvalidationErrorCode;
+			if (existing.cooldownReason === "auth-failure") {
+				delete existing.coolingDownUntil;
+				delete existing.cooldownReason;
+			}
+			changed = true;
+		}
 		if (existing.refreshToken !== refreshResult.refresh) {
 			existing.refreshToken = refreshResult.refresh;
 			changed = true;
@@ -648,6 +678,7 @@ function upsertRecoveredFlaggedAccount(
 	}
 
 	storage.accounts.push({
+		...recoveredFlaggedAccountMetadata(flagged),
 		refreshToken: refreshResult.refresh,
 		accessToken: refreshResult.access,
 		expiresAt: refreshResult.expires,

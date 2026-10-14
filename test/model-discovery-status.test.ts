@@ -26,10 +26,14 @@ afterEach(async () => {
 	else process.env.CODEX_MULTI_AUTH_DIR = previousMultiAuthDir;
 	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
-it.each(["invalidated", "cooldown", "quota"])("does not submit initially restricted OAuth discovery (%s)", async restriction => {
+it.each(["invalidated", "code-only", "zero", "negative", "cooldown", "quota"])("does not submit initially restricted OAuth discovery (%s)", async restriction => {
 	const storage: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "R1", accountId: "W1", accessToken: "fixture-A", refreshToken: "fixture-refresh-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
 	const account = storage.accounts[0]!;
 	if (restriction === "invalidated") account.authInvalidatedAt = Date.now();
+	if (["code-only", "zero", "negative"].includes(restriction)) {
+		account.authInvalidationErrorCode = "token_invalidated";
+		if (restriction !== "code-only") account.authInvalidatedAt = restriction === "zero" ? 0 : -1;
+	}
 	if (restriction === "cooldown") Object.assign(account, {coolingDownUntil: Date.now() + 60000, cooldownReason: "auth-failure"});
 	if (restriction === "quota") account.rateLimitResetTimes = {codex: Date.now() + 60000};
 	const path = isolationJoin(multiAuthDir, "accounts.json");

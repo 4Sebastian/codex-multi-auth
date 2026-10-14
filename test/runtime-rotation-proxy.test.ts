@@ -6757,7 +6757,7 @@ describe("commit-window and receipt cancellation regressions", () => {
 		else request = postResponses(proxy, {model: target, input: [], stream: true}, "/responses", {authorization: "Bearer access-1"}).then(async response => {await response.text(); return response.status;});
 		try {
 			await readReady; releaseWrite(); await saving;
-			expect(disk.accounts[0]?.authInvalidatedAt).toBe(1500);
+			expect(disk.accounts[0]?.authInvalidatedAt, JSON.stringify({disk, live: manager.getAccountsSnapshot()})).toBe(1500);
 			releaseRead(); expect(await request).toBe(401);
 			expect(manager.getAccountByIndex(0)?.authInvalidatedAt).toBe(1500);
 			expect(calls).toHaveLength(0);
@@ -8093,6 +8093,23 @@ describe("catalog review concurrency and backoff",()=>{
 });
 
 describe("native inventory read resilience",()=>{
+ it.each([undefined, 0, -1].flatMap(timestamp => [false, true].map(warm => ({timestamp, warm}))))("rejects raw durable native revocation before auth, HTTP, WS and discovery (%j)", async ({timestamp, warm}) => {
+  const storage = createStorage(Date.now(), 1), path = getStoragePath();
+  await fs.writeFile(path, JSON.stringify(storage));
+  const {fetchImpl, calls} = createRecordingFetch(call => call.url.includes("/models") ? Response.json({models: [{slug: "model-test"}]}) : textEventStream());
+  const proxy = await startRuntimeRotationProxy({nativeOpenai: true, fetchImpl, upstreamBaseUrl: "https://example.test/backend-api", clientApiKey: DEFAULT_CLIENT_API_KEY, readApiRoutes: async () => []});
+  openServers.push(proxy);
+  if (warm) {const response = await getModels(proxy); expect(response.status).toBe(200); await response.text();}
+  const before = calls.length;
+  await fs.writeFile(path, JSON.stringify({...storage, accounts: [{...storage.accounts[0], authInvalidatedAt: timestamp, authInvalidationErrorCode: "token_invalidated"}]}));
+  const bearer = await getModels(proxy, undefined, {authorization: "Bearer access-1"});
+  expect(bearer.status).toBe(401); await bearer.text();
+  await expect(connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", "access-1")).rejects.toThrow(/401/);
+  const response = await postResponses(proxy, {model: "model-test", input: "fixture"});
+  expect(response.status).toBe(503); await response.text();
+  const discovery = await getModels(proxy); expect(discovery.status).toBe(503); await discovery.text();
+  expect(calls).toHaveLength(before);
+ });
  it.each(["EBUSY","EPERM","EACCES"])("preserves live routing after a delayed %s without trusting managed bearers",async code=>{
   let clock=Date.now();vi.spyOn(Date,"now").mockImplementation(()=>clock);
   vi.spyOn(performance,"now").mockImplementation(()=>clock);

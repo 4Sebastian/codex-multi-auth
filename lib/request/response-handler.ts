@@ -792,10 +792,7 @@ export async function convertSseToJson(
 		streamStallTimeoutMs?: number;
 	},
 ): Promise<Response> {
-	if (!response.body) {
-		throw new Error(`[${PLUGIN_NAME}] Response has no body`);
-	}
-	const reader = response.body.getReader();
+	const reader = response.body?.getReader();
 	const decoder = new TextDecoder();
 	// REQ-HIGH-03: Accumulate decoded chunks in an array instead of concatenating
 	// into a growing string. Repeated `fullText += chunk` is O(n) per append,
@@ -803,6 +800,20 @@ export async function convertSseToJson(
 	// pattern is O(n) total. The size check runs BEFORE appending so we never
 	// allocate a chunk that would exceed MAX_SSE_SIZE.
 	const chunks: string[] = [];
+	const outcome = new ResponseOutcome(true);
+	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => outcome.observe(event)});
+	let settled = false;
+	const finish = async (failure?: "failure" | "cancelled", finalUsage?: UsageTokenCounts | null) => {
+		if (settled) return;
+		settled = true;
+		const scannedUsage = scanner.result();
+		const usage = failure || options?.onCompletion ? finalUsage ?? scannedUsage : finalUsage;
+		try {if (usage) options?.onUsage?.(usage);}
+		catch (error) {log.warn("Accepted response usage could not be settled", {error});}
+		const completion = outcome.finish();
+		try {await options?.onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
+		catch (error) {log.warn("Accepted response completion could not be settled", {error});}
+	};
 	let totalSize = 0;
 	const streamStallTimeoutMs = Math.max(
 		1_000,
@@ -812,6 +823,7 @@ export async function convertSseToJson(
 	);
 
 	try {
+		if (!reader) throw new Error(`[${PLUGIN_NAME}] Response has no body`);
 		// Consume the entire stream
 		while (true) {
 			const { done, value } = await readWithTimeout(
@@ -827,6 +839,7 @@ export async function convertSseToJson(
 			if (totalSize + decodedBytes > MAX_SSE_SIZE) {
 				throw new Error(`SSE response exceeds ${MAX_SSE_SIZE} bytes limit`);
 			}
+			if (value) scanner.push(value);
 			chunks.push(decoded);
 			totalSize += decodedBytes;
 		}
@@ -843,13 +856,7 @@ export async function convertSseToJson(
 			options?.onResponseId,
 		);
 
-		const outcome = new ResponseOutcome(true);
-		const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => outcome.observe(event)});
-		scanner.push(new TextEncoder().encode(fullText));
-		const usage = scanner.result();
-		if (usage && options?.onCompletion) options.onUsage?.(usage);
-		try {await options?.onCompletion?.(outcome.finish());}
-		catch (error) {log.warn("Accepted response completion could not be settled", {error});}
+		await finish(undefined, finalResponse ? extractResponsesUsage(finalResponse) : null);
 
 		// A terminal failure event (mid-stream `error`, `response.failed`, or
 		// `response.incomplete`) means the upstream turn failed even though HTTP
@@ -901,14 +908,6 @@ export async function convertSseToJson(
 		}
 		logStreamDiagnostics(finalResponse);
 
-		if (options?.onUsage && !options.onCompletion) {
-			// The non-streaming branch already holds the assembled response, so
-			// the token counts come straight off it. Reported even though the
-			// caller sees JSON rather than SSE: the usage ledger (and therefore
-			// the maxTokens / maxCostUsd budget caps) needs both shapes.
-			const usage = extractResponsesUsage(finalResponse);
-			if (usage) options.onUsage(usage);
-		}
 		// Return as plain JSON (not SSE)
 		const jsonHeaders = new Headers(headers);
 		jsonHeaders.set("content-type", "application/json; charset=utf-8");
@@ -921,13 +920,14 @@ export async function convertSseToJson(
 	} catch (error) {
 		log.error("Error converting stream", { error: String(error) });
 		logRequest("stream-error", { error: String(error) });
-		if (typeof reader.cancel === "function") {
-			await reader.cancel(String(error)).catch(() => {});
+		await finish(error instanceof Error && error.name === "AbortError" ? "cancelled" : "failure");
+		if (typeof reader?.cancel === "function") {
+			await reader.cancel(error).catch(() => {});
 		}
 		throw error;
 	} finally {
 		// Release the reader lock to prevent resource leaks
-		reader.releaseLock();
+		reader?.releaseLock();
 	}
 }
 
@@ -972,7 +972,8 @@ function createResponseIdCapturingStream(
 		finished = true;
 		captureLines();
 		const usage = scanner.result();
-		if (usage && onCompletion) onUsage?.(usage);
+		try {if (usage && onCompletion) onUsage?.(usage);}
+		catch (error) {log.warn("Accepted stream usage could not be settled", {error});}
 		const completion = outcome.finish();
 		try {await onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
 		catch (error) {log.warn("Accepted stream completion could not be settled", {error});}

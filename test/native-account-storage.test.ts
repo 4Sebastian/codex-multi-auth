@@ -78,6 +78,25 @@ it("rejects a primary revision changed during journal observation", async () => 
 	expect((await read()).storage?.accounts[0]?.enabled).toBe(false);
 });
 
+it.each([undefined, 0, -1].flatMap(timestamp => [false, true].flatMap(warm => [false, true].map(normalizedMetadata => ({timestamp, warm, normalizedMetadata})))))("does not certify raw orphaned revocation across native cache reads (%j)", async ({timestamp, warm, normalizedMetadata}) => {
+    const root = await mkdtemp(join(tmpdir(), "native-raw-revocation-")); roots.push(root);
+    const path = join(root, "accounts.json");
+    const disk = {version: 3, activeIndex: 0, accounts: [{recordId: "raw-owner", accountId: "W1", email: normalizedMetadata ? " Fixture@example.com " : "fixture@example.com", refreshToken: "refresh-A", accessToken: "access-A", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+    await writeFile(path, JSON.stringify(disk));
+    const read = createNativeAccountStorageReader(undefined, path);
+    if (warm) expect((await read()).verified).toBe(true);
+    await writeFile(path, JSON.stringify({...disk, accounts: [{...disk.accounts[0], authInvalidationErrorCode: "token_invalidated", authInvalidatedAt: timestamp}]}));
+    for (let i = 0; i < 2; i++) expect(await read()).toMatchObject({storage: null, verified: false, routingAvailable: false});
+    vi.spyOn(parser, "loadAccountsFromPath").mockRejectedValueOnce(Object.assign(Error("fixture primary locked after revocation"), {code: "EBUSY"}));
+    expect(await read()).toMatchObject({storage: null, verified: false, routingAvailable: false});
+    await recordPendingAuth(path, {priorRefreshToken: "refresh-A", recordId: "raw-owner", refreshToken: "refresh-A", accessToken: "access-A", expiresAt: disk.accounts[0]!.expiresAt, at: 1});
+    expect(await read()).toMatchObject({storage: null, verified: false, routingAvailable: false});
+    await writeFile(path, JSON.stringify({...disk, accounts: [{...disk.accounts[0], refreshToken: "refresh-B", accessToken: "access-B"}]}));
+    const recovered = await read();
+    expect(recovered.verified).toBe(true);
+    expect(recovered.storage?.accounts[0]).toMatchObject({recordId: "raw-owner", accessToken: "access-B"});
+});
+
 it("caches settled primary storage but adopts credential revocation on change", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-cache-"));
     roots.push(root);

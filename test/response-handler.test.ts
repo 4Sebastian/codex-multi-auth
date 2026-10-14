@@ -695,6 +695,39 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 			expect(body.reasoning_summary_text).toBeUndefined();
 		});
 
+		it.each(["reader", "stall", "size", "cancelled"])("settles incremental nonstream usage before exposing %s failure", async mode => {
+			vi.useFakeTimers();
+			const first = mode === "cancelled" ? new DOMException("fixture cancelled", "AbortError") : Error("fixture reader failed");
+			const cancel = vi.fn();
+			let pulls = 0, release!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (++pulls === 1) controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n'));
+					else if (mode === "stall") return new Promise<void>(() => {});
+					else if (mode === "size") controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 1));
+					else controller.error(first);
+				}, cancel,
+			});
+			const usage = vi.fn(() => {throw Error("fixture usage observer failed");});
+			const completion = vi.fn(async () => {await gate; throw Error("fixture settlement failed");});
+			let exposed = false;
+			const pending = convertSseToJson(new Response(body), new Headers(), {onUsage: usage, onCompletion: completion, streamStallTimeoutMs: 1000}).catch(error => {exposed = true; return error;});
+			await vi.advanceTimersByTimeAsync(1100);
+			expect(usage).toHaveBeenCalledOnce();
+			expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3, totalTokens: 10}));
+			expect(completion).toHaveBeenCalledOnce();
+			expect(completion.mock.calls[0]).toMatchObject([{success: false, outcome: mode === "cancelled" ? "cancelled" : "failure", errorCode: mode === "cancelled" ? "client_cancelled" : "stream_read_failed"}]);
+			expect(exposed).toBe(false);
+			release();
+			const error = await pending;
+			if (mode === "reader" || mode === "cancelled") expect(error).toBe(first);
+			else expect(error.message).toMatch(mode === "stall" ? /stalled/ : /exceeds/);
+			expect(body.locked).toBe(false);
+			if (mode === "stall" || mode === "size") expect(cancel).toHaveBeenCalledOnce();
+			vi.useRealTimers();
+		});
+
 		it('should throw error if SSE stream exceeds size limit', async () => {
 			const largeContent = 'a'.repeat(20 * 1024 * 1024 + 1);
 			const response = new Response(largeContent);

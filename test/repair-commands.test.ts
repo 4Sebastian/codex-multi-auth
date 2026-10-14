@@ -257,6 +257,42 @@ describe("repair-commands direct deps coverage", () => {
 		expect(parseFixArgs(["-m", "gpt-5.5"]).ok).toBe(true);
 	});
 
+	it.each(["empty", "matching", "foreign", "delete", "reset", "record", "revocation", "journal"])("preserves verified flagged identity in real CLI restoration (%s)", async change => {
+		const storage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		const filesystem = await import("node:fs/promises");
+		const source: import("../lib/storage.js").FlaggedAccountMetadataV1 = {recordId: "original-cli-record", accountId: "W1", email: "fixture@example.com", refreshToken: "old-refresh", accessToken: "old-access", expiresAt: Date.now() + 3600000, addedAt: 321, lastUsed: 1, flaggedAt: 1, authInvalidatedAt: 1, authInvalidationErrorCode: "token_invalidated", workspaces: [{id: "W1", enabled: true}, {id: "W2", enabled: false, disabledAt: 2}], currentWorkspaceIndex: 0};
+		const flagged = {version: 1 as const, accounts: [source]};
+		const primary: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: change === "matching" || change === "foreign" ? [{...source, recordId: change === "foreign" ? "independent-owner" : source.recordId, authInvalidatedAt: undefined, authInvalidationErrorCode: undefined}] : []};
+		await filesystem.writeFile(getAuthorityStoragePath(), JSON.stringify(primary));
+		await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+		storageMocks.loadAccounts.mockResolvedValue(structuredClone(primary));
+		storageMocks.loadFlaggedAccounts.mockResolvedValue(structuredClone(flagged));
+		storageMocks.withAccountAndFlaggedStorageTransaction.mockImplementation(storage.withAccountAndFlaggedStorageTransaction);
+		extractAccountEmailMock.mockReturnValue(source.email);
+		extractAccountIdMock.mockReturnValue(source.accountId);
+		refreshQueueMocks.queuedRefresh.mockImplementationOnce(async () => {
+			if (change === "delete") flagged.accounts = [];
+			if (change === "record") source.recordId = "replaced-record";
+			if (change === "revocation") source.authInvalidatedAt = 2;
+			if (change === "reset") await filesystem.writeFile(`${getAuthorityStoragePath()}.reset-intent`, "{}");
+			if (change === "journal") await filesystem.writeFile((await import("../lib/storage/pending-auth.js")).getPendingAuthPath(getAuthorityStoragePath()), "{");
+			await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+			return {type: "success", access: "new-access", refresh: "new-refresh", expires: Date.now() + 7200000};
+		});
+		silenceConsole("log");
+		const pending = runVerifyFlagged(["--json"], createDeps());
+		if (!["empty", "matching"].includes(change)) await pending.catch(() => undefined);
+		else expect(await pending).toBe(0);
+		const published = JSON.parse(await filesystem.readFile(getAuthorityStoragePath(), "utf8"));
+		if (change === "empty" || change === "matching") {
+			expect(published.accounts).toHaveLength(1);
+			expect(published.accounts[0]).toMatchObject({recordId: "original-cli-record", addedAt: 321, accessToken: "new-access", refreshToken: "new-refresh", workspaces: source.workspaces});
+			expect(published.accounts[0].authInvalidatedAt).toBeUndefined();
+			expect((await storage.loadFlaggedAccounts()).accounts).toHaveLength(0);
+		} else if (change === "foreign") expect(published.accounts).toMatchObject([{recordId: "independent-owner", refreshToken: "old-refresh", accessToken: "old-access"}]);
+		else expect(published.accounts).toEqual([]);
+	});
+
 	it("runVerifyFlagged uses the injected identity resolver in the direct no-restore flow", async () => {
 		const flaggedAccount = {
 			flaggedAt: 1,

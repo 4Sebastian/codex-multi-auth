@@ -40,7 +40,21 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
                     if (cached && nextSignature === signature && Date.now() - Math.max(info.mtimeMs, info.ctimeMs) > 2000) {
                         storage = structuredClone(cached);
                     } else {
-                        storage = (await loadAccountsFromPath(path, {normalizeAccountStorage, isRecord})).normalized;
+                        storage = (await loadAccountsFromPath(path, {normalizeAccountStorage: data => {
+                            const normalized = normalizeAccountStorage(data);
+                            if (normalized && isRecord(data) && Array.isArray(data.accounts)) {
+                                for (const row of normalized.accounts) {
+                                    const revoked = data.accounts.find(raw => isRecord(raw) && raw.recordId === row.recordId && raw.accountId === row.accountId && raw.email === row.email && raw.refreshToken === row.refreshToken && raw.accessToken === row.accessToken && raw.expiresAt === row.expiresAt &&
+                                        (raw.authInvalidatedAt !== undefined || raw.authInvalidationErrorCode !== undefined));
+                                    if (isRecord(revoked)) {
+                                        if (revoked.authInvalidatedAt !== undefined && typeof revoked.authInvalidatedAt !== "number" || revoked.authInvalidationErrorCode !== undefined && typeof revoked.authInvalidationErrorCode !== "string") throw new Error("Invalid primary revocation evidence");
+                                        row.authInvalidatedAt = revoked.authInvalidatedAt;
+                                        row.authInvalidationErrorCode = revoked.authInvalidationErrorCode;
+                                    }
+                                }
+                            }
+                            return normalized;
+                        }, isRecord})).normalized;
                     }
                 } else {
                     storage = await read();
@@ -59,6 +73,13 @@ export function createNativeAccountStorageReader(read?: () => Promise<AccountSto
             try {
                 const observed = await capturePendingAuth(path, storage?.accounts);
                 const snapshot = await applyPendingAuth(path, structuredClone(storage), observed.entries);
+                if (snapshot?.accounts.some(row => (row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined) &&
+                    (row.authInvalidatedAt === undefined || !Number.isFinite(row.authInvalidatedAt) || row.authInvalidatedAt <= 0))) {
+                    cached = null;
+                    signature = undefined;
+                    lastSuccess = undefined;
+                    return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
+                }
                 if (!verified && (lastSuccess === undefined || performance.now() - lastSuccess >= 30000)) {
                     return {storage: null, verified: false, capturedAt, transientFailure: true, routingAvailable: false};
                 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CircuitBreaker, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
+import { CircuitBreaker, getCircuitBreaker, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { setImmediate as yieldForIo } from "node:timers/promises";
@@ -13,7 +13,10 @@ import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as ge
 
 function admitFixtureRequest(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}): boolean {
 	if (_account && typeof _account === "object" && (!("expires" in _account) || _account.expires === undefined)) Object.assign(_account, {expires: Date.now() + 60000});
-	return new CircuitBreaker().tryCanExecute(options?.onAdmission).ok;
+	if (!_account || typeof _account !== "object") return false;
+	if (!("circuitKeyId" in _account) || typeof _account.circuitKeyId !== "string") Object.assign(_account, {circuitKeyId: `fixture:${"refreshToken" in _account ? _account.refreshToken : "account"}`});
+	if (!("circuitKeyId" in _account) || typeof _account.circuitKeyId !== "string") return false;
+	return getCircuitBreaker(_account.circuitKeyId).tryCanExecute(options?.onAdmission).ok;
 }
 
 process.env.CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS = "1";
@@ -950,6 +953,57 @@ describe("OpenAIOAuthPlugin", () => {
 			await autoMethod.authorize().catch(() => undefined);
 			expect(clearAccountsMock).toHaveBeenCalledTimes(1);
 			expect(clearCredentialSidecarsMock).toHaveBeenCalledTimes(1);
+		});
+
+		it.each(["empty", "matching", "foreign", "delete", "reset", "record", "revocation", "journal"])("retains verified flagged identity through the real plugin publisher (%s)", async change => {
+			const storageModule = await import("../lib/storage.js"), storage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+			const restore: Array<() => void> = [];
+			for (const name of ["loadAccounts", "loadFlaggedAccounts", "withAccountAndFlaggedStorageTransaction", "saveAccounts", "saveFlaggedAccounts"] as const) {
+				const mock = vi.mocked(storageModule[name]);
+				const previous = mock.getMockImplementation();
+				mock.mockImplementation(storage[name] as never);
+				restore.push(() => {mock.mockReset(); if (previous) mock.mockImplementation(previous as never);});
+			}
+			try {
+			const filesystem = await import("node:fs/promises");
+			const source: import("../lib/storage.js").FlaggedAccountMetadataV1 = {
+				recordId: "original-flagged-record", refreshToken: "flagged-refresh", accessToken: "old-access", expiresAt: Date.now() + 60000,
+				accountId: "acc-1", email: "user@example.com", accountLabel: "Original label", addedAt: 123, lastUsed: 1, flaggedAt: 1,
+				authInvalidatedAt: 1, authInvalidationErrorCode: "token_invalidated", workspaces: [{id: "acc-1", enabled: true}, {id: "disabled-workspace", enabled: false, disabledAt: 45}], currentWorkspaceIndex: 0,
+			};
+			const flagged = {version: 1 as const, accounts: [source]};
+			await filesystem.writeFile(getAuthorityStoragePath(), JSON.stringify({version: 3, activeIndex: 0, accounts: change === "matching" || change === "foreign" ? [{...source, recordId: change === "foreign" ? "independent-owner" : source.recordId, authInvalidatedAt: undefined, authInvalidationErrorCode: undefined}] : []}));
+			await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+			const cliModule = await import("../lib/cli.js");
+			vi.mocked(cliModule.promptLoginMode).mockReset().mockResolvedValueOnce({mode: "verify-flagged"} as never).mockResolvedValue({mode: "cancel"} as never);
+			vi.mocked((await import("../lib/refresh-queue.js")).queuedRefresh).mockImplementationOnce(async () => {
+				if (change === "delete") flagged.accounts = [];
+				if (change === "record") source.recordId = "replaced-record";
+				if (change === "revocation") source.authInvalidatedAt = 2;
+				if (change === "reset") await filesystem.writeFile(`${getAuthorityStoragePath()}.reset-intent`, "{}");
+				if (change === "journal") await filesystem.writeFile((await import("../lib/storage/pending-auth.js")).getPendingAuthPath(getAuthorityStoragePath()), "{");
+				await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+				return {type: "success", access: "restored-access", refresh: "restored-refresh", expires: Date.now() + 3600000};
+			});
+			const method = plugin.auth.methods[0] as unknown as {authorize: () => Promise<unknown>};
+			if (change === "empty" || change === "matching") {
+				await method.authorize();
+				const primary = await storage.loadAccounts();
+				expect(primary?.accounts).toHaveLength(1);
+				expect(primary?.accounts[0]).toMatchObject({recordId: "original-flagged-record", addedAt: 123, refreshToken: "restored-refresh", workspaces: source.workspaces});
+				expect(primary?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+				expect((await storage.loadFlaggedAccounts()).accounts).toHaveLength(0);
+				const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+				const manager = new realAccounts.AccountManager(undefined, primary!);
+				expect(manager.getAccountByIndex(0)?.recordId).toBe("original-flagged-record");
+				await manager.flushPendingSave();
+			} else {
+				await expect(method.authorize()).rejects.toBeInstanceOf((await import("../lib/storage/pending-auth.js")).PendingAuthLocalError);
+				const primary = JSON.parse(await filesystem.readFile(getAuthorityStoragePath(), "utf8"));
+				if (change === "foreign") expect(primary.accounts).toMatchObject([{recordId: "independent-owner", refreshToken: "flagged-refresh", accessToken: "old-access"}]);
+				else expect(primary.accounts).toEqual([]);
+			}
+			} finally {for (const reset of restore) reset();}
 		});
 
 		it("uses combined flagged persistence when verify-flagged restores from the login menu", async () => {

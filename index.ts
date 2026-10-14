@@ -568,6 +568,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 			}
 			await persistAccountPoolResults({
 				results,
+				recoveredSources,
 				replaceAll,
 				modelFamilies: MODEL_FAMILIES,
 				withAccountStorageTransaction: async (handler) =>
@@ -2773,7 +2774,10 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												},
 												onCompletion: async completion => {
 													observedCompletion = completion;
-													if (isStreaming) await settleAcceptedResponse(completion);
+													if (isStreaming || completion.errorCode === "stream_read_failed" || completion.errorCode === "client_cancelled") {
+														await settleAcceptedResponse(completion);
+														usageCompletion = null;
+													}
 												},
 												streamStallTimeoutMs,
 											});

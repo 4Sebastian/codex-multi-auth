@@ -1,7 +1,8 @@
 import type { Workspace } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
-import type { AccountMetadataV3, AccountStorageV3 } from "../storage.js";
+import type { AccountMetadataV3, AccountStorageV3, FlaggedAccountMetadataV1 } from "../storage.js";
 import type { AccountIdSource, TokenResult } from "../types.js";
+import { PendingAuthLocalError } from "../storage/pending-auth.js";
 
 export type TokenSuccessWithAccount = Extract<
 	TokenResult,
@@ -15,8 +16,21 @@ export type TokenSuccessWithAccount = Extract<
 	codexCliMirror?: AccountMetadataV3["codexCliMirror"] | null;
 };
 
+export function recoveredFlaggedAccountMetadata(source: FlaggedAccountMetadataV1): AccountMetadataV3 {
+	return {
+		recordId: source.recordId, addedAt: source.addedAt, lastUsed: source.lastUsed,
+		refreshToken: source.refreshToken, accountId: source.accountId, accountIdSource: source.accountIdSource,
+		accountLabel: source.accountLabel, email: source.email, lastSwitchReason: source.lastSwitchReason,
+		workspaces: structuredClone(source.workspaces), currentWorkspaceIndex: source.currentWorkspaceIndex,
+		codexCliMirror: source.codexCliMirror, rateLimitResetTimes: source.rateLimitResetTimes,
+		coolingDownUntil: source.cooldownReason === "auth-failure" ? undefined : source.coolingDownUntil,
+		cooldownReason: source.cooldownReason === "auth-failure" ? undefined : source.cooldownReason,
+	};
+}
+
 export async function persistAccountPoolResults(params: {
 	results: TokenSuccessWithAccount[];
+	recoveredSources?: FlaggedAccountMetadataV1[];
 	replaceAll?: boolean;
 	modelFamilies: readonly ModelFamily[];
 	withAccountStorageTransaction: <T>(
@@ -41,18 +55,21 @@ export async function persistAccountPoolResults(params: {
 		const stored = replaceAll ? null : loadedStorage;
 		const accounts = stored?.accounts ? [...stored.accounts] : [];
 
-		for (const result of results) {
+		for (const [resultIndex, result] of results.entries()) {
+			const source = params.recoveredSources?.[resultIndex];
+			const sourceMetadata = source ? recoveredFlaggedAccountMetadata(source) : undefined;
 			const accountId =
-				result.accountIdOverride ?? params.extractAccountId(result.access);
+				result.accountIdOverride ?? params.extractAccountId(result.access) ?? source?.accountId;
 			const accountIdSource = accountId
 				? (result.accountIdSource ??
 					(result.accountIdOverride ? "manual" : "token"))
 				: undefined;
-			const accountLabel = result.accountLabel;
+			const accountLabel = result.accountLabel ?? source?.accountLabel;
 			const accountEmail = params.sanitizeEmail(
-				params.extractAccountEmail(result.access, result.idToken),
+				params.extractAccountEmail(result.access, result.idToken) ?? source?.email,
 			);
-			const existingIndex = params.findMatchingAccountIndex(
+			const sourceIndex = source?.recordId ? accounts.findIndex(row => row.recordId === source.recordId) : -1;
+			const existingIndex = sourceIndex >= 0 ? sourceIndex : params.findMatchingAccountIndex(
 				accounts,
 				{
 					accountId,
@@ -85,6 +102,7 @@ export async function persistAccountPoolResults(params: {
 							})()
 						: undefined;
 				accounts.push({
+					...sourceMetadata,
 					accountId,
 					accountIdSource,
 					accountLabel,
@@ -92,17 +110,24 @@ export async function persistAccountPoolResults(params: {
 					refreshToken: result.refresh,
 					accessToken: result.access,
 					expiresAt: result.expires,
-					addedAt: now,
+					addedAt: source?.addedAt ?? now,
 					lastUsed: now,
-					workspaces: result.workspaces,
-					currentWorkspaceIndex: initialWorkspaceIndex,
+					workspaces: source?.workspaces ?? result.workspaces,
+					currentWorkspaceIndex: source?.currentWorkspaceIndex ?? initialWorkspaceIndex,
 					...(result.codexCliMirror ? { codexCliMirror: result.codexCliMirror } : {}),
 				});
 				continue;
 			}
 
-			const existing = accounts[existingIndex];
-			if (!existing) continue;
+			const storedAccount = accounts[existingIndex];
+			if (!storedAccount) continue;
+			if (source?.recordId && storedAccount.recordId && source.recordId !== storedAccount.recordId) throw new PendingAuthLocalError("Flagged recovery cannot replace another primary record");
+			const existing = source ? {
+				...sourceMetadata, ...storedAccount,
+				recordId: source.recordId ?? storedAccount.recordId, addedAt: source.addedAt,
+				workspaces: storedAccount.workspaces ?? source.workspaces,
+				currentWorkspaceIndex: storedAccount.currentWorkspaceIndex ?? source.currentWorkspaceIndex,
+			} : storedAccount;
 
 			const nextEmail = accountEmail ?? params.sanitizeEmail(existing.email);
 			const nextAccountId = accountId ?? existing.accountId;
@@ -165,6 +190,8 @@ export async function persistAccountPoolResults(params: {
 				accessToken: result.access,
 				expiresAt: result.expires,
 				lastUsed: now,
+				...(source ? {enabled: true, authInvalidatedAt: undefined, authInvalidationErrorCode: undefined,
+					...(existing.cooldownReason === "auth-failure" ? {coolingDownUntil: undefined, cooldownReason: undefined} : {})} : {}),
 				workspaces: mergedWorkspaces,
 				currentWorkspaceIndex: nextCurrentWorkspaceIndex,
 				codexCliMirror:

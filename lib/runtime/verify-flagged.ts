@@ -92,6 +92,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 			if (!resolved.accountLabel && flagged.accountLabel) {
 				resolved.accountLabel = flagged.accountLabel;
 			}
+			resolved.workspaces = flagged.workspaces ?? resolved.workspaces;
 			state.restored.push(resolved);
 			recoveredSources.push(flagged);
 			deps.showLine(
