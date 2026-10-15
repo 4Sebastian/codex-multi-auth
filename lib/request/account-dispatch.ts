@@ -25,11 +25,14 @@ export function createAccountDispatch(params: {
 		try {
 			for (let attempt = 0; attempt < 2; attempt++) {
 				const policyCurrent = captureRuntimePolicyRevision();
-				const policy = await evaluateRuntimePolicy({state: await loadRuntimePolicyState(), accounts: manager.getAccountsSnapshot(), model, now: Date.now()});
+				const state = await loadRuntimePolicyState();
+				// Policy indexes belong to this snapshot, not the live pool after a wait.
+				const policyIndex = account.index;
+				const policy = await evaluateRuntimePolicy({state, accounts: manager.getAccountsSnapshot(), model, now: Date.now()});
 				let changed = false;
 				await manager.withCurrentAccountCredential(account, submitted, row => {
 					changed = !policyCurrent(policy.budgetEvaluations.length > 0);
-					if (changed || !resetCurrent() || manager.resolveSelectionStoragePath() !== path || !policy.allowed || policy.blockedAccountIndexes.has(account.index) ||
+					if (changed || !resetCurrent() || manager.resolveSelectionStoragePath() !== path || !policy.allowed || policy.blockedAccountIndexes.has(policyIndex) ||
 						(submitted.expiresAt ?? 0) <= Date.now() || !account.circuitKeyId || !getCircuitBreaker(account.circuitKeyId).isAdmissionCurrent(admission) || !params.eligible()) return false;
 					const reason = manager.getManagedAccountRuntimeSkipReason(account, family, model);
 					if (reason && !(reason === "circuit-open" && admission.halfOpen)) return false;

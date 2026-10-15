@@ -92,7 +92,7 @@ export function captureApiRouteAuthorization(route: ApiRouteCredential, requireP
 	const source = route[API_ROUTE_SOURCE]?.root ?? getApiRoutesPath();
 	const path = route[API_ROUTE_SOURCE]?.path ?? source;
 	const {id, kind, apiKey, enabled, probeCapabilities} = route;
-	if (!enabled || requireProbeConsent && probeCapabilities !== true) return async () => () => false;
+	if (!enabled || requireProbeConsent && probeCapabilities !== true) return () => Promise.resolve(() => false);
 	let denied = false;
 	const current = () => {
 		if (denied) return false;
@@ -112,7 +112,7 @@ export function captureApiRouteAuthorization(route: ApiRouteCredential, requireP
 		return !denied;
 	};
 	current();
-	return async () => current;
+	return () => Promise.resolve(current);
 }
 export async function saveApiRoutes(
 	routes: ApiRouteCredential[],
@@ -169,7 +169,7 @@ export function updateApiModelDiscovery(
 	const source = route[API_ROUTE_SOURCE] ?? {path, root: getApiRoutesPath()};
 	const authorize = source.path === path
 		? captureApiRouteAuthorization(Object.defineProperty({...route}, API_ROUTE_SOURCE, {value: source}))
-		: async () => () => false;
+		: () => Promise.resolve(() => false);
 	const result = discoveryUpdates.then(() =>
 		updateApiModelDiscoverySerial(route, models, path, authorize),
 	);

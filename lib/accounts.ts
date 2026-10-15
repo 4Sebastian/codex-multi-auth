@@ -1603,22 +1603,23 @@ export class AccountManager {
 		if (!this.isNativeSnapshotCurrent(account, capturedAt)) return false;
 		const prior = this.nativeAuthSnapshots.get(account);
 		const before = account.authInvalidatedAt;
+		const beforeCode = account.authInvalidationErrorCode;
 		const wasEnabled = account.enabled !== false;
 		const enabled = disk.enabled !== false;
 		const replacedCredential = disk.accessToken !== account.access ||
 			(disk.refreshToken !== undefined && disk.refreshToken !== account.refreshToken) || disk.expiresAt !== account.expires;
 		if (!prior || enabled !== prior.enabled || (!retainingLiveCredentials && replacedCredential)) account.enabled = enabled;
 		const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
-		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt &&
+		const unchangedAuthorization = retainingLiveCredentials && disk.authInvalidatedAt === baseline?.authInvalidatedAt && disk.authInvalidationErrorCode === baseline?.authInvalidationErrorCode &&
 			disk.accessToken === baseline?.accessToken && disk.refreshToken === baseline?.refreshToken && disk.expiresAt === baseline?.expiresAt;
 		const diskInvalidatedAt = unchangedAuthorization ? before : disk.authInvalidatedAt;
-		if (diskInvalidatedAt) {
-			if (!unchangedAuthorization && (!before || diskInvalidatedAt > before || replacedCredential)) {
+		if (diskInvalidatedAt !== undefined || (!unchangedAuthorization && disk.authInvalidationErrorCode !== undefined)) {
+			if (!unchangedAuthorization && (before === undefined || diskInvalidatedAt === undefined || diskInvalidatedAt > before || replacedCredential || diskInvalidatedAt <= 0)) {
 				account.authInvalidatedAt = diskInvalidatedAt;
 				account.authInvalidationErrorCode = disk.authInvalidationErrorCode;
 			}
 		} else if (!retainingLiveCredentials && ((replacedCredential && !!disk.accessToken) ||
-			(prior?.authInvalidatedAt === before && prior?.authInvalidatedAt !== undefined))) {
+			(prior?.authInvalidatedAt === before && typeof before === "number" && Number.isFinite(before) && before > 0))) {
 			this.clearAuthInvalidation(account);
 			if (account.cooldownReason === "auth-failure") this.clearAccountCooldown(account);
 		}
@@ -1626,7 +1627,7 @@ export class AccountManager {
 			? prior?.authInvalidatedAt
 			: diskInvalidatedAt;
 		this.nativeAuthSnapshots.set(account, {authInvalidatedAt: observedInvalidation, enabled, observedAt: capturedAt});
-		return before !== account.authInvalidatedAt || wasEnabled !== (account.enabled !== false);
+		return before !== account.authInvalidatedAt || beforeCode !== account.authInvalidationErrorCode || wasEnabled !== (account.enabled !== false);
 	}
 
 	private readonly nativeRuntimeSnapshots = new WeakMap<ManagedAccount, Pick<AccountStorageV3["accounts"][number], "accessToken" | "refreshToken" | "expiresAt" | "coolingDownUntil" | "cooldownReason" | "rateLimitResetTimes">>();
@@ -1661,11 +1662,7 @@ export class AccountManager {
 	}
 
 	isAccountAuthInvalidated(account: ManagedAccount): boolean {
-		return (
-			typeof account.authInvalidatedAt === "number" &&
-			Number.isFinite(account.authInvalidatedAt) &&
-			account.authInvalidatedAt > 0
-		);
+		return account.authInvalidatedAt !== undefined || account.authInvalidationErrorCode !== undefined;
 	}
 
 	getAccountByIdentity(
@@ -1768,10 +1765,7 @@ export class AccountManager {
 				account.expiresAt = disk.expiresAt;
 			}
 			const diskInvalidatedAt = disk.authInvalidatedAt;
-			const diskHasValidInvalidation =
-				typeof diskInvalidatedAt === "number" &&
-				Number.isFinite(diskInvalidatedAt) &&
-				diskInvalidatedAt > 0;
+			const diskHasValidInvalidation = diskInvalidatedAt !== undefined || disk.authInvalidationErrorCode !== undefined;
 			if (adoptedNewerCredentials && replacedCredentials && !diskHasValidInvalidation) {
 				// A refresh/re-login in another process supersedes an invalidation of
 				// the prior access token. Do not combine the newer disk credentials
@@ -1779,10 +1773,7 @@ export class AccountManager {
 				delete account.authInvalidatedAt;
 				delete account.authInvalidationErrorCode;
 			}
-			const accountHasValidInvalidation =
-				typeof account.authInvalidatedAt === "number" &&
-				Number.isFinite(account.authInvalidatedAt) &&
-				account.authInvalidatedAt > 0;
+			const accountHasValidInvalidation = account.authInvalidatedAt !== undefined || account.authInvalidationErrorCode !== undefined;
 			const baseline = this.persistenceBaseline?.accounts.find(row => isSameNativeAccount(account, row));
 			const explicitlyCleared = baseline?.authInvalidatedAt === diskInvalidatedAt && baseline?.authInvalidationErrorCode === disk.authInvalidationErrorCode &&
 				baseline?.accessToken === account.accessToken && baseline?.refreshToken === account.refreshToken && baseline?.expiresAt === account.expiresAt &&
@@ -1865,8 +1856,6 @@ export class AccountManager {
 		const snapshot: AccountStorageV3 = {
 			version: 3,
 			accounts: this.accounts.map((account) => {
-				const hasValidAuthInvalidation =
-					this.isAccountAuthInvalidated(account);
 				return {
 					recordId: account.recordId,
 					accountId: account.accountId,
@@ -1886,12 +1875,8 @@ export class AccountManager {
 							: undefined,
 					coolingDownUntil: account.coolingDownUntil,
 					cooldownReason: account.cooldownReason,
-					authInvalidatedAt: hasValidAuthInvalidation
-						? account.authInvalidatedAt
-						: undefined,
-					authInvalidationErrorCode: hasValidAuthInvalidation
-						? account.authInvalidationErrorCode
-						: undefined,
+					authInvalidatedAt: account.authInvalidatedAt,
+					authInvalidationErrorCode: account.authInvalidationErrorCode,
 					workspaces: account.workspaces,
 					currentWorkspaceIndex: account.currentWorkspaceIndex,
 					codexCliMirror: account.codexCliMirror,
@@ -2475,7 +2460,7 @@ export class AccountManager {
      account.refreshToken = saved.refreshToken;
      account.expires = saved.expiresAt;
      account.authInvalidatedAt = saved.authInvalidatedAt;
-     account.authInvalidationErrorCode = account.authInvalidatedAt ? saved.authInvalidationErrorCode : undefined;
+     account.authInvalidationErrorCode = saved.authInvalidationErrorCode;
     }
     if ((account.enabled !== false) === (prior.enabled !== false)) account.enabled = saved.enabled !== false;
     Object.assign(account, cooldown);

@@ -1114,14 +1114,21 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								runtimeMetrics.lastRequestAt = Date.now();
 								syncRuntimeObservability(requestTraceId);
 								let runtimePolicyDecision: RuntimePolicyDecision | null = null;
+								const runtimePolicyBlockedAccounts = new Set<ReturnType<typeof accountManager.getAccountByIndex>>();
 								try {
 									const runtimePolicyState = await loadRuntimePolicyState();
+									const policyAccounts = accountManager.getAccountsSnapshot();
+									const policyOwners = new Map(policyAccounts.map(candidate => [candidate.index, accountManager.getAccountByIndex(candidate.index)]));
 									runtimePolicyDecision = await evaluateRuntimePolicy({
 										state: runtimePolicyState,
-										accounts: accountManager.getAccountsSnapshot(),
+										accounts: policyAccounts,
 										model: model ?? null,
 										capabilityPolicy: capabilityPolicyStore,
 									});
+									for (const index of runtimePolicyDecision.blockedAccountIndexes) {
+										const owner = policyOwners.get(index);
+										if (owner) runtimePolicyBlockedAccounts.add(owner);
+									}
 								} catch (policyError) {
 									logWarn("Runtime policy evaluation failed open.", {
 										error:
@@ -1348,9 +1355,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													modelFamily,
 													model,
 												) &&
-												!runtimePolicyDecision?.blockedAccountIndexes.has(
-													preferredSessionAccountIndex,
-												)
+												!runtimePolicyBlockedAccounts.has(accountManager.getAccountByIndex(preferredSessionAccountIndex))
 											) {
 												account = accountManager.getAccountByIndex(
 													preferredSessionAccountIndex,
@@ -1383,9 +1388,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 										}
 										attempted.add(account.index);
 										if (
-											runtimePolicyDecision?.blockedAccountIndexes.has(
-												account.index,
-											)
+											runtimePolicyBlockedAccounts.has(account)
 										) {
 											continue;
 										}

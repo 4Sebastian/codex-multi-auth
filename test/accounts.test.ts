@@ -1629,7 +1629,7 @@ describe("AccountManager", () => {
 			["negative", -1],
 			["NaN", Number.NaN],
 			["infinity", Number.POSITIVE_INFINITY],
-		] as const)("does not treat %s as an auth invalidation", (_label, timestamp) => {
+		] as const)("denies authentication with a malformed %s invalidation marker", (_label, timestamp) => {
 			const now = Date.now();
 			const manager = new AccountManager(undefined, {
 				version: 3 as const,
@@ -1646,7 +1646,7 @@ describe("AccountManager", () => {
 			const account = manager.getCurrentAccount();
 			if (!account) throw new Error("account missing");
 
-			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
 		});
 
 		it("treats a positive finite timestamp as an auth invalidation", () => {
@@ -2536,7 +2536,7 @@ describe("AccountManager", () => {
 			expect(savedData?.accounts[0]?.rateLimitResetTimes).toBeDefined();
 		});
 
-		it("omits malformed auth invalidation markers from routine saves", async () => {
+		it("preserves malformed auth invalidation markers through routine saves", async () => {
 			const { saveAccounts } = await import("../lib/storage.js");
 			const mockSaveAccounts = vi.mocked(saveAccounts);
 			const now = Date.now();
@@ -2557,8 +2557,8 @@ describe("AccountManager", () => {
 			await manager.saveToDisk();
 
 			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
-			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
-			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+			expect(savedAccount?.authInvalidatedAt).toBe(0);
+			expect(savedAccount?.authInvalidationErrorCode).toBe("oauth_token_revoked");
 		});
 
 		it("preserves persisted current-generation invalidation despite issuer clock skew", async () => {

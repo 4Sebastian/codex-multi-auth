@@ -2610,7 +2610,7 @@ describe("storage", () => {
 		});
 
 		it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
-			"removes malformed auth invalidation fields for timestamp %s",
+			"preserves denial evidence for malformed invalidation timestamp %s",
 			(timestamp) => {
 				const result = normalizeAccountStorage({
 					version: 3,
@@ -2623,10 +2623,8 @@ describe("storage", () => {
 					],
 				});
 
-				expect(result?.accounts[0]).not.toHaveProperty("authInvalidatedAt");
-				expect(result?.accounts[0]).not.toHaveProperty(
-					"authInvalidationErrorCode",
-				);
+				expect(result?.accounts[0]?.authInvalidatedAt).toBe(timestamp);
+				expect(result?.accounts[0]?.authInvalidationErrorCode).toBe("oauth_token_revoked");
 			},
 		);
 

@@ -1767,21 +1767,8 @@ export function normalizeAccountStorage(
 				isRecord(account) &&
 				typeof account.refreshToken === "string" &&
 				!!account.refreshToken.trim(),
-		)
-		.map((account) => {
-			const invalidationTimestamp = account.authInvalidatedAt;
-			if (
-				typeof invalidationTimestamp === "number" &&
-				Number.isFinite(invalidationTimestamp) &&
-				invalidationTimestamp > 0
-			) {
-				return account;
-			}
-			const normalized = { ...account };
-			delete normalized.authInvalidatedAt;
-			delete normalized.authInvalidationErrorCode;
-			return normalized;
-		});
+		);
+	// Malformed or code-only revocation is still denial evidence, not recovery.
 
 	const deduplicatedAccounts = deduplicateAccounts(validAccounts);
 

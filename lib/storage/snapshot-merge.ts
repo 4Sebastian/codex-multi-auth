@@ -100,17 +100,21 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
     const accessToken = local.accessToken === base.accessToken ? disk.accessToken : local.accessToken;
     const refreshToken = local.refreshToken === base.refreshToken ? disk.refreshToken : local.refreshToken;
     const expiresAt = local.expiresAt === base.expiresAt ? disk.expiresAt : local.expiresAt;
-    const sameCredential = (a: AccountMetadataV3, b: AccountMetadataV3) => a.accessToken === b.accessToken && a.refreshToken === b.refreshToken && a.expiresAt === b.expiresAt;
+    const sameCredential = (a: Pick<AccountMetadataV3, "accessToken" | "refreshToken" | "expiresAt">, b: Pick<AccountMetadataV3, "accessToken" | "refreshToken" | "expiresAt">) => a.accessToken === b.accessToken && a.refreshToken === b.refreshToken && a.expiresAt === b.expiresAt;
     const currentInvalidation = (row: AccountMetadataV3) => row.accessToken === accessToken && row.refreshToken === refreshToken && row.expiresAt === expiresAt ? row.authInvalidatedAt : undefined;
     const diskInvalidation = currentInvalidation(disk), localInvalidation = currentInvalidation(local);
     const clearedInvalidation = currentInvalidation(base) !== undefined && (
         (sameCredential(disk, base) && sameCredential(local, base) && disk.authInvalidatedAt === undefined && local.authInvalidatedAt === base.authInvalidatedAt) ||
         (sameCredential(local, base) && sameCredential(disk, base) && local.authInvalidatedAt === undefined && disk.authInvalidatedAt === base.authInvalidatedAt));
-    const invalidated = (diskInvalidation ?? 0) >= (localInvalidation ?? 0) ? disk : local;
-    const authInvalidatedAt = clearedInvalidation ? undefined : currentInvalidation(invalidated);
+    // An orphaned marker cannot be cleared by normalization or an unrelated save.
+    const orphaned = [disk, local, base].find(row => sameCredential(row, {accessToken, refreshToken, expiresAt}) &&
+        (row.authInvalidatedAt !== undefined || row.authInvalidationErrorCode !== undefined) &&
+        !(typeof row.authInvalidatedAt === "number" && Number.isFinite(row.authInvalidatedAt) && row.authInvalidatedAt > 0));
+    const invalidated = orphaned ?? ((diskInvalidation ?? 0) >= (localInvalidation ?? 0) ? disk : local);
+    const authInvalidatedAt = !orphaned && clearedInvalidation ? undefined : currentInvalidation(invalidated);
     const runtime = {
         authInvalidatedAt,
-        authInvalidationErrorCode: authInvalidatedAt ? invalidated.authInvalidationErrorCode : undefined,
+        authInvalidationErrorCode: orphaned || authInvalidatedAt !== undefined ? invalidated.authInvalidationErrorCode : undefined,
         rateLimitResetTimes: Object.keys(limits).length ? limits : undefined,
         ...mergeAccountCooldown(base, disk, local),
         lastSwitchReason: local.lastSwitchReason ?? disk.lastSwitchReason,
