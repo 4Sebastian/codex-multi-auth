@@ -19,9 +19,10 @@ vi.mock("node:fs", async importOriginal => ({...await importOriginal<typeof impo
 // its own multi-auth directory instead of the worker's shared one.
 function discoverModelInventory(...args:Parameters<typeof discoverManagedModelInventory>){
  if(args[0]&&!existsSync(getStoragePath()))writeAccountSourceFixture(args[0]);
- return discoverManagedModelInventory(args[0], args[1], {captureProbeAuthorization: fixtureProbeAuthorization, ...args[2]});
+ return discoverManagedModelInventory(args[0], args[1], {captureProbeAuthorization: fixtureProbeAuthorization, captureRouteAuthorization: fixtureRouteAuthorization, ...args[2]});
 }
 const fixtureProbeAuthorization = (route: ApiRouteCredential) => async () => () => route.enabled && route.probeCapabilities === true;
+const fixtureRouteAuthorization = (route: ApiRouteCredential) => async () => () => route.enabled;
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
@@ -485,7 +486,9 @@ it("reports a failed capability refresh to the focused CLI caller", async () => 
 it("serializes independent inventory writers and preserves both successful baselines",async()=>{
  const {promises:fs}=await import("node:fs");
  const first=await import("../lib/runtime/model-discovery-status.js");
+ const firstAuthority=(await import("../lib/runtime/account-model-catalog.js")).CATALOG_AUTHORITY;
  vi.resetModules();const second=await import("../lib/runtime/model-discovery-status.js");
+ const secondAuthority=(await import("../lib/runtime/account-model-catalog.js")).CATALOG_AUTHORITY;
  const originalWrite=fs.writeFile.bind(fs),originalRename=fs.rename.bind(fs);
  let release!:()=>void,entered!:()=>void,checkpoint!:()=>void;
  const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r),overlap=new Promise<void>(r=>checkpoint=r);
@@ -496,12 +499,12 @@ it("serializes independent inventory writers and preserves both successful basel
   if(String(args[1]).startsWith('{"version":1,"checkedAt":102,'))checkpoint();
  });
  const rename=vi.spyOn(fs,"rename").mockImplementation(async(...args)=>{if(parked&&String(args[1]).endsWith("model-discovery.json.write-lock"))checkpoint();return originalRename(...args);});
- const entry=(id:string,ok:boolean)=>({id,label:id,kind:"api" as const,enabled:true,error:!ok,checkedAt:ok?101:102,models:ok?[id]:[],visibleModels:[]});
+ const entry=(id:string,ok:boolean,authority:symbol)=>({[authority]:()=>true,id,label:id,kind:"api" as const,enabled:true,error:!ok,checkedAt:ok?101:102,models:ok?[id]:[],visibleModels:[]});
  let pending:Promise<unknown>|undefined;
  try {
-  const a=first.saveModelInventory({version:1,checkedAt:101,entries:[entry("writer-a",true),entry("writer-b",false)]});
+  const a=first.saveModelInventory({version:1,checkedAt:101,entries:[entry("writer-a",true,firstAuthority),entry("writer-b",false,firstAuthority)]});
   await started;
-  const b=second.saveModelInventory({version:1,checkedAt:102,entries:[entry("writer-a",false),entry("writer-b",true)]});
+  const b=second.saveModelInventory({version:1,checkedAt:102,entries:[entry("writer-a",false,secondAuthority),entry("writer-b",true,secondAuthority)]});
   pending=Promise.all([a,b]);await overlap;await new Promise(r=>setImmediate(r));release();await pending;
   const result=await second.loadModelInventory();
   expect(result?.entries.map(e=>e.lastSuccessful?.models)).toEqual([["writer-a"],["writer-b"]]);
@@ -527,7 +530,7 @@ it("honours the persisted 15-minute probe cache across fresh CLI processes unles
   const run = async (forceProbes?: boolean) => {
    vi.resetModules();
    const fresh = await import("../lib/runtime/model-discovery-status.js");
-   await fresh.discoverModelInventory(null, [route], { captureProbeAuthorization: fixtureProbeAuthorization, fetchImpl: fetcher as typeof fetch, now: () => clock, updateApiDiscovery: async (r) => r, persistProbes: true, forceProbes });
+   await fresh.discoverModelInventory(null, [route], { captureProbeAuthorization: fixtureProbeAuthorization, captureRouteAuthorization: fixtureRouteAuthorization, fetchImpl: fetcher as typeof fetch, now: () => clock, updateApiDiscovery: async (r) => r, persistProbes: true, forceProbes });
   };
   await run();
   const first = probes;
@@ -833,7 +836,7 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
   const a = await import("../lib/runtime/model-discovery-status.js");
   vi.resetModules();
   const b = await import("../lib/runtime/model-discovery-status.js");
-  const options = { captureProbeAuthorization: fixtureProbeAuthorization, fetchImpl: fetcher as typeof fetch, now: () => 1_000_000, updateApiDiscovery: async (r: never) => r, persistProbes: true };
+  const options = { captureProbeAuthorization: fixtureProbeAuthorization, captureRouteAuthorization: fixtureRouteAuthorization, fetchImpl: fetcher as typeof fetch, now: () => 1_000_000, updateApiDiscovery: async (r: never) => r, persistProbes: true };
   // Both start from the same (empty) cache and probe different credentials.
   await Promise.all([a.discoverModelInventory(null, [route("one")], options), b.discoverModelInventory(null, [route("two")], options)]);
   const cached = JSON.parse(await fs.readFile(join(dir, "api-capability-probes.json"), "utf8")).entries;

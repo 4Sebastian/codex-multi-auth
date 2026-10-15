@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { ApiModelRuntime } from "../lib/runtime/api-model-runtime.js";
 import type { ApiRouteCredential } from "../lib/api-route-store.js";
+vi.mock("../lib/api-route-store.js", async importOriginal => ({
+	...await importOriginal<typeof import("../lib/api-route-store.js")>(),
+	captureApiRouteAuthorization: (route: ApiRouteCredential) => async () => () => route.enabled,
+}));
 const credential = (
 	id: string,
 	kind: "api" | "zdr" = "zdr",

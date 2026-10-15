@@ -230,10 +230,13 @@ describe("usage ledger core", () => {
 			return Response.json({service_tier: speed === "speed/fast/" ? "priority" : speed ? "ultrafast" : "default", usage: {input_tokens: 1000, output_tokens: 100, total_tokens: 1100}});
 		}, Date.now, undefined, async models => models.map(item => ({...item, service_tiers: [{id: "priority", name: "Fast", description: "Fixture"}, {id: "ultrafast", name: "Ultrafast", description: "Fixture"}]})));
 		const alias = `${kind}/${speed}${model}`;
-		const response = await runtime.request(alias, {model: alias, input: "Fixture"}, [{id: "priced-fixture", label: "Fixture", kind, apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: [model]}]);
+		const {saveApiRoutes} = await import("../lib/api-route-store.js");
+		const routes = [{id: "priced-fixture", label: "Fixture", kind, apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: [model]}];
+		await saveApiRoutes(routes);
+		const response = await runtime.request(alias, {model: alias, input: "Fixture"}, routes);
 		expect(response.status).toBe(200);
 		expect(sent).toHaveLength(1);
-		expect(sent[0]).toMatchObject({model, store: false, ...(speed ? {service_tier: speed === "speed/fast/" ? "fast" : "ultrafast"} : {})});
+		expect(sent[0]).toMatchObject({model, store: false, ...(speed ? {service_tier: speed === "speed/fast/" ? "priority" : "ultrafast"} : {})});
 		const usage = extractResponsesUsage(await response.json());
 		expect(usage).toMatchObject({inputTokens: 1000, outputTokens: 100, totalTokens: 1100});
 		const row = await appendUsageLedgerRow({id: "actual-api-model", source: "runtime-proxy", operation: "responses", outcome: "success", model: alias, ...usage});

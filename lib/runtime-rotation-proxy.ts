@@ -3910,7 +3910,7 @@ async function handleRequestInner(
 				});
 
 				const currentOAuth=modelCatalog.cachedList(routableKeys()).filter(model=>!/^(api|zdr)\//.test(model.slug));
-				const models=[...currentOAuth,...buildVisibleModelUnion(apiCatalogs.filter(catalog=>catalog[CATALOG_AUTHORITY]?.()!==false))];
+				const models=[...currentOAuth,...buildVisibleModelUnion(apiCatalogs.filter(catalog=>catalog[CATALOG_AUTHORITY]?.()===true))];
 				if(state.modelCatalog===modelCatalog){state.catalogOAuthModels=currentOAuth;setCatalogEtag(state,models);}
 				return models;
 				})();

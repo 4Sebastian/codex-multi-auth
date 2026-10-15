@@ -8,6 +8,7 @@ import { createAutomaticSubscriptionCheck } from "../lib/runtime/automatic-subsc
 import { findQuotaCacheEntryForAccount, quotaWorkspaceKey } from "../lib/quota-readiness.js";
 import type { QuotaCacheData } from "../lib/quota-cache.js";
 import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
+import * as prompts from "../lib/prompts/codex.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
 const { probe, saveQuota, loadQuota } = vi.hoisted(() => ({ probe: vi.fn(), saveQuota: vi.fn(), loadQuota: vi.fn() }));
 vi.mock("../lib/quota-cache.js", async (importOriginal) => ({
@@ -18,7 +19,45 @@ vi.mock("../lib/quota-cache.js", async (importOriginal) => ({
 vi.mock("../lib/quota-probe.js", () => ({ fetchCodexQuotaSnapshot: probe }));
 let dir: string;
 beforeEach(async () => { dir = await fs.mkdtemp(join(tmpdir(), "subscription-checks-")); vi.stubEnv("CODEX_MULTI_AUTH_DIR", dir); setStoragePathDirect(join(dir, "accounts.json")); saveQuota.mockReset(); loadQuota.mockReset().mockImplementation(async () => ({ byAccountId: {}, byEmail: {} })); probe.mockReset().mockResolvedValue({ status: 200, model: "fixture", primary: { usedPercent: 0 }, secondary: { usedPercent: 0 }, primingCompleted: true }); });
-afterEach(async () => { vi.restoreAllMocks(); setStoragePathDirect(null); vi.unstubAllEnvs(); await removeWithRetry(dir, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); setStoragePathDirect(null); vi.unstubAllEnvs(); await removeWithRetry(dir, { recursive: true, force: true }); });
+it.each((["preparation", "fallback"] as const).flatMap(stage => ["expired", "boundary", "missing", "valid"].map(expiry => ({stage, expiry}))))("checks original expiry at each actual automatic probe send: %j", async ({stage, expiry}) => {
+    let clock = Date.now();
+    const expiresAt = expiry === "missing" ? undefined : clock + 120000;
+    const account = {recordId: "expiry", accountId: "personal", refreshToken: "fixture-refresh", accessToken: "fixture-access", expiresAt, addedAt: 1, lastUsed: 1};
+    await saveAccounts({version: 3, activeIndex: 0, accounts: [account]});
+    const policies: AccountPolicyStore = {version: 1, accounts: {}};
+    upsertAccountPolicy(policies, getAccountPolicyKey(account), policy => {policy.autoPrime = true;});
+    await saveAccountPolicyStore(policies);
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    vi.spyOn(tokenRefresh, "ensureFreshAccessToken").mockImplementation(async ({account: live}) => ({ok: true, account: live, accessToken: "fixture-access"}));
+    let enter!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => {enter = resolve;}), gate = new Promise<void>(resolve => {release = resolve;});
+    vi.spyOn(prompts, "getCodexInstructions").mockImplementation(async () => {
+        if (stage === "preparation") {enter(); await gate;}
+        return "Fixture instructions";
+    });
+    let sends = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-access");
+        if (++sends === 1 && stage === "fallback") {
+            enter(); await gate;
+            return Response.json({error: {message: "The model is not supported when using Codex with a ChatGPT account."}}, {status: 400});
+        }
+        return new Response('data: {"type":"response.completed","response":{"status":"completed"}}\n\n', {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "1"}});
+    }));
+    const actual = await vi.importActual<typeof import("../lib/quota-probe.js")>("../lib/quota-probe.js");
+    probe.mockImplementation(actual.fetchCodexQuotaSnapshot);
+    const observed = vi.fn();
+    const pending = createAutomaticSubscriptionCheck(observed)(new AbortController().signal);
+    if (expiry === "missing" && stage === "fallback") {await pending; expect(sends).toBe(0); expect(observed).not.toHaveBeenCalled(); return;}
+    try {
+        await ready;
+        if (expiry !== "valid") clock = (expiresAt ?? clock) + (expiry === "expired" ? 1 : 0);
+    } finally {release();}
+    await pending;
+    expect(sends).toBe((stage === "fallback" ? 1 : 0) + (expiry === "valid" ? 1 : 0));
+    expect(observed).toHaveBeenCalledTimes(expiry === "valid" ? 1 : 0);
+});
 it("automatically enables first-use completion only for the opted-in saved subscription binding", async () => {
     const account = { recordId: "fixture", accountId: "personal", refreshToken: "fixture-refresh", accessToken: "fixture-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, workspaces: [{ id: "personal", enabled: true }, { id: "other", enabled: true }] };
     await saveAccounts({ version: 3, activeIndex: 0, accounts: [account] });

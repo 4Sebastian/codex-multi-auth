@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, renameSync, openSync, readSync, closeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { getCodexMultiAuthDir } from "./runtime-paths.js";
@@ -6,7 +6,6 @@ import { tempPathFor } from "./temp-path.js";
 import { withRetry } from "./fs-retry.js";
 import { withStorageLock } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
-import { captureAuthorityRevision } from "./storage/authority-revision.js";
 const API_ROUTE_SOURCE = Symbol("api-route-source");
 const modelId = z
 	.string()
@@ -43,7 +42,7 @@ const schema = z.object({
 	version: z.literal(1),
 	routes: z.array(routeSchema).max(100),
 });
-export type ApiRouteCredential = z.infer<typeof routeSchema>;
+export type ApiRouteCredential = z.infer<typeof routeSchema> & {[API_ROUTE_SOURCE]?: {path: string; root: string}};
 export function getApiRoutesPath(): string {
 	return join(getCodexMultiAuthDir(), "api-routes.json");
 }
@@ -60,6 +59,7 @@ function validate(value: unknown): ApiRouteCredential[] {
 export async function loadApiRoutes(
 	path = getApiRoutesPath(),
 ): Promise<ApiRouteCredential[]> {
+	const source = {path, root: getApiRoutesPath()};
 	let raw: string;
 	try {
         raw = await withRetry(async () => {
@@ -79,39 +79,46 @@ export async function loadApiRoutes(
 		throw new Error("Unable to read API route configuration");
 	}
 	try {
-		return validate(JSON.parse(raw)).map(route => Object.defineProperty(route, API_ROUTE_SOURCE, {value: path}));
+		return validate(JSON.parse(raw)).map(route => Object.defineProperty(route, API_ROUTE_SOURCE, {value: source}));
 	} catch {
 		throw new Error("Invalid API route configuration");
 	}
 }
 export type ApiProbeAuthorization = () => Promise<() => boolean>;
 export function captureApiProbeAuthorization(route: ApiRouteCredential): ApiProbeAuthorization {
-	const path = API_ROUTE_SOURCE in route && typeof route[API_ROUTE_SOURCE] === "string" ? route[API_ROUTE_SOURCE] : getApiRoutesPath();
+	return captureApiRouteAuthorization(route, true);
+}
+export function captureApiRouteAuthorization(route: ApiRouteCredential, requireProbeConsent = false): ApiProbeAuthorization {
+	const source = route[API_ROUTE_SOURCE]?.root ?? getApiRoutesPath();
+	const path = route[API_ROUTE_SOURCE]?.path ?? source;
 	const {id, kind, apiKey, enabled, probeCapabilities} = route;
-	if (!enabled || probeCapabilities !== true) return async () => () => false;
+	if (!enabled || requireProbeConsent && probeCapabilities !== true) return async () => () => false;
 	let denied = false;
-	const readAuthority = async () => {
-		const revision = captureAuthorityRevision([path]);
-		let current: ApiRouteCredential | undefined;
-		try { current = (await loadApiRoutes(path)).find(candidate => candidate.id === id); }
-		catch { denied = true; }
-		const permitted = enabled && probeCapabilities === true && current?.enabled === true &&
-			current.probeCapabilities === true && current.kind === kind && current.apiKey === apiKey;
-		return () => {
-			denied ||= !permitted || getApiRoutesPath() !== path || !revision();
-			return !denied;
-		};
+	const current = () => {
+		if (denied) return false;
+		try {
+			const handle = openSync(path, "r");
+			let routes: ApiRouteCredential[];
+			try {
+				const buffer = Buffer.alloc(1024 * 1024 + 1);
+				const bytes = readSync(handle, buffer, 0, buffer.length, 0);
+				if (bytes > 1024 * 1024) throw Error("Invalid API route configuration");
+				routes = validate(JSON.parse(buffer.subarray(0, bytes).toString("utf8")));
+			} finally {closeSync(handle);}
+			const route = routes.find(candidate => candidate.id === id);
+			denied = getApiRoutesPath() !== source || route?.enabled !== true || route.kind !== kind || route.apiKey !== apiKey ||
+				(requireProbeConsent && route.probeCapabilities !== true);
+		} catch {denied = true;}
+		return !denied;
 	};
-	const initial = readAuthority().then(current => current(), () => false);
-	return async () => {
-		denied ||= !await initial;
-		return readAuthority();
-	};
+	current();
+	return async () => current;
 }
 export async function saveApiRoutes(
 	routes: ApiRouteCredential[],
 	path = getApiRoutesPath(),
 	expected?: ApiRouteCredential[],
+	authority?: () => boolean,
 ): Promise<void> {
 	const validated = validate({ version: 1, routes });
 	const serialized = JSON.stringify({ version: 1, routes: validated }) + "\n";
@@ -131,7 +138,12 @@ export async function saveApiRoutes(
 				);
 			}
 			await fs.writeFile(temp, serialized, { mode: 0o600, flag: "wx" });
-			await withRetry(() => fs.rename(temp, path), {
+			await withRetry(() => {
+				if (!authority) return fs.rename(temp, path);
+				if (!authority()) throw Error("API catalog authority changed");
+				renameSync(temp, path);
+				return Promise.resolve();
+			}, {
 				maxAttempts: 6,
 				backoffMs: 25,
 			});
@@ -154,8 +166,12 @@ export function updateApiModelDiscovery(
 	models: string[],
 	path = getApiRoutesPath(),
 ): Promise<ApiRouteCredential> {
+	const source = route[API_ROUTE_SOURCE] ?? {path, root: getApiRoutesPath()};
+	const authorize = source.path === path
+		? captureApiRouteAuthorization(Object.defineProperty({...route}, API_ROUTE_SOURCE, {value: source}))
+		: async () => () => false;
 	const result = discoveryUpdates.then(() =>
-		updateApiModelDiscoverySerial(route, models, path),
+		updateApiModelDiscoverySerial(route, models, path, authorize),
 	);
 	discoveryUpdates = result.then(
 		() => undefined,
@@ -166,8 +182,10 @@ export function updateApiModelDiscovery(
 async function updateApiModelDiscoverySerial(
 	route: ApiRouteCredential,
 	models: string[],
-	path = getApiRoutesPath(),
+	path: string,
+	authorize: ApiProbeAuthorization,
 ): Promise<ApiRouteCredential> {
+	if (!(await authorize())()) throw Error("API catalog authority changed");
 	const routes = await loadApiRoutes(path);
 	const current = routes.find(
 		(r) =>
@@ -191,6 +209,7 @@ async function updateApiModelDiscoverySerial(
 			routes.map((r) => (r.id === current.id ? updated : r)),
 			path,
 			routes,
+			await authorize(),
 		);
 	return updated;
 }

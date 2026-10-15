@@ -20,6 +20,7 @@ import {syncNativeAccountCredentials} from "./native-account-sync.js";
 import {
 	type ApiRouteCredential,
 	captureApiProbeAuthorization,
+	captureApiRouteAuthorization,
 	loadApiRoutes,
 	updateApiModelDiscovery,
 } from "../api-route-store.js";
@@ -79,7 +80,6 @@ export function captureCatalogAuthority(manager:AccountManager,account:ManagedAc
 }
 export function revalidateModelInventory(value:ModelInventory):ModelInventory {
  value.entries=value.entries.map(entry=>{
-  if(entry.kind!=='oauth'&&!entry[CATALOG_AUTHORITY])return entry;
   let current=false;try{current=entry[CATALOG_AUTHORITY]?.()===true;}catch{}
   return current?entry:{...entry,enabled:false,routable:false,visibleModels:[],error:true,bound:false,selected:false};
  });
@@ -126,11 +126,13 @@ export async function discoverModelInventory(
 		/** Share probe results with later CLI processes through the multi-auth directory. */
 		persistProbes?: boolean;
 		captureProbeAuthorization?: typeof captureApiProbeAuthorization;
+		captureRouteAuthorization?: typeof captureApiRouteAuthorization;
 	} = {},
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
 		now = options.now ?? Date.now;
 	const probeAuthorities = new Map(routes.map(route => [route, (options.captureProbeAuthorization ?? captureApiProbeAuthorization)(route)]));
+	const routeAuthorities = new Map(routes.map(route => [route, (options.captureRouteAuthorization ?? captureApiRouteAuthorization)(route)]));
 	const capabilities = new ApiModelCapabilities(fetcher, now);
 	if (options.persistProbes) {
 		const cached = await loadProbeCache();
@@ -235,12 +237,24 @@ export async function discoverModelInventory(
 			if (!authorize) throw Error("API probe authority unavailable");
 			return authorize;
 		},
+		route => {
+			const authorize = routeAuthorities.get(route);
+			if (!authorize) throw Error("API catalog authority unavailable");
+			return authorize;
+		},
 	);
 	await api.catalogs(routes, true, options.forceProbes === true);
-	const publicationChecks = await Promise.all(routes.filter(route => options.updateApiDiscovery && route.enabled && route.probeCapabilities).map(route => {
-		const authorize = probeAuthorities.get(route);
-		if (!authorize) throw Error("API probe authority unavailable");
-		return authorize();
+	const publicationChecks = await Promise.all(routes.filter(route => route.enabled).map(async route => {
+		const authorize = routeAuthorities.get(route);
+		if (!authorize) throw Error("API catalog authority unavailable");
+		const current = await authorize();
+		if (options.updateApiDiscovery && route.probeCapabilities) {
+			const probe = probeAuthorities.get(route);
+			if (!probe) throw Error("API probe authority unavailable");
+			const consent = await probe();
+			return () => current() && consent();
+		}
+		return current;
 	}));
 	const requirePublication = () => {
 		if (publicationChecks.some(current => !current())) throw Error("API probe authority changed");

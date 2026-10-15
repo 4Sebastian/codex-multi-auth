@@ -7,6 +7,7 @@ import { writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
 import { createServer, ServerResponse } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import * as pendingAuth from "../lib/storage/pending-auth.js";
+import { saveApiRoutes } from "../lib/api-route-store.js";
 import { AccountModelCatalog } from "../lib/runtime/account-model-catalog.js";
 import { workspaceModelScopes } from "../lib/runtime/workspace-model-scopes.js";
 import * as nativeStorageReader from "../lib/runtime/native-account-storage.js";
@@ -153,6 +154,8 @@ async function startProxy(params: {
 	openManagers.push(params.accountManager);
 	// A managed catalog now retains its physical pre-await source authority.
 	if (params.options?.nativeOpenai && !existsSync(getStoragePath())) writeAccountSourceFixture({version: 3, activeIndex: 0, accounts: params.accountManager.getAccountsSnapshot().map(account => ({...account, accessToken: account.access, expiresAt: account.expires}))});
+	const readRoutes = params.options?.readApiRoutes;
+	let seededRoutes = false;
 	const proxy = await startRuntimeRotationProxy({
 		accountManager: params.accountManager,
 		fetchImpl: params.fetchImpl,
@@ -160,6 +163,11 @@ async function startProxy(params: {
 		clientApiKey: DEFAULT_CLIENT_API_KEY,
 		quotaRemainingPercentThreshold: 10,
 		...params.options,
+		...(readRoutes ? {readApiRoutes: async () => {
+			const routes = await readRoutes();
+			if (!seededRoutes) { await saveApiRoutes(routes); seededRoutes = true; }
+			return routes;
+		}} : {}),
 	});
 	openServers.push(proxy);
 	return proxy;
@@ -431,10 +439,13 @@ function textEventStream(body = "data: {}\n\n", headers?: HeadersInit): Response
 }
 
 let storageFixtureDir: string;
+let previousApiDirectory: string | undefined;
 beforeEach(async () => {
 	vi.restoreAllMocks();
 	storageFixtureDir = await fs.mkdtemp(join(tmpdir(), "rotation-proxy-storage-"));
 	setStoragePathDirect(join(storageFixtureDir, "accounts.json"));
+	previousApiDirectory = process.env.CODEX_MULTI_AUTH_DIR;
+	process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
@@ -465,6 +476,8 @@ afterEach(async () => {
 	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED;
 	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT;
 	setStoragePathDirect(null);
+	if (previousApiDirectory === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+	else process.env.CODEX_MULTI_AUTH_DIR = previousApiDirectory;
 	await removeWithRetry(storageFixtureDir, {recursive: true, force: true});
 });
 

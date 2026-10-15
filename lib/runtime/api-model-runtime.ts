@@ -12,10 +12,11 @@ import { parseRetryAfterBodyMs, parseRetryAfterHeaderMs } from "../request/rate-
 import { isModelAtCapacityError } from "../request/error-classification.js";
 import { MAX_RATE_LIMIT_DELAY_MS } from "../constants.js";
 import { createHash } from "node:crypto";
-import { captureApiProbeAuthorization, type ApiProbeAuthorization, type ApiRouteCredential } from "../api-route-store.js";
+import { captureApiRouteAuthorization, captureApiProbeAuthorization, type ApiProbeAuthorization, type ApiRouteCredential } from "../api-route-store.js";
 import {
 	resolveModelRoute,
 	parseModelRoute,
+	canonicalServiceTier,
 	type RouteCatalog,
 	type RouteModel,
 	modelEntitlements,
@@ -116,7 +117,7 @@ export class ApiModelRuntime {
 		return this.failures.supports(this.key(credential), model, effort, tier);
 	}
 	cachedCatalogs(): AuthorizedApiCatalog[] {
-		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot[CATALOG_AUTHORITY]?.() === false ? {...entry.snapshot, enabled: false, visibleModels: []} : entry.snapshot] : []);
+		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot[CATALOG_AUTHORITY]?.() !== true ? {...entry.snapshot, enabled: false, visibleModels: [], models: []} : entry.snapshot] : []);
 	}
 	private readonly cache = new Map<
 		string,
@@ -138,6 +139,7 @@ export class ApiModelRuntime {
 		) => Promise<RouteModel[]>,
 		private readonly onCatalogUpdated?: () => void,
 		private readonly captureProbeAuthorization = captureApiProbeAuthorization,
+		private readonly captureRouteAuthorization = captureApiRouteAuthorization,
 	) {}
 	private key(route: ApiRouteCredential): string {
 		return createHash("sha256")
@@ -162,7 +164,8 @@ export class ApiModelRuntime {
 		}
 		const work = (requestKind ? routes.filter(route => route.kind === requestKind) : routes).map(route => {
 			const key = this.key(route);
-			const cached = this.cache.get(key);
+			const previous = this.cache.get(key);
+			const cached = previous?.snapshot?.[CATALOG_AUTHORITY]?.() === true ? previous : undefined;
 			const entry = {
 				at: cached?.at ?? 0,
 				models: cached?.models ?? [],
@@ -178,9 +181,15 @@ export class ApiModelRuntime {
 			}
 			this.cache.set(key, entry);
 			const probeRoute = {...route};
-			return {route, key, cached, entry, probeRoute, authorizeProbe: this.captureProbeAuthorization(route)};
+			return {route, key, cached, entry, probeRoute, authorizeProbe: this.captureProbeAuthorization(route), authorizeRoute: this.captureRouteAuthorization(route)};
 		});
-		return mapWithConcurrency(work, 3, async ({route, key, cached, entry, probeRoute, authorizeProbe}) => {
+		const catalogs = await mapWithConcurrency(work, 3, async ({route, key, cached, entry, probeRoute, authorizeProbe, authorizeRoute}) => {
+					let current = await authorizeRoute();
+					if (!current()) {
+						entry.models = [];
+						entry.error = true;
+						return entry.snapshot = {id: route.id, kind: route.kind, enabled: false, priority: route.priority, models: [], visibleModels: [], [CATALOG_AUTHORITY]: current};
+					}
 					if (
 						route.enabled &&
 						(refresh ||
@@ -204,6 +213,8 @@ export class ApiModelRuntime {
 								throw Error("API catalog unavailable");
 							}
 							const value = await boundedJson(response);
+							current = await authorizeRoute();
+							if (!current()) throw Error("API catalog authority changed");
 							if (
 								!isRecord(value) ||
 								!Array.isArray(value.data) ||
@@ -248,16 +259,26 @@ export class ApiModelRuntime {
 						}
 					}
 
+					current = await authorizeRoute();
+					if (!requestKind && probeRoute.probeCapabilities && entry.models.some(model => model.capability_probe_status)) {
+						const routeCurrent = current, consent = await authorizeProbe();
+						current = () => routeCurrent() && consent();
+					}
+					if (!current()) {
+						entry.models = [];
+						entry.error = true;
+					}
 					const snapshot: AuthorizedApiCatalog = {
+						[CATALOG_AUTHORITY]: current,
 						id: route.id,
 						kind: route.kind,
-						enabled: route.enabled,
+						enabled: route.enabled && current(),
 						priority: route.priority,
 						models: entry.models.map(model => withAccessPrograms(model, route)),
-						visibleModels: route.visibleModels,
+						visibleModels: current() ? route.visibleModels : [],
 					};
 					entry.snapshot = snapshot;
-					if (route.enabled && !entry.error && this.enrichModels && (!requestKind || !cached || cached.error)) {
+					if (snapshot.enabled && !entry.error && this.enrichModels && (!requestKind || !cached || cached.error)) {
 						const pending = this.enrichModels(
 							entry.models.filter((m) => route.visibleModels.includes(m.slug)),
 							refresh,
@@ -265,11 +286,15 @@ export class ApiModelRuntime {
 							forceProbes,
 							authorizeProbe,
 						).then(async (enriched) => {
+							const routeCurrent = await authorizeRoute();
+							if (!routeCurrent()) throw Error("API catalog authority changed");
+							let publicationCurrent = routeCurrent;
 							if (!requestKind && probeRoute.enabled && probeRoute.probeCapabilities) {
 								const current = await authorizeProbe();
 								if (!current()) throw Error("API probe authority changed");
-								snapshot[CATALOG_AUTHORITY] = current;
+								publicationCurrent = () => routeCurrent() && current();
 							}
+							snapshot[CATALOG_AUTHORITY] = publicationCurrent;
 							const byId = new Map(enriched.map((m) => [m.slug, m]));
 							snapshot.models = entry.models.map((m) => withAccessPrograms(byId.get(m.slug) ?? m, route));
 							// The caller receives its own completed result; only the newest refresh may replace the shared cache.
@@ -285,10 +310,25 @@ export class ApiModelRuntime {
 					}
 					return snapshot;
 		});
+		await Promise.all(work.map(async ({authorizeRoute, authorizeProbe, probeRoute}, index) => {
+			const snapshot = catalogs[index];
+			if (!snapshot) return;
+			const current = await authorizeRoute();
+			const consent = !requestKind && probeRoute.probeCapabilities && snapshot.models.some(model => model.capability_probe_status) ? await authorizeProbe() : undefined;
+			snapshot[CATALOG_AUTHORITY] = () => current() && (!consent || consent());
+			if (!snapshot[CATALOG_AUTHORITY]?.()) {
+				snapshot.enabled = false;
+				snapshot.visibleModels = [];
+				snapshot.models = [];
+			}
+		}));
+		return catalogs;
 	}
 	statuses(routes: ApiRouteCredential[]): ApiCatalogStatus[] {
 		return routes.map((r) => {
 			const c = this.cache.get(this.key(r));
+			const authorized = c?.snapshot?.[CATALOG_AUTHORITY]?.() === true;
+			const models = authorized ? c?.models ?? [] : [];
 			return {
 				[CATALOG_AUTHORITY]: c?.snapshot?.[CATALOG_AUTHORITY],
 				id: r.id,
@@ -296,9 +336,9 @@ export class ApiModelRuntime {
 				label: r.label,
 				priority: r.priority,
 				checkedAt: c?.at ?? 0,
-				error: c?.error ?? true,
-				availableModels: c?.models.map((m) => m.slug) ?? [],
-				entitlements: (c?.models ?? [])
+				error: !authorized || (c?.error ?? true),
+				availableModels: models.map((m) => m.slug),
+				entitlements: models
 					.filter((m) =>
 						(c?.snapshot?.visibleModels ?? r.visibleModels).includes(
 							m.slug,
@@ -307,7 +347,7 @@ export class ApiModelRuntime {
 					.map(model => modelEntitlements(withAccessPrograms(model, r))),
 				visibleModels: (
 					c?.snapshot?.visibleModels ?? r.visibleModels
-				).filter((id) => c?.models.some((m) => m.slug === id)),
+				).filter((id) => models.some((m) => m.slug === id)),
 			};
 		});
 	}
@@ -349,7 +389,7 @@ export class ApiModelRuntime {
 			model: route.upstreamModel,
 			store: false,
 		};
-		if (route.serviceTier) payload.service_tier = route.serviceTier;
+		if (route.serviceTier) payload.service_tier = canonicalServiceTier(route.serviceTier) === "fast" ? "priority" : route.serviceTier;
 		delete payload.client_metadata;
 		let lastStatus = 503;
 		let lastRejection: Response | undefined;

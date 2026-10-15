@@ -1,6 +1,44 @@
 # Integration review continuation
 
-## Binding and decision
+## Current fix continuation: b72a23a4
+
+Committed head: b72a23a4f1403eca719b5c7b479649b6c522ef31. Historical base remains 5735e20936e561938c8423bcb615f3df66df8bb9. This section supersedes the older working-diff binding and coverage inventory below; older inspection notes and verification are historical context, not new independent review.
+
+Verified tracked source/test diff SHA-256 (report excluded): f5a16d91aa4b2f37f5e764f299c9428f273c6f347b3695dcf47d6813d57e5416.
+New untracked behavioral test `test/api-catalog-authority.test.ts` SHA-256: c152c87f93269abf08403a10f9970e4f0998a7a249e5dc1cbc5dd4f75c0414c4.
+
+### Validated invariants and changes
+
+- R1/R2 and review-1/review-2 remain binding. The focused run includes their authorization, nine-probe, receipt-release, model-identity pricing and budget regressions. Passing these tests is not independent approval.
+- General catalog authority now captures the original source root/path, id, kind, key and enabled state before waits. Paid probes additionally require original/current explicit consent. The source binding is retained from the start of route loading, including when the ambient source changes before catalog capture.
+- The same bounded, schema-validated route check supplies synchronous live proof at queued GET sends, response acceptance, cached results, statuses, enrichment and publication. Missing proof is denied. Each check reads at most 1 MiB plus an overflow sentinel and closes its handle. Observed denial stays denied; an unchanged or metadata-only rewrite does not itself revoke an otherwise unchanged route.
+- Discovery metadata updates capture authority before their serialized queue and check again immediately before synchronous atomic rename. Existing expected-configuration and lock checks remain. No replacement key/source is adopted.
+- Background enrichment retains the existing paid-evidence proof while awaiting replacement proof; it does not temporarily replace a consent-bearing proof with general route authority. Existing paid metadata receives consent proof before becoming an intermediate cached snapshot.
+- Standalone inventory and native picker/background/ETag publication carry the same general proof, independently of probe consent. Historical loaded inventory is not promoted to live permission. Probe withdrawal does not unnecessarily forbid a freshly fetched non-probing catalog, but cannot publish paid evidence.
+- Explicit API/ZDR Fast aliases and equivalent body selections send `service_tier: "priority"`; upstream model, route/failure identity and `store:false` remain unchanged. The provider oracle rejects any non-Priority Fast wire tier.
+- Automatic quota diagnostics check original submitted `expiresAt > Date.now()` inside each final locked send callback. Held prompt preparation and unsupported-model fallback cover expired, exact-boundary, missing and valid expiry. Settlement credential matching was not changed.
+- Caller/failure-path retracing covered queued workers, non-OK responses, bounded body acceptance, persistence rejection, enrichment rejection, cache/status reads, inventory commit, native picker publication, API payload/failure keys, and automatic preparation/fallback admission. This is fixer self-review, not completion of the independent integration review.
+- Fixtures now persist the routes they authorize, isolate per-test source roots, persist replacement credentials, and attach explicit proof to synthetic inventory-writer entries. Production defaults never use those fixture callbacks.
+
+### Focused verification and limits
+
+The final focused command selected these 20 suites: api-catalog-authority, api-probe-authorization, api-route-store, api-model-runtime, api-model-capabilities, model-discovery-status, automatic-subscription-checks, automatic-account-checks, quota-probe, usage-ledger, usage-pricing-coverage, usage-service-tier, budget-guard, model-route-policy, preemptive-quota-scheduler, index-retry, runtime-rotation-proxy, dispatch-authority, native-error-no-replay and native-journal-auth.integration.
+
+- Initial execution: 1,599 passed and 18 failed. It exposed revision-only rejection of unchanged configuration as well as fixtures with non-durable route/key changes, cross-test source contamination, missing synthetic proof, an incorrect documentation-GET counter, and an overstrict withdrawn-consent status expectation.
+- After corrections: all 20 files and 1,617 tests passed.
+- Subsequent caller retracing found and removed an intermediate background proof downgrade while a replacement consent proof was awaiting resolution. Added an executable regression using a seeded paid catalog and a held authorization boundary.
+- Final execution: exit 0, all 20 files and 1,618 tests passed, duration 66.81 seconds. No source or test changes followed that final run.
+- `git diff --check` passed before the final report update; package.json and package-lock.json remain unchanged.
+- No full repository tests/lint, typecheck, build, installed/global-linked build, personal-client/provider activity, subagents, publication or pipeline control were performed. Independent normal phases and installed-delivery acceptance remain outstanding.
+
+### Independent review remains incomplete
+
+The prior reassessment reported 76 of 508 committed paths substantively reviewed and 432 not reviewed. Five of those 76 have changed in this continuation and require independent re-review: `lib/api-route-store.ts`, `lib/runtime/api-model-runtime.ts`, `lib/runtime/automatic-subscription-checks.ts`, `lib/runtime/model-discovery-status.ts`, `test/automatic-subscription-checks.test.ts`. The added behavioral test also requires independent review. Thus 438 of the current 509 paths are explicitly awaiting independent coverage/reconciliation below. No independent coverage was added by this fixer, and these counts do not certify the other paths or waive exact-head reconciliation.
+
+R3 and review-3 remain FIX, unresolved. The integration is not approved. No HIGH-to-PR escape, review waiver or replacement workflow is authorized. Only the original cancelled-terminal-usage-precedence and health-summary-revocation-exception warnings remain deferred; no new finding is deferred.
+
+## Historical binding and decision
+
 
 Run: 01M4YXD0G335FMKNZFTBGN47AQ
 
@@ -89,17 +127,15 @@ npm test -- test/usage-ledger.test.ts test/usage-pricing-coverage.test.ts test/u
 
 Full independent Test, Document, Lint and installed-delivery checks belong to their later phases. These focused results do not close R3.
 
-## Exact paths still requiring complete substantive review
+## Exact paths awaiting independent review at this fix head
 
-507 historical-base-to-head paths were enumerated. 11 have the inspection notes above; the following 496 remain open. This list includes partial inspections and does not represent a waiver. This newly added report is evidence only and is not part of the committed 507-path inventory.
+This current inventory replaces the historical 496-path list. It includes the 432 prior omissions, five changed previously reviewed paths, and the new behavioral test. Partial reads, focused test passes and this report are not independent coverage.
 
 - `.bugsweep-index.md`
 - `.bugsweep-transform.md`
 - `.codex-plugin/plugin.json`
 - `.github/pull_request_template.md`
-- `.github/workflows/ci.yml`
 - `.github/workflows/codeql.yml`
-- `.github/workflows/codex-plugin-scanner.yml`
 - `.gitignore`
 - `.nvmrc`
 - `AGENTS.md`
@@ -107,8 +143,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `CONTRIBUTING.md`
 - `README.md`
 - `SECURITY.md`
-- `codex_plugin_scanner/__init__.py`
-- `codex_plugin_scanner/action_runner.py`
 - `config/README.md`
 - `config/codex-legacy.json`
 - `config/codex-modern.json`
@@ -118,6 +152,7 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `docs/STYLE_GUIDE.md`
 - `docs/_config.yml`
 - `docs/architecture.md`
+- `docs/audits/evidence/2026-10-08-review2-coverage.md`
 - `docs/configuration.md`
 - `docs/design/earned-reset-credits.md`
 - `docs/design/model-route-pools-release.md`
@@ -221,10 +256,9 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `eslint.config.js`
 - `index.ts`
 - `knip.jsonc`
-- `lib/AGENTS.md`
 - `lib/account-policy.ts`
 - `lib/accounts.ts`
-- `lib/accounts/rate-limits.ts`
+- `lib/api-route-store.ts`
 - `lib/audit.ts`
 - `lib/auth/account-access.ts`
 - `lib/auth/auth.ts`
@@ -250,7 +284,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `lib/codex-manager/commands/resets.ts`
 - `lib/codex-manager/commands/rotation.ts`
 - `lib/codex-manager/commands/status.ts`
-- `lib/codex-manager/commands/uninstall.ts`
 - `lib/codex-manager/dashboard-settings-data.ts`
 - `lib/codex-manager/formatters/quota-formatters.ts`
 - `lib/codex-manager/formatters/subscription-status.ts`
@@ -267,11 +300,8 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `lib/codex-manager/settings-hub/dashboard.ts`
 - `lib/codex-manager/settings-panels.ts`
 - `lib/codex-manager/theme-settings-panel.ts`
-- `lib/concurrency.ts`
 - `lib/config.ts`
-- `lib/context-budget/model-context-windows.ts`
 - `lib/dashboard-settings.ts`
-- `lib/env-parsing.ts`
 - `lib/local-bridge.ts`
 - `lib/local-client-tokens.ts`
 - `lib/logger.ts`
@@ -285,63 +315,37 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `lib/quota-readiness.ts`
 - `lib/refresh-guardian.ts`
 - `lib/refresh-queue.ts`
-- `lib/request/account-dispatch.ts`
-- `lib/request/client-cancellation.ts`
 - `lib/request/error-classification.ts`
 - `lib/request/fetch-helpers.ts`
-- `lib/request/helpers/input-utils.ts`
 - `lib/request/helpers/model-map.ts`
 - `lib/request/helpers/tool-utils.ts`
 - `lib/request/rate-limit-decision.ts`
-- `lib/request/request-transformer.ts`
-- `lib/request/response-compaction.ts`
 - `lib/request/response-handler.ts`
-- `lib/request/response-outcome.ts`
-- `lib/request/stream-failover-runtime.ts`
-- `lib/request/stream-failover.ts`
 - `lib/request/token-refresh.ts`
-- `lib/request/url-rewriting.ts`
 - `lib/rotation.ts`
 - `lib/routing-profiles.ts`
-- `lib/runtime-constants.ts`
-- `lib/runtime-paths.ts`
 - `lib/runtime-rotation-proxy.ts`
 - `lib/runtime/account-check.ts`
-- `lib/runtime/account-model-catalog.ts`
 - `lib/runtime/account-pool.ts`
 - `lib/runtime/account-reset-credits.ts`
+- `lib/runtime/api-model-runtime.ts`
 - `lib/runtime/app-bind.ts`
-- `lib/runtime/automatic-account-checks.ts`
 - `lib/runtime/automatic-subscription-checks.ts`
-- `lib/runtime/catalog-capabilities.ts`
-- `lib/runtime/catalog-client-version.ts`
-- `lib/runtime/config-toml.ts`
 - `lib/runtime/hydrate-emails.ts`
-- `lib/runtime/inference-activity.ts`
-- `lib/runtime/native-binding-lock.ts`
-- `lib/runtime/native-client-auth.ts`
+- `lib/runtime/model-discovery-status.ts`
 - `lib/runtime/native-provider-config.ts`
-- `lib/runtime/native-rate-limits.ts`
 - `lib/runtime/reset-credit-routing.ts`
 - `lib/runtime/reset-credits.ts`
-- `lib/runtime/response-output-history.ts`
 - `lib/runtime/resume-picker.ts`
 - `lib/runtime/rotation-account-selection.ts`
 - `lib/runtime/rotation-proxy-state.ts`
-- `lib/runtime/rotation-server-types.ts`
 - `lib/runtime/rotation-token-refresh.ts`
-- `lib/runtime/runtime-capability-failures.ts`
 - `lib/runtime/runtime-observability.ts`
-- `lib/runtime/subscription-first-use.ts`
-- `lib/runtime/subscription-quota-event.ts`
-- `lib/runtime/subscription-quota-order.ts`
 - `lib/runtime/verify-flagged.ts`
-- `lib/runtime/workspace-model-scopes.ts`
 - `lib/schemas.ts`
 - `lib/session-affinity.ts`
 - `lib/storage.ts`
 - `lib/storage/account-save.ts`
-- `lib/storage/authority-revision.ts`
 - `lib/storage/credential-sidecars.ts`
 - `lib/storage/file-lock.ts`
 - `lib/storage/file-paths.ts`
@@ -354,7 +358,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `lib/storage/pending-auth.ts`
 - `lib/storage/public-types.ts`
 - `lib/storage/record-identity.ts`
-- `lib/storage/recovery-credentials.ts`
 - `lib/storage/snapshot-merge.ts`
 - `lib/storage/storage-parser.ts`
 - `lib/storage/transactions.ts`
@@ -369,45 +372,35 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `lib/unified-settings.ts`
 - `lib/usage/stream-usage-deferral.ts`
 - `lib/usage/usage-extraction.ts`
-- `lib/utils.ts`
 - `package-lock.json`
-- `package.json`
 - `scripts/bench-format/models.mjs`
-- `scripts/check-pack-budget-lib.js`
-- `scripts/codex-app-router.js`
 - `scripts/codex-bin-resolver.js`
-- `scripts/codex-multi-auth.js`
-- `scripts/codex-routing.js`
 - `scripts/codex.js`
-- `test/AGENTS.md`
 - `test/README.md`
 - `test/account-access.test.ts`
-- `test/account-dispatch-boundaries.test.ts`
 - `test/account-model-catalog.test.ts`
 - `test/account-policy.test.ts`
 - `test/account-rate-limits.test.ts`
-- `test/account-reset-target.test.ts`
 - `test/accounts-load-from-disk.test.ts`
 - `test/accounts-workspace-baseline.test.ts`
 - `test/accounts.test.ts`
 - `test/active-account-sync.test.ts`
+- `test/api-catalog-authority.test.ts`
 - `test/api-login-menu.test.ts`
 - `test/api-model-capabilities.test.ts`
 - `test/api-model-runtime.test.ts`
+- `test/api-probe-authorization.test.ts`
 - `test/api-route-store.test.ts`
 - `test/app-bind.test.ts`
 - `test/audit.test.ts`
 - `test/auth.test.ts`
-- `test/automatic-account-checks.test.ts`
 - `test/automatic-subscription-checks.test.ts`
 - `test/budget-guard.test.ts`
-- `test/catalog-client-version.test.ts`
 - `test/chaos/fault-injection.test.ts`
 - `test/chaos/fs-faults.test.ts`
 - `test/chaos/net-faults.test.ts`
 - `test/check-pack-budget.test.ts`
 - `test/check-progress.test.ts`
-- `test/ci-workflows.test.ts`
 - `test/circuit-breaker.test.ts`
 - `test/cli-output-contracts.test.ts`
 - `test/codex-app-router.test.ts`
@@ -415,7 +408,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/codex-cli-mirror.test.ts`
 - `test/codex-cli-org-account-alignment.test.ts`
 - `test/codex-cli-state.test.ts`
-- `test/codex-cli-writer-callers.test.ts`
 - `test/codex-cli-writer.test.ts`
 - `test/codex-manager-account-command.test.ts`
 - `test/codex-manager-best-command.test.ts`
@@ -436,7 +428,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/codex-model-resolution.test.ts`
 - `test/codex-prompts.test.ts`
 - `test/codex.test.ts`
-- `test/concurrency.test.ts`
 - `test/config-save.test.ts`
 - `test/config-toml-restore.test.ts`
 - `test/config.test.ts`
@@ -444,7 +435,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/context-budget-guard.test.ts`
 - `test/context-budget-window-coverage.test.ts`
 - `test/crash-mid-write.test.ts`
-- `test/credential-sidecars.test.ts`
 - `test/dashboard-settings-data.test.ts`
 - `test/dashboard-settings.test.ts`
 - `test/dispatch-authority.test.ts`
@@ -488,12 +478,10 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/model-capability-matrix.test.ts`
 - `test/model-discovery-status.test.ts`
 - `test/model-map.test.ts`
-- `test/model-route-policy.test.ts`
 - `test/multi-proc-save.test.ts`
 - `test/named-backup-export.test.ts`
 - `test/native-account-storage.test.ts`
 - `test/native-account-sync.test.ts`
-- `test/native-client-auth.test.ts`
 - `test/native-error-no-replay.test.ts`
 - `test/native-journal-auth.integration.test.ts`
 - `test/native-provider-config.test.ts`
@@ -522,7 +510,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/property/storage-roundtrip.property.test.ts`
 - `test/property/transformer.property.test.ts`
 - `test/publication-authority.test.ts`
-- `test/python-output-encoding.test.ts`
 - `test/quota-cache.test.ts`
 - `test/quota-probe.test.ts`
 - `test/rate-limit-decision.test.ts`
@@ -533,14 +520,10 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/repair-commands.test.ts`
 - `test/request-transformer.test.ts`
 - `test/reset-authority.test.ts`
-- `test/reset-credit-routing.test.ts`
 - `test/reset-credits.test.ts`
-- `test/reset-identity-collision.test.ts`
 - `test/resilience-storage.integration.test.ts`
 - `test/response-compaction.test.ts`
 - `test/response-handler.test.ts`
-- `test/response-outcome.test.ts`
-- `test/response-output-history.test.ts`
 - `test/responses-websocket.test.ts`
 - `test/resume-picker.test.ts`
 - `test/retired-models.test.ts`
@@ -551,7 +534,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/router-address-probe.test.ts`
 - `test/routing-profiles.test.ts`
 - `test/runtime-account-check.test.ts`
-- `test/runtime-capability-failures.test.ts`
 - `test/runtime-observability.test.ts`
 - `test/runtime-paths.test.ts`
 - `test/runtime-policy-cache.test.ts`
@@ -572,8 +554,6 @@ Full independent Test, Document, Lint and installed-delivery checks belong to th
 - `test/stream-failover.test.ts`
 - `test/stream-usage-deferral.test.ts`
 - `test/subscription-first-use.test.ts`
-- `test/subscription-quota-event.test.ts`
-- `test/subscription-quota-order.test.ts`
 - `test/subscription-status.test.ts`
 - `test/token-utils.test.ts`
 - `test/tool-utils.test.ts`

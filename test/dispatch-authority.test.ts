@@ -5,7 +5,7 @@ import type {Socket} from "node:net";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import WebSocket, {WebSocketServer, type RawData} from "ws";
-import {afterEach, expect, it, vi} from "vitest";
+import {afterEach, beforeEach, expect, it, vi} from "vitest";
 import {AccountManager} from "../lib/accounts.js";
 import {ContextBudgetGuard} from "../lib/context-budget-guard.js";
 import {CircuitBreaker, getCircuitBreaker, clearCircuitBreakers, type CircuitAdmissionReceipt} from "../lib/circuit-breaker.js";
@@ -33,6 +33,11 @@ import {createRuntimeProxyHttpError} from '../lib/runtime/rotation-server-types.
 import {appendUsageLedgerRow, readUsageLedgerRows} from "../lib/usage/index.js";
 
 const cleanups: Array<() => Promise<void>> = [];
+beforeEach(async () => {
+	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-test-"));
+	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
+	vi.stubEnv("CODEX_MULTI_AUTH_DIR", root);
+});
 afterEach(async () => {
 	vi.restoreAllMocks();
 	vi.unstubAllGlobals();
@@ -54,7 +59,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("Missing fixture address");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number | {status: number; error: {code: string; param?: string; message?: string}; workspace?: string} = false, quotaRemainingPercentThreshold?: number) {
+async function fixture(native: boolean, delayed = false, readApiRoutes?: () => Promise<ApiRouteCredential[]>, refuse: boolean | number | {status: number; error: {code: string; param?: string; message?: string}; workspace?: string} = false, quotaRemainingPercentThreshold?: number, capabilityFetch?: typeof fetch) {
 	const root = await fs.mkdtemp(join(tmpdir(), "dispatch-authority-"));
 	cleanups.push(() => removeWithRetry(root, {recursive: true, force: true}));
 	const path = join(root, "accounts.json");
@@ -102,6 +107,7 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 	let quotaFailure = false;
 	let postResponse: (() => Promise<Response>) | undefined;
 	const fetchImpl: typeof fetch = async (_url, init) => {
+		if (capabilityFetch && (new URL(String(_url)).hostname === "developers.openai.com" || String(_url).endsWith("api.openai.com/v1/responses"))) return capabilityFetch(_url, init);
 		if (init?.method !== "POST") {discoveries.push(new Headers(init?.headers).get("authorization") ?? ""); return Response.json({models: [{slug: "shared", ...(typeof refuse === "object" ? {supported_reasoning_levels: [{effort: "high"}], service_tiers: [{id: "priority", name: "Priority", description: "Fixture"}]} : {})}], data: [{id: "shared"}]});}
 		fetched.push(new Headers(init.headers).get("authorization") ?? "");
 		httpWorkspaces.push(new Headers(init.headers).get("chatgpt-account-id") ?? "");
@@ -109,7 +115,13 @@ async function fixture(native: boolean, delayed = false, readApiRoutes?: () => P
 		if (quotaFailure) return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}});
 		return new Response('data: {"type":"response.completed","response":{"id":"http-result","status":"completed","output":[]}}\n\n', {headers: {"content-type": "text/event-stream"}});
 	};
-	const proxy = await startRuntimeRotationProxy({readApiRoutes, quotaRemainingPercentThreshold, nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
+	let seededRoutes = false;
+	const readRoutes = readApiRoutes && readApiRoutes !== loadApiRoutes ? async () => {
+		const routes = await readApiRoutes();
+		if (!seededRoutes) {await saveApiRoutes(routes); seededRoutes = true;}
+		return routes;
+	} : readApiRoutes;
+	const proxy = await startRuntimeRotationProxy({readApiRoutes: readRoutes, quotaRemainingPercentThreshold, nativeOpenai: native, accountManager: manager, fetchImpl, clientApiKey: "fixture-client", forcedAccountIndex: 0, upstreamBaseUrl: `${base}/backend-api`, ...(native ? {readNativeAccountStorage: async () => JSON.parse(await fs.readFile(path, "utf8"))} : {})});
 	cleanups.push(async () => {await proxy.close(); await manager.flushPendingSave();});
 	const connect = async () => {
 		const ws = new WebSocket(`${proxy.baseUrl.replace("http:", "ws:")}/responses`, {headers: {authorization: "Bearer fixture-client"}});
@@ -125,6 +137,7 @@ it.each([[403,'policy_blocked'],[503,'runtime_policy_unavailable'],[503,'routing
  let posts=0,selected=0;
  const gateway=new ResponsesWebSocketGateway(async(_input,init)=>{if(init?.method==='POST')posts++;return Response.json({data:[{id:'shared'}]});},{maxPayloadBytes:1024*1024});
  const runtime=new ApiModelRuntime(gateway.fetch),routes:ApiRouteCredential[]=['one','two'].map(id=>({id,kind:'api',label:id,apiKey:`fixture-${id}`,enabled:true,priority:0,visibleModels:['shared']}));
+ await saveApiRoutes(routes);
  await expect(gateway.withDispatchAuthorization(async(_input,init)=>{if(init.method==='POST')throw original;},()=>runtime.request('api/shared',{input:[]},routes,undefined,()=>{selected++;}))).rejects.toBe(original);
  expect(original.cause).toBeDefined();expect(posts).toBe(0);expect(selected).toBe(1);gateway.close();
 });
@@ -133,6 +146,7 @@ it('does not retry an ambiguous sent API transport failure',async()=>{
  let posts=0,submitted=0,selected=0;
  const gateway=new ResponsesWebSocketGateway(async(_input,init)=>{if(init?.method==='POST'){posts++;throw Error('Owned EOF after submission');}return Response.json({data:[{id:'shared'}]});},{maxPayloadBytes:1024*1024});
  const runtime=new ApiModelRuntime(gateway.fetch),routes:ApiRouteCredential[]=['one','two'].map(id=>({id,kind:'api',label:id,apiKey:`fixture-${id}`,enabled:true,priority:0,visibleModels:['shared']}));
+ await saveApiRoutes(routes);
  const response=await gateway.withDispatchAuthorization(async(_input,init)=>init.method==='POST'?()=>{submitted++;}:undefined,()=>runtime.request('api/shared',{input:[]},routes,undefined,()=>{selected++;}));
  expect(response.status).toBe(502);expect((await response.json()).error.code).toBe('upstream_transport_error');expect(posts).toBe(1);expect(submitted).toBe(1);expect(selected).toBe(1);gateway.close();
 });
@@ -188,7 +202,7 @@ it('revalidates OAuth authority when background API capability enrichment publis
  const base=await listen(server);cleanups.push(()=>new Promise<void>(done=>{server.closeAllConnections();server.close(()=>done());}));
  const actualFetch=fetch;vi.stubGlobal('fetch',((input,init)=>actualFetch(new URL(String(input)).hostname==='developers.openai.com'?`${base}/documentation`:new URL(String(input)).hostname==='api.openai.com'?`${base}/responses`:input,init)) satisfies typeof fetch);
  await saveApiRoutes([{id:'background',kind:'api',label:'Owned fixture',apiKey:'owned-probe-key',enabled:true,priority:0,probeCapabilities:true,visibleModels:['shared']}]);
- const f=await fixture(true,false,loadApiRoutes),headers={authorization:'Bearer fixture-client'};
+ const f=await fixture(true,false,loadApiRoutes,false,undefined,fetch),headers={authorization:'Bearer fixture-client'};
  const response=await fetch(`${f.proxy.baseUrl}/models?client_version=0.160.0`,{headers});expect(response.status).toBe(200);await response.json();await entered.promise;
  f.pool.accounts[0]!.enabled=false;await fs.writeFile(f.path,JSON.stringify(f.pool));release.resolve();
  await vi.waitFor(async()=>{

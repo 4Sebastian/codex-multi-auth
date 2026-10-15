@@ -11,7 +11,7 @@ import {resetTrackers} from "../lib/rotation.js";
 import {startRuntimeRotationProxy} from "../lib/runtime-rotation-proxy.js";
 import {setStoragePathDirect, type AccountStorageV3} from "../lib/storage.js";
 import {readUsageLedgerRows} from "../lib/usage/index.js";
-import type {ApiRouteCredential} from "../lib/api-route-store.js";
+import {saveApiRoutes, type ApiRouteCredential} from "../lib/api-route-store.js";
 import {removeWithRetry} from "./helpers/remove-with-retry.js";
 
 const transport = vi.hoisted(() => ({base: ""}));
@@ -67,7 +67,8 @@ it.each(["oauth", "api", "zdr"].flatMap(kind => failures.flatMap(failure => ["fi
 		id: `route-${index}`, kind: kind === "zdr" ? "zdr" : "api", label: `Fixture ${index}`, apiKey: `fixture-api-${index}`, enabled: true,
 		priority: index, visibleModels: ["shared"],
 	}));
-	if (kind !== "oauth") routes.push({...routes[0]!, kind: kind === "api" ? "zdr" : "api", priority: -100, apiKey: "fixture-other-pool"});
+	if (kind !== "oauth") routes.push({...routes[0]!, id: "other-pool", kind: kind === "api" ? "zdr" : "api", priority: 0, apiKey: "fixture-other-pool"});
+	await saveApiRoutes(routes);
 	let clock = Date.now();
 	const startedAt = clock;
 	const upstream = createServer((_req, res) => {httpPosts++; res.writeHead(500); res.end();});
@@ -156,6 +157,7 @@ it.each(["oauth", "api", "zdr"].flatMap(kind => failures.flatMap(failure => ["fi
 		expect(events.at(-1)).toMatchObject({type: "error", status, error: {code}});
 		expect((await readUsageLedgerRows())[3]).toMatchObject({outcome: "failure", statusCode: status, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 		routes[0]!.apiKey = "fixture-recovered-api";
+		await saveApiRoutes(routes);
 		send();
 		await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(5));
 		expect(creates[4]?.authorization).toBe("Bearer fixture-recovered-api");

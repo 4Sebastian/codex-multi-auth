@@ -49,7 +49,7 @@ export function createAutomaticSubscriptionCheck(observe?: Observer) {
                     const policyCurrent = captureAuthorityRevision([getAccountPolicyPath()]);
                     const latest = (await loadAccountPolicyStore()).accounts[getAccountPolicyKey(current)];
                     return manager.withCurrentAccountCredential(fresh.account, submitted, () =>
-                        !signal.aborted && policyCurrent() && !!latest?.autoPrime && !latest.paused && !latest.drained &&
+                        !signal.aborted && (submitted.expiresAt ?? 0) > Date.now() && policyCurrent() && !!latest?.autoPrime && !latest.paused && !latest.drained &&
                         fresh.account.enabled !== false && automaticCheckWorkspaceId({ ...current, accountId: fresh.account.accountId,
                             workspaces: fresh.account.workspaces, currentWorkspaceIndex: fresh.account.currentWorkspaceIndex }) === targetId &&
                         (fresh.account.coolingDownUntil ?? 0) <= Date.now(), false);
