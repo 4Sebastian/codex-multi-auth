@@ -387,8 +387,9 @@ export function captureQueuedRefreshAuthority(storagePath: string, refreshToken:
 		let entries: PendingAuth[] = [];
 		try { entries = fileSchema.parse(JSON.parse(readFileSync(getPendingAuthPath(storagePath), "utf8"))).entries; }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-		const retained = entries.find(entry => entry.prior === hash(refreshToken));
-		owner = overlayPendingAuth(structuredClone(primary), entries).accounts.find(row => row.refreshToken === refreshToken) ??
+		const prior = hash(refreshToken);
+		const retained = entries.find(entry => entry.prior === prior);
+		owner = (entries.length ? overlayPendingAuth(structuredClone(primary), entries) : primary).accounts.find(row => row.refreshToken === refreshToken) ??
 			primary.accounts.find(row => row.refreshToken === refreshToken || !!retained &&
 				(retained.recordId ? row.recordId === retained.recordId : row.refreshToken === retained.refreshToken));
 		if (!owner && settlement?.owner) {
@@ -562,8 +563,12 @@ export async function applyPendingAuth(
 
 function overlayPendingAuth(storage: AccountStorageV3, entries: PendingAuth[], options: {source?: "historical-recovery"} = {}): AccountStorageV3 {
 	if (!entries.length) return storage;
+	const byPrior = new Map<string, PendingAuth>();
+	for (const entry of entries) {
+		if (!byPrior.has(entry.prior)) byPrior.set(entry.prior, entry);
+	}
 	for (const account of storage.accounts) {
-		const entry = account.refreshToken ? entries.find((item) => item.prior === hash(account.refreshToken)) : undefined;
+		const entry = account.refreshToken ? byPrior.get(hash(account.refreshToken)) : undefined;
 		if (!entry) continue;
 		account.recordId ??= entry.recordId;
 		const replacesCredential = account.accessToken !== entry.accessToken || account.refreshToken !== entry.refreshToken || account.expiresAt !== entry.expiresAt;

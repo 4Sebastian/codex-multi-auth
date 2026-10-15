@@ -8309,7 +8309,8 @@ describe("native inventory read resilience",()=>{
   const storage=createStorage(Date.now(),1),manager=new AccountManager(undefined,storage);
   let release!:()=>void,started!:()=>void;
   const gate=new Promise<void>(r=>release=r),entered=new Promise<void>(r=>started=r);
-  const current = createStorage(Date.now(),2);
+  const current = createStorage(Date.now()+1000,2);
+  writeAccountSourceFixture(current);
   const read=vi.fn(async()=>{started();await gate;return structuredClone(current);});
   const original=nativeStorageReader.createNativeAccountStorageReader;
   const readerCalls=vi.fn();
@@ -8323,7 +8324,7 @@ describe("native inventory read resilience",()=>{
   await vi.waitFor(()=>expect(readerCalls).toHaveBeenCalledTimes(2));
   expect(read).toHaveBeenCalledTimes(1);
   release();const responses = await Promise.all([first,second]);await Promise.all(responses.map(response => response.text()));
-  expect(responses.every(response => response.status === 200)).toBe(true);expect(mode).toHaveBeenCalledTimes(1);
+  expect(responses.map(response => response.status)).toEqual([200,200]);expect(mode).toHaveBeenCalledTimes(1);
  });
  it("preserves unexpired 429 state across inventory changes",async()=>{
   const now=Date.now(),manager=new AccountManager(undefined,createStorage(now,1));
