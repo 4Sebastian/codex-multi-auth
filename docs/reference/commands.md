@@ -560,6 +560,8 @@ codex-multi-auth uninstall [--dry-run] [--json] [--clear-accounts]
 - `--clear-accounts` also removes stored credentials and API keys (irreversible)
 - `--dry-run` previews; `--json` prints a machine-readable removed/would-remove summary
 
+Before applying cleanup, [verify the resolved paths, back up data, and inspect ownership](../privacy.md#data-cleanup). A dry-run does not establish ownership of a shared path. Do not apply cleanup where ownership is uncertain. Neither uninstall nor `--clear-accounts` guarantees a complete data wipe or secure erasure of backups, journals, or exports.
+
 ---
 
 ## `codex-multi-auth usage`

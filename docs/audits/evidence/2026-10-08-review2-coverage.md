@@ -1,4 +1,233 @@
-# Integration review continuation
+# Current bounded documentation repair at 1f692de6
+
+Run: 01M4YXD0G335FMKNZFTBGN47AQ. Starting committed head: 1f692de67c311ba0d4eabb93513cada0f83f0891. Base: 5735e20936e561938c8423bcb615f3df66df8bb9. This section supersedes earlier current-head and remaining-path counts, not historical evidence or requirements.
+
+The exact documentation patch excluding this report has SHA-256 5d5a2db26f0b0d293666ee30e47f48304b07661b40206c6be25ab9de28d8b56b. Production source, tests, package metadata and lockfile were not changed in this fix continuation. No custody, policy, counter or checkpoint operation was performed.
+
+## Finding disposition and invariant
+
+- review-4 is legitimate. The shared-root ownership promise contradicted recursive generic-directory deletion, .gitignore deletion and filename-prefix globs in both shell examples. The defect was ownership inference in the guidance, not a missing cleanup subsystem.
+- Removed both manual wipe scripts and both soft-reset deletion examples. Replacement guidance requires resolved-path checks, private backups, stopped installation-owned writers and inspection of exact artifacts. Unknown ownership means leave the entry alone. Official CLI state and unrelated shared data remain protected.
+- Linked uninstall guidance now starts with a dry-run preview and explains that the preview is not ownership proof. Uninstall and --clear-accounts do not guarantee complete credential erasure. Backups, WAL, pending-auth, project pools and exported copies are separately relevant. The storage reference no longer claims every entry under the namespace belongs to this project.
+- R1, R2, review-1, review-2, api-catalog-source-authority, api-fast-wire-tier and automatic-probe-expiry-authority remain binding and their existing fixes/tests were preserved. The focused execution below revalidates them but does not independently approve them.
+- R3, review-3 and review-5 remain unresolved FIX obligations for the same entire integration. No coverage waiver, approval, new deferred warning or completion is claimed. Risk remains high, scope source-or-external, because mandatory independent whole-change coverage is still incomplete. The original two deferred warnings are unchanged.
+
+## Concrete inspection and caller judgments in this fix phase
+
+These are fixer inspection notes, not new independent coverage. Read ranges below were contiguous and nontruncated; an excerpt never establishes whole-file review.
+
+- `docs/privacy.md`: read the complete original page, traced its Bash and PowerShell examples against the advertised shared-root promise, then reviewed replacement cleanup prose. Default paths, overrides, generic directories and matching prefixes do not establish ownership. No executable deletion recipe remains in this page.
+- `docs/troubleshooting.md`: read the complete original page. Soft reset used a hard-coded default path and did not distinguish active state from credential recovery copies. Removed those commands rather than introducing replacement destructive commands. Uninstall now links the same preconditions and presents a preview, not a broad wipe.
+- `docs/reference/storage-paths.md`: complete original ranges 1-145 and 146-277. Root overrides, project pools, legacy paths, backups and official CLI state show why an inventory cannot certify all directory contents. Corrected its blanket ownership bullet. No cleanup code was added.
+- `docs/reference/commands.md`: range 540-604 only. Preserved command syntax and flags while adding the same ownership and erasure limits to the uninstall reference. The rest of this file is not newly reviewed.
+- `docs/upgrade.md`: complete 1-163. Existing uninstall references route readers to the revised troubleshooting procedure; no alternate recursive wipe recipe substitutes for the removed examples. This reading is not independent approval of the whole upgrade procedure or its live provider commands.
+- `lib/codex-manager/commands/uninstall.ts`: complete 1-190 and 191-361. Dry-run branches avoid launcher loading and mutating hooks. Actual cleanup operates configured host/cache paths and a supplied credential-clearing callback, so a preview cannot prove shared-root ownership or comprehensive credential erasure. Error aggregation and conservative malformed-config handling remain unchanged.
+- `test/uninstall-command.test.ts`: complete 1-180, 181-360 and 361-527. The executable tests supply disposable paths and inert launcher/unbind dependencies, assert config/cache results and shared bun.lock preservation, and expose partial failures. These tests do not certify safety of arbitrary shared overrides or any removed shell recipe.
+- `lib/storage/credential-sidecars.ts`: complete 1-58. Explicit credential-sidecar removals use existing file locks/retries; first failure is retained across clear steps. This is not a promise to erase all exported, flagged, project or historical copies.
+- `lib/storage.ts`: range 2850-3028 only. Account and flagged clears have separate entry points and backup/reset handling; exports can live at separately resolved paths. Deleting one active JSON file is not proof of total credential erasure. No whole storage review is claimed.
+- `scripts/codex.js`: range 3835-4009 only. Stale shadow cleanup requires recorded wrapper and child identity/liveness, treats unknown evidence conservatively, and retains non-marker contents even after both owners are gone. These controls are not permission for users to delete an arbitrary shared root.
+- `lib/accounts.ts`: range 2490-2646 only. The locked credential callback compares original record/access/refresh/exact expiry/workspace and rechecks source/journal state before mutation. Expiry equality remains distinct from the automatic job's strictly-future send check; settlement semantics were not changed.
+- `index.ts`: ranges 1690-1845 and 2375-2484 only. Header receipts precede classification waits; the owning finally releases reservations. Cancelled accepted responses retain usage completion without failure or false healing, and successful recovery remains gated by original credential/circuit ownership. The rest of the plugin remains outstanding.
+- `lib/runtime-rotation-proxy.ts`: ranges 4435-4544 and 5100-5179 only. Header receipt reservation is conditional on actual quota/plan or a classification-needing 429; owned completion releases it. Recovery is denied while unrelated quota work is pending and terminal ledger completion remains owned. Whole runtime, custom/native and cancellation coverage is still outstanding.
+- Retained-boundary rereads: complete `lib/api-route-store.ts` 1-215; `lib/runtime/api-model-capabilities.ts` 270-514; complete `lib/runtime/automatic-subscription-checks.ts` 1-68; `lib/preemptive-quota-scheduler.ts` 285-429; `lib/usage/pricing.ts` 220-319. Original general/probe authority, bounded file checks, local denial classification, original receipt epochs, expiry-in-lock, actual upstream model pricing and null-cost behavior were preserved.
+
+## Focused executable verification
+
+One focused verification ran after all four documentation edits, with isolated HOME, USERPROFILE, CODEX_HOME, CODEX_MULTI_AUTH_DIR and TMPDIR rooted at the ignored worktree fixture `.tmp/review4.gzWciy`. The existing global sandbox further redirects each worker before application imports. No personal cleanup, provider/auth/priming, client, daemon, global installation, or PowerShell execution is claimed.
+
+```sh
+npm test -- test/documentation.test.ts test/uninstall-command.test.ts test/uninstall-ebusy-retry.test.ts test/codex-manager-uninstall-dispatch.test.ts test/credential-sidecars.test.ts test/api-catalog-authority.test.ts test/api-probe-authorization.test.ts test/api-route-store.test.ts test/api-model-runtime.test.ts test/api-model-capabilities.test.ts test/model-discovery-status.test.ts test/automatic-subscription-checks.test.ts test/automatic-account-checks.test.ts test/quota-probe.test.ts test/usage-ledger.test.ts test/usage-pricing-coverage.test.ts test/usage-service-tier.test.ts test/budget-guard.test.ts test/model-route-policy.test.ts test/preemptive-quota-scheduler.test.ts test/index-retry.test.ts test/runtime-rotation-proxy.test.ts test/dispatch-authority.test.ts test/native-error-no-replay.test.ts test/native-journal-auth.integration.test.ts
+```
+
+Exit 0. All 25 files and 1,687 tests passed in 67.98 seconds. This includes retained authority/consent/queued catalog/body/cache/publication/ETag, Fast-to-Priority, expiry preparation/fallback, pricing/ledger/budget, nine-probe, receipt cleanup, terminal accounting and no-replay controls. No source, test or user-facing documentation changes followed this run. Documentation assertions are existing contract checks, not evidence that natural-language instructions enforce ownership; the unsafe examples were removed and the replacement prose was reviewed directly. No source-string safety test was added.
+
+Full normal Test, Document, Lint, typechecking/build and actual linked installed-delivery acceptance remain separate outstanding phases. The outer executor owns them. The prior failing focused runs and historical results below remain evidence, not final acceptance.
+
+## Independent-review evidence retained and reconciled
+
+The round-3 returned report at b72a23a4 listed 76 judged paths. The latest returned independent report for 1f692de6 listed 92, stated that no tests/build/lint ran in that review, and left whole-change coverage incomplete. Their supplied path metadata is retained below. Their full per-path ranges/judgments were not supplied in the returned JSON; none are fabricated here. External shared-boundary reassessments remain supporting context, not independent review.
+
+Of the earlier 76, 71 were unchanged by b72a23a4..1f692de6. Four changed paths were listed again in the latest independent report; `test/automatic-subscription-checks.test.ts` was not. The current repair changes `docs/privacy.md`, requiring independent re-review despite its presence in the latest report. The other three changed user docs and this report also need independent review.
+
+The union of supplied metadata, after excluding changed paths not rejudged, leaves 385 of the 509 paths awaiting independent coverage or reconciliation in the current inventory. This is an auditable handoff count, not certification of the other paths or permission to omit shared callers.
+
+Next independent review must prioritize complete omitted files: `index.ts`, `lib/accounts.ts`, `lib/storage.ts`, `lib/runtime-rotation-proxy.ts`, `scripts/codex.js`, then omitted whole test/config/docs files. Continue contiguous nontruncated source/caller/security/failure inspection, reconcile all prior FIX requirements and the changed docs, and record substantive judgments before acceptance. This instruction to the next phase does not start or control a workflow.
+
+### Prior returned independent path metadata at b72a23a4
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/codex-plugin-scanner.yml`
+- `codex_plugin_scanner/__init__.py`
+- `codex_plugin_scanner/action_runner.py`
+- `lib/AGENTS.md`
+- `lib/accounts/rate-limits.ts`
+- `lib/api-route-store.ts`
+- `lib/codex-manager/commands/uninstall.ts`
+- `lib/concurrency.ts`
+- `lib/context-budget/model-context-windows.ts`
+- `lib/env-parsing.ts`
+- `lib/model-route-policy.ts`
+- `lib/preemptive-quota-scheduler.ts`
+- `lib/request/account-dispatch.ts`
+- `lib/request/client-cancellation.ts`
+- `lib/request/helpers/input-utils.ts`
+- `lib/request/request-transformer.ts`
+- `lib/request/response-compaction.ts`
+- `lib/request/response-outcome.ts`
+- `lib/request/stream-failover-runtime.ts`
+- `lib/request/stream-failover.ts`
+- `lib/request/url-rewriting.ts`
+- `lib/runtime-constants.ts`
+- `lib/runtime-paths.ts`
+- `lib/runtime/account-model-catalog.ts`
+- `lib/runtime/api-model-capabilities.ts`
+- `lib/runtime/api-model-runtime.ts`
+- `lib/runtime/automatic-account-checks.ts`
+- `lib/runtime/automatic-subscription-checks.ts`
+- `lib/runtime/catalog-capabilities.ts`
+- `lib/runtime/catalog-client-version.ts`
+- `lib/runtime/config-toml.ts`
+- `lib/runtime/inference-activity.ts`
+- `lib/runtime/model-discovery-status.ts`
+- `lib/runtime/native-account-storage.ts`
+- `lib/runtime/native-account-sync.ts`
+- `lib/runtime/native-binding-lock.ts`
+- `lib/runtime/native-client-auth.ts`
+- `lib/runtime/native-rate-limits.ts`
+- `lib/runtime/response-output-history.ts`
+- `lib/runtime/responses-websocket.ts`
+- `lib/runtime/rotation-server-types.ts`
+- `lib/runtime/runtime-capability-failures.ts`
+- `lib/runtime/subscription-first-use.ts`
+- `lib/runtime/subscription-quota-event.ts`
+- `lib/runtime/subscription-quota-order.ts`
+- `lib/runtime/workspace-model-scopes.ts`
+- `lib/storage/authority-revision.ts`
+- `lib/storage/recovery-credentials.ts`
+- `lib/usage/pricing.ts`
+- `lib/utils.ts`
+- `package.json`
+- `scripts/check-pack-budget-lib.js`
+- `scripts/codex-app-router.js`
+- `scripts/codex-multi-auth.js`
+- `scripts/codex-routing.js`
+- `test/AGENTS.md`
+- `test/account-dispatch-boundaries.test.ts`
+- `test/account-reset-target.test.ts`
+- `test/automatic-account-checks.test.ts`
+- `test/automatic-subscription-checks.test.ts`
+- `test/catalog-client-version.test.ts`
+- `test/ci-workflows.test.ts`
+- `test/codex-cli-writer-callers.test.ts`
+- `test/concurrency.test.ts`
+- `test/credential-sidecars.test.ts`
+- `test/model-route-policy.test.ts`
+- `test/native-client-auth.test.ts`
+- `test/python-output-encoding.test.ts`
+- `test/reset-credit-routing.test.ts`
+- `test/reset-identity-collision.test.ts`
+- `test/response-outcome.test.ts`
+- `test/response-output-history.test.ts`
+- `test/runtime-capability-failures.test.ts`
+- `test/subscription-quota-event.test.ts`
+- `test/subscription-quota-order.test.ts`
+
+### Latest returned independent path metadata at 1f692de6
+
+- `.codex-plugin/plugin.json`
+- `.github/pull_request_template.md`
+- `.github/workflows/ci.yml`
+- `.github/workflows/codeql.yml`
+- `.github/workflows/codex-plugin-scanner.yml`
+- `.gitignore`
+- `.nvmrc`
+- `CONTRIBUTING.md`
+- `SECURITY.md`
+- `codex_plugin_scanner/__init__.py`
+- `codex_plugin_scanner/action_runner.py`
+- `docs/privacy.md`
+- `eslint.config.js`
+- `knip.jsonc`
+- `lib/account-policy.ts`
+- `lib/api-route-store.ts`
+- `lib/audit.ts`
+- `lib/auth/server.ts`
+- `lib/budget-guard.ts`
+- `lib/circuit-breaker.ts`
+- `lib/codex-manager/commands/uninstall.ts`
+- `lib/concurrency.ts`
+- `lib/context-budget/model-context-windows.ts`
+- `lib/env-parsing.ts`
+- `lib/local-bridge.ts`
+- `lib/local-client-tokens.ts`
+- `lib/logger.ts`
+- `lib/model-route-policy.ts`
+- `lib/policy/runtime-policy-cache.ts`
+- `lib/policy/runtime-policy.ts`
+- `lib/preemptive-quota-scheduler.ts`
+- `lib/prompts/codex.ts`
+- `lib/request/account-dispatch.ts`
+- `lib/request/client-cancellation.ts`
+- `lib/request/helpers/input-utils.ts`
+- `lib/request/helpers/tool-utils.ts`
+- `lib/request/url-rewriting.ts`
+- `lib/routing-profiles.ts`
+- `lib/runtime-paths.ts`
+- `lib/runtime/api-model-capabilities.ts`
+- `lib/runtime/api-model-runtime.ts`
+- `lib/runtime/automatic-subscription-checks.ts`
+- `lib/runtime/catalog-capabilities.ts`
+- `lib/runtime/catalog-client-version.ts`
+- `lib/runtime/config-toml.ts`
+- `lib/runtime/model-discovery-status.ts`
+- `lib/runtime/native-account-storage.ts`
+- `lib/runtime/native-account-sync.ts`
+- `lib/runtime/native-client-auth.ts`
+- `lib/runtime/responses-websocket.ts`
+- `lib/runtime/runtime-capability-failures.ts`
+- `lib/runtime/workspace-model-scopes.ts`
+- `lib/storage/authority-revision.ts`
+- `lib/storage/credential-sidecars.ts`
+- `lib/storage/file-lock.ts`
+- `lib/storage/file-paths.ts`
+- `lib/storage/json-store-lock.ts`
+- `lib/storage/path-state.ts`
+- `lib/storage/paths.ts`
+- `lib/storage/pending-auth.ts`
+- `lib/storage/record-identity.ts`
+- `lib/storage/recovery-credentials.ts`
+- `lib/utils.ts`
+- `package.json`
+- `scripts/bench-format/models.mjs`
+- `scripts/check-pack-budget-lib.js`
+- `scripts/codex-app-router.js`
+- `scripts/codex-bin-resolver.js`
+- `scripts/codex-multi-auth.js`
+- `scripts/codex-routing.js`
+- `test/api-catalog-authority.test.ts`
+- `test/catalog-client-version.test.ts`
+- `test/check-pack-budget.test.ts`
+- `test/ci-workflows.test.ts`
+- `test/codex-app-router.test.ts`
+- `test/codex-cli-writer-callers.test.ts`
+- `test/concurrency.test.ts`
+- `test/context-budget-window-coverage.test.ts`
+- `test/env-parsing.test.ts`
+- `test/gpt61-sol-models.test.ts`
+- `test/local-bridge.test.ts`
+- `test/package-bin.test.ts`
+- `test/paths.test.ts`
+- `test/python-output-encoding.test.ts`
+- `test/retired-models.test.ts`
+- `test/router-address-probe.test.ts`
+- `test/runtime-paths.test.ts`
+- `test/token-utils.test.ts`
+- `test/utils.test.ts`
+- `tsconfig.json`
+- `tsconfig.scripts.json`
+- `vendor/provenance.json`
+
+# Historical integration review continuation
 
 ## Current fix continuation: b72a23a4
 
@@ -127,22 +356,15 @@ npm test -- test/usage-ledger.test.ts test/usage-pricing-coverage.test.ts test/u
 
 Full independent Test, Document, Lint and installed-delivery checks belong to their later phases. These focused results do not close R3.
 
-## Exact paths awaiting independent review at this fix head
+## Exact paths awaiting independent coverage or reconciliation now
 
-This current inventory replaces the historical 496-path list. It includes the 432 prior omissions, five changed previously reviewed paths, and the new behavioral test. Partial reads, focused test passes and this report are not independent coverage.
+These 385 paths are not credited by the retained returned reports at the current working state. This list replaces the historical 438-path inventory; fixer reads and focused tests add no independent credit. Other reported paths still require exact-final-head and caller reconciliation before whole-change approval.
 
 - `.bugsweep-index.md`
 - `.bugsweep-transform.md`
-- `.codex-plugin/plugin.json`
-- `.github/pull_request_template.md`
-- `.github/workflows/codeql.yml`
-- `.gitignore`
-- `.nvmrc`
 - `AGENTS.md`
 - `CHANGELOG.md`
-- `CONTRIBUTING.md`
 - `README.md`
-- `SECURITY.md`
 - `config/README.md`
 - `config/codex-legacy.json`
 - `config/codex-modern.json`
@@ -253,19 +475,11 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `docs/releases/v2.9.2.md`
 - `docs/troubleshooting.md`
 - `docs/upgrade.md`
-- `eslint.config.js`
 - `index.ts`
-- `knip.jsonc`
-- `lib/account-policy.ts`
 - `lib/accounts.ts`
-- `lib/api-route-store.ts`
-- `lib/audit.ts`
 - `lib/auth/account-access.ts`
 - `lib/auth/auth.ts`
-- `lib/auth/server.ts`
 - `lib/auth/token-utils.ts`
-- `lib/budget-guard.ts`
-- `lib/circuit-breaker.ts`
 - `lib/cli.ts`
 - `lib/codex-cli/state.ts`
 - `lib/codex-cli/writer.ts`
@@ -302,14 +516,8 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `lib/codex-manager/theme-settings-panel.ts`
 - `lib/config.ts`
 - `lib/dashboard-settings.ts`
-- `lib/local-bridge.ts`
-- `lib/local-client-tokens.ts`
-- `lib/logger.ts`
 - `lib/oc-chatgpt-target-detection.ts`
-- `lib/policy/runtime-policy-cache.ts`
-- `lib/policy/runtime-policy.ts`
 - `lib/proactive-refresh.ts`
-- `lib/prompts/codex.ts`
 - `lib/quota-cache.ts`
 - `lib/quota-probe.ts`
 - `lib/quota-readiness.ts`
@@ -318,21 +526,16 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `lib/request/error-classification.ts`
 - `lib/request/fetch-helpers.ts`
 - `lib/request/helpers/model-map.ts`
-- `lib/request/helpers/tool-utils.ts`
 - `lib/request/rate-limit-decision.ts`
 - `lib/request/response-handler.ts`
 - `lib/request/token-refresh.ts`
 - `lib/rotation.ts`
-- `lib/routing-profiles.ts`
 - `lib/runtime-rotation-proxy.ts`
 - `lib/runtime/account-check.ts`
 - `lib/runtime/account-pool.ts`
 - `lib/runtime/account-reset-credits.ts`
-- `lib/runtime/api-model-runtime.ts`
 - `lib/runtime/app-bind.ts`
-- `lib/runtime/automatic-subscription-checks.ts`
 - `lib/runtime/hydrate-emails.ts`
-- `lib/runtime/model-discovery-status.ts`
 - `lib/runtime/native-provider-config.ts`
 - `lib/runtime/reset-credit-routing.ts`
 - `lib/runtime/reset-credits.ts`
@@ -346,18 +549,10 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `lib/session-affinity.ts`
 - `lib/storage.ts`
 - `lib/storage/account-save.ts`
-- `lib/storage/credential-sidecars.ts`
-- `lib/storage/file-lock.ts`
-- `lib/storage/file-paths.ts`
 - `lib/storage/flagged-storage-io.ts`
 - `lib/storage/flagged-storage.ts`
-- `lib/storage/json-store-lock.ts`
 - `lib/storage/migrations.ts`
-- `lib/storage/path-state.ts`
-- `lib/storage/paths.ts`
-- `lib/storage/pending-auth.ts`
 - `lib/storage/public-types.ts`
-- `lib/storage/record-identity.ts`
 - `lib/storage/snapshot-merge.ts`
 - `lib/storage/storage-parser.ts`
 - `lib/storage/transactions.ts`
@@ -373,8 +568,6 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `lib/usage/stream-usage-deferral.ts`
 - `lib/usage/usage-extraction.ts`
 - `package-lock.json`
-- `scripts/bench-format/models.mjs`
-- `scripts/codex-bin-resolver.js`
 - `scripts/codex.js`
 - `test/README.md`
 - `test/account-access.test.ts`
@@ -385,7 +578,6 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/accounts-workspace-baseline.test.ts`
 - `test/accounts.test.ts`
 - `test/active-account-sync.test.ts`
-- `test/api-catalog-authority.test.ts`
 - `test/api-login-menu.test.ts`
 - `test/api-model-capabilities.test.ts`
 - `test/api-model-runtime.test.ts`
@@ -399,11 +591,9 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/chaos/fault-injection.test.ts`
 - `test/chaos/fs-faults.test.ts`
 - `test/chaos/net-faults.test.ts`
-- `test/check-pack-budget.test.ts`
 - `test/check-progress.test.ts`
 - `test/circuit-breaker.test.ts`
 - `test/cli-output-contracts.test.ts`
-- `test/codex-app-router.test.ts`
 - `test/codex-bin-wrapper.test.ts`
 - `test/codex-cli-mirror.test.ts`
 - `test/codex-cli-org-account-alignment.test.ts`
@@ -433,21 +623,18 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/config.test.ts`
 - `test/context-budget-guard-proxy.test.ts`
 - `test/context-budget-guard.test.ts`
-- `test/context-budget-window-coverage.test.ts`
 - `test/crash-mid-write.test.ts`
 - `test/dashboard-settings-data.test.ts`
 - `test/dashboard-settings.test.ts`
 - `test/dispatch-authority.test.ts`
 - `test/documentation.test.ts`
 - `test/effort-suffix-stripping.test.ts`
-- `test/env-parsing.test.ts`
 - `test/fetch-helpers.test.ts`
 - `test/fixtures/custom-upgrade-error.mjs`
 - `test/flagged-publication-boundaries.test.ts`
 - `test/gpt56-models.test.ts`
 - `test/gpt6-astra-models.test.ts`
 - `test/gpt6-sol-luna-models.test.ts`
-- `test/gpt61-sol-models.test.ts`
 - `test/health-check.test.ts`
 - `test/helpers/account-source-fixture.ts`
 - `test/helpers/cli-test-fixtures.ts`
@@ -467,7 +654,6 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/json-store-lock.test.ts`
 - `test/live-account-sync.test.ts`
 - `test/live-proxy-parallel.test.ts`
-- `test/local-bridge.test.ts`
 - `test/local-client-tokens.test.ts`
 - `test/logger.test.ts`
 - `test/login-flow.test.ts`
@@ -491,8 +677,6 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/oauth-server.integration.test.ts`
 - `test/oc-chatgpt-target-detection.test.ts`
 - `test/outcome-authority.test.ts`
-- `test/package-bin.test.ts`
-- `test/paths.test.ts`
 - `test/pending-auth-capacity.integration.test.ts`
 - `test/pending-auth-refresh.integration.test.ts`
 - `test/pending-auth.test.ts`
@@ -526,16 +710,13 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/response-handler.test.ts`
 - `test/responses-websocket.test.ts`
 - `test/resume-picker.test.ts`
-- `test/retired-models.test.ts`
 - `test/rotation-account-selection.test.ts`
 - `test/rotation-integration.test.ts`
 - `test/rotation-proxy-state.test.ts`
 - `test/rotation-token-refresh.test.ts`
-- `test/router-address-probe.test.ts`
 - `test/routing-profiles.test.ts`
 - `test/runtime-account-check.test.ts`
 - `test/runtime-observability.test.ts`
-- `test/runtime-paths.test.ts`
 - `test/runtime-policy-cache.test.ts`
 - `test/runtime-policy.test.ts`
 - `test/runtime-rotation-proxy.test.ts`
@@ -555,7 +736,6 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/stream-usage-deferral.test.ts`
 - `test/subscription-first-use.test.ts`
 - `test/subscription-status.test.ts`
-- `test/token-utils.test.ts`
 - `test/tool-utils.test.ts`
 - `test/ui-runtime.test.ts`
 - `test/ui-theme.test.ts`
@@ -564,8 +744,4 @@ This current inventory replaces the historical 496-path list. It includes the 43
 - `test/usage-ledger.test.ts`
 - `test/usage-redaction.test.ts`
 - `test/usage-service-tier.test.ts`
-- `test/utils.test.ts`
 - `test/zz-stress-helper-lifecycle.test.ts`
-- `tsconfig.json`
-- `tsconfig.scripts.json`
-- `vendor/provenance.json`

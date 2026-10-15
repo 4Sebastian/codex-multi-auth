@@ -84,9 +84,11 @@ run.
 
 ### Ownership notes
 
-- `~/.codex/multi-auth/*` is managed by this project; `~/.codex/accounts.json`,
-  `~/.codex/auth.json`, and `~/.codex/config.toml` are managed by the official
-  Codex CLI.
+- These paths describe artifacts used by this project, not ownership of every
+  entry in a storage root. Shared roots can contain unrelated files. Follow
+  the [cleanup ownership checks](../privacy.md#data-cleanup) before deleting
+  anything. `~/.codex/accounts.json`, `~/.codex/auth.json`, and
+  `~/.codex/config.toml` belong to the official Codex CLI.
 - The `codex-multi-auth-codex` wrapper preserves the official file-backed auth
   layout by forwarding non-auth commands with
   `-c cli_auth_credentials_store="file"` — unless the caller already set it —

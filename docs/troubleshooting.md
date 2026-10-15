@@ -153,34 +153,27 @@ Attach those outputs plus the failing command and its full terminal output.
 
 ## Soft Reset (Pool + Settings Only)
 
-```bash
-rm -f ~/.codex/multi-auth/openai-codex-accounts.json
-rm -f ~/.codex/multi-auth/openai-codex-flagged-accounts.json
-rm -f ~/.codex/multi-auth/settings.json
-codex-multi-auth login
-```
+Before a manual reset, follow the [path verification, backup, and ownership checks](privacy.md#data-cleanup). Do not assume that the active files live under `~/.codex/multi-auth` or that a shared root belongs exclusively to this installation.
 
-```powershell
-Remove-Item "$HOME\.codex\multi-auth\openai-codex-accounts.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\openai-codex-flagged-accounts.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\settings.json" -Force -ErrorAction SilentlyContinue
-codex-multi-auth login
-```
+Limit a soft reset to the verified active account pool, flagged pool, and settings files. Leave the usage ledger, budgets, policies, quota cache, backups, and unrelated files intact. Do not use recursive directory deletion or filename-prefix globs.
 
-This keeps the usage ledger, budgets, policies, quota cache, and backups. For a full wipe, see [privacy.md](privacy.md#data-cleanup).
+This is not secure credential erasure. Backups, WAL files, and pending-auth journals can retain credentials or restore active state. Inspect recovery copies separately before deciding whether to keep or remove them. Re-authenticate only after you have completed the intended reset.
 
 ---
 
 ## Uninstall Completely
 
-`npm uninstall -g codex-multi-auth` alone leaves residue — the shipped `preuninstall.js` is **not** wired as an npm lifecycle hook on modern npm, so it never runs by itself. Run the package's own cleanup first:
+`npm uninstall -g codex-multi-auth` alone leaves residue. The shipped `preuninstall.js` is not wired as an npm lifecycle hook, so cleanup is operator-driven.
+
+Start with the [path verification, backup, and ownership checks](privacy.md#data-cleanup), then preview the package cleanup:
 
 ```bash
-codex-multi-auth uninstall          # add --dry-run to preview, --clear-accounts to wipe credentials too
-npm uninstall -g codex-multi-auth
+codex-multi-auth uninstall --dry-run --json
 ```
 
-The cleanup unbinds the app router, removes OS launchers, strips the `Codex.json` entry, and clears the package's `node_modules` cache.
+Inspect the proposed changes before running uninstall without `--dry-run`. The preview does not prove that a shared path belongs to this installation. If ownership is uncertain, do not apply cleanup there.
+
+The cleanup unbinds the app router, removes managed OS launchers, strips the package's `Codex.json` entry, and clears its `node_modules` cache. Run package cleanup before removing the npm package. The optional `--clear-accounts` flag removes stored credentials and API keys, but is not a full data wipe or a secure-erasure guarantee. It does not replace inspection of backups, journals, exports, or shared directories.
 
 ---
 

@@ -74,82 +74,20 @@ Optional debug logging:
 
 ## Data Cleanup
 
-`codex-multi-auth uninstall --clear-accounts` wipes stored credentials as part of a full uninstall. For a manual wipe, run the recipe below — it resolves the same root the code does (`CODEX_MULTI_AUTH_DIR`, then `$CODEX_HOME/multi-auth`, then `~/.codex/multi-auth`) and deletes only the artifacts multi-auth owns, so an override pointing at a shared directory leaves unrelated files alone. Run `codex-multi-auth verify --paths` first to see the resolved root — with no overrides, an existing install under `~/DevTools/config/codex/multi-auth` (or very old installs storing files directly in `~/.codex`) is preferred over an empty `~/.codex/multi-auth`:
+A shared storage root can contain data owned by other applications. Neither a default directory name nor an environment override proves that its contents belong to this installation. Do not recursively delete the root or use filename-prefix globs.
 
-```bash
-# If verify --paths reported a different root, set ROOT to that path instead.
-ROOT="${CODEX_MULTI_AUTH_DIR:-${CODEX_HOME:-$HOME/.codex}/multi-auth}"
-rm -rf "$ROOT"/openai-codex-accounts.json*          # pool + .wal/.bak.*/.pending-auth/.lock sidecars
-rm -rf "$ROOT"/codex-accounts.json*                 # legacy pool filename (pre-rename installs)
-rm -rf "$ROOT"/openai-codex-flagged-accounts.json*
-rm -rf "$ROOT"/openai-codex-blocked-accounts.json*  # legacy flagged filename
-rm -rf "$ROOT"/settings.json*
-rm -rf "$ROOT"/quota-cache.json*
-rm -rf "$ROOT"/runtime-observability.json*
-rm -f "$ROOT/first-run-setup.json"
-rm -rf "$ROOT"/config.json*
-rm -rf "$ROOT"/dashboard-settings.json*
-rm -rf "$ROOT"/account-policies.json*
-rm -rf "$ROOT"/routing-profiles.json*
-rm -rf "$ROOT"/budget-guards.json*
-rm -rf "$ROOT"/local-client-tokens.json*
-rm -rf "$ROOT"/api-routes.json*
-rm -rf "$ROOT"/reset-credits.json*
-rm -rf "$ROOT"/api-capability-probes.json*
-rm -rf "$ROOT"/model-discovery.json*
-rm -rf "$ROOT/refresh-leases"
-rm -rf "$ROOT/usage"
-rm -rf "$ROOT/backups"
-rm -rf "$ROOT/projects"
-rm -f "$ROOT"/runtime-rotation-app-helper*.json
-rm -rf "$ROOT/app-bind"
-rm -rf "$ROOT/inference-activity"
-rm -rf "$ROOT/logs"                               # audit.log rotations + codex-plugin request logs
-rm -rf "$ROOT/cache"
-rm -rf "$ROOT/tmp"
-rm -f "$ROOT/.gitignore"
-# Standalone config override (only if set):
-[ -n "${CODEX_MULTI_AUTH_CONFIG_PATH:-}" ] && rm -f "$CODEX_MULTI_AUTH_CONFIG_PATH"
-```
+Before manually removing data:
 
-```powershell
-# If verify --paths reported a different root, set $root to that path instead.
-$root = $env:CODEX_MULTI_AUTH_DIR
-if (-not $root) { $root = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "multi-auth" } else { "$HOME\.codex\multi-auth" } }
-Remove-Item "$root\openai-codex-accounts.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\codex-accounts.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\openai-codex-flagged-accounts.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\openai-codex-blocked-accounts.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\settings.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\quota-cache.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\runtime-observability.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\first-run-setup.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\config.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\dashboard-settings.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\account-policies.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\routing-profiles.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\budget-guards.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\local-client-tokens.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\api-routes.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\reset-credits.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\api-capability-probes.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\model-discovery.json*" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\refresh-leases" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\usage" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\backups" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\projects" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\runtime-rotation-app-helper*.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\app-bind" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\inference-activity" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\logs" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\cache" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\tmp" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$root\.gitignore" -Force -ErrorAction SilentlyContinue
-# Standalone config override (only if set):
-if ($env:CODEX_MULTI_AUTH_CONFIG_PATH) { Remove-Item "$env:CODEX_MULTI_AUTH_CONFIG_PATH" -Force -ErrorAction SilentlyContinue }
-```
+1. Run `codex-multi-auth verify --paths` and record the resolved paths. Check `CODEX_MULTI_AUTH_DIR`, `CODEX_HOME`, and any separate `CODEX_MULTI_AUTH_CONFIG_PATH` override. Existing legacy installations can resolve outside the default `~/.codex/multi-auth` directory.
+2. Stop this installation's writers before removing their data. Back up the files you intend to change to a private location. Backups can contain credentials.
+3. Inspect each exact file or directory and establish that it belongs exclusively to this installation. Use the storage table above and [storage paths reference](reference/storage-paths.md) as an inventory, not as ownership proof. If ownership is uncertain, leave the entry alone.
+4. Remove only the entries whose ownership you verified. Preserve shared `logs`, `cache`, `tmp`, and `.gitignore` entries and similarly prefixed unrelated files. A shared directory must not be removed merely because it contains some multi-auth files.
 
-For a lighter reset that keeps the ledger, budgets, policies, and backups, see [troubleshooting.md](troubleshooting.md#soft-reset-pool--settings-only).
+Do not remove the official CLI's `auth.json`, `accounts.json`, `config.toml`, sessions, or history as part of this procedure. An old installation can share the official CLI directory.
+
+A [soft reset](troubleshooting.md#soft-reset-pool--settings-only) is not secure credential erasure. Backups, WAL files, pending-auth journals, per-project pools, and exported copies can retain credentials or restore active state. Inspect those copies separately rather than assuming that deleting the active JSON files removes every copy.
+
+For package removal, review the [uninstall guidance](troubleshooting.md#uninstall-completely). Its dry-run preview is not ownership proof, and `--clear-accounts` is not a complete wipe or a secure-erasure guarantee.
 
 ---
 
