@@ -116,12 +116,24 @@ it.each(["oauth", "api", "zdr"].flatMap(kind => failures.flatMap(failure => ["fi
 	const events: Array<Record<string, unknown>> = [];
 	client.on("message", raw => events.push(JSON.parse(String(raw))));
 	const send = () => client.send(JSON.stringify({type: "response.create", model: kind === "oauth" ? "shared" : `${kind}/shared`, input: []}));
+	const waitForTurn = async (count: number, terminal: Record<string, unknown>) => {
+		await vi.waitFor(async () => {
+			expect(await readUsageLedgerRows()).toHaveLength(count);
+			const terminals = events.filter(event => event.type === "error" || event.type === "response.completed");
+			expect(terminals).toHaveLength(count);
+			expect(terminals.at(-1)).toMatchObject(terminal);
+		});
+	};
+	// Settlement must finish before terminal delivery, not before client observation.
+	client.pause();
 	send();
 	await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(1));
+	expect(events).toHaveLength(0);
+	client.resume();
+	await waitForTurn(1, {type: "error", status, error: {code}});
 	expect(creates).toHaveLength(1);
 	expect(httpPosts).toBe(0);
 	expect(creates[0]).toMatchObject(kind === "oauth" ? {workspace: "W0"} : {authorization: "Bearer fixture-api-0"});
-	expect(events.at(-1)).toMatchObject({type: "error", status, error: {code}});
 	const row = (await readUsageLedgerRows())[0];
 	expect(row).toMatchObject({outcome: "failure", statusCode: status, errorCode: code, tokens: {inputTokens: mode === "usage" ? 17 : 0, outputTokens: mode === "usage" ? 4 : 0, totalTokens: mode === "usage" ? 21 : 0}});
 	if (kind === "oauth") expect(row?.account?.index).toBe(0);
@@ -129,10 +141,9 @@ it.each(["oauth", "api", "zdr"].flatMap(kind => failures.flatMap(failure => ["fi
 	const cachedCatalogs = catalogs;
 	transientRecovered = kind === "oauth" ? code === "model_at_capacity" : !modelRejected && !credentialRejected;
 	send();
-	await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(2));
+	await waitForTurn(2, {type: "response.completed"});
 	expect(creates).toHaveLength(2);
 	expect(httpPosts).toBe(0);
-	expect(events.at(-1)?.type).toBe("response.completed");
 	expect((await readUsageLedgerRows())[1]).toMatchObject({outcome: "success", statusCode: 200, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 	if (kind !== "oauth") {
 		expect(catalogs).toBe(cachedCatalogs);
@@ -148,20 +159,18 @@ it.each(["oauth", "api", "zdr"].flatMap(kind => failures.flatMap(failure => ["fi
 	if (kind !== "oauth" && credentialRejected && mode === "usage") {
 		clock = startedAt + 59_999;
 		send();
-		await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(3));
+		await waitForTurn(3, {type: "response.completed"});
 		expect(creates[2]?.authorization).toBe("Bearer fixture-api-1");
 		clock = startedAt + 60_000;
 		send();
-		await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(4));
+		await waitForTurn(4, {type: "error", status, error: {code}});
 		expect(creates[3]?.authorization).toBe("Bearer fixture-api-0");
-		expect(events.at(-1)).toMatchObject({type: "error", status, error: {code}});
 		expect((await readUsageLedgerRows())[3]).toMatchObject({outcome: "failure", statusCode: status, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
 		routes[0]!.apiKey = "fixture-recovered-api";
 		await saveApiRoutes(routes);
 		send();
-		await vi.waitFor(async () => expect(await readUsageLedgerRows()).toHaveLength(5));
+		await waitForTurn(5, {type: "response.completed"});
 		expect(creates[4]?.authorization).toBe("Bearer fixture-recovered-api");
-		expect(events.at(-1)?.type).toBe("response.completed");
 		expect(creates).toHaveLength(5);
 		expect(httpPosts).toBe(0);
 	}
