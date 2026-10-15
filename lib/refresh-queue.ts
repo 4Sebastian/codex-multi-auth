@@ -200,7 +200,7 @@ export class RefreshQueue {
         const cached = unsettled?.error.result ?? (lease?.role === "follower" ? lease.result : undefined);
         if (!authorityCurrent()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
         const result = await withPendingAuthRefresh(storagePath, token, () =>
-          cached ? Promise.resolve(cached) : this.executeRefreshWithRotationTracking(token, storagePath), unsettled?.error, source);
+          cached ? Promise.resolve(cached) : this.executeRefreshWithRotationTracking(token, storagePath), unsettled?.error, source, ownerCurrent);
         if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh publication authority changed"), {code: "ESTALE"}));
         try {
           await lease?.release(result);

@@ -194,6 +194,17 @@ export function captureRefreshCredentialAuthority(
 	storagePath = getStoragePath(),
 	source?: FlaggedRefreshSource,
 ): (result?: TokenSuccess) => boolean {
+	return captureCredentialAuthority(account, current, retainAccount, storagePath, source);
+}
+
+function captureCredentialAuthority(
+	account: RefreshOwner,
+	current: () => boolean,
+	retainAccount: () => RefreshOwner | null,
+	storagePath: string,
+	source?: FlaggedRefreshSource,
+	parsedPrimary?: {raw: string; storage: AccountStorageV3},
+): (result?: TokenSuccess) => boolean {
 	const submitted = structuredClone(account);
 	const ambientPath = getStoragePath();
 	const flaggedPaths = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].flatMap(name => {
@@ -216,17 +227,23 @@ export function captureRefreshCredentialAuthority(
 		: submitted.recordId && row.recordId ? row.recordId === submitted.recordId : row.refreshToken === submitted.refreshToken || row.refreshToken === result?.refresh;
 	const sample = (path: string, result?: TokenSuccess): AccountMetadataV3 | undefined => {
 		try {
-			let value: unknown = JSON.parse(readFileSync(path, "utf8"));
+			const raw = readFileSync(path, "utf8");
 			if (!flaggedPaths.includes(path)) {
-				if (path === walPath) value = JSON.parse(AccountsJournalEntrySchema.pick({version: true, content: true}).parse(value).content);
-				const storage = AnyAccountStorageSchema.parse(value);
+				let storage;
+				// Reuse only this capture's fully validated, byte-identical primary.
+				if (path === storagePath && parsedPrimary?.raw === raw) storage = parsedPrimary.storage;
+				else {
+					let value: unknown = JSON.parse(raw);
+					if (path === walPath) value = JSON.parse(AccountsJournalEntrySchema.pick({version: true, content: true}).parse(value).content);
+					storage = AnyAccountStorageSchema.parse(value);
+				}
 				const rows = (storage.version === 3 ? storage : migrateV1ToV3(storage)).accounts.filter(row => matches(row, result));
 				const selected = rows.length > 1 && !("type" in submitted)
 					? rows.filter(row => row.email === submitted.email && row.accountId === submitted.accountId) : rows;
 				if (selected.length > 1) throw Object.assign(Error("Ambiguous recovery owner"), {code: "ESTALE"});
 				return selected[0];
 			}
-			const flagged = FlaggedAccountStorageV1Schema.parse(value);
+			const flagged = FlaggedAccountStorageV1Schema.parse(JSON.parse(raw));
 			return flagged.accounts.find(row => matches(row, result));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -234,6 +251,7 @@ export function captureRefreshCredentialAuthority(
 		}
 	};
 	const sampledRoots = paths.map(path => ({path, row: sample(path)}));
+	parsedPrimary = undefined;
 	const flaggedPrimaries = [FLAGGED_ACCOUNTS_FILE_NAME, LEGACY_FLAGGED_ACCOUNTS_FILE_NAME].map(name => getFlaggedAccountsPath(storagePath, name));
 	const authoritative = source
 		? sampledRoots.find(root => flaggedPrimaries.includes(root.path) && existsSync(root.path))
@@ -381,9 +399,12 @@ export function captureQueuedRefreshAuthority(storagePath: string, refreshToken:
 		return captureRefreshCredentialAuthority(source.account, undefined, undefined, storagePath, source);
 	}
 	let owner: AccountMetadataV3 | undefined;
+	let parsedPrimary: {raw: string; storage: AccountStorageV3} | undefined;
 	try {
-		const value = AnyAccountStorageSchema.parse(JSON.parse(readFileSync(storagePath, "utf8")));
+		const raw = readFileSync(storagePath, "utf8");
+		const value = AnyAccountStorageSchema.parse(JSON.parse(raw));
 		const primary = value.version === 3 ? value : migrateV1ToV3(value);
+		parsedPrimary = {raw, storage: primary};
 		let entries: PendingAuth[] = [];
 		try { entries = fileSchema.parse(JSON.parse(readFileSync(getPendingAuthPath(storagePath), "utf8"))).entries; }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -404,7 +425,8 @@ export function captureQueuedRefreshAuthority(storagePath: string, refreshToken:
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new PendingAuthAdmissionError(error);
 	}
-	return captureRefreshCredentialAuthority(owner ?? {type: "oauth", refresh: refreshToken, access: "", expires: 0}, undefined, undefined, storagePath);
+	const capturedOwner: RefreshOwner = owner ?? {type: "oauth", refresh: refreshToken, access: "", expires: 0};
+	return captureCredentialAuthority(capturedOwner, () => true, () => capturedOwner, storagePath, undefined, parsedPrimary);
 }
 
 export async function withPendingAuthRefresh(
@@ -413,8 +435,8 @@ export async function withPendingAuthRefresh(
 	refresh: () => Promise<TokenResult>,
 	settlement?: PendingAuthSettlementError,
 	source?: FlaggedRefreshSource,
+	ownerCurrent = captureQueuedRefreshAuthority(storagePath, refreshToken, source, settlement),
 ): Promise<TokenResult> {
-	const ownerCurrent = captureQueuedRefreshAuthority(storagePath, refreshToken, source, settlement);
 	const current = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
 	return withFileTransactionLock(storagePath, () => withFileTransactionLock(getPendingAuthPath(storagePath), async () => {
 		if (!current()) throw Object.assign(Error("Account pool was reset"), {code: "ESTALE"});
