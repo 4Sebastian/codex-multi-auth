@@ -943,14 +943,25 @@ function createResponseIdCapturingStream(
 	const reader = body.getReader();
 	const state = createParsedResponseState();
 	const outcome = new ResponseOutcome(true);
-	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => {
+	const observeEvent = (event: unknown): void => {
 		outcome.observe(event);
 		try {
 			if (!state.encounteredError && isRecord(event)) maybeCaptureResponseEvent(state, event as SSEEventData, onResponseId);
 			const usage = extractResponsesUsage(event);
 			if (usage && !onCompletion) onUsage?.(usage);
 		} catch (error) {log.warn("Accepted stream observation could not be captured", {error});}
-	}});
+	};
+	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: onCompletion ? observeEvent : undefined});
+	const observeFrame = (frame: Uint8Array): void => {
+		scanner.push(frame);
+		// The compatibility capture-only interface accepts one JSON event per data line.
+		if (onCompletion) return;
+		const line = Buffer.from(frame).toString("utf8").trim();
+		if (!line.startsWith("data:")) return;
+		const payload = line.slice(5).trim();
+		if (!payload || payload === "[DONE]") return;
+		try {observeEvent(JSON.parse(payload));} catch { /* Preserve malformed bytes without publishing an event. */ }
+	};
 	let pending: Uint8Array[] = [], pendingSize = 0, lineSize = 0, lastByte = 0;
 	let currentChunk: Uint8Array | undefined, currentOffset = 0;
 	const retain = (value: Uint8Array) => {
@@ -977,7 +988,7 @@ function createResponseIdCapturingStream(
 		finished = true;
 		clearTimeout(idleTimer);
 		finishing = (async () => {
-			if (pendingSize) scanner.push(takePending());
+			if (pendingSize) observeFrame(takePending());
 			if (failure && currentChunk) scanner.push(currentChunk.subarray(currentOffset));
 			const usage = scanner.result();
 			try {if (usage && onCompletion) onUsage?.(usage);}
@@ -1014,7 +1025,7 @@ function createResponseIdCapturingStream(
 						if (finished) return;
 						if (done) {
 							const tail = takePending();
-							if (tail.byteLength) scanner.push(tail);
+							if (tail.byteLength) observeFrame(tail);
 							await finish();
 							release();
 							if (tail.byteLength) controller.enqueue(tail);
@@ -1026,17 +1037,17 @@ function createResponseIdCapturingStream(
 						currentChunk = value; currentOffset = 0;
 					}
 					const value = currentChunk, start = currentOffset;
-					for (let index = start; index < value.length; index++) {
-						const byte = value[index];
+					for (const [offset, byte] of value.subarray(start).entries()) {
+						const index = start + offset;
 						if (byte === 10) {
-							const boundary = lineSize === 0 || (lineSize === 1 && lastByte === 13);
+							const boundary = !onCompletion || lineSize === 0 || (lineSize === 1 && lastByte === 13);
 							lineSize = 0;
 							if (boundary) {
 								retain(value.subarray(start, index + 1));
 								const frame = takePending();
 								currentOffset = index + 1; lastByte = byte;
 								if (currentOffset === value.length) currentChunk = undefined;
-								scanner.push(frame);
+								observeFrame(frame);
 								if (onCompletion && outcome.hasTerminal()) {
 									await finish();
 									await reader.cancel().catch(() => undefined);

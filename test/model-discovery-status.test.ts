@@ -22,7 +22,10 @@ function discoverModelInventory(...args:Parameters<typeof discoverManagedModelIn
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
-	vi.spyOn(catalogVersion, "resolveCatalogClientVersion").mockImplementation(async requested => requested ?? "0.160.0");
+	// resetModules callers use a fresh resolver; the static discovery import retains the original.
+	for (const version of new Set([catalogVersion, await import("../lib/runtime/catalog-client-version.js")])) {
+		vi.spyOn(version, "resolveCatalogClientVersion").mockImplementation(async requested => requested ?? "0.160.0");
+	}
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;

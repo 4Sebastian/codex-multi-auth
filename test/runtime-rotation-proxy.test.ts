@@ -51,6 +51,7 @@ import {
 } from "../lib/rotation.js";
 import { getStoragePath, loadAccounts, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 import { estimateUsageCostUsd } from "../lib/usage/pricing.js";
+import { hashUsageIdentifier } from "../lib/usage/redaction.js";
 import type { UsageTokenCounts } from "../lib/usage/types.js";
 
 const {
@@ -487,6 +488,112 @@ describe("normalizeForcedAccountIndex (#623)", () => {
 });
 
 describe("runtime rotation proxy", () => {
+	it.each(["native-legacy", "native-scoped", "custom"].flatMap(mode => ["pool", "journal"].flatMap(gate => (mode === "custom" ? ["terminal"] : ["terminal", "quota"]).map(event => ({mode, gate, event})))))("does not reapply an old WebSocket restriction after a newer receipt crosses a held boundary %j", async ({mode, gate, event}) => {
+		const now = Date.now(), stored = createStorage(now, 1); stored.accounts[0]!.recordId = "socket-receipt-owner";
+		if (mode === "native-scoped") stored.accounts[0]!.workspaces = [{id: "acc_1", enabled: true}];
+		writeAccountSourceFixture(stored);
+		const manager = new AccountManager(undefined, stored), account = manager.getAccountByIndex(0)!;
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow"), receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		let armed = false, suspended = false, release!: () => void, entered!: () => void;
+		const held = new Promise<void>(resolve => {entered = resolve;}), resume = new Promise<void>(resolve => {release = resolve;});
+		const realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		withAccountStorageTransactionMock.mockImplementation(handler => realStorage.withAccountStorageTransaction(async (current, persist) => {
+			if (gate === "pool" && armed && !suspended) {suspended = true; entered(); await resume;}
+			return handler(current, persist);
+		}));
+		const journal = manager.isAccountJournalEligible.bind(manager);
+		vi.spyOn(manager, "isAccountJournalEligible").mockImplementation(async row => {if (gate === "journal" && armed && !suspended) {suspended = true; entered(); await resume;} return journal(row);});
+		let source: WebSocket | undefined, creates = 0, resolveHttp!: (response: Response) => void;
+		const terminal = (id: string, failed = false) => ({type: failed ? "response.failed" : "response.completed", response: {id, status: failed ? "failed" : "completed", usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}, ...(failed ? {error: {code: "rate_limit_exceeded", message: "Rate limit reached"}} : {})}});
+		const upstream = await startTestWebSocketUpstream({onConnection: socket => {source = socket; socket.on("message", () => {creates++; socket.send(JSON.stringify(creates === 1 ? {type: "response.created", response: {id: "A"}} : terminal("D")));});}});
+		let httpSends = 0;
+		const {fetchImpl} = createRecordingFetch(call => {if (new URL(call.url).pathname.endsWith("/models")) return Response.json({models: [{slug: "common"}]}); httpSends++; return new Promise<Response>(resolve => {resolveHttp = resolve;});});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: mode !== "custom", upstreamBaseUrl: upstream.baseUrl, forcedAccountIndex: 0, readNativeAccountStorage: async () => structuredClone(stored)}});
+		const client = await connectWebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses");
+		try {
+			const created = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "common", input: []})); expect(JSON.parse(await created).type).toBe("response.created");
+			const pendingHttp = postResponses(proxy, {model: "common", input: "B", stream: true}); await vi.waitFor(() => expect(httpSends).toBe(1));
+			armed = true;
+			const endA = nextWebSocketMessage(client);
+			source!.send(JSON.stringify(event === "terminal" ? terminal("A", true) : {type: "codex.rate_limits", rate_limits: {primary: {used_percent: 100, reset_at: Math.floor(now / 1000) + 300}}}));
+			await held;
+			resolveHttp(new Response(`data: ${JSON.stringify(terminal("B"))}\n\n`, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20", "x-codex-primary-reset-after-seconds": "3600"}}));
+			await vi.waitFor(() => expect(receive.mock.calls.some(([, snapshot]) => snapshot.primary.usedPercent === 20)).toBe(true));
+			release(); await endA;
+			if (event === "quota") {const completed = nextWebSocketMessage(client); source!.send(JSON.stringify(terminal("A"))); await completed;}
+			const http = await pendingHttp; await http.text();
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+			const i = receive.mock.calls.findIndex(([, snapshot]) => snapshot.primary.usedPercent === 20), [key, , owner, baseline] = receive.mock.calls[i]!;
+			expect(receive.mock.contexts[i]!.getSnapshot(key, owner, baseline)).toMatchObject({status: 200, primary: {usedPercent: 20}});
+			expect(receive.mock.contexts[i]!.getDeferral(key, now, owner, baseline).defer).toBe(false);
+			expect(Object.values(account.rateLimitResetTimes).some(reset => reset !== undefined && reset > now)).toBe(false);
+			const rows = await Promise.all(append.mock.results.map(result => result.value as ReturnType<typeof usageLedger.appendUsageLedgerRow>));
+			expect(rows.map(row => row.outcome).sort()).toEqual(event === "terminal" ? ["failure", "success"] : ["success", "success"]);
+			for (const row of rows) expect(row).toMatchObject({account: {index: 0, accountHash: hashUsageIdentifier("acc_1")}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+			const later = nextWebSocketMessage(client); client.send(JSON.stringify({type: "response.create", model: "common", input: []})); expect(JSON.parse(await later).response.id).toBe("D");
+			await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(3)); expect(creates).toBe(2); expect(httpSends).toBe(1);
+		} finally {release(); client.terminate(); await upstream.close(); append.mockRestore(); receive.mockRestore();}
+	});
+
+	it.each(["http", "native-legacy", "native-scoped"].flatMap(mode => ["older-error", "newer-error", "capacity", "unrelated"].flatMap(order => (order.endsWith("error") ? ["none", "secondary", "plan"] : ["none"]).map(field => ({mode, order, field})))))("uses original HTTP receipt authority rather than held error completion %j", async ({mode, order, field}) => {
+		const now = Math.floor(Date.now() / 1000) * 1000; let clock = now;
+		const stored = createStorage(now, 1); stored.accounts[0]!.recordId = "receipt-owner";
+		if (mode === "native-scoped") stored.accounts[0]!.workspaces = [{id: "acc_1", enabled: true}];
+		writeAccountSourceFixture(stored);
+		const manager = new AccountManager(undefined, stored), account = manager.getAccountByIndex(0)!;
+		const append = vi.spyOn(usageLedger, "appendUsageLedgerRow"), receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		const replies = new Map<string, (response: Response) => void>(); let sends = 0;
+		const terminal = 'data: {"type":"response.completed","response":{"id":"healthy","status":"completed","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const healthyHeaders = {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20", "x-codex-primary-reset-after-seconds": "3600"};
+		const {fetchImpl} = createRecordingFetch(call => {
+			if (new URL(call.url).pathname.endsWith("/models")) return Response.json({models: [{slug: "common"}]});
+			sends++; const label = (JSON.parse(call.bodyText!) as {input: string}).input;
+			if (label === "D") return new Response(terminal, {headers: healthyHeaders});
+			return new Promise<Response>(resolve => replies.set(label, resolve));
+		});
+		const proxy = await startProxy({accountManager: manager, fetchImpl, options: {nativeOpenai: mode !== "http", now: () => clock, modelCapacityRetryMs: 0, readNativeAccountStorage: async () => structuredClone(stored)}});
+		const post = (input: string) => postResponses(proxy, {model: "common", input, stream: true});
+		let releaseBody!: () => void, held!: () => void;
+		const bodyGate = new Promise<void>(resolve => {releaseBody = resolve;}), bodyRead = new Promise<void>(resolve => {held = resolve;});
+		const errorHeaders: Record<string, string> = {"content-type": "application/json", "retry-after": "300"};
+		if (field === "secondary") Object.assign(errorHeaders, {"x-codex-secondary-used-percent": "61", "x-codex-secondary-reset-after-seconds": "7200"});
+		if (field === "plan") errorHeaders["x-codex-plan-type"] = "pro";
+		const errorResponse = () => new Response(new ReadableStream<Uint8Array>({async pull(controller) {
+			held(); await bodyGate; controller.enqueue(Buffer.from(JSON.stringify({error: {code: order === "capacity" ? "model_capacity" : order === "unrelated" ? "not_found" : "rate_limit_exceeded", message: order === "capacity" ? "The model is at capacity" : order === "unrelated" ? "Unknown fixture resource" : "Rate limit reached"}}))); controller.close();
+		}}, {highWaterMark: 0}), {status: order === "unrelated" ? 404 : 429, headers: errorHeaders});
+		let healthyController!: ReadableStreamDefaultController<Uint8Array>;
+		let first: Response | undefined, second: Response | undefined;
+		try {
+			const pendingA = post("A"); await vi.waitFor(() => expect(replies.has("A")).toBe(true));
+			const pendingB = post("B"); await vi.waitFor(() => expect(replies.has("B")).toBe(true));
+			if (order === "newer-error") {
+				replies.get("A")!(new Response(new ReadableStream<Uint8Array>({start(controller) {healthyController = controller; controller.enqueue(Buffer.from('data: {"type":"response.created","response":{"id":"healthy"}}\n\n'));}}, {highWaterMark: 0}), {headers: healthyHeaders}));
+				first = await pendingA; const reader = first.body!.getReader(); await reader.read();
+				clock = now - 1000; replies.get("B")!(errorResponse()); await bodyRead;
+				healthyController.enqueue(Buffer.from(terminal)); let chunk = await reader.read(); while (!chunk.done) chunk = await reader.read();
+				releaseBody(); second = await pendingB; await second.text();
+			} else {
+				replies.get("A")!(errorResponse()); await bodyRead;
+				clock = now - 1000; replies.get("B")!(new Response(terminal, {headers: healthyHeaders}));
+				second = await pendingB; await second.text(); releaseBody(); first = await pendingA; await first.text();
+			}
+			expect(sends).toBe(2);
+			const i = receive.mock.calls.findIndex(([, snapshot]) => snapshot.primary.usedPercent === 20);
+			expect(i).toBeGreaterThanOrEqual(0);
+			const [key, , owner, baseline] = receive.mock.calls[i]!;
+			const scheduler = receive.mock.contexts[i]!, snapshot = scheduler.getSnapshot(key, owner, baseline);
+			const restricted = order === "newer-error";
+			expect(snapshot).toMatchObject({status: restricted ? 429 : 200, primary: {usedPercent: restricted ? 100 : 20}});
+			if (field === "secondary") expect(snapshot?.secondary.usedPercent).toBe(61);
+			if (field === "plan") expect(snapshot?.planType).toBe("pro");
+			expect(scheduler.getDeferral(key, clock, owner, baseline).defer).toBe(restricted);
+			expect(Object.values(account.rateLimitResetTimes).some(reset => reset !== undefined && reset > clock)).toBe(restricted && mode !== "native-scoped");
+			const initial = await Promise.all(append.mock.results.map(result => result.value as ReturnType<typeof usageLedger.appendUsageLedgerRow>));
+			expect(initial).toHaveLength(2); expect(initial.filter(row => row.outcome === "failure")).toHaveLength(1);
+			expect(initial.find(row => row.outcome === "success")).toMatchObject({account: {index: 0, accountHash: hashUsageIdentifier("acc_1")}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+			const later = await post("D"); await later.text(); expect(later.status).toBe(restricted ? (mode === "http" ? 429 : 503) : 200); expect(sends).toBe(restricted ? 2 : 3);
+		} finally {releaseBody(); await first?.body?.cancel().catch(() => undefined); await second?.body?.cancel().catch(() => undefined); append.mockRestore(); receive.mockRestore();}
+	});
 	it("forwards 80 concurrent requests without a synthetic local request cap", async () => {
 		const accountManager = new AccountManager(
 			undefined,
@@ -9293,12 +9400,14 @@ it("does not admit an unsupported workspace through a shared missing-binding key
  const stored=createStorage(Date.now(),2);
  stored.accounts.forEach((a,i)=>{delete a.accountId;a.workspaces=[{id:`workspace-${i}`,enabled:true}];a.currentWorkspaceIndex=0;});
  const manager=new AccountManager(undefined,stored);
- const {fetchImpl}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('chatgpt-account-id')==='workspace-1'?'model-test':'other'}]}):textEventStream());
+ const {fetchImpl,calls}=createRecordingFetch(call=>call.url.includes('/models')?Response.json({models:[{slug:call.headers.get('chatgpt-account-id')==='workspace-1'?'model-test':'other'}]}):textEventStream());
  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readApiRoutes:async()=>[]}});
  const models=await getModels(proxy);await models.text();
  const refresh=vi.spyOn(tokenRefreshRuntime,'ensureFreshAccessToken');
- try {const response=await postResponses(proxy,{model:'model-test',input:[]});await response.text();expect(response.status).toBe(200);
- expect(refresh.mock.calls.filter(([args])=>args.model==='model-test').map(([args])=>args.account.index)).toEqual([1]);}
+ // Exercise the fetched catalog, not the fail-open race of a different client version.
+ try {const response=await postResponses(proxy,{model:'model-test',input:[]},'/responses',{version:'0.125.0'});await response.text();expect(response.status).toBe(200);
+ expect(refresh.mock.calls.filter(([args])=>args.model==='model-test').map(([args])=>args.account.index)).toEqual([1]);
+ expect(calls.filter(call=>!call.url.includes('/models')).map(call=>call.headers.get('chatgpt-account-id'))).toEqual(['workspace-1']);}
  finally{refresh.mockRestore();}
 });
 

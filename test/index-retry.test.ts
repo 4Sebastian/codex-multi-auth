@@ -763,6 +763,85 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 	});
 
 
+	it.each(["body", "terminal", "nonstream", "half-open", "stale-half-open", "replaced-breaker"])("settles cancellation without changing real account health or probe ownership (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-cancel-health-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "cancel-owner", accountId: "W1", refreshToken: "refresh-cancel", accessToken: "access-cancel", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		realStorage.setStoragePathDirect(path);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		for (const method of ["handleSuccessResponse", "createCodexHeaders"] as const) vi.spyOn(helpers, method).mockImplementation(actualHelpers[method] as never);
+		const circuits = await import("../lib/circuit-breaker.js"), {getHealthTracker} = await import("../lib/rotation.js");
+		const family = (await import("../lib/prompts/codex.js")).getModelFamily("gpt-5.1");
+		const tracker = getHealthTracker(), trackerKey = realAccounts.getRuntimeTrackerKey(account), quotaKey = `${family}:gpt-5.1`;
+		let breaker = circuits.getCircuitBreaker(account.circuitKeyId!);
+		const halfOpen = ["half-open", "stale-half-open", "replaced-breaker"].includes(mode);
+		const usage = await import("../lib/usage/index.js"), before = new Set((await usage.readUsageLedgerRows()).map(row => row.id));
+		const created = 'data: {"type":"response.created","response":{"id":"cancel-partial","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const cancelled = 'data: {"type":"response.cancelled","response":{"id":"cancel-partial","status":"cancelled","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const completed = 'data: {"type":"response.completed","response":{"id":"independent","status":"completed"}}\n\n';
+		let finishNext = false;
+		const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({start(controller) {
+			controllers.push(controller);
+			controller.enqueue(Buffer.from(finishNext ? completed : created + (["terminal", "nonstream"].includes(mode) ? cancelled : "")));
+		}}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream"}}));
+		const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-cancel", refresh: "refresh-cancel", expires: storage.accounts[0]!.expiresAt!, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: mode !== "nonstream"})});
+			manager.consumeToken(account, family, "gpt-5.1", {onAdmission: receipt => {breaker = receipt.breaker;}});
+			expect(breaker).toBe(circuits.getCircuitBreaker(account.circuitKeyId!));
+			tracker.recordFailure(trackerKey, quotaKey);
+			if (halfOpen) {for (let n = 0; n < 3; n++) breaker.recordFailure(); now += 30001;}
+			const count = halfOpen ? 1 : 4;
+			for (let n = 0; n < count; n++) {
+				const requestFailures = breaker.getFailureCount(), requestHealth = tracker.getScore(trackerKey, quotaKey), requestConsecutive = tracker.getConsecutiveFailures(trackerKey, quotaKey);
+				const response = await turn();
+				let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+				if (mode !== "nonstream") {reader = response.body!.getReader(); readers.push(reader); expect(Buffer.from((await reader.read()).value!).toString()).toBe(created);}
+				let replacementReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+				if (mode === "stale-half-open" || mode === "replaced-breaker") {
+					if (mode === "replaced-breaker") {circuits.clearCircuitBreakers(); breaker = circuits.getCircuitBreaker(account.circuitKeyId!); for (let k = 0; k < 3; k++) breaker.recordFailure();}
+					now += 30001;
+					replacementReader = (await turn()).body!.getReader(); readers.push(replacementReader); await replacementReader.read();
+				}
+				const failures = mode === "nonstream" ? requestFailures : breaker.getFailureCount(), health = mode === "nonstream" ? requestHealth : tracker.getScore(trackerKey, quotaKey), consecutive = mode === "nonstream" ? requestConsecutive : tracker.getConsecutiveFailures(trackerKey, quotaKey);
+				if (mode === "nonstream") await response.text();
+				else if (mode === "terminal") {expect(Buffer.from((await reader!.read()).value!).toString()).toBe(cancelled); expect((await reader!.read()).done).toBe(true);}
+				else await reader!.cancel();
+				expect(breaker.getState()).toBe(halfOpen ? "half-open" : "closed");
+				expect(breaker.getFailureCount()).toBe(failures);
+				expect(tracker.getScore(trackerKey, quotaKey)).toBe(health);
+				expect(tracker.getConsecutiveFailures(trackerKey, quotaKey)).toBe(consecutive);
+				expect(account.cooldownReason).toBeUndefined();
+				if (replacementReader) {controllers.at(-1)!.enqueue(Buffer.from(completed)); await replacementReader.read(); expect((await replacementReader.read()).done).toBe(true); expect(breaker.getState()).toBe("closed");}
+			}
+			const rows = (await usage.readUsageLedgerRows()).filter(row => !before.has(row.id) && row.outcome === "cancelled");
+			expect(rows).toHaveLength(count);
+			for (const row of rows) {
+				expect(row).toMatchObject({outcome: "cancelled", account: {index: 0, accountHash: usage.hashUsageIdentifier("W1")}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+				expect(row.costUsd).toBe((await import("../lib/usage/pricing.js")).estimateUsageCostUsd(row.model, row.tokens));
+			}
+			if (mode === "half-open") {expect(breaker.isAvailable()).toBe(false); now += 30001; expect(breaker.isAvailable()).toBe(true);}
+			finishNext = true;
+			const later = await turn(); await later.text(); expect(later.status).toBe(200); expect(breaker.getState()).toBe("closed");
+		} finally {
+			for (const reader of readers) await reader.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null); await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
 	it.each(["active", "abandoned", "partial-abandoned", "never-consumed", "cancelled", "reader-error", "ledger-held", "ledger-open", "ledger-mixed", "ledger-split", "ledger-multiline", "ledger-failed", "fallback-429", "fallback-500"])("settles actual plugin stream lifecycle once (%s)", async mode => {
 		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
 		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-stream-lifecycle-")), path = join(dir, "accounts.json");

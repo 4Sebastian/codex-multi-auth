@@ -2411,7 +2411,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														clearPoolExhaustionCooldown();
 														clearServerBurstCooldown();
 													}
-												} else {
+												} else if (completion.outcome !== "cancelled") {
 													runtimeMetrics.failedRequests++;
 													runtimeMetrics.lastError = completion.errorCode;
 													await accountManager.withCurrentAccountCredential(account, primarySubmittedCredential, () => {

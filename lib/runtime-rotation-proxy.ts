@@ -1150,6 +1150,44 @@ async function applyDispatchRestriction(state: RotationProxyState, binding: Acco
 	}, persistChanges);
 }
 
+async function applyDispatchRateLimit(
+	state: RotationProxyState,
+	binding: AccountDispatchBinding,
+	context: RequestContext,
+	receipt: QuotaObservationReceipt,
+	retryAfterMs: number,
+	scopeKey?: string,
+): Promise<boolean> {
+	const key = buildQuotaScheduleKey(binding.account, context.family, context.model);
+	const baseline = () => scopeKey ? state.subscriptionQuotaObservations?.get(scopeKey) : undefined;
+	const previous = state.preemptiveQuotaScheduler.getSnapshot(key, receipt.owner, baseline());
+	const primary = {...receipt, secondary: undefined, planType: undefined, snapshot: {
+		...receipt.snapshot, status: 429, secondary: {}, planType: undefined,
+		primary: {usedPercent: 100, resetAtMs: Math.max(receipt.snapshot.updatedAt + retryAfterMs,
+			(previous?.primary.usedPercent ?? 0) >= 100 ? previous?.primary.resetAtMs ?? 0 : 0,
+			(receipt.snapshot.primary.usedPercent ?? 0) >= 100 ? receipt.snapshot.primary.resetAtMs ?? 0 : 0)},
+	}};
+	try {
+		const applied = await applyDispatchRestriction(state, binding, () => {
+			const merged = state.preemptiveQuotaScheduler.observeReceipt(key, primary, baseline());
+			if (!merged) return false;
+			if (scopeKey) {
+				const observations = state.subscriptionQuotaObservations ??= new Map();
+				if (observations.size >= 1000 && !observations.has(scopeKey)) observations.delete(observations.keys().next().value ?? "");
+				observations.set(scopeKey, Object.assign(merged, {model: context.model ?? "unknown"}));
+			}
+			binding.accountManager.recordRateLimit(binding.account, context.family, context.model);
+			if (!scopeKey || !binding.account.workspaces?.length) binding.accountManager.markRateLimitedWithReason(binding.account, retryAfterMs, context.family, "quota", context.model);
+			return true;
+		});
+		if (applied) state.preemptiveQuotaScheduler.settleReceipt(key, primary, true, baseline());
+		return applied;
+	} catch (error) {
+		state.preemptiveQuotaScheduler.settleReceipt(key, primary, false, baseline());
+		throw error;
+	}
+}
+
 interface PreparedWebSocketAccount extends AccountDispatchBinding {
 	circuitAdmission: CircuitAdmissionReceipt;
 	request: PreparedWebSocketRequest;
@@ -1682,6 +1720,7 @@ async function applyWebSocketTerminalAccountFailure(
 	if (typeof statusCode !== "number") return;
 	const { accountManager, account, request } = active;
 	const { context } = request;
+	const quotaReceipt = statusCode === 429 ? state.preemptiveQuotaScheduler.receive(buildQuotaScheduleKey(account, context.family, context.model), {status: 429, updatedAt: state.now(), primary: {}, secondary: {}}, quotaReceiptOwner(active)) : undefined;
 	const forgetAffinity = (): void => {
 		state.sessionAffinityStore?.forgetSession(context.sessionKey);
 		state.status.retries += 1;
@@ -1695,21 +1734,8 @@ async function applyWebSocketTerminalAccountFailure(
 			terminal.retryAfterMs ??
 			parseRetryAfterBodyMs(terminal.rawBody, state.now()) ??
 			60_000;
-		const applied = await applyDispatchRestriction(state, active, () => {
-			state.preemptiveQuotaScheduler.markRateLimited(
-				buildQuotaScheduleKey(account, context.family, context.model),
-				retryAfterMs,
-				state.now(),
-			);
-			accountManager.recordRateLimit(account, context.family, context.model);
-			accountManager.markRateLimitedWithReason(
-				account,
-				retryAfterMs,
-				context.family,
-				"quota",
-				context.model,
-			);
-		});
+		if (!quotaReceipt) return;
+		const applied = await applyDispatchRateLimit(state, active, context, quotaReceipt, retryAfterMs);
 		if (applied) forgetAffinity();
 		return;
 	}
@@ -1836,6 +1862,7 @@ function openUpstreamWebSocket(
 	headers: Record<string, string>,
 	timeoutMs: number,
 	signal: AbortSignal,
+	onResponseHeaders: (status: number, headers: Headers) => void,
 ): Promise<{upstream: WebSocket; release: () => void; error?: Error}> {
 	return new Promise((resolve, reject) => {
 		const upstream = new WebSocket(url, {
@@ -1886,6 +1913,7 @@ function openUpstreamWebSocket(
 			unexpectedResponse = response;
 			const statusCode = response.statusCode ?? null;
 			const responseHeaders = headersFromIncoming(response);
+			onResponseHeaders(statusCode ?? 502, responseHeaders);
 			void readBoundedIncomingBody(
 				response,
 				MAX_WEBSOCKET_HANDSHAKE_ERROR_BODY_BYTES,
@@ -2174,6 +2202,7 @@ async function connectManagedWebSocket(
 			break;
 		}
 		let connection: Awaited<ReturnType<typeof openUpstreamWebSocket>> | undefined;
+		let handshakeQuota: QuotaObservationReceipt | undefined;
 		try {
 			await validateWebSocketRequestForAccount(state, request, prepared, prepared.circuitAdmission);
 			if (lifecycle.isClosed() || !prepared.tokenRefundable) throw new ClientCancellationError();
@@ -2183,6 +2212,12 @@ async function connectManagedWebSocket(
 				createWebSocketOutboundHeaders(context.headers, account, accessToken, accountId),
 				state.fetchTimeoutMs,
 				abortController.signal,
+				(status, headers) => {
+					if (status !== 429 || !isDispatchBindingCurrent(state, prepared)) return;
+					const snapshot = readQuotaSchedulerSnapshot(headers, status, state.now()) ?? {status, updatedAt: state.now(), primary: {}, secondary: {}};
+					handshakeQuota = state.preemptiveQuotaScheduler.receive(buildQuotaScheduleKey(account, context.family, context.model), snapshot, quotaReceiptOwner(prepared));
+					state.preemptiveQuotaScheduler.observeReceipt(buildQuotaScheduleKey(account, context.family, context.model), handshakeQuota);
+				},
 			);
 			const {upstream} = connection;
 			if (lifecycle.isClosed()) {
@@ -2258,21 +2293,7 @@ async function connectManagedWebSocket(
 							: null) ??
 						parseRetryAfterBodyMs(bodyText, state.now()) ??
 						60_000;
-					await applyDispatchRestriction(state, prepared, () => {
-						state.preemptiveQuotaScheduler.markRateLimited(
-							buildQuotaScheduleKey(account, context.family, context.model),
-							retryAfterMs,
-							state.now(),
-						);
-						accountManager.recordRateLimit(account, context.family, context.model);
-						accountManager.markRateLimitedWithReason(
-							account,
-							retryAfterMs,
-							context.family,
-							"quota",
-							context.model,
-						);
-					});
+					if (handshakeQuota && !isModelAtCapacityError(statusCode, bodyText)) await applyDispatchRateLimit(state, prepared, context, handshakeQuota, retryAfterMs);
 				} else {
 					await applyDispatchRestriction(state, prepared, () => {
 						accountManager.recordFailure(account, context.family, context.model, prepared.circuitAdmission);
@@ -4426,6 +4447,25 @@ async function handleRequestInner(
 				accountId,
 			);
 
+			const quotaScopeKey = state.nativeOpenai && requestScope && isResponsesRequest ? JSON.stringify([requestScope.id, context.model]) : undefined;
+			const currentQuotaScope = () => quotaScopeKey ? state.subscriptionQuotaObservations?.get(quotaScopeKey) : undefined;
+			const receiveQuota = (snapshot: QuotaSchedulerSnapshot): QuotaObservationReceipt | undefined => {
+				if (!isDispatchBindingCurrent(state, binding)) return undefined;
+				if (quotaScopeKey && requestScope && !currentQuotaScope()) {
+					const observations = state.subscriptionQuotaObservations ??= new Map();
+					if (observations.size >= 1000) observations.delete(observations.keys().next().value ?? "");
+					observations.set(quotaScopeKey, quotaForScope(refreshed.account, requestScope) ?? {model: context.model ?? "unknown", status: 200, updatedAt: 0, primary: {}, secondary: {}});
+				}
+				const owner = quotaReceiptOwner(binding);
+				const baseline = state.preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, owner, currentQuotaScope());
+				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, snapshot, owner, baseline);
+				state.preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt, baseline);
+				return receipt;
+			};
+			let headerQuota: QuotaObservationReceipt | undefined;
+			authorize.onResponseHeaders = (status, headers) => {
+				headerQuota ??= receiveQuota({...readQuotaSchedulerSnapshot(headers, status, state.now()) ?? {status, updatedAt: state.now(), primary: {}, secondary: {}}, planType: headers.get("x-codex-plan-type") ?? undefined});
+			};
 			let upstream: Response;
 			// Abort the in-flight upstream fetch when the client disconnects
 			// before headers arrive. Image generation holds upstream capacity
@@ -4463,7 +4503,10 @@ async function handleRequestInner(
 					? Math.max(state.fetchTimeoutMs, 300_000)
 					: state.fetchTimeoutMs;
 				upstream = await withTimeout(
-					withDispatchAuthorization(state, authorize, () => state.fetchImpl(upstreamUrl, upstreamRequestInit)),
+					withDispatchAuthorization(state, authorize, () => state.fetchImpl(upstreamUrl, upstreamRequestInit).then(response => {
+						authorize.onResponseHeaders?.(response.status, response.headers);
+						return response;
+					})),
 					fetchTimeoutMs,
 					() => fetchAbortController.abort(),
 					`upstream fetch timed out after ${fetchTimeoutMs}ms`,
@@ -4590,22 +4633,7 @@ async function handleRequestInner(
 				restrictionFailure ??= {error};
 				state.status.lastError = restrictionFailure.error instanceof Error ? restrictionFailure.error.message : String(restrictionFailure.error);
 			};
-			const quotaScopeKey = state.nativeOpenai && requestScope && isResponsesRequest ? JSON.stringify([requestScope.id, context.model]) : undefined;
-			const currentQuotaScope = () => quotaScopeKey ? state.subscriptionQuotaObservations?.get(quotaScopeKey) : undefined;
-			const observeQuota = (snapshot: QuotaSchedulerSnapshot, planType?: string): Promise<void> => {
-				if (state.activeAccountManager !== accountManager || accountManager.getAccountByIndex(refreshed.account.index) !== refreshed.account ||
-					refreshed.account.recordId !== binding.recordId || refreshed.account.access !== binding.accessToken || refreshed.account.refreshToken !== binding.refreshToken || refreshed.account.expires !== binding.expiresAt) return Promise.resolve();
-				if (quotaScopeKey && requestScope && !currentQuotaScope()) {
-					const observations = state.subscriptionQuotaObservations ??= new Map();
-					if (observations.size >= 1000) observations.delete(observations.keys().next().value ?? "");
-					observations.set(quotaScopeKey, quotaForScope(refreshed.account, requestScope) ?? {model: context.model ?? "unknown", status: 200, updatedAt: 0, primary: {}, secondary: {}});
-				}
-				const owner = quotaReceiptOwner(binding);
-				const baseline = state.preemptiveQuotaScheduler.getSnapshot(quotaScheduleKey, owner, currentQuotaScope());
-				const receipt = state.preemptiveQuotaScheduler.receive(quotaScheduleKey, {...snapshot, planType}, owner, baseline);
-				// Admission sees received deltas immediately through the existing
-				// private epoch. Only the guarded worker can settle or persist them.
-				state.preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt, baseline);
+			const observeQuota = (receipt: QuotaObservationReceipt): Promise<void> => {
 				pendingQuota = mergeQuotaReceipts(receipt, pendingQuota);
 				quotaUpdate ??= (async () => {
 					let failure: {error: unknown} | undefined;
@@ -4635,7 +4663,7 @@ async function handleRequestInner(
 				return quotaUpdate;
 			};
 			const quotaSnapshot = readQuotaSchedulerSnapshot(upstream.headers, upstream.status, state.now());
-			if (quotaSnapshot) await observeQuota(quotaSnapshot, upstream.headers.get("x-codex-plan-type") ?? undefined).catch(captureRestrictionFailure);
+			if (headerQuota && (quotaSnapshot || headerQuota.snapshot.planType)) await observeQuota(headerQuota).catch(captureRestrictionFailure);
 			const readUpstreamErrorBody = async (maxBytes?: number): Promise<string> => {
 				const body = await readErrorBody(upstream, state.streamStallTimeoutMs, maxBytes);
 				upstream = new Response(body, {status: upstream.status, headers: upstream.headers});
@@ -4697,15 +4725,9 @@ async function handleRequestInner(
 					}
 					if (outcome === "retry") continue;
 				}
-				if (quotaScopeKey) await observeQuota({status: 429, updatedAt: state.now(), primary: {usedPercent: 100, resetAtMs: state.now() + retryAfterMs}, secondary: {}});
-				await applyDispatchRestriction(state, binding, () => {
-					// Preserve the consumed token; scoped native quota does not bench siblings.
-					accountManager.recordRateLimit(refreshed.account, context.family, context.model);
-					if (!quotaScopeKey || !refreshed.account.workspaces?.length) {
-						state.preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, retryAfterMs, state.now());
-						accountManager.markRateLimitedWithReason(refreshed.account, retryAfterMs, context.family, "quota", context.model);
-					}
-				});
+				// Explicitly disabling capacity retries retains the legacy non-native 429 contract.
+				const legacyCapacityLimit = !state.nativeOpenai && state.modelCapacityRetryMs === 0;
+				if (headerQuota && (legacyCapacityLimit || !isModelAtCapacityError(upstream.status, bodyText))) await applyDispatchRateLimit(state, binding, context, headerQuota, retryAfterMs, quotaScopeKey);
 				exhaustionReason = "rate-limit";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -4960,25 +4982,15 @@ async function handleRequestInner(
 			// "rate-limited") lingers on disk until an explicit runtime reset and
 			// the forecast keeps reporting this working account as unavailable.
 			// No-op when no reason is recorded, so the hot path stays write-free.
-			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
-				quotaScheduleKey,
-				state.now(),
-				quotaReceiptOwner(binding),
-				state.nativeOpenai ? currentQuotaScope() ?? null : undefined,
-			);
-			const nearExhaustionWaitMs = quotaSnapshot && quotaDeferral.defer
-				? quotaDeferral.waitMs
-				: 0;
-			if (!restrictionFailure && nearExhaustionWaitMs > 0) {
+			if (!restrictionFailure && quotaSnapshot && headerQuota && state.preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, state.now(), headerQuota.owner, state.nativeOpenai ? currentQuotaScope() ?? null : undefined).defer) {
+				const receipt = {...headerQuota, planType: undefined, snapshot: {...headerQuota.snapshot, planType: undefined}};
 				await applyDispatchRestriction(state, binding, () => {
-					if (!quotaScopeKey) accountManager.markRateLimitedWithReason(
-						refreshed.account,
-						nearExhaustionWaitMs,
-						context.family,
-						"quota",
-						context.model,
-					);
+					if (!state.preemptiveQuotaScheduler.observeReceipt(quotaScheduleKey, receipt, currentQuotaScope())) return false;
+					const deferral = state.preemptiveQuotaScheduler.getDeferral(quotaScheduleKey, state.now(), receipt.owner, state.nativeOpenai ? currentQuotaScope() ?? null : undefined);
+					if (!deferral.defer) return false;
+					if (!quotaScopeKey) accountManager.markRateLimitedWithReason(refreshed.account, deferral.waitMs, context.family, "quota", context.model);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					return true;
 				}).catch(captureRestrictionFailure);
 			}
 
@@ -5004,14 +5016,8 @@ async function handleRequestInner(
 								if (typeof status !== "number" || isModelAtCapacityError(status, terminal.rawBody)) return false;
 								if (status === 429) {
 									const retryAfterMs = (terminal.retryHeaders ? parseRetryAfterHeaderMs(terminal.retryHeaders, state.now()) : null) ?? terminal.retryAfterMs ?? parseRetryAfterBodyMs(terminal.rawBody, state.now()) ?? 60_000;
-									if (quotaScopeKey) await observeQuota({status: 429, updatedAt: state.now(), primary: {usedPercent: 100, resetAtMs: state.now() + retryAfterMs}, secondary: {}});
-									return applyDispatchRestriction(state, binding, () => {
-										accountManager.recordRateLimit(refreshed.account, context.family, context.model);
-										if (!quotaScopeKey || !refreshed.account.workspaces?.length) {
-											state.preemptiveQuotaScheduler.markRateLimited(quotaScheduleKey, retryAfterMs, state.now());
-											accountManager.markRateLimitedWithReason(refreshed.account, retryAfterMs, context.family, "quota", context.model);
-										}
-									});
+									const receipt = receiveQuota({status: 429, updatedAt: state.now(), primary: {}, secondary: {}});
+									return receipt ? applyDispatchRateLimit(state, binding, context, receipt, retryAfterMs, quotaScopeKey) : false;
 								}
 								return applyDispatchRestriction(state, binding, () => {
 									if (status === 401) {
@@ -5043,7 +5049,8 @@ async function handleRequestInner(
 					}
 					const snapshot = readSubscriptionQuotaEvent(event, state.now());
 					if (!snapshot) return;
-					void observeQuota(snapshot, snapshot.planType).catch(captureRestrictionFailure);
+					const receipt = receiveQuota(snapshot);
+					if (receipt) void observeQuota(receipt).catch(captureRestrictionFailure);
 					state.status.streamQuotaUpdates = (state.status.streamQuotaUpdates ?? 0) + 1;
 					state.status.lastStreamQuotaUpdateAt = snapshot.updatedAt;
 				},
@@ -5075,7 +5082,7 @@ async function handleRequestInner(
 					usageScanner.result();
 					const completion = responseOutcome.finish();
 					if (!completion.success) await responseRestriction?.catch(captureRestrictionFailure);
-					if (!completion.success && !streamErrored && !res.destroyed && !restrictionFailure) {
+					if (!completion.success && completion.outcome !== "cancelled" && !streamErrored && !res.destroyed && !restrictionFailure) {
 				await applyDispatchRestriction(state, binding, () => {
 					if (!circuitAdmission || !refreshed.account.circuitKeyId || !getCircuitBreaker(refreshed.account.circuitKeyId).isAdmissionCurrent(circuitAdmission)) return false;
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);

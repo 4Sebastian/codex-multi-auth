@@ -25,7 +25,9 @@ const terminal = new Set([
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
 type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string; requestSent?: boolean };
-export type DispatchAuthorization = (input: string | URL | Request, init: RequestInit) => Promise<void | (() => void)>;
+export type DispatchAuthorization = ((input: string | URL | Request, init: RequestInit) => Promise<void | (() => void)>) & {
+	onResponseHeaders?: (status: number, headers: Headers) => void;
+};
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -221,6 +223,7 @@ class SocketSession {
 					init.signal?.addEventListener("abort", abort, { once: true });
 					opening.once("upgrade", (response) => {
 						handshakeHeaders = upstreamHeaders(response.headers);
+						authorize?.onResponseHeaders?.(200, new Headers(handshakeHeaders));
 					});
 					opening.once("open", () => {
 						cleanup();
@@ -231,6 +234,7 @@ class SocketSession {
 						reject(context.signal.aborted ? new ClientCancellationError() : Error("Upstream WebSocket connection failed"));
 					});
 					opening.once("unexpected-response", (_request, response) => {
+						authorize?.onResponseHeaders?.(response.statusCode ?? 502, new Headers(upstreamHeaders(response.headers)));
 						const chunks: Buffer[] = [];
 						let size = 0;
 						let done = false;
