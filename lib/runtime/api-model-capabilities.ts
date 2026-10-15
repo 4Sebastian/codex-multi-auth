@@ -1,7 +1,7 @@
 import { mapWithConcurrency } from "../concurrency.js";
 import { classifyCapabilityFailure } from "./runtime-capability-failures.js";
 import { createHash } from "node:crypto";
-import type { ApiRouteCredential } from "../api-route-store.js";
+import { captureApiProbeAuthorization, type ApiProbeAuthorization, type ApiRouteCredential } from "../api-route-store.js";
 import {
 	canonicalServiceTier,
 	type RouteModel,
@@ -257,6 +257,7 @@ export class ApiModelCapabilities {
 		documented: string[],
 		group: CredentialProbeGroup,
 		force = false,
+		authorize: ApiProbeAuthorization,
 	) {
 		const key = this.probeKey(route, id);
 		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
@@ -269,7 +270,7 @@ export class ApiModelCapabilities {
 		if (!force && old && old.at + freshFor > this.now()) return old;
 		const running = this.inFlight.get(key);
 		if (running?.group === group) return running.promise;
-		const pending = this.runProbe(route, id, documented, key, group).finally(() => {
+		const pending = this.runProbe(route, id, documented, key, group, authorize).finally(() => {
 			if (this.inFlight.get(key)?.promise === pending) this.inFlight.delete(key);
 		});
 		this.inFlight.set(key, {group, promise: pending});
@@ -281,7 +282,15 @@ export class ApiModelCapabilities {
 		documented: string[],
 		key: string,
 		group: CredentialProbeGroup,
+		authorize: ApiProbeAuthorization,
 	): Promise<ProbeResult> {
+		const requireAuthority = async () => {
+			let current: (() => boolean) | undefined;
+			try { current = await authorize(); } catch {}
+			return () => {
+				if (!current?.()) throw Object.assign(Error("API probe authority changed"), {code: "api_probe_authority_changed"});
+			};
+		};
 		const result = {
 			credentialOwner: group.owner,
 			generationAt: group.startedAt,
@@ -322,6 +331,8 @@ export class ApiModelCapabilities {
 			return this.withProbeSlot(async () => {
 				if (credentialUnavailable || modelDenied || group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group) return "unverified";
 				try {
+					(await requireAuthority())();
+					if (credentialUnavailable || modelDenied || group.lostAt !== undefined || this.credentialGroups.get(group.owner) !== group) return "unverified";
 					const response = await this.fetchImpl(
 						"https://api.openai.com/v1/responses",
 						{
@@ -365,6 +376,8 @@ export class ApiModelCapabilities {
 							}),
 						},
 					);
+					try { (await requireAuthority())(); }
+					catch (error) { void response.body?.cancel().catch(() => undefined); throw error; }
 					if ([401, 429].includes(response.status))
 						credentialUnavailable = true;
 					if (response.status === 401) {
@@ -386,6 +399,7 @@ export class ApiModelCapabilities {
 					} finally {
 						await reader.cancel();
 					}
+					(await requireAuthority())();
 					let data: unknown;
 					try {
 						data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -443,7 +457,7 @@ export class ApiModelCapabilities {
 						? "verified"
 						: "downgraded";
 				} catch (error) {
-					if (isRecord(error) && error.code === "ECAPACITY") throw error;
+					if (isRecord(error) && ["ECAPACITY", "api_probe_authority_changed"].includes(String(error.code))) throw error;
 					return "unverified";
 				}
 			});
@@ -489,10 +503,7 @@ export class ApiModelCapabilities {
 		const loss = this.ownerLosses.get(group.owner);
 		if (loss !== undefined && (result.observedLossAt ?? -Infinity) < loss) this.clearVerified(result, documented, loss);
 		const owner = createHash("sha256").update(route.id).update("\0").update(route.apiKey).digest("hex");
-		if (this.credentialGroups.get(owner) === group) {
-			if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
-			this.probes.set(key, {...result, levels: [...result.levels], tiers: [...result.tiers], status: {...result.status}, group, documented: [...documented]});
-		}
+		(await requireAuthority())();
 		if (this.credentialGroups.get(owner) !== group) this.clearVerified(result, documented, group.lostAt ?? group.retiredAt ?? this.now());
 		return result;
 	}
@@ -501,7 +512,9 @@ export class ApiModelCapabilities {
 		refresh = false,
 		route?: ApiRouteCredential,
 		forceProbes = false,
+		authorize = route ? captureApiProbeAuthorization(route) : undefined,
 	): Promise<RouteModel[]> {
+		if (route?.enabled && route.probeCapabilities && authorize && !(await authorize())()) throw Error("API probe authority changed");
 		const group = route?.enabled && route.probeCapabilities ? this.credentialGroup(route, forceProbes) : undefined;
 		if (route && group) {
 			for (const model of models) {
@@ -511,9 +524,18 @@ export class ApiModelCapabilities {
 		}
 		const enriched = await mapWithConcurrency(models, 3, async model => {
 			const documented = await this.documentation(model.slug, refresh);
-			const probed = route && group ? await this.probe(route, model.slug, documented.levels, group, forceProbes) : undefined;
+			const probed = route && group && authorize ? await this.probe(route, model.slug, documented.levels, group, forceProbes, authorize) : undefined;
 			return {model, documented, probed};
 		});
+		if (group && authorize && !(await authorize())()) throw Error("API probe authority changed");
+		if (route && group && this.credentialGroups.get(group.owner) === group) {
+			for (const {model, documented, probed} of enriched) {
+				if (!probed) continue;
+				if (group.lostAt !== undefined) this.clearVerified(probed, documented.levels, group.lostAt);
+				if (this.probes.size >= 1000) this.probes.delete(this.probes.keys().next().value ?? "");
+				this.probes.set(this.probeKey(route, model.slug), {...probed, levels: [...probed.levels], tiers: [...probed.tiers], status: {...probed.status}, group, documented: [...documented.levels]});
+			}
+		}
 		return enriched.map(({model, documented, probed}) => this.renderModel(model, documented, probed, group));
 	}
 	applyPersistedProbes(models: RouteModel[], route: ApiRouteCredential, entries: Array<[string, ProbeResult]>, ownerLosses: Array<[string, number]> = []): RouteModel[] {

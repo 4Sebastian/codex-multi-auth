@@ -6,6 +6,37 @@ import {
 } from "../lib/preemptive-quota-scheduler.js";
 
 describe("preemptive quota scheduler", () => {
+	it("retains no completed empty quota reservations across distinct models", () => {
+		const scheduler = new PreemptiveQuotaScheduler();
+		for (let i = 0; i < 1000; i++) {
+			const key = `account:no-signal-${i}`;
+			const receipt = scheduler.receive(key, {status: 404, updatedAt: 1000, primary: {}, secondary: {}}, "A");
+			expect(scheduler.observeReceipt(key, receipt)).toBeUndefined();
+			scheduler.releaseReceipt(key, receipt);
+			scheduler.releaseReceipt(key, {...receipt});
+			expect(scheduler.getSnapshot(key)).toBeUndefined();
+		}
+		expect(Object.values(scheduler).filter(value => value instanceof Map).map(value => value.size)).toEqual([0]);
+	});
+
+	it.each(["primary", "secondary", "planType"] as const)("releases only its empty reservation, preserving concurrent %s authority", field => {
+		const scheduler = new PreemptiveQuotaScheduler();
+		const key = "account:model";
+		const first = scheduler.receive(key, {status: 404, updatedAt: 1000, primary: {}, secondary: {}}, "A");
+		const second = scheduler.receive(key, {status: 429, updatedAt: 900, primary: {}, secondary: {}}, "A");
+		scheduler.releaseReceipt(key, first);
+		const supplied = {...second, snapshot: {...second.snapshot, primary: {}, secondary: {}, ...(field === "planType" ? {planType: "plus"} : {[field]: {usedPercent: 100, resetAtMs: 60000}})}};
+		expect(scheduler.observeReceipt(key, supplied)).toBeDefined();
+		scheduler.settleReceipt(key, supplied, false);
+		scheduler.releaseReceipt(key, second);
+		expect(scheduler.getSnapshot(key, "A")?.[field]).toEqual(field === "planType" ? "plus" : {usedPercent: 100, resetAtMs: 60000});
+		scheduler.clear(key);
+		const healthy = scheduler.receive(key, {status: 200, updatedAt: 800, primary: {usedPercent: 0}, secondary: {}}, "B");
+		scheduler.observeReceipt(key, healthy);
+		scheduler.releaseReceipt(key, first);
+		expect(scheduler.getSnapshot(key, "B")?.primary.usedPercent).toBe(0);
+		expect(scheduler.getDeferral(key, 1000, "B").defer).toBe(false);
+	});
 	it("reads received independent deltas without replaying a consumed field", () => {
 		const scheduler = new PreemptiveQuotaScheduler(), key = "account:model", owner = "A";
 		const first = scheduler.receive(key, {status: 200, updatedAt: 1000, primary: {usedPercent: 100}, secondary: {}, planType: "free"}, owner);

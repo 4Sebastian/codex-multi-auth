@@ -6,6 +6,8 @@ import { tempPathFor } from "./temp-path.js";
 import { withRetry } from "./fs-retry.js";
 import { withStorageLock } from "./storage/transactions.js";
 import { withFileTransactionLock } from "./storage/file-lock.js";
+import { captureAuthorityRevision } from "./storage/authority-revision.js";
+const API_ROUTE_SOURCE = Symbol("api-route-source");
 const modelId = z
 	.string()
 	.min(1)
@@ -77,10 +79,34 @@ export async function loadApiRoutes(
 		throw new Error("Unable to read API route configuration");
 	}
 	try {
-		return validate(JSON.parse(raw));
+		return validate(JSON.parse(raw)).map(route => Object.defineProperty(route, API_ROUTE_SOURCE, {value: path}));
 	} catch {
 		throw new Error("Invalid API route configuration");
 	}
+}
+export type ApiProbeAuthorization = () => Promise<() => boolean>;
+export function captureApiProbeAuthorization(route: ApiRouteCredential): ApiProbeAuthorization {
+	const path = API_ROUTE_SOURCE in route && typeof route[API_ROUTE_SOURCE] === "string" ? route[API_ROUTE_SOURCE] : getApiRoutesPath();
+	const {id, kind, apiKey, enabled, probeCapabilities} = route;
+	if (!enabled || probeCapabilities !== true) return async () => () => false;
+	let denied = false;
+	const readAuthority = async () => {
+		const revision = captureAuthorityRevision([path]);
+		let current: ApiRouteCredential | undefined;
+		try { current = (await loadApiRoutes(path)).find(candidate => candidate.id === id); }
+		catch { denied = true; }
+		const permitted = enabled && probeCapabilities === true && current?.enabled === true &&
+			current.probeCapabilities === true && current.kind === kind && current.apiKey === apiKey;
+		return () => {
+			denied ||= !permitted || getApiRoutesPath() !== path || !revision();
+			return !denied;
+		};
+	};
+	const initial = readAuthority().then(current => current(), () => false);
+	return async () => {
+		denied ||= !await initial;
+		return readAuthority();
+	};
 }
 export async function saveApiRoutes(
 	routes: ApiRouteCredential[],

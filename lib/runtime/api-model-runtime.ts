@@ -12,7 +12,7 @@ import { parseRetryAfterBodyMs, parseRetryAfterHeaderMs } from "../request/rate-
 import { isModelAtCapacityError } from "../request/error-classification.js";
 import { MAX_RATE_LIMIT_DELAY_MS } from "../constants.js";
 import { createHash } from "node:crypto";
-import type { ApiRouteCredential } from "../api-route-store.js";
+import { captureApiProbeAuthorization, type ApiProbeAuthorization, type ApiRouteCredential } from "../api-route-store.js";
 import {
 	resolveModelRoute,
 	parseModelRoute,
@@ -21,6 +21,7 @@ import {
 	modelEntitlements,
 } from "../model-route-policy.js";
 import { isRecord } from "../utils.js";
+import { CATALOG_AUTHORITY } from "./account-model-catalog.js";
 
 /** Endpoint-family exclusions, not a fixed allowlist of text model releases.
  * Model ID discovery alone does not prove Responses/tool compatibility. */
@@ -95,6 +96,7 @@ export async function boundedJson(
 	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 export interface ApiCatalogStatus {
+	[CATALOG_AUTHORITY]?: () => boolean;
 	id: string;
 	kind: "api" | "zdr";
 	label: string;
@@ -105,6 +107,7 @@ export interface ApiCatalogStatus {
 	visibleModels: string[];
 	entitlements: ReturnType<typeof modelEntitlements>[];
 }
+type AuthorizedApiCatalog = RouteCatalog & {[CATALOG_AUTHORITY]?: () => boolean};
 export class ApiModelRuntime {
 	private readonly discoveryUpdates = new Map<string, Promise<ApiRouteCredential>>();
 	lastPersistenceError: string | null = null;
@@ -112,12 +115,12 @@ export class ApiModelRuntime {
 	supportsDispatch(credential: ApiRouteCredential, model: string, effort?: string, tier?: string): boolean {
 		return this.failures.supports(this.key(credential), model, effort, tier);
 	}
-	cachedCatalogs(): RouteCatalog[] {
-		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot] : []);
+	cachedCatalogs(): AuthorizedApiCatalog[] {
+		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot[CATALOG_AUTHORITY]?.() === false ? {...entry.snapshot, enabled: false, visibleModels: []} : entry.snapshot] : []);
 	}
 	private readonly cache = new Map<
 		string,
-		{ at: number; models: RouteModel[]; error: boolean; snapshot?: RouteCatalog }
+		{ at: number; models: RouteModel[]; error: boolean; snapshot?: AuthorizedApiCatalog }
 	>();
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
@@ -131,8 +134,10 @@ export class ApiModelRuntime {
 			refresh: boolean,
 			route: ApiRouteCredential,
 			forceProbes: boolean,
+			authorize: ApiProbeAuthorization,
 		) => Promise<RouteModel[]>,
 		private readonly onCatalogUpdated?: () => void,
+		private readonly captureProbeAuthorization = captureApiProbeAuthorization,
 	) {}
 	private key(route: ApiRouteCredential): string {
 		return createHash("sha256")
@@ -150,7 +155,7 @@ export class ApiModelRuntime {
 		waitForCapabilities = true,
 		waitForPersistence = true,
         requestKind?: "oauth" | "api" | "zdr",
-	): Promise<RouteCatalog[]> {
+	): Promise<AuthorizedApiCatalog[]> {
 		const activeKeys = new Set(routes.map(route => this.key(route)));
 		for (const entries of [this.cache, this.discoveryUpdates]) {
 			for (const key of entries.keys()) if (!activeKeys.has(key)) entries.delete(key);
@@ -172,9 +177,10 @@ export class ApiModelRuntime {
 				}
 			}
 			this.cache.set(key, entry);
-			return {route, key, cached, entry};
+			const probeRoute = {...route};
+			return {route, key, cached, entry, probeRoute, authorizeProbe: this.captureProbeAuthorization(route)};
 		});
-		return mapWithConcurrency(work, 3, async ({route, key, cached, entry}) => {
+		return mapWithConcurrency(work, 3, async ({route, key, cached, entry, probeRoute, authorizeProbe}) => {
 					if (
 						route.enabled &&
 						(refresh ||
@@ -242,7 +248,7 @@ export class ApiModelRuntime {
 						}
 					}
 
-					const snapshot: RouteCatalog = {
+					const snapshot: AuthorizedApiCatalog = {
 						id: route.id,
 						kind: route.kind,
 						enabled: route.enabled,
@@ -255,9 +261,15 @@ export class ApiModelRuntime {
 						const pending = this.enrichModels(
 							entry.models.filter((m) => route.visibleModels.includes(m.slug)),
 							refresh,
-                            requestKind ? {...route, probeCapabilities:false} : route,
+                            requestKind ? {...probeRoute, probeCapabilities:false} : probeRoute,
 							forceProbes,
-						).then((enriched) => {
+							authorizeProbe,
+						).then(async (enriched) => {
+							if (!requestKind && probeRoute.enabled && probeRoute.probeCapabilities) {
+								const current = await authorizeProbe();
+								if (!current()) throw Error("API probe authority changed");
+								snapshot[CATALOG_AUTHORITY] = current;
+							}
 							const byId = new Map(enriched.map((m) => [m.slug, m]));
 							snapshot.models = entry.models.map((m) => withAccessPrograms(byId.get(m.slug) ?? m, route));
 							// The caller receives its own completed result; only the newest refresh may replace the shared cache.
@@ -278,6 +290,7 @@ export class ApiModelRuntime {
 		return routes.map((r) => {
 			const c = this.cache.get(this.key(r));
 			return {
+				[CATALOG_AUTHORITY]: c?.snapshot?.[CATALOG_AUTHORITY],
 				id: r.id,
 				kind: r.kind,
 				label: r.label,

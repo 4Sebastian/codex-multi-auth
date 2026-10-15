@@ -17,8 +17,9 @@ import {getPendingAuthPath} from "../lib/storage/pending-auth.js";
 // its own multi-auth directory instead of the worker's shared one.
 function discoverModelInventory(...args:Parameters<typeof discoverManagedModelInventory>){
  if(args[0]&&!existsSync(getStoragePath()))writeAccountSourceFixture(args[0]);
- return discoverManagedModelInventory(...args);
+ return discoverManagedModelInventory(args[0], args[1], {captureProbeAuthorization: fixtureProbeAuthorization, ...args[2]});
 }
+const fixtureProbeAuthorization = (route: ApiRouteCredential) => async () => () => route.enabled && route.probeCapabilities === true;
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
@@ -524,7 +525,7 @@ it("honours the persisted 15-minute probe cache across fresh CLI processes unles
   const run = async (forceProbes?: boolean) => {
    vi.resetModules();
    const fresh = await import("../lib/runtime/model-discovery-status.js");
-   await fresh.discoverModelInventory(null, [route], { fetchImpl: fetcher as typeof fetch, now: () => clock, updateApiDiscovery: async (r) => r, persistProbes: true, forceProbes });
+   await fresh.discoverModelInventory(null, [route], { captureProbeAuthorization: fixtureProbeAuthorization, fetchImpl: fetcher as typeof fetch, now: () => clock, updateApiDiscovery: async (r) => r, persistProbes: true, forceProbes });
   };
   await run();
   const first = probes;
@@ -824,7 +825,7 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
   const a = await import("../lib/runtime/model-discovery-status.js");
   vi.resetModules();
   const b = await import("../lib/runtime/model-discovery-status.js");
-  const options = { fetchImpl: fetcher as typeof fetch, now: () => 1_000_000, updateApiDiscovery: async (r: never) => r, persistProbes: true };
+  const options = { captureProbeAuthorization: fixtureProbeAuthorization, fetchImpl: fetcher as typeof fetch, now: () => 1_000_000, updateApiDiscovery: async (r: never) => r, persistProbes: true };
   // Both start from the same (empty) cache and probe different credentials.
   await Promise.all([a.discoverModelInventory(null, [route("one")], options), b.discoverModelInventory(null, [route("two")], options)]);
   const cached = JSON.parse(await fs.readFile(join(dir, "api-capability-probes.json"), "utf8")).entries;

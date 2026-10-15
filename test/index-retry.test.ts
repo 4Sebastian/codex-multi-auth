@@ -1063,6 +1063,19 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 				if (headers === "secondary") expect(snapshot?.secondary.usedPercent).toBe(40);
 				if (headers === "plan") expect(snapshot?.planType).toBe("plus");
 				if (mode === "unrelated" || mode.startsWith("entitlement")) expect(scheduler.getDeferral(firstReceipt[0]).defer).toBe(false);
+				if (headers === "none" && (mode === "unrelated" || mode.startsWith("entitlement"))) expect(snapshot).toBeUndefined();
+				if (headers === "none" && mode === "unrelated") {
+					const previousFetch = globalThis.fetch;
+					globalThis.fetch = vi.fn(async () => rejected());
+					try {
+						for (let i = 0; i < 12; i++) {
+							const completed = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: `gpt-5.1-no-signal-${i}`, stream: true})});
+							expect(completed.status).toBe(404);
+							await completed.text();
+						}
+						expect(Object.values(scheduler).filter(value => value instanceof Map).map(value => value.size)).toEqual([0]);
+					} finally {globalThis.fetch = previousFetch;}
+				}
 			}
 			if (!mode.startsWith("entitlement")) {
 				const count = bearers.length, probe = await turn();

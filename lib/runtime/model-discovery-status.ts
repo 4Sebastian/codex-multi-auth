@@ -19,6 +19,7 @@ import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
 import {syncNativeAccountCredentials} from "./native-account-sync.js";
 import {
 	type ApiRouteCredential,
+	captureApiProbeAuthorization,
 	loadApiRoutes,
 	updateApiModelDiscovery,
 } from "../api-route-store.js";
@@ -78,7 +79,7 @@ export function captureCatalogAuthority(manager:AccountManager,account:ManagedAc
 }
 export function revalidateModelInventory(value:ModelInventory):ModelInventory {
  value.entries=value.entries.map(entry=>{
-  if(entry.kind!=='oauth')return entry;
+  if(entry.kind!=='oauth'&&!entry[CATALOG_AUTHORITY])return entry;
   let current=false;try{current=entry[CATALOG_AUTHORITY]?.()===true;}catch{}
   return current?entry:{...entry,enabled:false,routable:false,visibleModels:[],error:true,bound:false,selected:false};
  });
@@ -124,10 +125,12 @@ export async function discoverModelInventory(
 		forceProbes?: boolean;
 		/** Share probe results with later CLI processes through the multi-auth directory. */
 		persistProbes?: boolean;
+		captureProbeAuthorization?: typeof captureApiProbeAuthorization;
 	} = {},
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
 		now = options.now ?? Date.now;
+	const probeAuthorities = new Map(routes.map(route => [route, (options.captureProbeAuthorization ?? captureApiProbeAuthorization)(route)]));
 	const capabilities = new ApiModelCapabilities(fetcher, now);
 	if (options.persistProbes) {
 		const cached = await loadProbeCache();
@@ -222,11 +225,26 @@ export async function discoverModelInventory(
 		now,
 		options.updateApiDiscovery,
 		options.updateApiDiscovery
-			? (models, refresh, route, forceProbes) =>
-					capabilities.enrich(models, refresh, route, forceProbes)
+			? (models, refresh, route, forceProbes, authorize) =>
+					capabilities.enrich(models, refresh, route, forceProbes, authorize)
 			: undefined,
+		undefined,
+		route => {
+			const original = routes.find(candidate => candidate.id === route.id && candidate.kind === route.kind && candidate.apiKey === route.apiKey);
+			const authorize = original && probeAuthorities.get(original);
+			if (!authorize) throw Error("API probe authority unavailable");
+			return authorize;
+		},
 	);
 	await api.catalogs(routes, true, options.forceProbes === true);
+	const publicationChecks = await Promise.all(routes.filter(route => options.updateApiDiscovery && route.enabled && route.probeCapabilities).map(route => {
+		const authorize = probeAuthorities.get(route);
+		if (!authorize) throw Error("API probe authority unavailable");
+		return authorize();
+	}));
+	const requirePublication = () => {
+		if (publicationChecks.some(current => !current())) throw Error("API probe authority changed");
+	};
 	if (options.persistProbes) {
 		const path = probeCachePath();
 		const persisted = await withFileTransactionLock(path, async () => {
@@ -260,7 +278,7 @@ export async function discoverModelInventory(
 			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
 			const serialized = JSON.stringify(probeCacheSchema.parse({ version: 1, entries, ownerLosses: [...losses] })) + "\n";
 			if (Buffer.byteLength(serialized) > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
-			await writeFileAtomic(path, serialized);
+			await writeFileAtomic(path, () => { requirePublication(); return serialized; });
 			return {entries, ownerLosses: [...losses]};
 		});
 		for (const catalog of api.cachedCatalogs()) {
@@ -269,8 +287,10 @@ export async function discoverModelInventory(
 			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted.entries, persisted.ownerLosses));
 		}
 	}
+	requirePublication();
 	entries.push(
 		...api.statuses(routes).map((s, i) => ({
+			[CATALOG_AUTHORITY]: s[CATALOG_AUTHORITY],
 			id: modelScopeId(s.kind,s.id),
    label: s.label,
 			kind: s.kind,

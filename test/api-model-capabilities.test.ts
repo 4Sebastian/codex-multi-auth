@@ -1,9 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
 import { isRecord } from "../lib/utils.js";
 import {
-	ApiModelCapabilities,
+	ApiModelCapabilities as ConfiguredApiModelCapabilities,
 	parseApiReasoningDocumentation,
 } from "../lib/runtime/api-model-capabilities.js";
+class ApiModelCapabilities extends ConfiguredApiModelCapabilities {
+	override enrich(...args: Parameters<ConfiguredApiModelCapabilities["enrich"]>) {
+		const route = args[2];
+		return super.enrich(args[0], args[1], route, args[3], args[4] ?? (async () => () => route?.enabled === true && route.probeCapabilities === true));
+	}
+}
 describe("public API reasoning metadata", () => {
 	it("reads only an explicit support statement for the exact model", () => {
 		expect(

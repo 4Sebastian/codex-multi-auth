@@ -1701,6 +1701,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 
 											let response: Response;
 											let quotaReceipt: QuotaObservationReceipt | undefined;
+											try {
 											let rateLimitResetFloor = 0;
 											const receiveQuota = (received: Response): Response => {
 												const now = Date.now();
@@ -2462,6 +2463,9 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												});
 											}
 											return successResponse;
+											} finally {
+												if (quotaReceipt) preemptiveQuotaScheduler.releaseReceipt(quotaScheduleKey, quotaReceipt);
+											}
 										}
 										if (retryNextAccountBeforeFallback) {
 											retryNextAccountBeforeFallback = false;

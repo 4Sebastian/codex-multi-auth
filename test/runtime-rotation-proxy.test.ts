@@ -9687,6 +9687,58 @@ it("stops a stored pin after refresh disables its only workspace",async()=>{
  expect(calls.filter(c=>c.url.endsWith("/responses"))).toHaveLength(0);
 });
 
+it.each(["success", "not-found", "capacity"])("retains no empty quota entries after distinct HTTP %s responses", async mode => {
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ const observed = vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral");
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async () => mode === "success" ? textEventStream('data: {"type":"response.completed","response":{}}\n\n') : Response.json({error: {code: mode === "capacity" ? "model_capacity_exceeded" : "not_found", message: mode === "capacity" ? "Model is at capacity" : "Not found"}}, {status: mode === "capacity" ? 429 : 404}), options: {modelCapacityRetryMs: 1}});
+ for (let i = 0; i < 12; i++) {
+  const response = await postResponses(proxy, {model: `gpt-5.1-no-signal-${i}`, input: "fixture", stream: true});
+  await response.text();
+  expect(response.status).toBe(mode === "success" ? 200 : mode === "not-found" ? 404 : 503);
+ }
+ expect(observed.mock.contexts.length).toBeGreaterThan(0);
+ for (const scheduler of new Set(observed.mock.contexts)) {
+  expect(Object.values(scheduler).filter(value => value instanceof Map).map(value => value.size)).toEqual([0]);
+ }
+});
+
+it.each([false, true])("revalidates production native background probe authority, withdrawn=%s", async withdrawn => {
+ const {saveApiRoutes} = await import("../lib/api-route-store.js");
+ const previous = process.env.CODEX_MULTI_AUTH_DIR;
+ process.env.CODEX_MULTI_AUTH_DIR = storageFixtureDir;
+ let release!: () => void, entered!: () => void;
+ const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+ const route = {id: "probe-fixture", label: "Probe fixture", kind: "zdr" as const, apiKey: "fixture-probe-key", enabled: true, priority: 0, visibleModels: ["fixture"], probeCapabilities: true};
+ let posts = 0;
+ try {
+  await saveApiRoutes([route]);
+  const manager = new AccountManager(undefined, createStorage(Date.now(), 0));
+  const proxy = await startProxy({accountManager: manager, fetchImpl: async (url, init) => {
+   if (String(url).endsWith("/v1/models")) return Response.json({data: [{id: "fixture"}]});
+   if (init?.method !== "POST") {entered(); await gate; return new Response("Model ID: `fixture`\nReasoning.effort supports: low.");}
+   posts++;
+   expect(new Headers(init.headers).get("authorization")).toBe("Bearer fixture-probe-key");
+   const body = JSON.parse(String(init.body));
+   return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
+  }, options: {nativeOpenai: true}});
+  const initial = getModels(proxy);
+  await ready;
+  if (withdrawn) await saveApiRoutes([{...route, probeCapabilities: false}]);
+  release();
+  expect((await initial).status).toBe(200);
+  if (!withdrawn) await vi.waitFor(() => expect(posts).toBe(10));
+  const response = await getModels(proxy, "/models?refresh_capabilities=1&client_version=0.125.0");
+  const result = await response.json();
+  expect(response.status).toBe(200);
+  expect(posts).toBe(withdrawn ? 0 : 10);
+  expect(result.models.some((model: {capability_probe_status?: {responses?: string}}) => model.capability_probe_status?.responses === "verified")).toBe(!withdrawn);
+ } finally {
+  release();
+  if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+  else process.env.CODEX_MULTI_AUTH_DIR = previous;
+ }
+});
+
 it("routes with scoped Personal quota while keeping exhausted shared organization bindings separate", async () => {
  const { updateQuotaCacheForWorkspace, updateQuotaCacheForAccount } = await import("../lib/codex-manager/quota-cache-helpers.js");
  const now = Date.now();

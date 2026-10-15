@@ -27,7 +27,7 @@ import { buildVisibleModelUnion, parseModelRoute, canonicalServiceTier, isRouteM
 import { isSameNativeAccount, syncNativeAccountCredentials } from "./runtime/native-account-sync.js";
 import { resolveAccountRecordId } from "./storage/record-identity.js";
 import { isNativeClientToken } from "./runtime/native-client-auth.js";
-import { CatalogRetryError, AccountModelCatalog, clampCatalogRetryMs, withCatalogAuthority } from "./runtime/account-model-catalog.js";
+import { CATALOG_AUTHORITY, CatalogRetryError, AccountModelCatalog, clampCatalogRetryMs, withCatalogAuthority } from "./runtime/account-model-catalog.js";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
@@ -476,9 +476,9 @@ const MODEL_CAPACITY_RETRY_ENV = "CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS";
 
 function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
  if(state.apiModelRuntime)return state.apiModelRuntime;
- const capabilities=state.apiModelCapabilities??=new ApiModelCapabilities();
+ const capabilities=state.apiModelCapabilities??=new ApiModelCapabilities(state.fetchImpl,state.now);
  const production=state.readApiRoutes===loadApiRoutes;
- state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>capabilities.enrich(models,refresh,route,force):undefined,()=>{
+ state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force,authorize)=>capabilities.enrich(models,refresh,route,force,authorize):undefined,()=>{
   const runtime=state.apiModelRuntime;
   if(!runtime)return;
   const currentModels=()=>{
@@ -490,7 +490,7 @@ function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
   if(state.catalogInventory){
    state.catalogInventory={...state.catalogInventory,checkedAt:state.now(),entries:[
     ...state.catalogInventory.entries.filter(entry=>entry.kind==="oauth"),
-    ...runtime.statuses(state.catalogApiRoutes??[]).map(entry=>({id:modelScopeId(entry.kind,entry.id),label:entry.label,kind:entry.kind,enabled:runtime.cachedCatalogs().some(c=>c.id===entry.id&&c.enabled),checkedAt:entry.checkedAt,error:entry.error,models:entry.availableModels,visibleModels:entry.visibleModels,entitlements:entry.entitlements})),
+    ...runtime.statuses(state.catalogApiRoutes??[]).map(entry=>({[CATALOG_AUTHORITY]:entry[CATALOG_AUTHORITY],id:modelScopeId(entry.kind,entry.id),label:entry.label,kind:entry.kind,enabled:runtime.cachedCatalogs().some(c=>c.id===entry.id&&c.enabled),checkedAt:entry.checkedAt,error:entry.error,models:entry.availableModels,visibleModels:entry.visibleModels,entitlements:entry.entitlements})),
    ]};
    void saveModelInventory(state.catalogInventory).then(()=>{setCatalogEtag(state,currentModels());}).catch(()=>{state.status.lastError="Model discovery status could not be saved";});
   }
@@ -1185,6 +1185,8 @@ async function applyDispatchRateLimit(
 	} catch (error) {
 		state.preemptiveQuotaScheduler.settleReceipt(key, primary, false, baseline());
 		throw error;
+	} finally {
+		state.preemptiveQuotaScheduler.releaseReceipt(key, receipt);
 	}
 }
 
@@ -2315,6 +2317,8 @@ async function connectManagedWebSocket(
 			if (isPinned) break;
 			state.status.retries += 1;
 			state.status.rotations += 1;
+		} finally {
+			if (handshakeQuota) state.preemptiveQuotaScheduler.releaseReceipt(buildQuotaScheduleKey(account, context.family, context.model), handshakeQuota);
 		}
 	}
 	return null;
@@ -3890,6 +3894,7 @@ async function handleRequestInner(
 						...apiRuntime
 							.statuses(configuredRoutes)
 							.map((a) => ({
+								[CATALOG_AUTHORITY]:a[CATALOG_AUTHORITY],
 								id:modelScopeId(a.kind,a.id),label: a.label,
 								kind: a.kind,
 								enabled: apiCatalogs.some((c) => c.id === a.id && c.enabled),
@@ -3905,7 +3910,7 @@ async function handleRequestInner(
 				});
 
 				const currentOAuth=modelCatalog.cachedList(routableKeys()).filter(model=>!/^(api|zdr)\//.test(model.slug));
-				const models=[...currentOAuth,...buildVisibleModelUnion(apiCatalogs)];
+				const models=[...currentOAuth,...buildVisibleModelUnion(apiCatalogs.filter(catalog=>catalog[CATALOG_AUTHORITY]?.()!==false))];
 				if(state.modelCatalog===modelCatalog){state.catalogOAuthModels=currentOAuth;setCatalogEtag(state,models);}
 				return models;
 				})();
@@ -4002,11 +4007,13 @@ async function handleRequestInner(
       const account=accountManager.getAccountsSnapshot().map(row=>accountManager.getAccountByIndex(row.index)).find(row=>row&&workspaceModelScopes(row).some(scope=>scope.id===target.key));
       const scope=account&&workspaceModelScopes(account).find(scope=>scope.id===target.key);
       if(!account||!scope)return ()=>{};
+      const quota=resetSnapshotQuota(snapshot);
+      if(!quota.planType?.trim()&&![quota.primary,quota.secondary].some(window=>window.usedPercent!==undefined||window.resetAtMs!==undefined))return ()=>{};
       const observations=state.subscriptionQuotaObservations??=new Map<string,QuotaCacheEntry>();
       const scopeKey=JSON.stringify([scope.id,context.model]),key=buildQuotaScheduleKey(account,context.family,context.model);
       const baseline=quotaForScope(account,scope)??{updatedAt:0,status:200,model:context.model??'unknown',primary:{},secondary:{}};
       observations.set(scopeKey,baseline);
-      const receipt=state.preemptiveQuotaScheduler.receive(key,resetSnapshotQuota(snapshot),quotaReceiptOwner(submitted),baseline);
+      const receipt=state.preemptiveQuotaScheduler.receive(key,quota,quotaReceiptOwner(submitted),baseline);
       return ()=>{
        const current=quotaForScope(account,scope)??baseline;
        const merged=state.preemptiveQuotaScheduler.observeReceipt(key,receipt,current);
@@ -4463,8 +4470,11 @@ async function handleRequestInner(
 				return receipt;
 			};
 			let headerQuota: QuotaObservationReceipt | undefined;
+			try {
 			authorize.onResponseHeaders = (status, headers) => {
-				headerQuota ??= receiveQuota({...readQuotaSchedulerSnapshot(headers, status, state.now()) ?? {status, updatedAt: state.now(), primary: {}, secondary: {}}, planType: headers.get("x-codex-plan-type") ?? undefined});
+				const snapshot = readQuotaSchedulerSnapshot(headers, status, state.now());
+				const planType = headers.get("x-codex-plan-type")?.trim();
+				if (snapshot || planType || status === 429) headerQuota ??= receiveQuota({...snapshot ?? {status, updatedAt: state.now(), primary: {}, secondary: {}}, planType});
 			};
 			let upstream: Response;
 			// Abort the in-flight upstream fetch when the client disconnects
@@ -5148,6 +5158,9 @@ async function handleRequestInner(
 				},
 			);
 			return;
+			} finally {
+				if (headerQuota) state.preemptiveQuotaScheduler.releaseReceipt(quotaScheduleKey, headerQuota);
+			}
 		}
 
 		if (
