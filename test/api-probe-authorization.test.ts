@@ -7,6 +7,7 @@ import { ApiModelRuntime } from "../lib/runtime/api-model-runtime.js";
 import { discoverModelInventory } from "../lib/runtime/model-discovery-status.js";
 import { getApiRoutesPath, saveApiRoutes, updateApiModelDiscovery, type ApiRouteCredential } from "../lib/api-route-store.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
+import { isRecord } from "../lib/utils.js";
 
 const route: ApiRouteCredential = {id: "fixture", kind: "zdr", label: "Fixture", apiKey: "fixture-probe-key", enabled: true, priority: 0, visibleModels: ["fixture"], probeCapabilities: true};
 let directory: string;
@@ -31,6 +32,7 @@ function deferred() {
 function heldFetcher(stage: "documentation" | "slots") {
 	const entered = deferred(), gate = deferred();
 	const posts: string[] = [];
+	const payloads: unknown[] = [];
 	const fetcher: typeof fetch = async (url, init) => {
 		if (String(url).endsWith("/models")) return Response.json({data: [{id: "fixture"}]});
 		if (init?.method !== "POST") {
@@ -43,9 +45,10 @@ function heldFetcher(stage: "documentation" | "slots") {
 			await gate.promise;
 		}
 		const body = JSON.parse(String(init.body));
+		payloads.push(body);
 		return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
 	};
-	return {fetcher, posts, entered, gate};
+	return {fetcher, posts, payloads, entered, gate};
 }
 const mutations = ["disable", "delete", "rekey", "kind", "consent", "unreadable", "source", "unchanged"] as const;
 async function mutate(mutation: typeof mutations[number]) {
@@ -71,7 +74,10 @@ it.each(mutations.flatMap(mutation => (["documentation", "slots"] as const).map(
 	if (mutation === "unchanged") {
 		expect(result.error).toBe(false);
 		expect(result.value[0]?.capability_probe_status).toMatchObject({responses: "verified", fast: "verified"});
-		expect(held.posts).toHaveLength(10);
+		expect(held.posts).toHaveLength(9);
+		expect(held.payloads.filter(isRecord).filter(body => !body.tools && !body.service_tier).map(body => isRecord(body.reasoning) ? body.reasoning.effort : undefined).sort()).toEqual(["high", "max", "medium", "minimal", "none", "xhigh"]);
+		expect(held.payloads.filter(isRecord).filter(body => body.tools || body.service_tier)).toHaveLength(3);
+		expect(held.payloads.filter(isRecord).filter(body => body.tools || body.service_tier).every(body => isRecord(body.reasoning) && body.reasoning.effort === "low")).toBe(true);
 		expect(capabilities.exportProbes()).toHaveLength(1);
 	} else {
 		expect(result.error).toBe(true);
@@ -97,7 +103,8 @@ it("rechecks consent at the final persisted probe publication", async () => {
 	finally {gate.resolve();}
 	expect(await outcome).toBe(true);
 	intercepted.mockRestore();
-	expect(held.posts).toHaveLength(10);
+	expect(held.posts).toHaveLength(9);
+	expect(held.payloads.filter(isRecord).filter(body => !body.tools && !body.service_tier).map(body => isRecord(body.reasoning) ? body.reasoning.effort : undefined)).not.toContain("low");
 	await expect(fs.stat(join(directory, "api-capability-probes.json"))).rejects.toMatchObject({code: "ENOENT"});
 });
 

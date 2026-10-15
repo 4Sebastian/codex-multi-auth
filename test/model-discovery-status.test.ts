@@ -4,6 +4,7 @@ import {
 	formatModelInventory,
 } from "../lib/runtime/model-discovery-status.js";
 import { promises as isolationFs } from "node:fs";
+import * as isolationSyncFs from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
@@ -13,6 +14,7 @@ import {getStoragePath,setStoragePathDirect, type AccountStorageV3} from "../lib
 import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
 import * as catalogVersion from "../lib/runtime/catalog-client-version.js";
 import {getPendingAuthPath} from "../lib/storage/pending-auth.js";
+vi.mock("node:fs", async importOriginal => ({...await importOriginal<typeof import("node:fs")>()}));
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 function discoverModelInventory(...args:Parameters<typeof discoverManagedModelInventory>){
@@ -728,10 +730,16 @@ it.each(["rename", "write", "lock", "reread", "malformed-reread"])("rejects a la
 				if (String(args[0]).startsWith(path + ".") && !String(args[0]).includes("write-lock")) throw Object.assign(Error("fixture full disk"), {code: "ENOSPC"});
 				return write(...args);
 			});
+		} else if (mode === "rename") {
+			const rename = isolationSyncFs.renameSync.bind(isolationSyncFs);
+			vi.spyOn(isolationSyncFs, "renameSync").mockImplementation((...args) => {
+				if (String(args[1]) === path) throw Object.assign(Error("fixture commit denied"), {code: "ENOSPC"});
+				return rename(...args);
+			});
 		} else {
 			const rename = isolationFs.rename.bind(isolationFs);
 			vi.spyOn(isolationFs, "rename").mockImplementation(async (...args) => {
-				if (String(args[1]) === (mode === "lock" ? path + ".write-lock" : path)) throw Object.assign(Error("fixture commit denied"), {code: "ENOSPC"});
+				if (String(args[1]) === path + ".write-lock") throw Object.assign(Error("fixture commit denied"), {code: "ENOSPC"});
 				return rename(...args);
 			});
 		}

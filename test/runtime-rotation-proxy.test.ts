@@ -9694,8 +9694,9 @@ it.each(["success", "not-found", "capacity"])("retains no empty quota entries af
  for (let i = 0; i < 12; i++) {
   const response = await postResponses(proxy, {model: `gpt-5.1-no-signal-${i}`, input: "fixture", stream: true});
   await response.text();
-  expect(response.status).toBe(mode === "success" ? 200 : mode === "not-found" ? 404 : 503);
+  expect(response.status).toBe(mode === "success" ? 200 : mode === "not-found" ? 404 : 429);
  }
+ expect(manager.getAccountByIndex(0)?.rateLimitResetTimes).toEqual({});
  expect(observed.mock.contexts.length).toBeGreaterThan(0);
  for (const scheduler of new Set(observed.mock.contexts)) {
   expect(Object.values(scheduler).filter(value => value instanceof Map).map(value => value.size)).toEqual([0]);
@@ -9710,6 +9711,7 @@ it.each([false, true])("revalidates production native background probe authority
  const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
  const route = {id: "probe-fixture", label: "Probe fixture", kind: "zdr" as const, apiKey: "fixture-probe-key", enabled: true, priority: 0, visibleModels: ["fixture"], probeCapabilities: true};
  let posts = 0;
+ const effortProbes: string[] = [];
  try {
   await saveApiRoutes([route]);
   const manager = new AccountManager(undefined, createStorage(Date.now(), 0));
@@ -9719,6 +9721,7 @@ it.each([false, true])("revalidates production native background probe authority
    posts++;
    expect(new Headers(init.headers).get("authorization")).toBe("Bearer fixture-probe-key");
    const body = JSON.parse(String(init.body));
+   if (!body.tools && !body.service_tier) effortProbes.push(body.reasoning?.effort);
    return body.tools ? Response.json({output: [{type: "function_call", name: "capability_probe"}]}) : Response.json({reasoning: body.reasoning, service_tier: body.service_tier ?? "default"});
   }, options: {nativeOpenai: true}});
   const initial = getModels(proxy);
@@ -9726,11 +9729,13 @@ it.each([false, true])("revalidates production native background probe authority
   if (withdrawn) await saveApiRoutes([{...route, probeCapabilities: false}]);
   release();
   expect((await initial).status).toBe(200);
-  if (!withdrawn) await vi.waitFor(() => expect(posts).toBe(10));
+  if (!withdrawn) await vi.waitFor(() => expect(posts).toBe(9));
   const response = await getModels(proxy, "/models?refresh_capabilities=1&client_version=0.125.0");
   const result = await response.json();
   expect(response.status).toBe(200);
-  expect(posts).toBe(withdrawn ? 0 : 10);
+  expect(posts).toBe(withdrawn ? 0 : 9);
+  expect(effortProbes).not.toContain("low");
+  expect(effortProbes).toHaveLength(withdrawn ? 0 : 6);
   expect(result.models.some((model: {capability_probe_status?: {responses?: string}}) => model.capability_probe_status?.responses === "verified")).toBe(!withdrawn);
  } finally {
   release();

@@ -3,6 +3,7 @@ import {
 	RETIRED_MODEL_REPLACEMENTS,
 } from "../request/helpers/model-map.js";
 import type { UsageServiceTier, UsageTokenCounts } from "./types.js";
+import { parseModelRoute } from "../model-route-policy.js";
 
 export interface UsageModelPricing {
 	inputUsdPerMillion: number;
@@ -222,7 +223,10 @@ function normalizeModelName(model: string | null | undefined): string | null {
 export function getUsageModelPricing(
 	model: string | null | undefined,
 ): UsageModelPricing | null {
-	const normalized = normalizeModelName(model?.replace(/^(api|zdr)\//, ""));
+	let route: ReturnType<typeof parseModelRoute>;
+	try { route = parseModelRoute(model?.trim() ?? ""); }
+	catch { return null; }
+	const normalized = normalizeModelName(route.upstreamModel);
 	if (!normalized) {
 		return null;
 	}
@@ -240,7 +244,7 @@ export function getUsageModelPricing(
 	// `gpt-5.6-sol` request; pricing it at the retired model's old rate would
 	// under-count a `maxCostUsd` budget. Rows already on disk are unaffected:
 	// the ledger stores `costUsd` when a row is written and never re-prices it.
-	const effective = !/^(api|zdr)\//.test(model ?? "") && Object.hasOwn(RETIRED_MODEL_REPLACEMENTS, normalized)
+	const effective = route.kind !== "oauth" ? route.upstreamModel : Object.hasOwn(RETIRED_MODEL_REPLACEMENTS, normalized)
 		? RETIRED_MODEL_REPLACEMENTS[normalized]
 		: // Bare aliases (`gpt-6.1`, `gpt-6`, `gpt-5.6`, `astra`) and
 			// effort-suffixed ids (`gpt-6.1-sol-max`) reach the ledger raw too;
