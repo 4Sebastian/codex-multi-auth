@@ -1,6 +1,10 @@
 import { homedir } from "node:os";
-import { join, normalize, win32 } from "node:path";
+import { join as nativeJoin, normalize, win32 } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
+
+function join(...parts: string[]): string {
+	return (process.platform === "win32" ? win32.join : nativeJoin)(...parts);
+}
 
 function firstNonEmpty(values: Array<string | undefined>): string | null {
 	for (const value of values) {
@@ -42,7 +46,8 @@ function getResolvedUserHomeDir(): string {
 
 export function getCodexHomeDir(): string {
 	const fromEnv = (process.env.CODEX_HOME ?? "").trim();
-	return fromEnv.length > 0 ? fromEnv : join(getResolvedUserHomeDir(), ".codex");
+	if (fromEnv.length > 0) return fromEnv;
+	return join(getResolvedUserHomeDir(), ".codex");
 }
 
 /**
@@ -266,4 +271,3 @@ export function getCodexLogDir(): string {
 export function getLegacyCodexDir(): string {
 	return join(getResolvedUserHomeDir(), ".codex");
 }
-

@@ -1,11 +1,12 @@
 import type { AccountManager, ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
-import { queuedRefresh } from "../refresh-queue.js";
+import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import {
 	isTokenInvalidationError,
 	isTokenRefreshRetryable,
 } from "../request/rate-limit-decision.js";
-import type { OAuthAuthDetails } from "../types.js";
+import type { OAuthAuthDetails, TokenSuccess } from "../types.js";
 
 /** @internal */
 export const DEFAULT_AUTH_FAILURE_COOLDOWN_MS = 30_000;
@@ -19,7 +20,9 @@ export function applyMonotonicAuthCooldown(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	cooldownMs: number,
+	submitted = {accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires},
 ): void {
+	if (accountManager.getAccountByIndex(account.index) !== account || account.access !== submitted.accessToken || account.refreshToken !== submitted.refreshToken || account.expires !== submitted.expiresAt) return;
 	const existing = accountManager.getAccountByIndex(account.index)?.coolingDownUntil ?? 0;
 	// Intentionally Date.now(), not the proxy's injected now(): coolingDownUntil is
 	// written by markAccountCoolingDown via nowMs() (== Date.now()), so both sides of
@@ -53,12 +56,13 @@ async function commitRefreshedAuthOnce(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	auth: OAuthAuthDetails,
+	priorRefreshToken: string,
 ): Promise<ManagedAccount | null> {
 	const key = [
 		account.index,
 		account.accountId ?? "",
 		account.email ?? "",
-		account.refreshToken,
+		priorRefreshToken,
 	].join("\0");
 	let queue = runtimeRefreshCommitQueues.get(accountManager);
 	if (!queue) {
@@ -83,35 +87,59 @@ export async function ensureFreshAccessToken(params: {
 	now: number;
 	tokenRefreshSkewMs: number;
 	tokenInvalidationCooldownMs: number;
+	authorityCurrent?: (result?: TokenSuccess) => boolean;
 }): Promise<
 	| { ok: true; accessToken: string; account: ManagedAccount }
 	| { ok: false; retryable: boolean; invalidated?: boolean }
 > {
 	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
 		params;
-	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs)) {
+	if (params.authorityCurrent && !params.authorityCurrent()) return {ok: false, retryable: true};
+	const storagePath = accountManager.resolveSelectionStoragePath();
+	const retainedBinding = {recordId: account.recordId, access: account.access, refresh: account.refreshToken, expires: account.expires};
+	const persistenceRetry = getRefreshQueue().retrySettlement(storagePath, retainedBinding);
+	if (persistenceRetry) {
+		const result = await persistenceRetry;
+		if (result.type !== "success" || (params.authorityCurrent && !params.authorityCurrent(result)) || accountManager.resolveSelectionStoragePath() !== storagePath ||
+			accountManager.getAccountByIndex(account.index) !== account || account.recordId !== retainedBinding.recordId ||
+			account.access !== retainedBinding.access || account.refreshToken !== retainedBinding.refresh || account.expires !== retainedBinding.expires ||
+			account.enabled === false || accountManager.isAccountAuthInvalidated(account) ||
+			!hasUsableAccessToken(account, Date.now(), tokenRefreshSkewMs)) return {ok: false, retryable: true};
+		// The queue's original source proof published the retained result to the
+		// existing journal without another OAuth request. Dispatch still performs
+		// its independent durable credential and workspace validation.
+		return {ok: true, accessToken: result.access, account};
+	}
+	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs) && !getRefreshQueue().isRefreshing(account.refreshToken, storagePath)) {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
-	const refreshResult = await queuedRefresh(account.refreshToken);
+	const submitted = {recordId: account.recordId, accessToken: account.access, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: account.accountId};
+	const submittedAccessToken = submitted.accessToken, submittedRefreshToken = submitted.refreshToken;
+	const refreshHealth = accountManager.captureRefreshHealth(account, family, model);
+	const refreshResult = await withRefreshCredentialRetention(account,
+		() => queuedRefresh(submittedRefreshToken, storagePath),
+		() => accountManager.getAccountByIndex(account.index) === account && accountManager.resolveSelectionStoragePath() === storagePath, undefined, storagePath);
+	if (params.authorityCurrent && !params.authorityCurrent(refreshResult.type === "success" ? refreshResult : undefined)) return {ok: false, retryable: true};
+	if ((account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) &&
+		!(refreshResult.type === "success" && account.recordId === submitted.recordId && account.expires === refreshResult.expires && account.access === refreshResult.access && account.refreshToken === refreshResult.refresh)) {
+		return !params.authorityCurrent && accountManager.getAccountByIndex(account.index) === account && hasUsableAccessToken(account, now, tokenRefreshSkewMs) && account.enabled !== false && !accountManager.isAccountAuthInvalidated(account)
+			? {ok: true, accessToken: account.access ?? "", account}
+			: {ok: false, retryable: true};
+	}
 	if (refreshResult.type === "failed") {
-		accountManager.recordFailure(account, family, model);
-		accountManager.incrementAuthFailures(account);
 		// If the refresh endpoint itself returns an explicit invalidation message
 		// (e.g. Microsoft/Outlook SSO revokes the refresh token server-side), apply
 		// the long cooldown and signal to the caller to stop rotating rather than
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
-		if (invalidated) {
-			accountManager.markAuthInvalidated(account);
-		}
-		applyMonotonicAuthCooldown(
-			accountManager,
-			account,
-			invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-		);
-		accountManager.saveToDiskDebounced();
-		return { ok: false, retryable: isTokenRefreshRetryable(refreshResult), invalidated };
+		const applied = await accountManager.withCurrentAccountCredential(account, submitted, () => {
+			refreshHealth(false);
+			accountManager.incrementAuthFailures(account);
+			if (invalidated) accountManager.markAuthInvalidated(account, "token_invalidated", undefined, submittedAccessToken);
+			applyMonotonicAuthCooldown(accountManager, account, invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
+		});
+		return { ok: false, retryable: !applied || isTokenRefreshRetryable(refreshResult), invalidated: applied && invalidated };
 	}
 
 	const auth: OAuthAuthDetails = {
@@ -125,6 +153,7 @@ export async function ensureFreshAccessToken(params: {
 			accountManager,
 			account,
 			auth,
+			submittedRefreshToken,
 		);
 		// If commit succeeded, use the stored access token from the committed
 		// account — this also handles the dedup case where two concurrent callers
@@ -133,6 +162,7 @@ export async function ensureFreshAccessToken(params: {
 		// fall back to the original account object but always use refreshResult.access:
 		// the original account may carry an expired token, and using that would
 		// cause a downstream 401 and incorrectly trigger invalidation-cooldown logic.
+		if (params.authorityCurrent && (!params.authorityCurrent(refreshResult) || !updatedAccount || updatedAccount.access !== refreshResult.access || updatedAccount.refreshToken !== refreshResult.refresh || updatedAccount.expires !== refreshResult.expires)) return {ok: false, retryable: true};
 		const resolvedAccount = updatedAccount ?? account;
 		const accessToken =
 			updatedAccount !== null
@@ -143,14 +173,13 @@ export async function ensureFreshAccessToken(params: {
 			accessToken,
 			account: resolvedAccount,
 		};
-	} catch {
-		accountManager.recordFailure(account, family, model);
-		accountManager.markAccountCoolingDown(
-			account,
-			DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-			"auth-failure",
-		);
-		accountManager.saveToDiskDebounced();
+	} catch (error) {
+		if (error instanceof PendingAuthLocalError) throw error;
+		if (account.recordId !== submitted.recordId || account.expires !== submitted.expiresAt || account.access !== submittedAccessToken || account.refreshToken !== submittedRefreshToken) return {ok: false, retryable: true};
+		await accountManager.withCurrentAccountCredential(account, submitted, () => {
+			refreshHealth(false);
+			applyMonotonicAuthCooldown(accountManager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS, submitted);
+		});
 		return { ok: false, retryable: true };
 	}
 }

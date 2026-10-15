@@ -1,4 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { CircuitBreaker, getCircuitBreaker, type CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { setImmediate as yieldForIo } from "node:timers/promises";
+async function awaitIoAdmission(admitted: () => boolean): Promise<void> {
+	for (let spin = 0; spin < 200; spin++) {if (admitted()) return; await yieldForIo();}
+	throw Error("Request did not reach its injected admission boundary");
+}
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
+
+function admitFixtureRequest(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}): boolean {
+	if (_account && typeof _account === "object" && (!("expires" in _account) || _account.expires === undefined)) Object.assign(_account, {expires: Date.now() + 60000});
+	if (!_account || typeof _account !== "object") return false;
+	if (!("circuitKeyId" in _account) || typeof _account.circuitKeyId !== "string") Object.assign(_account, {circuitKeyId: `fixture:${"refreshToken" in _account ? _account.refreshToken : "account"}`});
+	if (!("circuitKeyId" in _account) || typeof _account.circuitKeyId !== "string") return false;
+	return getCircuitBreaker(_account.circuitKeyId).tryCanExecute(options?.onAdmission).ok;
+}
 
 process.env.CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS = "1";
 
@@ -229,7 +248,8 @@ vi.mock("../lib/runtime/runtime-current-account.js", async () => {
 	};
 });
 
-vi.mock("../lib/quota-cache.js", () => ({
+vi.mock("../lib/quota-cache.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../lib/quota-cache.js")>()),
 	loadQuotaCache: loadQuotaCacheMock,
 }));
 
@@ -386,6 +406,14 @@ const saveAccountsMock = vi.fn(
 		};
 	},
 );
+const clearCredentialSidecarsMock = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../lib/storage/credential-sidecars.js", () => ({
+	clearCredentialSidecars: clearCredentialSidecarsMock,
+	clearAccountsAndCredentialSidecars: async (clearPool: () => Promise<void>) => {
+		await clearPool();
+		await clearCredentialSidecarsMock();
+	},
+}));
 const clearAccountsMock = vi.fn(async () => {
 	mockStorage.accounts = [];
 	mockStorage.activeIndex = 0;
@@ -489,6 +517,8 @@ vi.mock("../lib/accounts.js", async () => {
 			return new MockAccountManager();
 		}
 
+		resolveSelectionStoragePath() { return "/mock/path/accounts.json"; }
+
 		getAccountCount() {
 			return this.accounts.length;
 		}
@@ -512,8 +542,12 @@ vi.mock("../lib/accounts.js", async () => {
 			return workspaces[currentWorkspaceIndex] ?? null;
 		}
 
-		recordSuccess() {}
+		async withCurrentAccountCredential(_account: unknown, _submitted: unknown, mutate: () => boolean | void) { return mutate() !== false; }
+
+		recordSuccess() {return true;}
 		recordRateLimit() {}
+		captureRefreshHealth() {return () => true;}
+		getManagedAccountRuntimeSkipReason() {return null;}
 		recordFailure() {}
 
 		toAuthDetails() {
@@ -539,8 +573,8 @@ vi.mock("../lib/accounts.js", async () => {
 		markAccountCoolingDown() {}
 		markRateLimited() {}
 		markRateLimitedWithReason() {}
-		consumeToken() {
-			return true;
+		consumeToken(_account?: unknown, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}) {
+			return admitFixtureRequest(_account, _family, _model, options);
 		}
 		refundToken() {}
 		syncCodexCliActiveSelectionForIndex(index: number) {
@@ -905,6 +939,73 @@ describe("OpenAIOAuthPlugin", () => {
 			);
 		});
 
+		it("removes stored API keys and runtime sidecars on the login menu's delete-all reset", async () => {
+			const cliModule = await import("../lib/cli.js");
+			clearCredentialSidecarsMock.mockClear();
+			clearAccountsMock.mockClear();
+			mockStorage.accounts = [{ refreshToken: "fixture-refresh", accountId: "fixture", email: "fixture@example.com", addedAt: 1, lastUsed: 1 }] as typeof mockStorage.accounts;
+			vi.mocked(cliModule.promptLoginMode)
+				// Fresh leaves the menu for sign-in; no second prompt is consumed.
+				.mockResolvedValueOnce({ mode: "fresh", deleteAll: true } as never);
+			const autoMethod = plugin.auth.methods[0] as unknown as {
+				authorize: () => Promise<unknown>;
+			};
+			await autoMethod.authorize().catch(() => undefined);
+			expect(clearAccountsMock).toHaveBeenCalledTimes(1);
+			expect(clearCredentialSidecarsMock).toHaveBeenCalledTimes(1);
+		});
+
+		it.each(["empty", "matching", "foreign", "delete", "reset", "record", "revocation", "journal"])("retains verified flagged identity through the real plugin publisher (%s)", async change => {
+			const storageModule = await import("../lib/storage.js"), storage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+			const restore: Array<() => void> = [];
+			for (const name of ["loadAccounts", "loadFlaggedAccounts", "withAccountAndFlaggedStorageTransaction", "saveAccounts", "saveFlaggedAccounts"] as const) {
+				const mock = vi.mocked(storageModule[name]);
+				const previous = mock.getMockImplementation();
+				mock.mockImplementation(storage[name] as never);
+				restore.push(() => {mock.mockReset(); if (previous) mock.mockImplementation(previous as never);});
+			}
+			try {
+			const filesystem = await import("node:fs/promises");
+			const source: import("../lib/storage.js").FlaggedAccountMetadataV1 = {
+				recordId: "original-flagged-record", refreshToken: "flagged-refresh", accessToken: "old-access", expiresAt: Date.now() + 60000,
+				accountId: "acc-1", email: "user@example.com", accountLabel: "Original label", addedAt: 123, lastUsed: 1, flaggedAt: 1,
+				authInvalidatedAt: 1, authInvalidationErrorCode: "token_invalidated", workspaces: [{id: "acc-1", enabled: true}, {id: "disabled-workspace", enabled: false, disabledAt: 45}], currentWorkspaceIndex: 0,
+			};
+			const flagged = {version: 1 as const, accounts: [source]};
+			await filesystem.writeFile(getAuthorityStoragePath(), JSON.stringify({version: 3, activeIndex: 0, accounts: change === "matching" || change === "foreign" ? [{...source, recordId: change === "foreign" ? "independent-owner" : source.recordId, authInvalidatedAt: undefined, authInvalidationErrorCode: undefined}] : []}));
+			await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+			const cliModule = await import("../lib/cli.js");
+			vi.mocked(cliModule.promptLoginMode).mockReset().mockResolvedValueOnce({mode: "verify-flagged"} as never).mockResolvedValue({mode: "cancel"} as never);
+			vi.mocked((await import("../lib/refresh-queue.js")).queuedRefresh).mockImplementationOnce(async () => {
+				if (change === "delete") flagged.accounts = [];
+				if (change === "record") source.recordId = "replaced-record";
+				if (change === "revocation") source.authInvalidatedAt = 2;
+				if (change === "reset") await filesystem.writeFile(`${getAuthorityStoragePath()}.reset-intent`, "{}");
+				if (change === "journal") await filesystem.writeFile((await import("../lib/storage/pending-auth.js")).getPendingAuthPath(getAuthorityStoragePath()), "{");
+				await filesystem.writeFile(storage.getFlaggedAccountsPath(), JSON.stringify(flagged));
+				return {type: "success", access: "restored-access", refresh: "restored-refresh", expires: Date.now() + 3600000};
+			});
+			const method = plugin.auth.methods[0] as unknown as {authorize: () => Promise<unknown>};
+			if (change === "empty" || change === "matching") {
+				await method.authorize();
+				const primary = await storage.loadAccounts();
+				expect(primary?.accounts).toHaveLength(1);
+				expect(primary?.accounts[0]).toMatchObject({recordId: "original-flagged-record", addedAt: 123, refreshToken: "restored-refresh", workspaces: source.workspaces});
+				expect(primary?.accounts[0]?.authInvalidatedAt).toBeUndefined();
+				expect((await storage.loadFlaggedAccounts()).accounts).toHaveLength(0);
+				const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+				const manager = new realAccounts.AccountManager(undefined, primary!);
+				expect(manager.getAccountByIndex(0)?.recordId).toBe("original-flagged-record");
+				await manager.flushPendingSave();
+			} else {
+				await expect(method.authorize()).rejects.toBeInstanceOf((await import("../lib/storage/pending-auth.js")).PendingAuthLocalError);
+				const primary = JSON.parse(await filesystem.readFile(getAuthorityStoragePath(), "utf8"));
+				if (change === "foreign") expect(primary.accounts).toMatchObject([{recordId: "independent-owner", refreshToken: "flagged-refresh", accessToken: "old-access"}]);
+				else expect(primary.accounts).toEqual([]);
+			}
+			} finally {for (const reset of restore) reset();}
+		});
+
 		it("uses combined flagged persistence when verify-flagged restores from the login menu", async () => {
 			const cliModule = await import("../lib/cli.js");
 			const refreshQueueModule = await import("../lib/refresh-queue.js");
@@ -924,6 +1025,8 @@ describe("OpenAIOAuthPlugin", () => {
 				],
 			};
 			let loadFlaggedCallCount = 0;
+			mkdirSync(dirname(getAuthorityStoragePath()), {recursive: true});
+			writeFileSync(getAuthorityFlaggedPath(getAuthorityStoragePath(), "openai-codex-flagged-accounts.json"), JSON.stringify(flaggedStorage));
 
 			vi.mocked(cliModule.promptLoginMode)
 				.mockResolvedValueOnce({ mode: "verify-flagged" } as never)
@@ -1379,7 +1482,8 @@ describe("OpenAIOAuthPlugin", () => {
 			mockStorage.accounts = [
 				{ refreshToken: "r1", email: "user@example.com" },
 			];
-			const result = await plugin.tool["codex-health"].execute();
+			writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-health"].execute();
 			expect(result).toContain("Health Check");
 			expect(result).toContain("Healthy");
 		});
@@ -1429,7 +1533,8 @@ describe("OpenAIOAuthPlugin", () => {
 			mockStorage.accounts = [
 				{ refreshToken: "r1", email: "user@example.com" },
 			];
-			const result = await plugin.tool["codex-refresh"].execute();
+			writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 			expect(result).toContain("Refreshing");
 			expect(result).toContain("Refreshed");
 		});
@@ -1546,7 +1651,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-health"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-health"].execute();
 		expect(result).toContain("Error");
 		expect(result).toContain("0 healthy, 1 unhealthy");
 	});
@@ -1568,7 +1674,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-refresh"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 		expect(result).toContain("Failed");
 	});
 
@@ -1587,7 +1694,8 @@ describe("OpenAIOAuthPlugin edge cases", () => {
 			client: mockClient,
 		} as never)) as unknown as PluginType;
 
-		const result = await plugin.tool["codex-refresh"].execute();
+		writeAccountSourceFixture(mockStorage);
+const result = await plugin.tool["codex-refresh"].execute();
 		expect(result).toContain("Error");
 		expect(result).toContain("Network timeout");
 	});
@@ -1730,6 +1838,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			},
 			getAccountByIndex: (index: number) => accounts[index] ?? null,
 			getAccountsSnapshot: () => accounts,
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: (index: number) => Boolean(accounts[index]),
 			toAuthDetails: (account: (typeof accounts)[number]) => ({
 				type: "oauth" as const,
@@ -1748,14 +1857,16 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async (index: number) =>
 				syncCodexCliSelectionMock(index),
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -2048,6 +2159,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				accounts[selection++] ?? accounts[1] ?? null,
 		};
 		const responseIdCallbacks: Array<(responseId: string) => void> = [];
+		const completionCallbacks: Array<(completion: import("../lib/request/response-outcome.js").StreamCompletion) => Promise<void>> = [];
 
 		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
 			manager as never,
@@ -2087,6 +2199,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				if (options?.onResponseId) {
 					responseIdCallbacks.push(options.onResponseId);
 				}
+				if (options?.onCompletion) completionCallbacks.push(options.onCompletion);
 				return response;
 			},
 		);
@@ -2118,7 +2231,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		await Promise.all([firstRequest, secondRequest]);
 		expect(responseIdCallbacks).toHaveLength(2);
 		responseIdCallbacks[1]?.("resp_second_456");
+		await completionCallbacks[1]?.({success: true, outcome: "success", missingTerminal: false, errorCode: null});
 		responseIdCallbacks[0]?.("resp_first_123");
+		await completionCallbacks[0]?.({success: true, outcome: "success", missingTerminal: false, errorCode: null});
 
 		await sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
@@ -2252,6 +2367,10 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi.fn(async (requestUrl, init) => {
 			const normalizedUrl =
 				typeof requestUrl === "string" ? requestUrl : String(requestUrl);
@@ -2266,7 +2385,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 
 			const headers = new Headers(init?.headers);
 			if (headers.get("x-test-access-token") === "access-alpha") {
-				throw new Error("Network timeout");
+				return new Response("explicit rate-limit rejection", {status: 429});
 			}
 
 			return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
@@ -2316,7 +2435,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			.spyOn(entitlementModule.EntitlementCache.prototype, "isBlocked")
 			.mockImplementation(() => {
 				expect(manager.getAccountsSnapshot()[0]?.email).toBe(
-					"stale@example.com",
+					isBlockedSpy.mock.calls.length === 1 ? "stale@example.com" : "fresh@example.com",
 				);
 				return { blocked: false, waitMs: 0 };
 			});
@@ -2430,7 +2549,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(headers.get("x-test-account-id")).toBe("token-personal");
 	});
 
-	it("preserves stored workspace routing after a first-account network failure", async () => {
+	it("preserves stored workspace routing after an explicit rate-limit rejection", async () => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
 		const manager = buildRoutingManager([
@@ -2464,10 +2583,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2479,9 +2601,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		});
 
 		expect(response.status).toBe(200);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 		const thirdHeaders = new Headers(
-			vi.mocked(globalThis.fetch).mock.calls[2]?.[1]?.headers,
+			vi.mocked(globalThis.fetch).mock.calls[1]?.[1]?.headers,
 		);
 		expect(thirdHeaders.get("x-test-account-id")).toBe("workspace-fallback");
 		expect(thirdHeaders.get("x-test-access-token")).toBe("access-beta");
@@ -2547,10 +2669,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				dispatcher: proxyDispatcher,
 			}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2564,9 +2689,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(response.status).toBe(200);
 		expect(
 			vi.mocked(fetchHelpers.applyProxyCompatibleInit),
-		).toHaveBeenCalledTimes(3);
+		).toHaveBeenCalledTimes(2);
 		const thirdInit = vi.mocked(globalThis.fetch).mock
-			.calls[2]?.[1] as RequestInit;
+			.calls[1]?.[1] as RequestInit;
 		expect(thirdInit.dispatcher).toBe(proxyDispatcher);
 	});
 	it("locks fallback entitlement checks to a stable account snapshot before mutating the shared account", async () => {
@@ -2616,14 +2741,17 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 				) {
 					const fallbackSnapshot = manager.getAccountsSnapshot()[1];
 					expect(fallbackSnapshot?.accountId).toBe("workspace-fallback");
-					expect(fallbackSnapshot?.email).toBe("beta-stale@example.com");
+					expect(fallbackSnapshot?.email).toBe(isBlockedSpy.mock.calls.filter(([checked]) => checked === key).length === 1 ? "beta-stale@example.com" : "beta-fresh@example.com");
 				}
 				return { blocked: false, waitMs: 0 };
 			});
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2681,10 +2809,13 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					"x-test-access-token": String(accessToken),
 				}),
 		);
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi
 			.fn()
-			.mockRejectedValueOnce(new Error("Network timeout"))
-			.mockRejectedValueOnce(new Error("Network timeout"))
+			.mockResolvedValueOnce(new Response("explicit rate-limit rejection", {status: 429}))
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
 			);
@@ -2702,7 +2833,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(fallbackAfterRequest?.email).toBe("beta-fresh@example.com");
 	});
 
-	it("preserves per-request fallback entitlement keys during concurrent fetch failover", async () => {
+	it("preserves per-request fallback entitlement keys after concurrent explicit rejections", async () => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
 		const entitlementModule = await import("../lib/entitlement-cache.js");
@@ -2778,6 +2909,10 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			accountId: string | null;
 			accessToken: string | null;
 		}> = [];
+		vi.mocked(fetchHelpers.handleErrorResponse).mockImplementation(async response => ({
+			response,
+			...(response.status === 429 ? {rateLimit: {retryAfterMs: 60000, code: "rate_limit_exceeded"}} : {}),
+		}));
 		globalThis.fetch = vi.fn().mockImplementation(async (_url, init) => {
 			const headers = new Headers(init?.headers);
 			const accountId = headers.get("x-test-account-id");
@@ -2788,7 +2923,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 					releasePrimaryFailures?.();
 				}
 				await primaryBarrier;
-				throw new Error("Network timeout");
+				return new Response("explicit rate-limit rejection", {status: 429});
 			}
 
 			fallbackResponses.push({ accountId, accessToken });
@@ -2858,17 +2993,16 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(syncCodexCliSelectionMock).toHaveBeenCalledWith(1);
 	});
 
-	it("handles network errors and rotates to next account", async () => {
+	it("propagates the original network error without replaying an authorized request", async () => {
 		globalThis.fetch = vi.fn().mockRejectedValue(new Error("Network timeout"));
 
 		const { sdk } = await setupPlugin();
-		const response = await sdk.fetch!("https://api.openai.com/v1/chat", {
+		await expect(sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
 			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
+		})).rejects.toThrow("Network timeout");
 
-		expect(response.status).toBe(503);
-		expect(await response.text()).toContain("server errors or auth issues");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(syncCodexCliSelectionMock).not.toHaveBeenCalled();
 	});
 
@@ -2959,7 +3093,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		const consumeSpy = vi
 			.spyOn(AccountManager.prototype, "consumeToken")
 			.mockReturnValueOnce(false)
-			.mockReturnValueOnce(true);
+			.mockImplementationOnce(admitFixtureRequest);
 		globalThis.fetch = vi.fn().mockResolvedValue(
 			new Response(JSON.stringify({ content: "from-second-account" }), {
 				status: 200,
@@ -3011,12 +3145,12 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		});
 
 		const { sdk } = await setupPlugin();
-		const response = await sdk.fetch!("https://api.openai.com/v1/chat", {
+		await expect(sdk.fetch!("https://api.openai.com/v1/chat", {
 			method: "POST",
 			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
+		})).rejects.toMatchObject({name: "AbortError", message: "timeout"});
 
-		expect(response.status).toBe(503);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(recordFailureSpy).toHaveBeenCalled();
 		recordFailureSpy.mockRestore();
 		timeoutSpy.mockRestore();
@@ -3041,7 +3175,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(5000);
 		cooldownSpy.mockRestore();
@@ -3066,7 +3202,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(4500);
 		cooldownSpy.mockRestore();
@@ -3094,7 +3232,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(7000);
 		cooldownSpy.mockRestore();
@@ -3123,7 +3263,9 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(12000);
 		cooldownSpy.mockRestore();
@@ -3152,101 +3294,37 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			body: JSON.stringify({ model: "gpt-5.1" }),
 		});
 
-		expect(response.status).toBe(503);
+		expect(response.status).toBe(500);
+		expect(await response.text()).toBe("server error");
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(cooldownSpy).toHaveBeenCalled();
 		expect(cooldownSpy.mock.calls[0]?.[1]).toBe(9000);
 		cooldownSpy.mockRestore();
 		dateNowSpy.mockRestore();
 	});
 
-	it("notifies preemptive quota scheduler on 503 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("service unavailable", { status: 503 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("notifies preemptive quota scheduler on 502 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("bad gateway", { status: 502 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("notifies preemptive quota scheduler on 529 overload responses", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(new Response("overloaded", { status: 529 }));
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).toHaveBeenCalled();
-		schedulerSpy.mockRestore();
-	});
-
-	it("does not notify preemptive quota scheduler on generic 500 server errors", async () => {
-		const { PreemptiveQuotaScheduler } = await import(
-			"../lib/preemptive-quota-scheduler.js"
-		);
-		const schedulerSpy = vi.spyOn(
-			PreemptiveQuotaScheduler.prototype,
-			"markRateLimited",
-		);
-		globalThis.fetch = vi
-			.fn()
-			.mockResolvedValue(
-				new Response("internal server error", { status: 500 }),
-			);
-
-		const { sdk } = await setupPlugin();
-		await sdk.fetch!("https://api.openai.com/v1/chat", {
-			method: "POST",
-			body: JSON.stringify({ model: "gpt-5.1" }),
-		});
-
-		expect(schedulerSpy).not.toHaveBeenCalled();
-		schedulerSpy.mockRestore();
+	it.each([503, 502, 529, 500])("defers overloads but not generic server errors in the quota scheduler (%s)", async status => {
+		vi.spyOn(await import("../lib/config.js"), "getServerErrorCooldownMs").mockReturnValue(30_000);
+		const {AccountManager} = await import("../lib/accounts.js");
+		const manager = await AccountManager.loadFromDisk();
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js");
+		const admission = vi.spyOn(PreemptiveQuotaScheduler.prototype, "getDeferral");
+		globalThis.fetch = vi.fn().mockResolvedValue(new Response("server error", {status}));
+		const {sdk} = await setupPlugin();
+		const turn = () => sdk.fetch!("https://api.openai.com/v1/chat", {method: "POST", body: JSON.stringify({model: "gpt-5.1"})});
+		expect((await turn()).status).toBe(status);
+		const [key, , owner] = admission.mock.calls[0]!;
+		const scheduler = admission.mock.contexts[0];
+		if (!(scheduler instanceof PreemptiveQuotaScheduler)) throw Error("No quota scheduler checked admission");
+		const decision = scheduler.getDeferral(key, Date.now(), owner);
+		expect(decision.defer).toBe(status !== 500);
+		if (status !== 500) {
+			expect(decision.waitMs).toBeGreaterThan(0);
+			const sends = vi.mocked(globalThis.fetch).mock.calls.length;
+			expect((await turn()).ok).toBe(false);
+			expect(globalThis.fetch).toHaveBeenCalledTimes(sends);
+		}
 	});
 
 	it("falls back from gpt-5.3-codex to gpt-5.2-codex when unsupported fallback is enabled", async () => {
@@ -3608,14 +3686,16 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimitedWithReason: () => {},
 			recordRateLimit: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			getCurrentWorkspace: () => null,
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
 			markToastShown: () => {},
@@ -3624,6 +3704,7 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 			hasEnabledWorkspaces: () => true,
 			setActiveIndex: () => accountOne,
 			getAccountsSnapshot: () => [accountOne, accountTwo],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 		};
 		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
 			customManager as never,
@@ -5054,6 +5135,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5070,13 +5152,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5124,6 +5208,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
+		await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > 0);
 		await vi.advanceTimersByTimeAsync(1000);
 		const response = await responsePromise;
 
@@ -5163,6 +5248,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5179,13 +5265,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5262,6 +5350,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5278,13 +5367,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5350,6 +5441,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5366,13 +5458,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5474,6 +5568,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5490,13 +5585,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5575,6 +5672,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5591,13 +5689,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5672,6 +5772,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5688,13 +5789,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5764,6 +5867,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5780,13 +5884,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => false,
@@ -5872,6 +5978,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -5888,13 +5995,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -5992,6 +6101,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -6008,13 +6118,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit,
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -6062,7 +6174,10 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
-		await vi.advanceTimersByTimeAsync(4_000);
+		for (let attempt = 0; attempt < 4; attempt++) {
+			await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > attempt);
+			await vi.advanceTimersByTimeAsync(1000);
+		}
 		const response = await responsePromise;
 
 		expect(response.status).toBe(503);
@@ -6102,6 +6217,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			getCurrentWorkspace: () => null,
 			getAccountByIndex: () => null,
 			getAccountsSnapshot: () => [],
+			resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 			isAccountAvailableForFamily: () => true,
 			toAuthDetails: () => ({
 				type: "oauth" as const,
@@ -6118,13 +6234,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			markAccountCoolingDown: () => {},
 			markRateLimited: () => {},
 			markRateLimitedWithReason,
-			consumeToken: () => true,
+			consumeToken: admitFixtureRequest,
 			refundToken: () => {},
 			syncCodexCliActiveSelectionForIndex: async () => {},
 			markSwitched: () => {},
 			removeAccount: () => {},
 			recordFailure: () => {},
-			recordSuccess: () => {},
+			withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+			getManagedAccountRuntimeSkipReason: () => null,
+			recordSuccess: () => true,
 			recordRateLimit: () => {},
 			getMinWaitTimeForFamily: () => 0,
 			shouldShowAccountToast: () => true,
@@ -6174,6 +6292,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				body: JSON.stringify({ model: "gpt-5.1" }),
 			},
 		);
+		await awaitIoAdmission(() => vi.mocked(fetchHelpersModule.handleErrorResponse).mock.calls.length > 0);
 		await vi.advanceTimersByTimeAsync(2000);
 		const response = await responsePromise;
 
@@ -6222,9 +6341,12 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				) as Record<string, number>,
 			} as never);
 			const requestAccount = actualManager.getCurrentAccount()!;
-			const markRateLimitedWithReason = vi.fn(
-				actualManager.markRateLimitedWithReason.bind(actualManager),
-			);
+			let releaseShortResponse!: () => void;
+			const longPublished = new Promise<void>(resolve => {releaseShortResponse = resolve;});
+			const markRateLimitedWithReason = vi.fn((...args: Parameters<typeof actualManager.markRateLimitedWithReason>) => {
+				actualManager.markRateLimitedWithReason(...args);
+				releaseShortResponse();
+			});
 			const manager = {
 				getAccountCount: () => 1,
 				getCurrentOrNextForFamilyHybrid: () => requestAccount,
@@ -6232,6 +6354,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				getCurrentWorkspace: () => null,
 				getAccountByIndex: () => null,
 				getAccountsSnapshot: () => [requestAccount],
+				resolveSelectionStoragePath: () => "/mock/path/accounts.json",
 				isAccountAvailableForFamily: () => true,
 				toAuthDetails: () => ({
 					type: "oauth" as const,
@@ -6248,13 +6371,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				markAccountCoolingDown: () => {},
 				markRateLimited: () => {},
 				markRateLimitedWithReason,
-				consumeToken: () => true,
+				consumeToken: admitFixtureRequest,
 				refundToken: () => {},
 				syncCodexCliActiveSelectionForIndex: async () => {},
 				markSwitched: () => {},
 				removeAccount: () => {},
 				recordFailure: () => {},
-				recordSuccess: () => {},
+				withCurrentAccountCredential: async (_account: unknown, _submitted: unknown, mutate: () => boolean | void) => mutate() !== false,
+				getManagedAccountRuntimeSkipReason: () => null,
+				recordSuccess: () => true,
 				recordRateLimit: () => {},
 				getMinWaitTimeForFamily: () => 0,
 				shouldShowAccountToast: () => false,
@@ -6266,17 +6391,6 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			);
 
 			let rateLimitCallCount = 0;
-			const waitForSecondRateLimitCall = async () => {
-				for (let spin = 0; spin < 200; spin += 1) {
-					if (rateLimitCallCount > 1) {
-						return;
-					}
-					await Promise.resolve();
-				}
-				throw new Error(
-					"second overlapping request never reached the rate-limit handler",
-				);
-			};
 			vi.mocked(fetchHelpersModule.handleErrorResponse).mockImplementation(
 				async () => {
 					const callIndex = rateLimitCallCount++;
@@ -6295,12 +6409,6 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 						errorBody: "rate limited",
 					};
 
-					if (callIndex === 0) {
-						await waitForSecondRateLimitCall();
-						return result as never;
-					}
-
-					await Promise.resolve();
 					return result as never;
 				},
 			);
@@ -6309,13 +6417,15 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				delayMs: 60_000,
 			});
 
-			let upstreamCallCount = 0;
+			let upstreamCallCount = 0, releaseAdmissions!: () => void;
+			const bothAdmitted = new Promise<void>(resolve => {releaseAdmissions = resolve;});
 			globalThis.fetch = vi.fn(async () => {
-				upstreamCallCount += 1;
-				if (upstreamCallCount <= 2) {
-					return new Response("rate limited", { status: 429 });
-				}
-				return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
+				const attempt = ++upstreamCallCount;
+				if (attempt === 2) releaseAdmissions();
+				await bothAdmitted;
+				if (attempt === 2) await longPublished;
+				if (attempt <= 2) return new Response("rate limited", {status: 429, headers: {"retry-after": String((attempt === 1 ? longCooldownMs : shortCooldownMs) / 1000)}});
+				return new Response(JSON.stringify({content: "ok"}), {status: 200});
 			});
 
 			const mockClient = createMockClient();
@@ -6339,6 +6449,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 				}),
 			]);
 
+			expect(upstreamCallCount).toBe(2);
 			expect(markRateLimitedWithReason).toHaveBeenCalledTimes(2);
 			const familyKey = markRateLimitedWithReason.mock.calls[0]?.[2] as string;
 			expect(requestAccount.rateLimitResetTimes[familyKey]).toBe(
@@ -6347,322 +6458,6 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 		} finally {
 			vi.useRealTimers();
 		}
-	});
-
-	it("uses the floored cooldown for stream failover 429s", async () => {
-		const { AccountManager } = await import("../lib/accounts.js");
-		const { CapabilityPolicyStore } = await import(
-			"../lib/capability-policy.js"
-		);
-		const fetchHelpersModule = await import("../lib/request/fetch-helpers.js");
-		const rateLimitBackoffModule = await import(
-			"../lib/request/rate-limit-backoff.js"
-		);
-		const streamFailoverModule = await import(
-			"../lib/request/stream-failover.js"
-		);
-		const currentAccount = {
-			index: 0,
-			accountId: "acc-1",
-			email: "alpha@example.com",
-			refreshToken: "refresh-1",
-			accessToken: "access-alpha",
-		};
-		const fallbackAccount = {
-			index: 1,
-			accountId: "acc-2",
-			email: "beta@example.com",
-			refreshToken: "refresh-2",
-			accessToken: "access-beta",
-		};
-		const markRateLimitedWithReason = vi.fn();
-		const recordRateLimit = vi.fn();
-		const recordFailure = vi.fn();
-		const saveToDiskDebounced = vi.fn();
-		const capabilityFailureSpy = vi.spyOn(
-			CapabilityPolicyStore.prototype,
-			"recordFailure",
-		);
-		const pendingFailovers: Array<Promise<unknown>> = [];
-		const fallback429Response = new Response(
-			new ReadableStream({
-				start(controller) {
-					controller.enqueue(new TextEncoder().encode("rate limited"));
-					controller.close();
-				},
-			}),
-			{ status: 429 },
-		);
-		const fallbackCancelSpy = vi.spyOn(fallback429Response.body!, "cancel");
-		const manager = {
-			getAccountCount: () => 2,
-			getCurrentOrNextForFamilyHybrid: () => currentAccount,
-			getCurrentOrNextForFamily: () => currentAccount,
-			getCurrentWorkspace: () => null,
-			getAccountByIndex: (index: number) =>
-				index === fallbackAccount.index ? fallbackAccount : currentAccount,
-			getAccountsSnapshot: () => [currentAccount, fallbackAccount],
-			isAccountAvailableForFamily: (index: number) =>
-				index === fallbackAccount.index,
-			toAuthDetails: (
-				account: typeof currentAccount | typeof fallbackAccount,
-			) => ({
-				type: "oauth" as const,
-				access: account.accessToken,
-				refresh: account.refreshToken,
-				expires: Date.now() + 60_000,
-			}),
-			hasRefreshToken: () => true,
-			saveToDiskDebounced,
-			updateFromAuth: () => {},
-			clearAuthFailures: () => {},
-			incrementAuthFailures: () => 1,
-			saveToDisk: async () => {},
-			markAccountCoolingDown: () => {},
-			markRateLimited: () => {},
-			markRateLimitedWithReason,
-			consumeToken: () => true,
-			refundToken: () => {},
-			syncCodexCliActiveSelectionForIndex: async () => {},
-			markSwitched: () => {},
-			removeAccount: () => {},
-			recordFailure,
-			recordSuccess: () => {},
-			recordRateLimit,
-			getMinWaitTimeForFamily: () => 0,
-			shouldShowAccountToast: () => false,
-			markToastShown: () => {},
-			setActiveIndex: () => null,
-		};
-		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
-			manager as never,
-		);
-		vi.mocked(fetchHelpersModule.handleErrorResponse).mockImplementation(
-			async (response: Response) =>
-				({
-					response,
-					rateLimit:
-						response.status === 429
-							? { retryAfterMs: 4_000, code: "usage_limit_reached" }
-							: undefined,
-					errorBody: "rate limited",
-				}) as never,
-		);
-		vi.mocked(fetchHelpersModule.transformRequestForCodex).mockImplementation(
-			async (init, _url, _userConfig, _codexMode, body) => ({
-				updatedInit: {
-					...(init as RequestInit),
-					body: JSON.stringify(body ?? {}),
-				},
-				body: (body ?? {
-					model: "gpt-5.1",
-					stream: true,
-				}) as {
-					model: string;
-					stream?: boolean;
-				},
-			}),
-		);
-		vi.mocked(rateLimitBackoffModule.getRateLimitBackoff).mockReturnValue({
-			attempt: 3,
-			delayMs: 15_000,
-		});
-		vi.spyOn(streamFailoverModule, "withStreamingFailover").mockImplementation(
-			(initialResponse, getFallbackResponse) => {
-				pendingFailovers.push(getFallbackResponse(1, 0));
-				return initialResponse;
-			},
-		);
-		let fetchCount = 0;
-		globalThis.fetch = vi.fn().mockImplementation(async () => {
-			fetchCount += 1;
-			if (fetchCount === 1) {
-				return new Response("data: ok\n\n", { status: 200 });
-			}
-			return fallback429Response;
-		});
-
-		const mockClient = createMockClient();
-		const { OpenAIOAuthPlugin } = await import("../index.js");
-		const plugin = (await OpenAIOAuthPlugin({
-			client: mockClient,
-		} as never)) as unknown as PluginType;
-		const sdk = await plugin.auth.loader(getOAuthAuth, {
-			options: {},
-			models: {},
-		});
-		const response = await sdk.fetch!(
-			"https://api.openai.com/v1/chat/completions",
-			{
-				method: "POST",
-				body: JSON.stringify({ model: "gpt-5.1", stream: true }),
-			},
-		);
-		await Promise.all(pendingFailovers);
-
-		expect(response.status).toBe(200);
-		expect(markRateLimitedWithReason.mock.calls[0]?.[1]).toBe(15_000);
-		expect(recordRateLimit).toHaveBeenCalledWith(
-			fallbackAccount,
-			"gpt-5.1",
-			"gpt-5.1",
-		);
-		expect(recordFailure).not.toHaveBeenCalled();
-		expect(capabilityFailureSpy).not.toHaveBeenCalled();
-		expect(saveToDiskDebounced).toHaveBeenCalledTimes(1);
-		expect(fallbackCancelSpy).toHaveBeenCalledTimes(1);
-	});
-
-	it("records capability failure once for non-429 stream failover fallback errors", async () => {
-		const { AccountManager } = await import("../lib/accounts.js");
-		const { CapabilityPolicyStore } = await import(
-			"../lib/capability-policy.js"
-		);
-		const fetchHelpersModule = await import("../lib/request/fetch-helpers.js");
-		const streamFailoverModule = await import(
-			"../lib/request/stream-failover.js"
-		);
-		const currentAccount = {
-			index: 0,
-			accountId: "acc-1",
-			email: "alpha@example.com",
-			refreshToken: "refresh-1",
-			accessToken: "access-alpha",
-		};
-		const fallbackAccount = {
-			index: 1,
-			accountId: "acc-2",
-			email: "beta@example.com",
-			refreshToken: "refresh-2",
-			accessToken: "access-beta",
-		};
-		const recordFailure = vi.fn();
-		const saveToDiskDebounced = vi.fn();
-		const capabilityFailureSpy = vi.spyOn(
-			CapabilityPolicyStore.prototype,
-			"recordFailure",
-		);
-		const pendingFailovers: Array<Promise<unknown>> = [];
-		const fallbackErrorResponse = new Response(
-			new ReadableStream({
-				start(controller) {
-					controller.enqueue(new TextEncoder().encode("server error"));
-					controller.close();
-				},
-			}),
-			{ status: 500 },
-		);
-		const manager = {
-			getAccountCount: () => 2,
-			getCurrentOrNextForFamilyHybrid: () => currentAccount,
-			getCurrentOrNextForFamily: () => currentAccount,
-			getCurrentWorkspace: () => null,
-			getAccountByIndex: (index: number) =>
-				index === fallbackAccount.index ? fallbackAccount : currentAccount,
-			getAccountsSnapshot: () => [currentAccount, fallbackAccount],
-			isAccountAvailableForFamily: (index: number) =>
-				index === fallbackAccount.index,
-			toAuthDetails: (
-				account: typeof currentAccount | typeof fallbackAccount,
-			) => ({
-				type: "oauth" as const,
-				access: account.accessToken,
-				refresh: account.refreshToken,
-				expires: Date.now() + 60_000,
-			}),
-			hasRefreshToken: () => true,
-			saveToDiskDebounced,
-			updateFromAuth: () => {},
-			clearAuthFailures: () => {},
-			incrementAuthFailures: () => 1,
-			saveToDisk: async () => {},
-			markAccountCoolingDown: () => {},
-			markRateLimited: () => {},
-			markRateLimitedWithReason: () => {},
-			consumeToken: () => true,
-			refundToken: () => {},
-			syncCodexCliActiveSelectionForIndex: async () => {},
-			markSwitched: () => {},
-			removeAccount: () => {},
-			recordFailure,
-			recordSuccess: () => {},
-			recordRateLimit: () => {},
-			getMinWaitTimeForFamily: () => 0,
-			shouldShowAccountToast: () => false,
-			markToastShown: () => {},
-			setActiveIndex: () => null,
-		};
-		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce(
-			manager as never,
-		);
-		vi.mocked(fetchHelpersModule.handleErrorResponse).mockImplementation(
-			async (response: Response) =>
-				({
-					response,
-					errorBody: "server error",
-				}) as never,
-		);
-		vi.mocked(fetchHelpersModule.transformRequestForCodex).mockImplementation(
-			async (init, _url, _userConfig, _codexMode, body) => ({
-				updatedInit: {
-					...(init as RequestInit),
-					body: JSON.stringify(body ?? {}),
-				},
-				body: (body ?? {
-					model: "gpt-5.1",
-					stream: true,
-				}) as {
-					model: string;
-					stream?: boolean;
-				},
-			}),
-		);
-		vi.spyOn(streamFailoverModule, "withStreamingFailover").mockImplementation(
-			(initialResponse, getFallbackResponse) => {
-				pendingFailovers.push(getFallbackResponse(1, 0));
-				return initialResponse;
-			},
-		);
-		let fetchCount = 0;
-		globalThis.fetch = vi.fn().mockImplementation(async () => {
-			fetchCount += 1;
-			if (fetchCount === 1) {
-				return new Response("data: ok\n\n", { status: 200 });
-			}
-			return fallbackErrorResponse;
-		});
-
-		const mockClient = createMockClient();
-		const { OpenAIOAuthPlugin } = await import("../index.js");
-		const plugin = (await OpenAIOAuthPlugin({
-			client: mockClient,
-		} as never)) as unknown as PluginType;
-		const sdk = await plugin.auth.loader(getOAuthAuth, {
-			options: {},
-			models: {},
-		});
-		const response = await sdk.fetch!(
-			"https://api.openai.com/v1/chat/completions",
-			{
-				method: "POST",
-				body: JSON.stringify({ model: "gpt-5.1", stream: true }),
-			},
-		);
-		await Promise.all(pendingFailovers);
-
-		expect(response.status).toBe(200);
-		expect(recordFailure).toHaveBeenCalledTimes(1);
-		expect(recordFailure).toHaveBeenCalledWith(
-			fallbackAccount,
-			"gpt-5.1",
-			"gpt-5.1",
-		);
-		expect(capabilityFailureSpy).toHaveBeenCalledTimes(1);
-		expect(capabilityFailureSpy.mock.calls[0]?.[0]).toMatch(
-			/^account:acc-2::email:/,
-		);
-		expect(capabilityFailureSpy.mock.calls[0]?.[1]).toBe("gpt-5.1");
-		expect(saveToDiskDebounced).not.toHaveBeenCalled();
 	});
 
 	it("forwards persistence error toast arguments through manual OAuth flow", async () => {

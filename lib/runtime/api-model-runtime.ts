@@ -1,0 +1,515 @@
+import { isRuntimeProxyHttpError } from "./rotation-server-types.js";
+import { CodexValidationError } from '../errors.js';
+import { PendingAuthLocalError } from "../storage/pending-auth.js";
+import { ClientCancellationError } from "../request/client-cancellation.js";
+import { mapWithConcurrency } from "../concurrency.js";
+import {
+	RuntimeCapabilityFailures,
+	classifyCapabilityFailure,
+} from "./runtime-capability-failures.js";
+import { readErrorBody } from "../request/stream-failover-runtime.js";
+import { parseRetryAfterBodyMs, parseRetryAfterHeaderMs } from "../request/rate-limit-decision.js";
+import { isModelAtCapacityError } from "../request/error-classification.js";
+import { MAX_RATE_LIMIT_DELAY_MS } from "../constants.js";
+import { createHash } from "node:crypto";
+import { captureApiRouteAuthorization, captureApiProbeAuthorization, type ApiProbeAuthorization, type ApiRouteCredential } from "../api-route-store.js";
+import {
+	resolveModelRoute,
+	parseModelRoute,
+	canonicalServiceTier,
+	type RouteCatalog,
+	type RouteModel,
+	modelEntitlements,
+} from "../model-route-policy.js";
+import { isRecord } from "../utils.js";
+import { CATALOG_AUTHORITY } from "./account-model-catalog.js";
+
+/** Endpoint-family exclusions, not a fixed allowlist of text model releases.
+ * Model ID discovery alone does not prove Responses/tool compatibility. */
+export function isNonResponsesModel(id: string): boolean {
+	return (
+		/(?:^|[-_])(?:tts|whisper|embedding|moderation|transcribe|transcription|realtime|audio|image|sora)(?:[-_]|$)/i.test(
+			id,
+		) ||
+		/^(?:dall-e|babbage|davinci)(?:-|$)/i.test(id) ||
+		/(?:^|-)live(?:-|$)/i.test(id)
+	);
+}
+
+/** Conservative native-picker metadata: discovery proves an ID, not optional tool capabilities. */
+export function apiPickerModel(id: string): RouteModel {
+	return {
+		slug: id,
+		display_name: id,
+		description:
+			"API model; optional capabilities are not advertised by model discovery.",
+		supported_reasoning_levels: [],
+		default_reasoning_level: null,
+		shell_type: "shell_command",
+		visibility: "list",
+		supported_in_api: true,
+		priority: 0,
+		availability_nux: null,
+		upgrade: null,
+		model_messages: {
+			instructions_template:
+				"You are a coding assistant. Follow the user instructions and supplied tool definitions.",
+		},
+		support_verbosity: false,
+		default_verbosity: null,
+		apply_patch_tool_type: null,
+		truncation_policy: { mode: "bytes", limit: 10000 },
+		experimental_supported_tools: [],
+		input_modalities: ["text"],
+		supports_reasoning_summary_parameter: false,
+		use_responses_lite: false,
+	};
+}
+/** Apply current credential policy, never metadata inherited from another credential or old config. */
+function withAccessPrograms(model: RouteModel, route: ApiRouteCredential): RouteModel {
+ const result = {...model};
+ delete result.available_access_programs;
+ const override = route.modelAccessPrograms && Object.hasOwn(route.modelAccessPrograms, model.slug)
+  ? route.modelAccessPrograms[model.slug] : undefined;
+ const programs = override ?? route.accessPrograms;
+ if (programs) result.available_access_programs = structuredClone(programs);
+ return result;
+}
+export async function boundedJson(
+	response: Response,
+	max = 8 * 1024 * 1024,
+): Promise<unknown> {
+	const reader = response.body?.getReader();
+	if (!reader) throw Error("Empty model catalog");
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > max) throw Error("Model catalog too large");
+			chunks.push(value);
+		}
+	} finally {
+		await reader.cancel();
+	}
+	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+export interface ApiCatalogStatus {
+	[CATALOG_AUTHORITY]?: () => boolean;
+	id: string;
+	kind: "api" | "zdr";
+	label: string;
+	priority: number;
+	checkedAt: number;
+	error: boolean;
+	availableModels: string[];
+	visibleModels: string[];
+	entitlements: ReturnType<typeof modelEntitlements>[];
+}
+type AuthorizedApiCatalog = RouteCatalog & {[CATALOG_AUTHORITY]?: () => boolean};
+export class ApiModelRuntime {
+	private readonly discoveryUpdates = new Map<string, Promise<ApiRouteCredential>>();
+	lastPersistenceError: string | null = null;
+	private readonly failures = new RuntimeCapabilityFailures(() => this.now());
+	supportsDispatch(credential: ApiRouteCredential, model: string, effort?: string, tier?: string): boolean {
+		return this.failures.supports(this.key(credential), model, effort, tier);
+	}
+	cachedCatalogs(): AuthorizedApiCatalog[] {
+		return [...this.cache.values()].flatMap(entry => entry.snapshot ? [entry.snapshot[CATALOG_AUTHORITY]?.() !== true ? {...entry.snapshot, enabled: false, visibleModels: [], models: []} : entry.snapshot] : []);
+	}
+	private readonly cache = new Map<
+		string,
+		{ at: number; models: RouteModel[]; error: boolean; snapshot?: AuthorizedApiCatalog }
+	>();
+	constructor(
+		private readonly fetchImpl: typeof fetch = fetch,
+		private readonly now: () => number = Date.now,
+		private readonly updateDiscovery?: (
+			route: ApiRouteCredential,
+			models: string[],
+		) => Promise<ApiRouteCredential>,
+		private readonly enrichModels?: (
+			models: RouteModel[],
+			refresh: boolean,
+			route: ApiRouteCredential,
+			forceProbes: boolean,
+			authorize: ApiProbeAuthorization,
+		) => Promise<RouteModel[]>,
+		private readonly onCatalogUpdated?: () => void,
+		private readonly captureProbeAuthorization = captureApiProbeAuthorization,
+		private readonly captureRouteAuthorization = captureApiRouteAuthorization,
+	) {}
+	private key(route: ApiRouteCredential): string {
+		return createHash("sha256")
+			.update(route.kind)
+			.update("\0")
+			.update(route.id)
+			.update("\0")
+			.update(route.apiKey)
+			.digest("hex");
+	}
+	async catalogs(
+		routes: ApiRouteCredential[],
+		refresh = false,
+		forceProbes = false,
+		waitForCapabilities = true,
+		waitForPersistence = true,
+        requestKind?: "oauth" | "api" | "zdr",
+	): Promise<AuthorizedApiCatalog[]> {
+		const activeKeys = new Set(routes.map(route => this.key(route)));
+		for (const entries of [this.cache, this.discoveryUpdates]) {
+			for (const key of entries.keys()) if (!activeKeys.has(key)) entries.delete(key);
+		}
+		const work = (requestKind ? routes.filter(route => route.kind === requestKind) : routes).map(route => {
+			const key = this.key(route);
+			const previous = this.cache.get(key);
+			const cached = previous?.snapshot?.[CATALOG_AUTHORITY]?.() === true ? previous : undefined;
+			const entry = {
+				at: cached?.at ?? 0,
+				models: cached?.models ?? [],
+				error: cached?.error ?? true,
+				snapshot: cached?.snapshot ? {...cached.snapshot} : undefined,
+			};
+			if (!this.cache.has(key) && this.cache.size >= 100) {
+				const oldest = this.cache.keys().next().value;
+				if (oldest !== undefined) {
+					this.cache.delete(oldest);
+					this.discoveryUpdates.delete(oldest);
+				}
+			}
+			this.cache.set(key, entry);
+			const probeRoute = {...route};
+			return {route, key, cached, entry, probeRoute, authorizeProbe: this.captureProbeAuthorization(route), authorizeRoute: this.captureRouteAuthorization(route)};
+		});
+		const catalogs = await mapWithConcurrency(work, 3, async ({route, key, cached, entry, probeRoute, authorizeProbe, authorizeRoute}) => {
+					let current = await authorizeRoute();
+					if (!current()) {
+						entry.models = [];
+						entry.error = true;
+						return entry.snapshot = {id: route.id, kind: route.kind, enabled: false, priority: route.priority, models: [], visibleModels: [], [CATALOG_AUTHORITY]: current};
+					}
+					if (
+						route.enabled &&
+						(refresh ||
+							!cached ||
+							cached.at + (cached.error ? 5000 : 5 * 60_000) <= this.now())
+					) {
+						let models: RouteModel[] = [];
+						let error = false;
+						try {
+							const response = await this.fetchImpl(
+								"https://api.openai.com/v1/models",
+								{
+									method: "GET",
+									headers: { authorization: `Bearer ${route.apiKey}` },
+									redirect: "error",
+									signal: AbortSignal.timeout(15000),
+								},
+							);
+							if (!response.ok) {
+								await response.body?.cancel();
+								throw Error("API catalog unavailable");
+							}
+							const value = await boundedJson(response);
+							current = await authorizeRoute();
+							if (!current()) throw Error("API catalog authority changed");
+							if (
+								!isRecord(value) ||
+								!Array.isArray(value.data) ||
+								value.data.length > 10000
+							)
+								throw Error("Invalid API catalog");
+							models = value.data.flatMap((m) =>
+								isRecord(m) &&
+								typeof m.id === "string" &&
+								/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(m.id) &&
+								!isNonResponsesModel(m.id)
+									? [
+											{
+												...apiPickerModel(m.id),
+												...cached?.models.find((old) => old.slug === m.id),
+											},
+										]
+									: [],
+							);
+						} catch {
+							error = true;
+						}
+						entry.at = this.now();
+						entry.models = models;
+						entry.error = error;
+					}
+					if (route.enabled && !entry.error && this.updateDiscovery) {
+						let pending = this.discoveryUpdates.get(key);
+						if (!pending) {
+							pending = this.updateDiscovery(route, entry.models.map(m => m.slug));
+							if (this.cache.get(key) === entry) this.discoveryUpdates.set(key, pending);
+							void pending.then(() => {
+								if (this.discoveryUpdates.get(key) === pending) this.lastPersistenceError = null;
+							}, () => {
+								if (this.discoveryUpdates.get(key) === pending) this.lastPersistenceError = "api_catalog_persistence_failed";
+							}).finally(() => {
+								if (this.discoveryUpdates.get(key) === pending) this.discoveryUpdates.delete(key);
+							});
+						}
+						if (waitForPersistence) {
+							try {route = await pending;} catch { /* Keep the explicit policy read for this request; discovery cannot expand it. */ }
+						}
+					}
+
+					current = await authorizeRoute();
+					if (!requestKind && probeRoute.probeCapabilities && entry.models.some(model => model.capability_probe_status)) {
+						const routeCurrent = current, consent = await authorizeProbe();
+						current = () => routeCurrent() && consent();
+					}
+					if (!current()) {
+						entry.models = [];
+						entry.error = true;
+					}
+					const snapshot: AuthorizedApiCatalog = {
+						[CATALOG_AUTHORITY]: current,
+						id: route.id,
+						kind: route.kind,
+						enabled: route.enabled && current(),
+						priority: route.priority,
+						models: entry.models.map(model => withAccessPrograms(model, route)),
+						visibleModels: current() ? route.visibleModels : [],
+					};
+					entry.snapshot = snapshot;
+					if (snapshot.enabled && !entry.error && this.enrichModels && (!requestKind || !cached || cached.error)) {
+						const pending = this.enrichModels(
+							entry.models.filter((m) => route.visibleModels.includes(m.slug)),
+							refresh,
+                            requestKind ? {...probeRoute, probeCapabilities:false} : probeRoute,
+							forceProbes,
+							authorizeProbe,
+						).then(async (enriched) => {
+							const routeCurrent = await authorizeRoute();
+							if (!routeCurrent()) throw Error("API catalog authority changed");
+							let publicationCurrent = routeCurrent;
+							if (!requestKind && probeRoute.enabled && probeRoute.probeCapabilities) {
+								const current = await authorizeProbe();
+								if (!current()) throw Error("API probe authority changed");
+								publicationCurrent = () => routeCurrent() && current();
+							}
+							snapshot[CATALOG_AUTHORITY] = publicationCurrent;
+							const byId = new Map(enriched.map((m) => [m.slug, m]));
+							snapshot.models = entry.models.map((m) => withAccessPrograms(byId.get(m.slug) ?? m, route));
+							// The caller receives its own completed result; only the newest refresh may replace the shared cache.
+							if (this.cache.get(key) !== entry) return;
+							entry.models = snapshot.models;
+							this.onCatalogUpdated?.();
+						});
+						if (waitForCapabilities) await pending;
+						else
+							void pending.catch(() => {
+								entry.error = true;
+							});
+					}
+					return snapshot;
+		});
+		await Promise.all(work.map(async ({authorizeRoute, authorizeProbe, probeRoute}, index) => {
+			const snapshot = catalogs[index];
+			if (!snapshot) return;
+			const current = await authorizeRoute();
+			const consent = !requestKind && probeRoute.probeCapabilities && snapshot.models.some(model => model.capability_probe_status) ? await authorizeProbe() : undefined;
+			snapshot[CATALOG_AUTHORITY] = () => current() && (!consent || consent());
+			if (!snapshot[CATALOG_AUTHORITY]?.()) {
+				snapshot.enabled = false;
+				snapshot.visibleModels = [];
+				snapshot.models = [];
+			}
+		}));
+		return catalogs;
+	}
+	statuses(routes: ApiRouteCredential[]): ApiCatalogStatus[] {
+		return routes.map((r) => {
+			const c = this.cache.get(this.key(r));
+			const authorized = c?.snapshot?.[CATALOG_AUTHORITY]?.() === true;
+			const models = authorized ? c?.models ?? [] : [];
+			return {
+				[CATALOG_AUTHORITY]: c?.snapshot?.[CATALOG_AUTHORITY],
+				id: r.id,
+				kind: r.kind,
+				label: r.label,
+				priority: r.priority,
+				checkedAt: c?.at ?? 0,
+				error: !authorized || (c?.error ?? true),
+				availableModels: models.map((m) => m.slug),
+				entitlements: models
+					.filter((m) =>
+						(c?.snapshot?.visibleModels ?? r.visibleModels).includes(
+							m.slug,
+						),
+					)
+					.map(model => modelEntitlements(withAccessPrograms(model, r))),
+				visibleModels: (
+					c?.snapshot?.visibleModels ?? r.visibleModels
+				).filter((id) => models.some((m) => m.slug === id)),
+			};
+		});
+	}
+	async request(
+		alias: string,
+		body: Record<string, unknown>,
+		routes: ApiRouteCredential[],
+		signal?: AbortSignal,
+		onAttempt?: (credentialIndex: number, credential: ApiRouteCredential) => void,
+	): Promise<Response> {
+		let route;
+		try {
+			if (isNonResponsesModel(parseModelRoute(alias).upstreamModel))
+				return this.failure(
+					400,
+					"model_requires_other_endpoint",
+					"This model uses a media, audio, embedding, or legacy endpoint and cannot serve a Codex Responses turn. Select a text/coding model.",
+				);
+			route = resolveModelRoute(alias, await this.catalogs(routes, false, false, true, false, parseModelRoute(alias).kind), {
+				serviceTier:
+					typeof body.service_tier === "string" ? body.service_tier : undefined,
+				reasoningEffort:
+					isRecord(body.reasoning) && typeof body.reasoning.effort === "string"
+						? body.reasoning.effort
+						: undefined,
+			});
+		} catch {
+			return this.failure(400, "invalid_model_route");
+		}
+		if (route.kind === "oauth")
+			return this.failure(400, "explicit_api_model_required");
+		// Until connection-affinity support exists, never guess the owner of server-side response state.
+		if (body.background === true || body.conversation)
+			return this.failure(400, "stateful_api_route_unsupported");
+		if (body.previous_response_id)
+			return this.failure(400, "previous_response_not_found");
+		const payload: Record<string, unknown> = {
+			...body,
+			model: route.upstreamModel,
+			store: false,
+		};
+		if (route.serviceTier) payload.service_tier = canonicalServiceTier(route.serviceTier) === "fast" ? "priority" : route.serviceTier;
+		delete payload.client_metadata;
+		let lastStatus = 503;
+		let lastRejection: Response | undefined;
+		for (const candidate of route.candidates) {
+			const credentialIndex = routes.findIndex(r => r.id === candidate.id && r.kind === candidate.kind);
+			const configured = routes[credentialIndex];
+			if (!configured) continue;
+			const credential = {...configured};
+			const effort =
+				isRecord(body.reasoning) && typeof body.reasoning.effort === "string"
+					? body.reasoning.effort
+					: undefined;
+			if (
+				!this.supportsDispatch(credential, route.upstreamModel, effort, route.serviceTier)
+			)
+				continue;
+			if (signal?.aborted) throw new ClientCancellationError();
+			const controller = new AbortController();
+			const abort = () => controller.abort();
+			signal?.addEventListener("abort", abort, { once: true });
+			const timer = setTimeout(abort, 60000);
+			try {
+				onAttempt?.(credentialIndex, credential);
+				const response = await this.fetchImpl(
+					"https://api.openai.com/v1/responses",
+					{
+						method: "POST",
+						headers: {
+							authorization: `Bearer ${credential.apiKey}`,
+							"content-type": "application/json",
+						},
+						body: JSON.stringify(payload),
+						redirect: "error",
+						signal: controller.signal,
+					},
+				);
+				lastStatus = response.status;
+				lastRejection = undefined;
+				if (response.ok) {
+					const headers = new Headers();
+					for (const name of [
+						"content-type",
+						"cache-control",
+						"x-request-id",
+						"retry-after",
+					]) {
+						const value = response.headers.get(name);
+						if (value) headers.set(name, value);
+					}
+					return new Response(response.body, {
+						status: response.status,
+						headers,
+					});
+				}
+				const errorBody = await readErrorBody(response, 5000, 65536);
+				let data: unknown;
+				try {
+					data = JSON.parse(errorBody);
+				} catch {
+					data = null;
+				}
+				this.recordStreamFailure(credential, alias, body, data, {status: response.status, headers: response.headers});
+				const rejection = classifyCapabilityFailure(response.status, data);
+				const source = isRecord(data) && isRecord(data.error) ? data.error : {};
+                const sanitized: Record<string,string> = {message:"Upstream rejected the API request.",code:"api_request_rejected"};
+                for (const field of ["code","type","param"]) {
+                    const value=source[field];
+                    if (typeof value === "string" && /^[A-Za-z0-9_.]{1,80}$/.test(value)) sanitized[field]=value;
+                }
+                if (rejection) {
+                    lastRejection = Response.json({error:sanitized},{status:response.status});
+					continue;
+				}
+				if (![401, 403, 429].includes(response.status)) {
+                    return Response.json({error:sanitized},{status:response.status});
+                }
+			} catch (error) {
+                if (error instanceof ClientCancellationError || error instanceof CodexValidationError || error instanceof PendingAuthLocalError || isRuntimeProxyHttpError(error)) throw error;
+				if (signal?.aborted) throw new ClientCancellationError();
+				return this.failure(502, "upstream_transport_error", "Upstream request failed after dispatch; not replayed.");
+			} finally {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", abort);
+			}
+		}
+		if (lastRejection) return lastRejection;
+		// A 401/403 here belongs to the API key, not the desktop login; the native
+		// client must not read an exhausted credential pool as a bad login.
+		return this.failure(lastStatus === 401 || lastStatus === 403 ? 503 : lastStatus, "model_route_pool_unavailable");
+	}
+	recordStreamFailure(credential: ApiRouteCredential, alias: string, body: Record<string, unknown>, error: unknown, response?: {status: number; headers?: Headers | null; retryAfterMs?: number | null}): void {
+		const route = parseModelRoute(alias);
+		if (route.kind !== credential.kind) return;
+		const status = response?.status ?? 400;
+		const errorBody = JSON.stringify(error ?? {});
+		if (status === 401 || status === 429 && !isModelAtCapacityError(status, errorBody)) {
+			const now = this.now();
+			const hint = (response?.headers ? parseRetryAfterHeaderMs(response.headers, now) : null) ?? response?.retryAfterMs ?? parseRetryAfterBodyMs(errorBody, now);
+			const delay = Math.min(MAX_RATE_LIMIT_DELAY_MS, typeof hint === "number" && Number.isFinite(hint) && hint > 0 ? hint : 60_000);
+			this.failures.deferCredential(this.key(credential), now + delay);
+		}
+		const rejection = classifyCapabilityFailure(status, error);
+		if (!rejection) return;
+		const effort = isRecord(body.reasoning) && typeof body.reasoning.effort === "string" ? body.reasoning.effort : undefined;
+		const tier = route.serviceTier ?? (typeof body.service_tier === "string" ? body.service_tier : undefined);
+		this.failures.record(this.key(credential), route.upstreamModel, rejection, effort, tier);
+	}
+	private failure(
+		status: number,
+		code: string,
+		message = "No eligible credential could serve the selected API model route. No other pool was used.",
+	): Response {
+		return Response.json(
+			{
+				error: {
+					code,
+					message,
+				},
+			},
+			{ status },
+		);
+	}
+}

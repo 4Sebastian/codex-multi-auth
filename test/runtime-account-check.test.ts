@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { runRuntimeAccountCheck } from "../lib/runtime/account-check.js";
+import { runRuntimeAccountCheck as runActualRuntimeAccountCheck } from "../lib/runtime/account-check.js";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+const runRuntimeAccountCheck: typeof runActualRuntimeAccountCheck = (deep, deps) =>
+	runActualRuntimeAccountCheck(deep, {...deps, loadAccounts: withAccountSourceFixture(deps.loadAccounts)});
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
 

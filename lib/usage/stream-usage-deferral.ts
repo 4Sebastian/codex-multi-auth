@@ -4,12 +4,13 @@ export interface StreamUsageDeferral<TRow> {
 	/** Latest counts reported by upstream, or null if none have arrived. */
 	captured: () => UsageTokenCounts | null;
 	/** Feed upstream-reported counts. Writes a deferred row immediately. */
-	onUsage: (usage: UsageTokenCounts) => void;
+	onUsage: (usage: UsageTokenCounts, flushPending?: boolean) => void;
 	/**
 	 * Hand over a row to be written once upstream reports its counts, or after
 	 * `fallbackMs` without them. Only the first pending row is held.
 	 */
 	defer: (completion: TRow) => void;
+	complete: (completion: TRow) => Promise<void>;
 }
 
 /**
@@ -31,7 +32,7 @@ export interface StreamUsageDeferral<TRow> {
  * importing the policy layer that imports it back.
  */
 export function createStreamUsageDeferral<TRow extends object>(options: {
-	record: (completion: TRow & Partial<UsageTokenCounts>) => void;
+	record: (completion: TRow & Partial<UsageTokenCounts>) => void | Promise<void>;
 	fallbackMs: number;
 	/** Injectable for tests; defaults to an unref'd setTimeout. */
 	schedule?: (run: () => void, ms: number) => { cancel: () => void };
@@ -47,6 +48,8 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 
 	let captured: UsageTokenCounts | null = null;
 	let pending: TRow | null = null;
+	let recorded = false;
+	let settlement = Promise.resolve();
 	let timer: { cancel: () => void } | null = null;
 
 	const flush = (usage: UsageTokenCounts | null): void => {
@@ -54,22 +57,30 @@ export function createStreamUsageDeferral<TRow extends object>(options: {
 		pending = null;
 		timer?.cancel();
 		timer = null;
-		if (!completion) return;
-		options.record(usage ? { ...completion, ...usage } : completion);
+		if (!completion || recorded) return;
+		recorded = true;
+		settlement = Promise.resolve(options.record(usage ? { ...completion, ...usage } : completion));
 	};
 
 	return {
 		captured: () => captured,
-		onUsage: (usage) => {
+		onUsage: (usage, flushPending = true) => {
 			captured = usage;
-			flush(usage);
+			if (flushPending) flush(usage);
 		},
 		defer: (completion) => {
 			// A second defer would orphan the first row's timer, so keep the row
 			// already in flight and let it settle on its own terms.
-			if (pending) return;
+			if (pending || recorded) return;
 			pending = completion;
-			timer = schedule(() => flush(null), options.fallbackMs);
+			timer = schedule(() => flush(captured), options.fallbackMs);
+		},
+		complete: completion => {
+			if (!recorded) {
+				pending = completion;
+				flush(captured);
+			}
+			return settlement;
 		},
 	};
 }

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { RefreshQueue, getRefreshQueue, resetRefreshQueue, queuedRefresh } from "../lib/refresh-queue.js";
 import * as authModule from "../lib/auth/auth.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "../lib/refresh-lease.js";
+import { getStoragePath } from "../lib/storage.js";
 
 const loggerMocks = vi.hoisted(() => ({
   info: vi.fn(),
@@ -16,6 +17,11 @@ const loggerMocks = vi.hoisted(() => ({
 vi.mock("../lib/auth/auth.js", () => ({
   refreshAccessToken: vi.fn(),
 }));
+
+vi.mock("../lib/storage/pending-auth.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../lib/storage/pending-auth.js")>();
+  return {...actual, withPendingAuthRefresh: (_path: string, _token: string, refresh: () => Promise<unknown>) => refresh()};
+});
 
 vi.mock("../lib/logger.js", () => ({
   createLogger: () => ({
@@ -837,7 +843,7 @@ describe("RefreshQueue", () => {
 			const promise1 = queue.refresh("old-token");
 			expect(queue.pendingCount).toBe(1);
 			
-			queueInternal.tokenRotationMap.set("old-token", "new-rotated-token");
+			queueInternal.tokenRotationMap.set(`${getStoragePath()}\0old-token`, `${getStoragePath()}\0new-rotated-token`);
 			
 			const promise2 = queue.refresh("new-rotated-token");
 			await Promise.resolve();
@@ -862,8 +868,8 @@ describe("RefreshQueue", () => {
 				tokenRotationMap: Map<string, string>;
 			};
 			
-			queueInternal.tokenRotationMap.set("token-a", "token-b");
-			queueInternal.tokenRotationMap.set("token-c", "token-b");
+			queueInternal.tokenRotationMap.set(`${getStoragePath()}\0token-a`, `${getStoragePath()}\0token-b`);
+			queueInternal.tokenRotationMap.set(`${getStoragePath()}\0token-c`, `${getStoragePath()}\0token-b`);
 			
 			vi.mocked(authModule.refreshAccessToken).mockResolvedValue({
 				type: "success",
@@ -874,8 +880,8 @@ describe("RefreshQueue", () => {
 			
 			await queue.refresh("token-b");
 			
-			expect(queueInternal.tokenRotationMap.has("token-a")).toBe(false);
-			expect(queueInternal.tokenRotationMap.has("token-c")).toBe(false);
+			expect(queueInternal.tokenRotationMap.has(`${getStoragePath()}\0token-a`)).toBe(false);
+			expect(queueInternal.tokenRotationMap.has(`${getStoragePath()}\0token-c`)).toBe(false);
 		});
 
 		it("should handle non-Error exception during refresh (line 193-200 coverage)", async () => {
@@ -908,8 +914,8 @@ describe("RefreshQueue", () => {
 			const promise1 = queue.refresh("original-token");
 			expect(queue.pendingCount).toBe(1);
 			
-			queueInternal.tokenRotationMap.set("unrelated-token", "some-other-token");
-			queueInternal.tokenRotationMap.set("original-token", "rotated-token");
+			queueInternal.tokenRotationMap.set(`${getStoragePath()}\0unrelated-token`, `${getStoragePath()}\0some-other-token`);
+			queueInternal.tokenRotationMap.set(`${getStoragePath()}\0original-token`, `${getStoragePath()}\0rotated-token`);
 			
       const promise2 = queue.refresh("rotated-token");
       await Promise.resolve();

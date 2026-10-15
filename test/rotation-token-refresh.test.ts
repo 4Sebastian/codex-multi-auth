@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+import { readFileSync } from "node:fs";
+import { getStoragePath } from "../lib/storage/file-paths.js";
+import { AccountStorageV3Schema } from "../lib/schemas.js";
+function readSource(): AccountStorageV3 {return AccountStorageV3Schema.parse(JSON.parse(readFileSync(getStoragePath(), "utf8")));}
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 const { queuedRefreshMock, saveAccountsMock, withAccountStorageTransactionMock } =
@@ -72,10 +78,9 @@ function managerWith(
 	expiresAt: number,
 	accountOverrides: Partial<AccountStorageV3["accounts"][number]> = {},
 ): AccountManager {
-	const accountManager = new AccountManager(
-		undefined,
-		storageWith(expiresAt, accountOverrides),
-	);
+	const storage = storageWith(expiresAt, accountOverrides);
+	writeAccountSourceFixture(storage);
+	const accountManager = new AccountManager(undefined, storage);
 	openManagers.push(accountManager);
 	return accountManager;
 }
@@ -99,7 +104,7 @@ beforeEach(() => {
 	AccountManager.resetVolatileRuntimeState();
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(null, async () => undefined),
+		handler(readSource(), async (next: AccountStorageV3) => writeAccountSourceFixture(next)),
 	);
 });
 
@@ -110,6 +115,18 @@ afterEach(async () => {
 });
 
 describe("ensureFreshAccessToken", () => {
+	it("does not invalidate a newer login after an older refresh fails", async () => {
+		const manager=managerWith(STALE_EXPIRES), params=refreshParams(manager);
+		let release!: () => void, entered!: () => void;
+		const gate=new Promise<void>(r=>release=r), ready=new Promise<void>(r=>entered=r);
+		queuedRefreshMock.mockImplementation(async()=>{entered();await gate;return {type:"failed",reason:"http_error",statusCode:401,message:"OAuth token has been invalidated"};});
+		const pending=ensureFreshAccessToken(params);await ready;
+		manager.updateFromAuth(params.account,{type:"oauth",access:"access-new-login",refresh:"refresh-new-login",expires:FRESH_EXPIRES});
+		release();await expect(pending).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
+		expect(params.account.authInvalidatedAt).toBeUndefined();
+		expect(params.account.coolingDownUntil).toBeUndefined();
+		expect(params.account.consecutiveAuthFailures ?? 0).toBe(0);
+	});
 	it("uses a fresh token as-is without touching the refresh queue", async () => {
 		const accountManager = managerWith(FRESH_EXPIRES);
 
@@ -130,7 +147,7 @@ describe("ensureFreshAccessToken", () => {
 
 		const result = await ensureFreshAccessToken(refreshParams(accountManager));
 
-		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1");
+		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1", accountManager.resolveSelectionStoragePath());
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.accessToken).toBe("access-new");
@@ -184,7 +201,7 @@ describe("ensureFreshAccessToken", () => {
 		});
 		withAccountStorageTransactionMock.mockImplementation(async (handler) => {
 			await commitGate;
-			return handler(null, async () => undefined);
+			return handler(readSource(), async (next: AccountStorageV3) => writeAccountSourceFixture(next));
 		});
 		const params = refreshParams(accountManager);
 
@@ -267,7 +284,8 @@ describe("ensureFreshAccessToken", () => {
 	it("persists the invalidation marker until a successful refresh clears it", async () => {
 		let persisted: AccountStorageV3 | undefined;
 		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-			handler(null, async (nextStorage: AccountStorageV3) => {
+			handler(readSource(), async (nextStorage: AccountStorageV3) => {
+				writeAccountSourceFixture(nextStorage);
 				persisted = structuredClone(nextStorage);
 			}),
 		);
@@ -329,7 +347,7 @@ describe("ensureFreshAccessToken", () => {
 		);
 	});
 
-	it("cools down and stays retryable when the commit itself fails", async () => {
+	it("retains the rotated credential but reports the locked primary publication", async () => {
 		const accountManager = managerWith(STALE_EXPIRES);
 		queuedRefreshMock.mockResolvedValue({
 			type: "success",
@@ -343,12 +361,8 @@ describe("ensureFreshAccessToken", () => {
 			Object.assign(new Error("locked"), { code: "EBUSY" }),
 		);
 
-		const result = await ensureFreshAccessToken(refreshParams(accountManager));
-
-		expect(result).toMatchObject({ ok: false, retryable: true });
-		expect(
-			accountManager.getAccountByIndex(0)?.coolingDownUntil ?? 0,
-		).toBeGreaterThan(NOW);
+		await expect(ensureFreshAccessToken(refreshParams(accountManager))).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EBUSY"}, durability: "journal"});
+		expect(accountManager.getAccountByIndex(0)?.refreshToken).toBe("refresh-new");
 	});
 });
 

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import {
 	type ForecastCommandDeps,
 	runForecastCommand,
@@ -40,7 +42,7 @@ function createDeps(
 ): ForecastCommandDeps & {
 	formatQuotaSnapshotLine: (snapshot: unknown) => string;
 } {
-	return {
+	const deps: ForecastCommandDeps & {formatQuotaSnapshotLine: (snapshot: unknown) => string} = {
 		setStoragePath: vi.fn(),
 		loadAccounts: vi.fn(async () => createStorage()),
 		saveAccounts: vi.fn(async () => undefined),
@@ -117,9 +119,8 @@ function createDeps(
 		logError: vi.fn(),
 		getNow: vi.fn(() => 1_000),
 		...overrides,
-	} as ForecastCommandDeps & {
-		formatQuotaSnapshotLine: (snapshot: unknown) => string;
 	};
+	return {...deps, loadAccounts: vi.fn(withAccountSourceFixture(deps.loadAccounts))};
 }
 
 describe("runForecastCommand", () => {
@@ -449,5 +450,45 @@ describe("runForecastCommand", () => {
 			),
 		).toBe(true);
 		expect(jsonLine).not.toContain("is not supported when using Codex");
+	});
+});
+
+describe("runForecastCommand refresh keeps explicit bindings", () => {
+	it("keeps a manual id and source when the refreshed token names another workspace", async () => {
+		const storage = createStorage();
+		storage.accounts[0] = {
+			...storage.accounts[0]!,
+			accountId: "ws-team",
+			accountIdSource: "manual",
+			expiresAt: 0,
+		};
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => structuredClone(storage)),
+			hasUsableAccessToken: vi.fn(() => false),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-forecast-next",
+				refresh: "refresh-forecast-next",
+				expires: 999_999,
+			})),
+			extractAccountId: vi.fn(() => "ws-token-claim"),
+		});
+
+		expect(await runForecastCommand(["--json", "--live"], deps)).toBe(0);
+
+		expect(deps.saveAccounts).toHaveBeenCalledWith(
+			expect.objectContaining({
+				accounts: [
+					expect.objectContaining({
+						accessToken: "access-forecast-next",
+						accountId: "ws-team",
+						accountIdSource: "manual",
+					}),
+				],
+			}),
+		);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({ accountId: "ws-team" }),
+		);
 	});
 });

@@ -25,6 +25,10 @@ export const REQUIRED_PREFIXES = [
 	"dist/",
 	"assets/",
 	"config/",
+	// .codex-plugin/plugin.json declares "skills": "./skills/" — if files[]
+	// drops this prefix the published package ships a manifest that points at
+	// content that does not exist.
+	"skills/",
 	"scripts/",
 	"vendor/codex-ai-plugin/",
 	"vendor/codex-ai-sdk/",

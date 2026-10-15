@@ -1,4 +1,6 @@
+import { captureRefreshCredentialAuthority, PendingAuthLocalError, withRefreshCredentialRetention, type FlaggedRefreshSource } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
+import type { TokenResult } from "../types.js";
 import type { FlaggedAccountMetadataV1 } from "../storage.js";
 import type { TokenSuccessWithAccount } from "./account-selection.js";
 import { createFlaggedVerificationState } from "./flagged-verify-types.js";
@@ -26,16 +28,7 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		| null
 		| undefined
 	>;
-	queuedRefresh: (refreshToken: string) => Promise<
-		| {
-				type: "success";
-				access: string;
-				refresh: string;
-				expires: number;
-				idToken?: string;
-		  }
-		| { type: "failed"; message?: string; reason?: string }
-	>;
+	queuedRefresh: (refreshToken: string, storagePath?: string, source?: FlaggedRefreshSource) => Promise<TokenResult>;
 	resolveTokenSuccessAccount: (
 		tokens: SuccessfulAccountTokens,
 	) => TokenSuccessWithAccount<SuccessfulAccountTokens>;
@@ -43,13 +36,15 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		results: Array<TokenSuccessWithAccount<SuccessfulAccountTokens>>,
 		replaceAll?: boolean,
 	) => Promise<void>;
-	persistAccountsAndFlagged?: (
+	persistAccountsAndFlagged: (
 		results: Array<TokenSuccessWithAccount<SuccessfulAccountTokens>>,
 		flaggedStorage: {
 			version: 1;
 			accounts: FlaggedAccountMetadataV1[];
 		},
-		replaceAll?: boolean,
+		replaceAll: boolean,
+		publicationCurrent: () => boolean,
+		recoveredSources: FlaggedAccountMetadataV1[],
 	) => Promise<void>;
 	invalidateAccountManagerCache: () => void;
 	saveFlaggedAccounts: (storage: {
@@ -68,6 +63,8 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 
 	deps.showLine("\nVerifying flagged accounts...\n");
 	const state = createFlaggedVerificationState();
+	const publicationChecks: Array<() => boolean> = [];
+	const recoveredSources: FlaggedAccountMetadataV1[] = [];
 
 	for (let i = 0; i < flaggedStorage.accounts.length; i += 1) {
 		const flagged = flaggedStorage.accounts[i];
@@ -75,42 +72,10 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		const maskedEmail = flagged.email ? maskEmail(flagged.email) : undefined;
 		const label = flagged.accountLabel ?? maskedEmail ?? `Flagged ${i + 1}`;
 		try {
-			const cached = await deps.lookupCodexCliTokensByEmail(flagged.email).catch(() => null);
-			const now = deps.now?.() ?? Date.now();
-			if (
-				cached &&
-				typeof cached.expiresAt === "number" &&
-				Number.isFinite(cached.expiresAt) &&
-				cached.expiresAt > now
-			) {
-				const refreshToken =
-					typeof cached.refreshToken === "string" && cached.refreshToken.trim()
-						? cached.refreshToken.trim()
-						: undefined;
-				if (refreshToken) {
-					const resolved = deps.resolveTokenSuccessAccount({
-						type: "success",
-						access: cached.accessToken,
-						refresh: refreshToken,
-						expires: cached.expiresAt,
-						multiAccount: true,
-					});
-					if (!resolved.accountIdOverride && flagged.accountId) {
-						resolved.accountIdOverride = flagged.accountId;
-						resolved.accountIdSource = flagged.accountIdSource ?? "manual";
-					}
-					if (!resolved.accountLabel && flagged.accountLabel) {
-						resolved.accountLabel = flagged.accountLabel;
-					}
-					state.restored.push(resolved);
-					deps.showLine(
-						`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: RESTORED (Codex CLI cache)`,
-					);
-					continue;
-				}
-			}
-
-			const refreshResult = await deps.queuedRefresh(flagged.refreshToken);
+			const source: FlaggedRefreshSource = {kind: "flagged", account: flagged};
+			const publicationCurrent = captureRefreshCredentialAuthority(flagged, undefined, undefined, undefined, source);
+			const refreshResult = await withRefreshCredentialRetention(flagged, () => deps.queuedRefresh(flagged.refreshToken, undefined, source), () => flaggedStorage.accounts.includes(flagged), undefined, undefined, source);
+			publicationChecks.push(() => publicationCurrent(refreshResult.type === "success" ? refreshResult : undefined));
 			if (refreshResult.type !== "success") {
 				deps.showLine(
 					`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: STILL FLAGGED (${refreshResult.message ?? refreshResult.reason ?? "refresh failed"})`,
@@ -127,11 +92,14 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 			if (!resolved.accountLabel && flagged.accountLabel) {
 				resolved.accountLabel = flagged.accountLabel;
 			}
+			resolved.workspaces = flagged.workspaces ?? resolved.workspaces;
 			state.restored.push(resolved);
+			recoveredSources.push(flagged);
 			deps.showLine(
 				`[${i + 1}/${flaggedStorage.accounts.length}] ${label}: RESTORED`,
 			);
 		} catch (error) {
+			if (error instanceof PendingAuthLocalError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			deps.logError?.(`Failed to verify flagged account ${label}: ${message}`);
 			deps.showLine(
@@ -148,17 +116,8 @@ export async function verifyRuntimeFlaggedAccounts(deps: {
 		version: 1 as const,
 		accounts: state.remaining,
 	};
-	if (state.restored.length > 0 && deps.persistAccountsAndFlagged) {
-		await deps.persistAccountsAndFlagged(state.restored, nextFlaggedStorage, false);
-		deps.invalidateAccountManagerCache();
-	} else {
-		if (state.restored.length > 0) {
-			await deps.persistAccounts(state.restored, false);
-			deps.invalidateAccountManagerCache();
-		}
-		await deps.saveFlaggedAccounts(nextFlaggedStorage);
-	}
-
+	await deps.persistAccountsAndFlagged(state.restored, nextFlaggedStorage, false, () => publicationChecks.every(current => current()), recoveredSources);
+	if (state.restored.length > 0) deps.invalidateAccountManagerCache();
 	deps.showLine("");
 	deps.showLine(
 		`Results: ${state.restored.length} restored, ${state.remaining.length} still flagged`,

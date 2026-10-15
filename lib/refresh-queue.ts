@@ -10,10 +10,14 @@
 
 import { createHash } from "node:crypto";
 import { refreshAccessToken } from "./auth/auth.js";
-import type { TokenResult } from "./types.js";
+import type { TokenResult, TokenSuccess } from "./types.js";
 import { createLogger } from "./logger.js";
 import { RefreshLeaseCoordinator, DEFAULT_WAIT_TIMEOUT_MS } from "./refresh-lease.js";
 import { isAbortError } from "./utils.js";
+import { MAX_PENDING_AUTH_ENTRIES, PendingAuthAdmissionError, PendingAuthLocalError, PendingAuthCapacityError, PendingAuthSettlementError, withPendingAuthRefresh, captureQueuedRefreshAuthority, type FlaggedRefreshSource } from "./storage/pending-auth.js";
+import { getStoragePath } from "./storage.js";
+import { captureAuthorityRevision } from "./storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "./storage/backup-paths.js";
 
 const log = createLogger("refresh-queue");
 
@@ -41,13 +45,16 @@ function tokenFingerprint(token: string): string {
 /**
  * Entry representing an in-flight token refresh operation.
  */
-interface RefreshEntry {
+type RefreshEntry = {
   promise: Promise<TokenResult>;
   startedAt: number;
-  stage: "acquire" | "refresh";
+  acquireEvictionAgeMs: number;
   generation: number;
   staleWarningLogged?: boolean;
-}
+} & (
+  | { stage: "acquire" | "refresh" }
+  | { stage: "unsettled"; error: PendingAuthSettlementError; token: string }
+);
 
 /**
  * Manages queued token refresh operations to prevent race conditions.
@@ -81,16 +88,18 @@ interface RefreshEntry {
  * ```
  */
 export class RefreshQueue {
-  private pending: Map<string, RefreshEntry> = new Map();
+  private static pending: Map<string, RefreshEntry> = new Map();
+  private get pending() { return RefreshQueue.pending; }
   private readonly leaseCoordinator: RefreshLeaseCoordinator;
-  private nextGeneration = 0;
+  private static nextGeneration = 0;
   
   /**
    * Maps old refresh tokens to new tokens after rotation.
    * This allows lookups with either old or new token to find the same entry.
    * Format: oldToken → newToken
    */
-  private tokenRotationMap: Map<string, string> = new Map();
+  private static tokenRotationMap: Map<string, string> = new Map();
+  private get tokenRotationMap() { return RefreshQueue.tokenRotationMap; }
 
   /**
    * Age threshold for stale pending refresh operations.
@@ -118,42 +127,45 @@ export class RefreshQueue {
    * @param refreshToken - The refresh token to use
    * @returns Token result (success with new tokens, or failure)
    */
-  async refresh(refreshToken: string): Promise<TokenResult> {
+  async refresh(refreshToken: string, storagePath = getStoragePath(), source?: FlaggedRefreshSource): Promise<TokenResult> {
     this.cleanup();
+    let token = refreshToken;
+    refreshToken = `${storagePath}\0${token}`;
+    refreshToken = this.findOriginalToken(refreshToken) ?? refreshToken;
+    const existing = this.pending.get(refreshToken);
+    const unsettled = existing?.stage === "unsettled" ? existing : undefined;
+    if (unsettled) {
+      token = unsettled.token;
+    }
+    let ownerCurrent: ReturnType<typeof captureQueuedRefreshAuthority>;
+    try { ownerCurrent = captureQueuedRefreshAuthority(storagePath, existing ? refreshToken.slice(storagePath.length + 1) : token, source, unsettled?.error); }
+    catch (error) { throw unsettled?.error ?? error; }
 
     // Check for existing in-flight refresh (direct match)
-    const existing = this.pending.get(refreshToken);
-    if (existing) {
+    if (existing && !unsettled) {
       log.info("Reusing in-flight refresh for token", {
         tokenSuffix: tokenFingerprint(refreshToken),
         waitingMs: Date.now() - existing.startedAt,
       });
-      return existing.promise;
+      const result = await existing.promise;
+      if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh follower authority changed"), {code: "ESTALE"}));
+      return result;
     }
 
-    // Check if this token was rotated FROM another token that's still refreshing
-    // This handles: Request A starts with oldToken, gets newToken, Request B arrives with newToken
-    const rotatedFrom = this.findOriginalToken(refreshToken);
-    if (rotatedFrom) {
-      const originalEntry = this.pending.get(rotatedFrom);
-      if (originalEntry) {
-        log.info("Reusing in-flight refresh via rotation mapping", {
-          newTokenSuffix: tokenFingerprint(refreshToken),
-          originalTokenSuffix: tokenFingerprint(rotatedFrom),
-          waitingMs: Date.now() - originalEntry.startedAt,
-        });
-        return originalEntry.promise;
-      }
-    }
+    if (!existing && this.pending.size >= MAX_PENDING_AUTH_ENTRIES) throw new PendingAuthCapacityError();
 
     // Start a new refresh immediately so local state reflects "in-flight"
     // without waiting on cross-process lease checks.
     const startedAt = Date.now();
-    const generation = ++this.nextGeneration;
+    const configuredWaitTimeoutMs = this.leaseCoordinator.configuredWaitTimeoutMs;
+    const leaseWaitTimeoutMs = typeof configuredWaitTimeoutMs === "number" && Number.isFinite(configuredWaitTimeoutMs)
+      ? configuredWaitTimeoutMs : DEFAULT_WAIT_TIMEOUT_MS;
+    const acquireEvictionAgeMs = Math.max(this.maxEntryAgeMs, leaseWaitTimeoutMs + ACQUIRE_EVICTION_SLACK_MS);
+    const generation = ++RefreshQueue.nextGeneration;
     const markStage = (stage: "acquire" | "refresh") => {
       const entry = this.pending.get(refreshToken);
       if (!entry || entry.generation !== generation) return;
-      entry.stage = stage;
+      if (entry.stage !== "unsettled") entry.stage = stage;
       entry.startedAt = Date.now();
       entry.staleWarningLogged = false;
     };
@@ -169,51 +181,52 @@ export class RefreshQueue {
       });
       return current.promise;
     };
+    const authorityCurrent = captureAuthorityRevision([storagePath], [getIntentionalResetMarkerPath(storagePath)]);
     const promise = (async (): Promise<TokenResult> => {
-      let lease: Awaited<ReturnType<RefreshLeaseCoordinator["acquire"]>>;
+      let lease: Awaited<ReturnType<RefreshLeaseCoordinator["acquire"]>> | undefined;
       try {
-        lease = await this.leaseCoordinator.acquire(refreshToken);
-      } catch (error) {
-        log.warn("Refresh lease acquire failed; falling back to local refresh", {
-          tokenSuffix: tokenFingerprint(refreshToken),
-          error: (error as Error)?.message ?? String(error),
-        });
-        const supersedingPromise = getSupersedingPromise();
-        if (supersedingPromise) {
-          return supersedingPromise;
-        }
-        markStage("refresh");
-        return this.executeRefreshWithRotationTracking(refreshToken);
-      }
-      if (lease.role === "follower" && lease.result) {
-        log.info("Using refresh result from cross-process lease", {
-          tokenSuffix: tokenFingerprint(refreshToken),
-        });
-        return lease.result;
-      }
-
-      try {
-        const supersedingPromise = getSupersedingPromise();
-        if (supersedingPromise) {
-          return supersedingPromise;
-        }
-        markStage("refresh");
-        const result = await this.executeRefreshWithRotationTracking(refreshToken);
+        if (!authorityCurrent()) throw Object.assign(Error("Account pool was reset"), {code: "ESTALE"});
         try {
-          await lease.release(result);
+          lease = await this.leaseCoordinator.acquire(refreshToken);
+        } catch (error) {
+          log.warn("Refresh lease acquire failed; falling back to local refresh", {
+            tokenSuffix: tokenFingerprint(token),
+            error: (error as Error)?.message ?? String(error),
+          });
+        }
+        const supersedingPromise = getSupersedingPromise();
+        if (supersedingPromise) return supersedingPromise;
+        markStage("refresh");
+        const cached = unsettled?.error.result ?? (lease?.role === "follower" ? lease.result : undefined);
+        if (!authorityCurrent()) throw Object.assign(Error("Account authority changed before refresh"), {code: "ESTALE"});
+        const result = await withPendingAuthRefresh(storagePath, token, () =>
+          cached ? Promise.resolve(cached) : this.executeRefreshWithRotationTracking(token, storagePath), unsettled?.error, source, ownerCurrent);
+        if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh publication authority changed"), {code: "ESTALE"}));
+        try {
+          await lease?.release(result);
         } catch (error) {
           log.warn("Failed to publish lease refresh result", {
-            tokenSuffix: tokenFingerprint(refreshToken),
+            tokenSuffix: tokenFingerprint(token),
             error: (error as Error)?.message ?? String(error),
           });
         }
         return result;
+      } catch (error) {
+        if (unsettled || error instanceof PendingAuthSettlementError) {
+          const firstError = unsettled?.error ?? error;
+          if (firstError instanceof PendingAuthSettlementError) {
+            const entry = this.pending.get(refreshToken);
+            if (entry?.generation === generation) this.pending.set(refreshToken, {...entry, stage: "unsettled", error: firstError, token});
+            throw firstError;
+          }
+        }
+        throw error instanceof PendingAuthLocalError ? error : new PendingAuthAdmissionError(error);
       } finally {
         try {
-          await lease.release();
+          await lease?.release();
         } catch (error) {
           log.warn("Failed to release refresh lease", {
-            tokenSuffix: tokenFingerprint(refreshToken),
+            tokenSuffix: tokenFingerprint(token),
             error: (error as Error)?.message ?? String(error),
           });
         }
@@ -222,24 +235,58 @@ export class RefreshQueue {
     this.pending.set(refreshToken, {
       promise,
       startedAt,
-      stage: "acquire",
+      acquireEvictionAgeMs,
+      stage: unsettled ? "refresh" : "acquire",
       generation,
     });
 
     try {
-      return await promise;
+      const result = await promise;
+      if (!ownerCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Refresh owner authority changed"), {code: "ESTALE"}));
+      return result;
     } finally {
       const entry = this.pending.get(refreshToken);
-      if (!entry || entry.generation === generation) {
+      if (!entry || (entry.generation === generation && entry.stage !== "unsettled")) {
         this.pending.delete(refreshToken);
         this.cleanupRotationMapping(refreshToken);
       }
     }
   }
 
+  /** Retain an already-spent result for persistence-only retry in the bounded queue. */
+  retainSettlement(storagePath: string, priorRefreshToken: string, error: PendingAuthSettlementError): void {
+    const key = `${storagePath}\0${priorRefreshToken}`;
+    if (this.pending.has(key)) throw new PendingAuthAdmissionError(new Error("A refresh already owns this credential"));
+    if (this.pending.size >= MAX_PENDING_AUTH_ENTRIES) throw new PendingAuthCapacityError();
+    const promise = Promise.reject<TokenResult>(error);
+    void promise.catch(() => undefined);
+    this.pending.set(key, {stage: "unsettled", error, token: priorRefreshToken, promise,
+      startedAt: Date.now(), acquireEvictionAgeMs: this.maxEntryAgeMs, generation: ++RefreshQueue.nextGeneration});
+    this.tokenRotationMap.set(key, `${storagePath}\0${error.result.refresh}`);
+  }
+
+  /** Carry the existing unsettled result's original source proof, never recapture it. */
+  captureSettlementAuthority(storagePath: string, credential: {access: string | undefined; refresh: string; expires: number | undefined}): ((result?: TokenSuccess) => boolean) | undefined {
+    const key = `${storagePath}\0${credential.refresh}`;
+    const entry = this.pending.get(this.findOriginalToken(key) ?? key);
+    if (entry?.stage !== "unsettled" || entry.error.result.access !== credential.access ||
+      entry.error.result.refresh !== credential.refresh || entry.error.result.expires !== credential.expires) return undefined;
+    const original = entry.error;
+    return result => (!result || result.access === credential.access && result.refresh === credential.refresh && result.expires === credential.expires) && original.authorityCurrent();
+  }
+
+  /** No entry means no retry and, importantly, no OAuth request. */
+  retrySettlement(storagePath: string, credential: {access: string | undefined; refresh: string; expires: number | undefined}): Promise<TokenResult> | undefined {
+    const key = `${storagePath}\0${credential.refresh}`;
+    const entry = this.pending.get(this.findOriginalToken(key) ?? key);
+    if (entry?.stage !== "unsettled" || entry.error.result.access !== credential.access ||
+      entry.error.result.refresh !== credential.refresh || entry.error.result.expires !== credential.expires) return undefined;
+    return this.refresh(credential.refresh, storagePath);
+  }
+
   private findOriginalToken(newToken: string): string | undefined {
     for (const [oldToken, mappedNewToken] of this.tokenRotationMap.entries()) {
-      if (mappedNewToken === newToken) {
+      if (mappedNewToken === newToken && this.pending.has(oldToken)) {
         return oldToken;
       }
     }
@@ -255,11 +302,11 @@ export class RefreshQueue {
     }
   }
 
-  private async executeRefreshWithRotationTracking(refreshToken: string): Promise<TokenResult> {
+  private async executeRefreshWithRotationTracking(refreshToken: string, storagePath: string): Promise<TokenResult> {
     const result = await this.executeRefresh(refreshToken);
     
     if (result.type === "success" && result.refresh !== refreshToken) {
-      this.tokenRotationMap.set(refreshToken, result.refresh);
+      this.tokenRotationMap.set(`${storagePath}\0${refreshToken}`, `${storagePath}\0${result.refresh}`);
       log.info("Token rotated during refresh", {
         oldTokenSuffix: tokenFingerprint(refreshToken),
         newTokenSuffix: tokenFingerprint(result.refresh),
@@ -359,20 +406,11 @@ export class RefreshQueue {
     // option / CODEX_AUTH_REFRESH_LEASE_WAIT_MS) rather than the static default:
     // under a larger configured budget the default would evict too early. An
     // injected test double may not expose the getter, so fall back to the default.
-    const configuredWaitTimeoutMs = this.leaseCoordinator.configuredWaitTimeoutMs;
-    const leaseWaitTimeoutMs =
-      typeof configuredWaitTimeoutMs === "number" &&
-      Number.isFinite(configuredWaitTimeoutMs)
-        ? configuredWaitTimeoutMs
-        : DEFAULT_WAIT_TIMEOUT_MS;
-    const acquireEvictionAgeMs = Math.max(
-      this.maxEntryAgeMs,
-      leaseWaitTimeoutMs + ACQUIRE_EVICTION_SLACK_MS,
-    );
     for (const [token, entry] of this.pending.entries()) {
+      if (entry.stage === "unsettled") continue;
       const ageMs = now - entry.startedAt;
       if (entry.stage === "acquire") {
-        if (ageMs <= acquireEvictionAgeMs) continue;
+        if (ageMs <= entry.acquireEvictionAgeMs) continue;
         log.warn("Evicting stale refresh entry during lease acquire stage", {
           tokenSuffix: tokenFingerprint(token),
           ageMs,
@@ -397,8 +435,9 @@ export class RefreshQueue {
    * @param refreshToken - The refresh token to check
    * @returns True if refresh is in progress
    */
-  isRefreshing(refreshToken: string): boolean {
-    return this.pending.has(refreshToken);
+  isRefreshing(refreshToken: string, storagePath = getStoragePath()): boolean {
+    const key = `${storagePath}\0${refreshToken}`;
+    return this.pending.has(this.findOriginalToken(key) ?? key);
   }
 
   /**
@@ -413,8 +452,12 @@ export class RefreshQueue {
    * Clear all pending entries (primarily for testing).
    */
   clear(): void {
-    this.pending.clear();
-    this.tokenRotationMap.clear();
+    RefreshQueue.resetForTests();
+  }
+
+  static resetForTests(): void {
+    RefreshQueue.pending.clear();
+    RefreshQueue.tokenRotationMap.clear();
   }
 }
 
@@ -440,7 +483,7 @@ export function getRefreshQueue(maxEntryAgeMs?: number): RefreshQueue {
  * Reset the singleton instance (primarily for testing).
  */
 export function resetRefreshQueue(): void {
-  refreshQueueInstance?.clear();
+  RefreshQueue.resetForTests();
   refreshQueueInstance = null;
 }
 
@@ -449,6 +492,6 @@ export function resetRefreshQueue(): void {
  * @param refreshToken - The refresh token to use
  * @returns Token result
  */
-export async function queuedRefresh(refreshToken: string): Promise<TokenResult> {
-  return getRefreshQueue().refresh(refreshToken);
+export async function queuedRefresh(refreshToken: string, storagePath = getStoragePath(), source?: FlaggedRefreshSource): Promise<TokenResult> {
+  return getRefreshQueue().refresh(refreshToken, storagePath, source);
 }

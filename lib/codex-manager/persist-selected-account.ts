@@ -1,8 +1,10 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import {
 	extractAccountEmail,
 	extractAccountId,
 	sanitizeEmail,
 } from "../accounts.js";
+import { codexCliAccountIdFor } from "../auth/token-utils.js";
 import { setCodexCliActiveSelection } from "../codex-cli/writer.js";
 import { MODEL_FAMILIES } from "../prompts/codex.js";
 import { queuedRefresh } from "../refresh-queue.js";
@@ -77,9 +79,6 @@ export async function persistAndSyncSelectedAccount({
 		}
 	}
 	const wasDisabled = account.enabled === false;
-	if (wasDisabled) {
-		account.enabled = true;
-	}
 	const switchNow = Date.now();
 	let syncAccessToken = account.accessToken;
 	let syncRefreshToken = account.refreshToken;
@@ -87,7 +86,7 @@ export async function persistAndSyncSelectedAccount({
 	let syncIdToken = initialSyncIdToken;
 
 	if (!hasUsableAccessToken(account, switchNow)) {
-		const refreshResult = await queuedRefresh(account.refreshToken);
+		const refreshResult = await withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 		if (refreshResult.type === "success") {
 			const tokenAccountId = extractAccountId(refreshResult.access);
 			const nextEmail = sanitizeEmail(
@@ -117,6 +116,7 @@ export async function persistAndSyncSelectedAccount({
 		}
 	}
 
+	if (wasDisabled) account.enabled = true;
 	account.lastUsed = switchNow;
 	account.lastSwitchReason = switchReason;
 	if (setPin) {
@@ -154,12 +154,12 @@ export async function persistAndSyncSelectedAccount({
 	await saveAccountsWithRetry(storage, saveAccounts);
 
 	const synced = await setCodexCliActiveSelection({
-		accountId: account.accountId,
+		accountId: codexCliAccountIdFor(account, syncAccessToken, syncIdToken),
 		email: account.email,
 		accessToken: syncAccessToken,
 		refreshToken: syncRefreshToken,
 		expiresAt: syncExpiresAt,
 		...(syncIdToken ? { idToken: syncIdToken } : {}),
-	});
+	}, {account, current: () => storage.accounts[targetIndex] === account});
 	return { synced, wasDisabled };
 }

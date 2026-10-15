@@ -7,10 +7,63 @@ export interface QuotaSchedulerWindow {
 }
 
 export interface QuotaSchedulerSnapshot {
+	planType?: string;
 	status: number;
 	primary: QuotaSchedulerWindow;
 	secondary: QuotaSchedulerWindow;
 	updatedAt: number;
+}
+
+export function mergeQuotaObservations(snapshot: QuotaSchedulerSnapshot, previous?: Pick<QuotaSchedulerSnapshot, "primary" | "secondary" | "planType"> | null): QuotaSchedulerSnapshot {
+	return {
+		...snapshot,
+		primary: snapshot.primary.usedPercent === undefined && snapshot.primary.resetAtMs === undefined ? previous?.primary ?? snapshot.primary : snapshot.primary,
+		secondary: snapshot.secondary.usedPercent === undefined && snapshot.secondary.resetAtMs === undefined ? previous?.secondary ?? snapshot.secondary : snapshot.secondary,
+		planType: snapshot.planType?.trim() ? snapshot.planType : previous?.planType,
+	};
+}
+
+export interface QuotaObservationReceipt {
+	snapshot: QuotaSchedulerSnapshot;
+	owner: string;
+	position: number;
+	epoch: QuotaReceiptEpoch;
+	primary?: symbol;
+	secondary?: symbol;
+	planType?: symbol;
+	reservation?: {released: boolean};
+}
+
+interface QuotaReceiptEpoch {
+	retainUntil: number;
+	position: number;
+	pending: number;
+}
+
+interface QuotaReceiptField {
+	received: symbol;
+	position: number;
+	applied?: symbol;
+	failed?: QuotaSchedulerSnapshot;
+}
+
+interface QuotaReceiptState {
+	owner: string;
+	epoch: QuotaReceiptEpoch;
+	primary?: QuotaReceiptField;
+	secondary?: QuotaReceiptField;
+	planType?: QuotaReceiptField;
+}
+
+export function mergeQuotaReceipts(receipt: QuotaObservationReceipt, previous?: QuotaObservationReceipt): QuotaObservationReceipt {
+	if (previous?.owner !== receipt.owner || previous.epoch !== receipt.epoch) return receipt;
+	return {
+		...receipt,
+		snapshot: {...mergeQuotaObservations(receipt.snapshot, previous.snapshot), status: receipt.primary ? receipt.snapshot.status : previous.snapshot.status},
+		primary: receipt.primary ?? previous.primary,
+		secondary: receipt.secondary ?? previous.secondary,
+		planType: receipt.planType ?? previous.planType,
+	};
 }
 
 export interface QuotaDeferralDecision {
@@ -173,6 +226,7 @@ export function readQuotaSchedulerSnapshot(headers: Headers, status: number, now
 
 export class PreemptiveQuotaScheduler {
 	private readonly snapshots = new Map<string, QuotaSchedulerSnapshot>();
+	private readonly receipts = new WeakMap<QuotaSchedulerSnapshot, QuotaReceiptState>();
 	private enabled: boolean;
 	private primaryRemainingPercentThreshold: number;
 	private secondaryRemainingPercentThreshold: number;
@@ -239,7 +293,110 @@ export class PreemptiveQuotaScheduler {
 	update(key: string, snapshot: QuotaSchedulerSnapshot): void {
 		if (!key) return;
 		this.maybePrune(snapshot.updatedAt || Date.now());
+		if (!this.receipts.has(snapshot)) this.receipts.set(snapshot, {owner: "", epoch: {retainUntil: 0, position: 0, pending: 0}});
 		this.snapshots.set(key, snapshot);
+	}
+
+	observe(key: string, snapshot: QuotaSchedulerSnapshot, baseline?: Pick<QuotaSchedulerSnapshot, "primary" | "secondary" | "planType"> | null): QuotaSchedulerSnapshot {
+		this.maybePrune(snapshot.updatedAt || Date.now());
+		const merged = mergeQuotaObservations(snapshot, baseline === undefined ? this.snapshots.get(key) : baseline);
+		this.update(key, merged);
+		return merged;
+	}
+
+	receive(key: string, snapshot: QuotaSchedulerSnapshot, owner: string, baseline?: QuotaSchedulerSnapshot): QuotaObservationReceipt {
+		this.maybePrune(snapshot.updatedAt || Date.now());
+		let shared = this.snapshots.get(key);
+		if (!shared) {
+			shared = baseline ?? {status: 200, updatedAt: 0, primary: {}, secondary: {}};
+			this.receipts.set(shared, {owner: "", epoch: {retainUntil: 0, position: 0, pending: 0}});
+			if (key) this.snapshots.set(key, shared);
+		}
+		let epoch = this.receipts.get(shared)?.epoch;
+		if (!epoch) {
+			epoch = {retainUntil: 0, position: 0, pending: 0};
+			this.receipts.set(shared, {owner: "", epoch});
+		}
+		const current = baseline ?? shared;
+		let state = this.receipts.get(current);
+		if (!state || state.owner !== owner || state.epoch !== epoch) {
+			state = {owner, epoch};
+			this.receipts.set(current, state);
+		}
+		const receipt: QuotaObservationReceipt = {snapshot, owner, epoch, position: ++epoch.position};
+		for (const field of ["primary", "secondary", "planType"] as const) {
+			const supplied = field === "planType" ? Boolean(snapshot.planType?.trim()) : snapshot[field].usedPercent !== undefined || snapshot[field].resetAtMs !== undefined;
+			if (!supplied) continue;
+			const token = Symbol();
+			receipt[field] = token;
+			state[field] = {received: token, position: receipt.position, applied: state[field]?.applied, failed: state[field]?.failed};
+		}
+		if (!receipt.primary && !receipt.secondary && !receipt.planType) {
+			receipt.reservation = {released: false};
+			epoch.pending++;
+		}
+		return receipt;
+	}
+
+	releaseReceipt(key: string, receipt: QuotaObservationReceipt): void {
+		if (!receipt.reservation || receipt.reservation.released) return;
+		receipt.reservation.released = true;
+		receipt.epoch.pending--;
+		const shared = this.snapshots.get(key);
+		const state = shared && this.receipts.get(shared);
+		if (state?.epoch === receipt.epoch && !state.epoch.pending && !state.epoch.retainUntil &&
+			!state.primary && !state.secondary && !state.planType && shared &&
+			shared.primary.usedPercent === undefined && shared.primary.resetAtMs === undefined &&
+			shared.secondary.usedPercent === undefined && shared.secondary.resetAtMs === undefined && !shared.planType?.trim()) {
+			this.snapshots.delete(key);
+		}
+	}
+
+	observeReceipt(key: string, receipt: QuotaObservationReceipt, baseline?: QuotaSchedulerSnapshot | null): QuotaSchedulerSnapshot | undefined {
+		const previous = this.getSnapshot(key, receipt.owner, baseline);
+		const state = previous ? this.receipts.get(previous) : undefined;
+		const shared = this.snapshots.get(key);
+		if (!previous || !state || state.owner !== receipt.owner || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return undefined;
+		if (receipt.epoch !== state.epoch) return undefined;
+		for (const field of ["primary", "secondary", "planType"] as const) {
+			const supplied = field === "planType" ? Boolean(receipt.snapshot.planType?.trim()) : receipt.snapshot[field].usedPercent !== undefined || receipt.snapshot[field].resetAtMs !== undefined;
+			if (!supplied || receipt[field] || (state[field]?.position ?? 0) > receipt.position) continue;
+			const token = Symbol();
+			receipt[field] = token;
+			state[field] = {received: token, position: receipt.position, applied: state[field]?.applied, failed: state[field]?.failed};
+		}
+		const primary = receipt.primary !== undefined && receipt.primary === state.primary?.received;
+		const secondary = receipt.secondary !== undefined && receipt.secondary === state.secondary?.received;
+		const planType = receipt.planType !== undefined && receipt.planType === state.planType?.received;
+		if (!primary && !secondary && !planType) return undefined;
+		const merged = mergeQuotaObservations({
+			...receipt.snapshot,
+			status: primary ? receipt.snapshot.status : previous.status,
+			primary: primary ? receipt.snapshot.primary : {},
+			secondary: secondary ? receipt.snapshot.secondary : {},
+			planType: planType ? receipt.snapshot.planType : undefined,
+		}, previous);
+		this.receipts.set(merged, state);
+		this.update(key, merged);
+		return merged;
+	}
+
+	settleReceipt(key: string, receipt: QuotaObservationReceipt, succeeded: boolean, baseline?: QuotaSchedulerSnapshot): void {
+		const current = baseline ?? this.snapshots.get(key);
+		const state = current ? this.receipts.get(current) : undefined;
+		const shared = this.snapshots.get(key);
+		if (!state || state.owner !== receipt.owner || state.epoch !== receipt.epoch || state.epoch !== (shared ? this.receipts.get(shared)?.epoch : undefined)) return;
+		for (const field of ["primary", "secondary", "planType"] as const) {
+			const token = receipt[field], owned = state[field];
+			if (!token || !owned) continue;
+			if (succeeded && token === owned.received) {
+				owned.applied = token;
+				owned.failed = undefined;
+			} else if (!succeeded && owned.applied !== owned.received && (token === owned.received || !owned.failed)) {
+				owned.failed = receipt.snapshot;
+				if (field !== "planType") state.epoch.retainUntil = Math.max(state.epoch.retainUntil, receipt.snapshot[field].resetAtMs ?? 0);
+			}
+		}
 	}
 
 	markRateLimited(key: string, retryAfterMs: number, now = Date.now()): void {
@@ -272,13 +429,45 @@ export class PreemptiveQuotaScheduler {
 		});
 	}
 
-	getDeferral(key: string, now = Date.now()): QuotaDeferralDecision {
+	/** Read received fields for this owner without treating them as durable settlement. */
+	getSnapshot(key: string, owner?: string, baseline?: QuotaSchedulerSnapshot | null): QuotaSchedulerSnapshot | undefined {
+		const shared = this.snapshots.get(key);
+		let snapshot = baseline === undefined ? shared : baseline;
+		const state = snapshot ? this.receipts.get(snapshot) : undefined;
+		const sharedState = shared ? this.receipts.get(shared) : undefined;
+		if (!snapshot || owner === undefined || state?.owner !== owner || state.epoch !== sharedState?.epoch) return snapshot ?? undefined;
+		if (shared && sharedState === state) snapshot = shared;
+		for (const field of ["primary", "secondary"] as const) {
+			const failed = state[field]?.failed;
+			if (!failed) continue;
+			const prior = failed[field], next = snapshot[field];
+			const priorLeft = typeof prior.usedPercent === "number" && Number.isFinite(prior.usedPercent) ? quotaLeftPercentFromUsed(prior.usedPercent) ?? 100 : failed.status === 429 ? 0 : 100;
+			const nextLeft = typeof next.usedPercent === "number" && Number.isFinite(next.usedPercent) ? quotaLeftPercentFromUsed(next.usedPercent) ?? 100 : snapshot.status === 429 ? 0 : 100;
+			if (priorLeft < nextLeft || priorLeft === nextLeft && (prior.resetAtMs ?? 0) > (next.resetAtMs ?? 0)) {
+				snapshot = mergeQuotaObservations({
+					...snapshot, status: failed.status === 429 ? 429 : snapshot.status,
+					primary: field === "primary" ? prior : {}, secondary: field === "secondary" ? prior : {},
+				}, snapshot);
+				this.receipts.set(snapshot, state);
+			}
+		}
+		return snapshot;
+	}
+
+	getResetSnapshot(key:string,owner:string,reset:QuotaSchedulerSnapshot,baseline?:QuotaSchedulerSnapshot|null):QuotaSchedulerSnapshot {
+	 const current=this.getSnapshot(key,owner,baseline);
+	 const state=current?this.receipts.get(current):undefined;
+	 if(state?.owner===owner&&(state.primary||state.secondary||state.planType))return current??reset;
+	 return !current||reset.updatedAt>current.updatedAt?mergeQuotaObservations(reset,current):current;
+	}
+
+	getDeferral(key: string, now = Date.now(), owner?: string, baseline?: QuotaSchedulerSnapshot | null): QuotaDeferralDecision {
 		this.maybePrune(now);
 		if (!this.enabled) {
 			return { defer: false, waitMs: 0 };
 		}
 
-		const snapshot = this.snapshots.get(key);
+		const snapshot = this.getSnapshot(key, owner, baseline);
 		if (!snapshot) return { defer: false, waitMs: 0 };
 
 		// For a 429 deferral, only count a window whose reset is genuinely a
@@ -354,6 +543,11 @@ export class PreemptiveQuotaScheduler {
 		}
 	}
 
+	/** Forget one verified recovered model; preserve sibling quota buckets. */
+	clear(key: string): void {
+		this.snapshots.delete(key);
+	}
+
 	/** Forget every cached quota observation. */
 	clearAll(): void {
 		this.snapshots.clear();
@@ -362,7 +556,7 @@ export class PreemptiveQuotaScheduler {
 	prune(now = Date.now()): number {
 		let removed = 0;
 		for (const [key, snapshot] of this.snapshots.entries()) {
-			const latestReset = Math.max(snapshot.primary.resetAtMs ?? 0, snapshot.secondary.resetAtMs ?? 0);
+			const latestReset = Math.max(snapshot.primary.resetAtMs ?? 0, snapshot.secondary.resetAtMs ?? 0, this.receipts.get(snapshot)?.epoch.retainUntil ?? 0);
 			if (latestReset > 0 && latestReset <= now) {
 				this.snapshots.delete(key);
 				removed += 1;

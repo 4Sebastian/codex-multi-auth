@@ -695,6 +695,39 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 			expect(body.reasoning_summary_text).toBeUndefined();
 		});
 
+		it.each(["reader", "stall", "size", "cancelled"])("settles incremental nonstream usage before exposing %s failure", async mode => {
+			vi.useFakeTimers();
+			const first = mode === "cancelled" ? new DOMException("fixture cancelled", "AbortError") : Error("fixture reader failed");
+			const cancel = vi.fn();
+			let pulls = 0, release!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (++pulls === 1) controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n'));
+					else if (mode === "stall") return new Promise<void>(() => {});
+					else if (mode === "size") controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 1));
+					else controller.error(first);
+				}, cancel,
+			});
+			const usage = vi.fn(() => {throw Error("fixture usage observer failed");});
+			const completion = vi.fn(async () => {await gate; throw Error("fixture settlement failed");});
+			let exposed = false;
+			const pending = convertSseToJson(new Response(body), new Headers(), {onUsage: usage, onCompletion: completion, streamStallTimeoutMs: 1000}).catch(error => {exposed = true; return error;});
+			await vi.advanceTimersByTimeAsync(1100);
+			expect(usage).toHaveBeenCalledOnce();
+			expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3, totalTokens: 10}));
+			expect(completion).toHaveBeenCalledOnce();
+			expect(completion.mock.calls[0]).toMatchObject([{success: false, outcome: mode === "cancelled" ? "cancelled" : "failure", errorCode: mode === "cancelled" ? "client_cancelled" : "stream_read_failed"}]);
+			expect(exposed).toBe(false);
+			release();
+			const error = await pending;
+			if (mode === "reader" || mode === "cancelled") expect(error).toBe(first);
+			else expect(error.message).toMatch(mode === "stall" ? /stalled/ : /exceeds/);
+			expect(body.locked).toBe(false);
+			if (mode === "stall" || mode === "size") expect(cancel).toHaveBeenCalledOnce();
+			vi.useRealTimers();
+		});
+
 		it('should throw error if SSE stream exceeds size limit', async () => {
 			const largeContent = 'a'.repeat(20 * 1024 * 1024 + 1);
 			const response = new Response(largeContent);
@@ -749,7 +782,120 @@ data: {"type":"response.done","response":{"id":"resp_789"}}
 		});
 	});
 
+	it("converts a terminal response without waiting for an open transport", async () => {
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {entered = resolve;});
+		const cancel = vi.fn(), usage = vi.fn();
+		const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"id":"open-terminal","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'));}, cancel});
+		let exposed = false;
+		const pending = convertSseToJson(new Response(body), new Headers(), {onUsage: usage, onCompletion: async () => {entered(); await gate;}}).then(response => {exposed = true; return response;});
+		try {
+			await ready;
+			expect(exposed).toBe(false);
+			expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+			release();
+			expect(await (await pending).json()).toMatchObject({id: "open-terminal", status: "completed"});
+			expect(cancel).toHaveBeenCalledOnce();
+			expect(body.locked).toBe(false);
+		} finally {release(); await pending;}
+	});
+
 	describe('attachResponseIdCapture', () => {
+		it("preserves usage and terminal bytes when response-ID observation throws", async () => {
+			const payload = 'data: {"type":"response.completed","response":{"id":"observer-error","usage":{"input_tokens":7,"output_tokens":3}}}\n\n';
+			const usage = vi.fn(), completion = vi.fn(async () => {});
+			const response = attachResponseIdCapture(new Response(payload), new Headers(), () => {throw Error("fixture response-ID observer failed");}, usage, completion);
+			expect(await response.text()).toBe(payload);
+			expect(usage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+			expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: true}));
+		});
+		it("keeps buffered ordinary frames alive through ongoing consumer progress", async () => {
+			vi.useFakeTimers();
+			const terminal = 'data: {"type":"response.completed","response":{"id":"buffered-progress"}}\n\n';
+			const completion = vi.fn(async () => {});
+			const response = attachResponseIdCapture(new Response(': progress\n\n'.repeat(97) + terminal), new Headers(), undefined, undefined, completion, 1000, 900000);
+			const reader = response.body!.getReader();
+			try {
+				for (let index = 0; index < 97; index++) {
+					await vi.advanceTimersByTimeAsync(10000);
+					expect(new TextDecoder().decode((await reader.read()).value)).toBe(': progress\n\n');
+				}
+				expect(new TextDecoder().decode((await reader.read()).value)).toBe(terminal);
+				expect((await reader.read()).done).toBe(true);
+				expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: true}));
+			} finally {await reader.cancel().catch(() => undefined); vi.useRealTimers();}
+		});
+		it.each(["completed", "done", "incomplete", "failed", "error"])('withholds split multiline terminal %s until settlement on an open transport', async type => {
+			let release!: () => void, entered!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const ready = new Promise<void>(resolve => {entered = resolve;});
+			const cancel = vi.fn(), usage = vi.fn();
+			const payload = `data: {"type":"${type === "error" ? "error" : `response.${type}`}",\r\ndata: "response":{"id":"é","status":"${type === "done" ? "completed" : type}","usage":{"input_tokens":7,"output_tokens":3}}}\r\n\r\n`;
+			const bytes = new TextEncoder().encode(payload), split = bytes.indexOf(0xc3) + 1;
+			const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode(': progress\r\n\r\n')); controller.enqueue(bytes.subarray(0, split)); controller.enqueue(bytes.subarray(split));}, cancel}, {highWaterMark: 0});
+			const completion = vi.fn(async () => {entered(); await gate; if (type === "done") throw Error("fixture local settlement failed");});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, usage, completion);
+			const reader = response.body!.getReader();
+			try {
+				expect(new TextDecoder().decode((await reader.read()).value)).toBe(': progress\r\n\r\n');
+				let exposed = false;
+				const terminal = reader.read().then(result => {exposed = true; return result;});
+				await ready;
+				expect(exposed).toBe(false);
+				expect(cancel).not.toHaveBeenCalled();
+				release();
+				expect(new TextDecoder().decode((await terminal).value)).toBe(payload);
+				expect((await reader.read()).done).toBe(true);
+				expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({success: ["completed", "done", "incomplete"].includes(type), missingTerminal: false}));
+				expect(usage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+				expect(cancel).toHaveBeenCalledOnce();
+				expect(body.locked).toBe(false);
+			} finally {release(); await reader.cancel().catch(() => undefined);}
+		});
+		it("cancels an abandoned reader after owned settlement even when it rejects", async () => {
+			vi.useFakeTimers();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {release = resolve;});
+			const cancel = vi.fn();
+			const body = new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"usage":{"input_tokens":7,"output_tokens":3}}}\n\n'));}, cancel});
+			const usage = vi.fn(), completion = vi.fn(async () => {await gate; throw Error("fixture settlement rejected");});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, usage, completion, 1000, 100);
+			try {
+				await vi.advanceTimersByTimeAsync(101);
+				expect(completion).toHaveBeenCalledOnce();
+				expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+				expect(cancel).not.toHaveBeenCalled();
+				release();
+				await expect(response.text()).rejects.toThrow(/abandoned/);
+				expect(cancel).toHaveBeenCalledOnce();
+				expect(body.locked).toBe(false);
+			} finally {release(); vi.useRealTimers();}
+		});
+		it.each(["completed", "failed", "error", "eof"])("settles observed terminal %s without losing bytes or billed tokens", async type => {
+			const usage = vi.fn(), completion = vi.fn(async () => {});
+			const payload = type === "eof" ? 'data: {"type":"response.created","response":{"id":"held"}}\n\n' :
+				`data: ${JSON.stringify({type: type === "error" ? "error" : `response.${type}`, response: {id: "held", status: type, usage: {input_tokens: 7, output_tokens: 3}}})}\n\n`;
+			const response = attachResponseIdCapture(new Response(payload), new Headers(), undefined, usage, completion);
+			expect(completion).not.toHaveBeenCalled();
+			expect(await response.text()).toBe(payload);
+			expect(completion).toHaveBeenCalledOnce();
+			expect(completion.mock.calls[0]).toMatchObject([{success: type === "completed", outcome: type === "completed" ? "success" : "failure"}]);
+			if (type !== "eof") expect(usage).toHaveBeenCalledWith(expect.objectContaining({inputTokens: 7, outputTokens: 3}));
+		});
+		it("awaits failure settlement and closes a broken body when settlement rejects", async () => {
+			let release!: () => void;
+			const gate = new Promise<void>(done => {release = done;});
+			const first = new Error("fixture body failed"), settlement = new Error("fixture local settlement failed");
+			const body = new ReadableStream<Uint8Array>({pull() {throw first;}});
+			const completion = vi.fn(async () => {await gate; throw settlement;});
+			const response = attachResponseIdCapture(new Response(body), new Headers(), undefined, undefined, completion);
+			let exposed = false;
+			const read = response.text().catch(error => {exposed = true; return error;});
+			await vi.waitFor(() => expect(completion).toHaveBeenCalledOnce());
+			expect(exposed).toBe(false); release();
+			expect(await read).toBe(first); expect(body.locked).toBe(false);
+		});
 		it('should capture response ids while preserving the SSE stream', async () => {
 			const onResponseId = vi.fn();
 			const sseContent = [

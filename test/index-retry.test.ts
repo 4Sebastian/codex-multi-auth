@@ -1,11 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { getStoragePath } from "../lib/storage.js";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
+import type { CircuitAdmissionReceipt } from "../lib/circuit-breaker.js";
 
 process.env.CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS = "1";
+let fixtureCircuitGetter: typeof import("../lib/circuit-breaker.js").getCircuitBreaker;
 
 const accountManagerState = vi.hoisted(() => ({
 	accounts: [] as Array<Record<string, unknown>>,
 	accountSelections: [] as Array<Record<string, unknown> | null>,
 	saveToDiskDebouncedCalls: 0,
+	durableRestrictionCommits: 0,
 	disableCurrentWorkspaceCalls: 0,
 	rotateToNextWorkspaceCalls: 0,
 	setAccountEnabledCalls: [] as Array<{ index: number; enabled: boolean }>,
@@ -57,6 +65,7 @@ function resetAccountManagerState(): void {
 	accountManagerState.accounts = [createMockAccount()];
 	accountManagerState.accountSelections = [null, accountManagerState.accounts[0] ?? null];
 	accountManagerState.saveToDiskDebouncedCalls = 0;
+	accountManagerState.durableRestrictionCommits = 0;
 	accountManagerState.disableCurrentWorkspaceCalls = 0;
 	accountManagerState.rotateToNextWorkspaceCalls = 0;
 	accountManagerState.setAccountEnabledCalls = [];
@@ -83,19 +92,19 @@ vi.mock("../lib/request/fetch-helpers.js", () => ({
 	rewriteUrlForCodex: (url: string) => url,
 	applyProxyCompatibleInit: (_url: string, init: RequestInit) => init,
 	transformRequestForCodex: async (init: any) => ({ updatedInit: init, body: { model: "gpt-5.1" } }),
-	shouldRefreshToken: () => false,
-	refreshAndUpdateToken: async (auth: any) => auth,
+	shouldRefreshToken: vi.fn(() => false),
+	refreshAndUpdateToken: vi.fn(async (auth: any) => auth),
 	createCodexHeaders: (_requestInit: any, accountId?: string) =>
 		new Headers(accountId ? { "x-account-id": accountId } : {}),
 	handleErrorResponse: async (response: Response) => {
-		const rawBody = await response.text();
+		const rawBody = await response.clone().text();
 		let errorBody: unknown;
 		try {
 			errorBody = rawBody ? JSON.parse(rawBody) : undefined;
 		} catch {
 			errorBody = undefined;
 		}
-		return { response, rateLimit: false, errorBody };
+		return { response, rateLimit: response.status === 429 ? {retryAfterMs: Number(response.headers.get("retry-after") ?? 60) * 1000} : false, errorBody };
 	},
 	getUnsupportedCodexModelInfo: () => ({
 		isUnsupported: false,
@@ -160,6 +169,8 @@ vi.mock("../lib/accounts.js", async () => {
 			return new AccountManager();
 		}
 
+		resolveSelectionStoragePath() { return getStoragePath(); }
+
 		getAccountCount() {
 			return accountManagerState.accounts.length;
 		}
@@ -183,7 +194,16 @@ vi.mock("../lib/accounts.js", async () => {
 			);
 		}
 
-		recordSuccess() {}
+		async withCurrentAccountCredential(_account: unknown, _submitted: unknown, mutate: () => boolean | void, persist = true) {
+			const applied = mutate() !== false;
+			if (applied && persist) accountManagerState.durableRestrictionCommits++;
+			return applied;
+		}
+
+		captureRefreshHealth() {return () => true;}
+		getAccountsSnapshot() {return accountManagerState.accounts;}
+		getManagedAccountRuntimeSkipReason() {return null;}
+		recordSuccess() { return true; }
 
 		recordRateLimit() {}
 
@@ -231,7 +251,11 @@ vi.mock("../lib/accounts.js", async () => {
 
 		markRateLimitedWithReason() {}
 
-		consumeToken() { return true; }
+		consumeToken(account?: Record<string, unknown>, _family?: unknown, _model?: unknown, options?: {onAdmission?: (receipt: CircuitAdmissionReceipt) => void}) {
+			if (!account) return false;
+			account.circuitKeyId ??= `fixture:${account.index}:${account.refreshToken}`;
+			return fixtureCircuitGetter(String(account.circuitKeyId)).tryCanExecute(options?.onAdmission).ok;
+		}
 
 		refundToken() {}
 
@@ -252,6 +276,15 @@ vi.mock("../lib/accounts.js", async () => {
 		markToastShown() {}
 
 		clearAuthFailures() {}
+
+		incrementAuthFailures(account: Record<string, unknown>) {
+			account.consecutiveAuthFailures = Number(account.consecutiveAuthFailures ?? 0) + 1;
+			return Number(account.consecutiveAuthFailures);
+		}
+
+		removeAccount(account: Record<string, unknown>) {
+			accountManagerState.accounts = accountManagerState.accounts.filter(row => row !== account);
+		}
 
 		setAccountEnabled(index: number, enabled: boolean) {
 			accountManagerState.setAccountEnabledCalls.push({ index, enabled });
@@ -274,9 +307,9 @@ vi.mock("../lib/accounts.js", async () => {
 			return workspaces[currentWorkspaceIndex] ?? null;
 		}
 
-		disableCurrentWorkspace(account: Record<string, any>, expectedWorkspaceId?: string) {
+		disableWorkspace(account: Record<string, any>, expectedWorkspaceId: string) {
 			accountManagerState.disableCurrentWorkspaceCalls += 1;
-			const workspace = this.getCurrentWorkspace(account);
+			const workspace = account.workspaces?.find((item: {id: string}) => item.id === expectedWorkspaceId);
 			if (!workspace) {
 				return false;
 			}
@@ -432,7 +465,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 	const originalEnv: Record<string, string | undefined> = {};
 	let originalFetch: any;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		resetAccountManagerState();
 		recoveryState.forceRecoverable = false;
 		recoveryState.isRecoverableErrorCalls = 0;
@@ -441,6 +474,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		retryConfigState.retryAllAccountsMaxWaitMs = 5000;
 		retryConfigState.retryAllAccountsMaxRetries = 1;
 		vi.resetModules();
+		fixtureCircuitGetter = (await import("../lib/circuit-breaker.js")).getCircuitBreaker;
 
 		for (const key of envKeys) originalEnv[key] = process.env[key];
 
@@ -470,6 +504,996 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		}
 
 		vi.restoreAllMocks();
+	});
+
+	it("keeps a delayed W1 rejection from disabling the recovered W2", async () => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-workspace-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "workspace-outcome", accountId: "W1", refreshToken: "refresh-workspace", accessToken: "access-workspace", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, currentWorkspaceIndex: 0, workspaces: [{id: "W1", enabled: true}, {id: "W2", enabled: true}]}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js"); realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		const {AccountManager} = await import("../lib/accounts.js"); vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		let releaseFirst!: () => void, releaseSecond!: () => void;
+		const firstGate = new Promise<void>(done => {releaseFirst = done;}), secondGate = new Promise<void>(done => {releaseSecond = done;});
+		const submitted: string[] = [];
+		globalThis.fetch = vi.fn(async (_input, init) => {
+			const workspace = new Headers(init?.headers).get("x-account-id")!; submitted.push(workspace);
+			if (workspace === "W1") {await (submitted.length === 1 ? firstGate : secondGate); return Response.json({error: {code: "workspace_disabled"}}, {status: 403});}
+			return Response.json({id: "recovered-W2", output: []});
+		});
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-workspace", refresh: "refresh-workspace", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const first = sdk.fetch!("https://example.com", {}), second = sdk.fetch!("https://example.com", {});
+			await vi.waitFor(() => expect(submitted).toEqual(["W1", "W1"])); releaseFirst();
+			expect((await first).status).toBe(200);
+			const afterRecovery = structuredClone(account.workspaces);
+			releaseSecond(); expect((await second).status).toBe(403);
+			expect(submitted).toEqual(["W1", "W1", "W2"]);
+			expect(account.workspaces).toEqual(afterRecovery); expect(account.enabled).not.toBe(false);
+			expect(account.workspaces).toEqual([expect.objectContaining({id: "W1", enabled: false}), {id: "W2", enabled: true}]);
+			expect((await realStorage.loadAccounts())?.accounts[0]?.workspaces).toEqual(account.workspaces);
+		} finally {
+			releaseFirst(); releaseSecond(); await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null); await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["primary", "journal"].flatMap(change => ["network", 401, 403, 429, 503].map(status => ({change, status}))))("preserves the original plugin rejection when local settlement cannot observe authority (%j)", async ({change, status}) => {
+		const stream = false;
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-${change}`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, workspaces: [{id: "W1", enabled: true}]}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {getPendingAuthPath} = await import("../lib/storage/pending-auth.js");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const {getCircuitBreaker} = await import("../lib/circuit-breaker.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const logger = await import("../lib/logger.js");
+		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+
+		const first = new Error("original fixture network outcome");
+		const payload = JSON.stringify({error: {code: status === 403 ? "workspace_disabled" : "fixture_rejection", message: "original fixture rejection"}, usage: {input_tokens: 7, output_tokens: 3}});
+		const upstream = new Response(payload, {status: typeof status === "number" ? status : 503});
+		const fetch = vi.fn(async () => {
+			account.consecutiveAuthFailures = 2;
+			await fs.writeFile(change === "journal" ? getPendingAuthPath(path) : path, "{");
+			if (status === "network") throw first;
+			return upstream;
+		});
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			if (status === "network") await expect(sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})})).rejects.toBe(first);
+			else {
+				const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})});
+				expect(response.status).toBe(status); expect(await response.text()).toBe(payload);
+			}
+			expect(fetch).toHaveBeenCalledOnce(); expect(account.consecutiveAuthFailures).toBe(2);
+			expect(logWarnSpy).toHaveBeenCalledWith("Submitted outcome restriction authority could not be observed", expect.objectContaining({error: expect.any(Error)}));
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))[0]).toMatchObject({outcome: "failure", account: {index: 0}});
+		} finally {
+			if (change === "journal") await fs.unlink(getPendingAuthPath(path));
+			else await fs.writeFile(path, JSON.stringify(storage));
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null); await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["healthy", "delete", "disable", "revoke", "expiry", "replacement", "journal", "primary", "lock"])("checks plugin actual-send authority after the awaited account toast (%s)", async change => {
+		const stream = true;
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-${change}`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		storage.accounts.push({...storage.accounts[0]!, recordId: "standby", accountId: "W2", refreshToken: "standby-refresh", accessToken: "standby-access", enabled: false});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {getPendingAuthPath} = await import("../lib/storage/pending-auth.js");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const {getCircuitBreaker} = await import("../lib/circuit-breaker.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const logger = await import("../lib/logger.js");
+		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+
+		vi.spyOn(manager, "shouldShowAccountToast").mockReturnValue(true);
+		const toast = await import("../lib/runtime/toast.js");
+		let changed = false;
+		vi.spyOn(toast, "showRuntimeToast").mockImplementation(async (_client, message) => {
+			if (!message.startsWith("Using ") || changed) return;
+			changed = true;
+			const disk = structuredClone(storage), row = disk.accounts[0]!;
+			if (change === "delete") disk.accounts.shift();
+			if (change === "disable") row.enabled = false;
+			if (change === "revoke") row.authInvalidatedAt = Date.now();
+			if (change === "expiry") vi.spyOn(Date, "now").mockReturnValue(row.expiresAt! + 1);
+			if (change === "replacement") row.accessToken = "replacement-access";
+			if (change === "journal") await fs.writeFile(getPendingAuthPath(path), "{");
+			await fs.writeFile(path, change === "primary" ? "{" : JSON.stringify(disk));
+			if (change === "lock") vi.spyOn(manager, "withCurrentAccountCredential").mockRejectedValue(Object.assign(Error("fixture lock failed"), {code: "ELOCKTIMEOUT"}));
+		});
+		const fetch = vi.fn(async () => new Response('data: {"type":"response.completed","response":{"id":"original-accepted","status":"completed","output":[]}}\\n\\n', {headers: {"Content-Type": "text/event-stream"}}));
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			if (change === "healthy") expect(await (await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})})).text()).toContain("original-accepted");
+			else await expect(sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})})).rejects.toBeInstanceOf((await import("../lib/storage/pending-auth.js")).PendingAuthLocalError);
+			expect(changed).toBe(true); expect(fetch).toHaveBeenCalledTimes(change === "healthy" ? 1 : 0);
+			if (change !== "healthy") expect(getCircuitBreaker(account.circuitKeyId!).getFailureCount()).toBe(0);
+			expect(account.cooldownReason).not.toBe("network-error");
+		} finally {
+			if (change === "journal") await fs.unlink(getPendingAuthPath(path));
+			await fs.writeFile(path, JSON.stringify(storage));
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null); await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["fallback", "short"].flatMap(route => ["healthy", "primary", "lock"].map(failure => ({route, failure}))))("preserves plugin local admission classification and held rejection (%j)", async ({route, failure}) => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-local-admission-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "local-primary", accountId: "W1", accessToken: "access-outcome", refreshToken: "refresh-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (route === "fallback") storage.accounts.push({...storage.accounts[0]!, recordId: "local-fallback", accountId: "W2", accessToken: "access-fallback", refreshToken: "refresh-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		realStorage.setStoragePathDirect(path);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		const manager = new realAccounts.AccountManager(undefined, storage);
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const held = new Response("original safe rejection", {status: 429, headers: {"Retry-After": route === "short" ? "0.001" : "60", "x-fixture-first": "original"}});
+		let sent = 0;
+		globalThis.fetch = vi.fn(async () => {sent++; return sent === 1 ? held : new Response('data: {"type":"response.completed","response":{"id":"healthy-control","status":"completed","output":[]}}\n\n', {headers: {"Content-Type": "text/event-stream"}});});
+		const boundary = await import("../lib/request/account-dispatch.js"), create = boundary.createAccountDispatch;
+		vi.spyOn(boundary, "createAccountDispatch").mockImplementation(params => {
+			const dispatch = create(params);
+			return async send => {
+				if (sent > 0 && failure !== "healthy") {
+					if (failure === "primary") await fs.writeFile(path, "{");
+					else vi.spyOn(manager, "withCurrentAccountCredential").mockRejectedValue(Object.assign(Error("fixture lock admission failed"), {code: "ELOCKTIMEOUT"}));
+				}
+				return dispatch(send);
+			};
+		});
+		vi.spyOn(await import("../lib/request/rate-limit-backoff.js"), "getRateLimitShortRetryThresholdMs").mockReturnValue(route === "short" ? 60000 : 0);
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const pending = sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			if (failure !== "healthy" && route === "fallback") await expect(pending).rejects.toBeInstanceOf((await import("../lib/storage/pending-auth.js")).PendingAuthLocalError);
+			else {
+				const response = await pending;
+				if (failure === "healthy") expect(await response.text()).toContain("healthy-control");
+				else {expect(response.status).toBe(429); expect(response.headers.get("x-fixture-first")).toBe("original"); expect(await response.text()).toBe("original safe rejection");}
+			}
+			expect(sent).toBe(failure === "healthy" ? 2 : 1);
+			for (const row of manager.getAccountsSnapshot()) expect(row.cooldownReason).not.toBe("network-error");
+		} finally {
+			await fs.writeFile(path, JSON.stringify(storage));
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each([false, true])("bills the immutable submitted index after concurrent earlier-account removal (fallback=%s)", async fallback => {
+		const stream = true;
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-reindex`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: `fallback-${stream}-reindex`, accountId: "W2", refreshToken: "refresh-outcome-fallback", accessToken: "access-outcome-fallback"});
+		storage.accounts.unshift({...storage.accounts[0]!, recordId: "removed-before-completion", accountId: "removed-workspace", accessToken: "removed-access", refreshToken: "removed-refresh", enabled: false});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 2 : 1)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback && bearer === "Bearer access-outcome") return new Response("safe explicit rejection", {status: 429, headers: {"Retry-After": "60"}});
+			expect(bearer).toBe(fallback ? "Bearer access-outcome-fallback" : "Bearer access-outcome");
+			account.consecutiveAuthFailures = 2;
+			expect(manager.removeAccount(manager.getAccountByIndex(0)!)).toBe(true); await manager.saveToDisk();
+			const type = "response.completed";
+			return new Response(`data: ${JSON.stringify({type, response: {id: "accepted-original", status: "completed", output: [], usage: {input_tokens: 7, output_tokens: 3, total_tokens: 10}}})}\n\n`, {headers: {"Content-Type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})});
+			expect(response.status).toBe(200);
+			expect(await response.text()).toContain("accepted-original");
+			expect(fetch).toHaveBeenCalledTimes(fallback ? 2 : 1); expect(account.consecutiveAuthFailures).toBe(0);
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))[0]).toMatchObject({outcome: "success", account: {index: fallback ? 2 : 1}, tokens: {inputTokens: 7, outputTokens: 3, totalTokens: 10}});
+		} finally {
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+
+	it.each(["body", "terminal", "nonstream", "half-open", "stale-half-open", "replaced-breaker"])("settles cancellation without changing real account health or probe ownership (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-cancel-health-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "cancel-owner", accountId: "W1", refreshToken: "refresh-cancel", accessToken: "access-cancel", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		realStorage.setStoragePathDirect(path);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		for (const method of ["handleSuccessResponse", "createCodexHeaders"] as const) vi.spyOn(helpers, method).mockImplementation(actualHelpers[method] as never);
+		const circuits = await import("../lib/circuit-breaker.js"), {getHealthTracker} = await import("../lib/rotation.js");
+		const family = (await import("../lib/prompts/codex.js")).getModelFamily("gpt-5.1");
+		const tracker = getHealthTracker(), trackerKey = realAccounts.getRuntimeTrackerKey(account), quotaKey = `${family}:gpt-5.1`;
+		let breaker = circuits.getCircuitBreaker(account.circuitKeyId!);
+		const halfOpen = ["half-open", "stale-half-open", "replaced-breaker"].includes(mode);
+		const usage = await import("../lib/usage/index.js"), before = new Set((await usage.readUsageLedgerRows()).map(row => row.id));
+		const created = 'data: {"type":"response.created","response":{"id":"cancel-partial","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const cancelled = 'data: {"type":"response.cancelled","response":{"id":"cancel-partial","status":"cancelled","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const completed = 'data: {"type":"response.completed","response":{"id":"independent","status":"completed"}}\n\n';
+		let finishNext = false;
+		const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({start(controller) {
+			controllers.push(controller);
+			controller.enqueue(Buffer.from(finishNext ? completed : created + (["terminal", "nonstream"].includes(mode) ? cancelled : "")));
+		}}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream"}}));
+		const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-cancel", refresh: "refresh-cancel", expires: storage.accounts[0]!.expiresAt!, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: mode !== "nonstream"})});
+			manager.consumeToken(account, family, "gpt-5.1", {onAdmission: receipt => {breaker = receipt.breaker;}});
+			expect(breaker).toBe(circuits.getCircuitBreaker(account.circuitKeyId!));
+			tracker.recordFailure(trackerKey, quotaKey);
+			if (halfOpen) {for (let n = 0; n < 3; n++) breaker.recordFailure(); now += 30001;}
+			const count = halfOpen ? 1 : 4;
+			for (let n = 0; n < count; n++) {
+				const requestFailures = breaker.getFailureCount(), requestHealth = tracker.getScore(trackerKey, quotaKey), requestConsecutive = tracker.getConsecutiveFailures(trackerKey, quotaKey);
+				const response = await turn();
+				let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+				if (mode !== "nonstream") {reader = response.body!.getReader(); readers.push(reader); expect(Buffer.from((await reader.read()).value!).toString()).toBe(created);}
+				let replacementReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+				if (mode === "stale-half-open" || mode === "replaced-breaker") {
+					if (mode === "replaced-breaker") {circuits.clearCircuitBreakers(); breaker = circuits.getCircuitBreaker(account.circuitKeyId!); for (let k = 0; k < 3; k++) breaker.recordFailure();}
+					now += 30001;
+					replacementReader = (await turn()).body!.getReader(); readers.push(replacementReader); await replacementReader.read();
+				}
+				const failures = mode === "nonstream" ? requestFailures : breaker.getFailureCount(), health = mode === "nonstream" ? requestHealth : tracker.getScore(trackerKey, quotaKey), consecutive = mode === "nonstream" ? requestConsecutive : tracker.getConsecutiveFailures(trackerKey, quotaKey);
+				if (mode === "nonstream") await response.text();
+				else if (mode === "terminal") {expect(Buffer.from((await reader!.read()).value!).toString()).toBe(cancelled); expect((await reader!.read()).done).toBe(true);}
+				else await reader!.cancel();
+				expect(breaker.getState()).toBe(halfOpen ? "half-open" : "closed");
+				expect(breaker.getFailureCount()).toBe(failures);
+				expect(tracker.getScore(trackerKey, quotaKey)).toBe(health);
+				expect(tracker.getConsecutiveFailures(trackerKey, quotaKey)).toBe(consecutive);
+				expect(account.cooldownReason).toBeUndefined();
+				if (replacementReader) {controllers.at(-1)!.enqueue(Buffer.from(completed)); await replacementReader.read(); expect((await replacementReader.read()).done).toBe(true); expect(breaker.getState()).toBe("closed");}
+			}
+			const rows = (await usage.readUsageLedgerRows()).filter(row => !before.has(row.id) && row.outcome === "cancelled");
+			expect(rows).toHaveLength(count);
+			for (const row of rows) {
+				expect(row).toMatchObject({outcome: "cancelled", account: {index: 0, accountHash: usage.hashUsageIdentifier("W1")}, tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+				expect(row.costUsd).toBe((await import("../lib/usage/pricing.js")).estimateUsageCostUsd(row.model, row.tokens));
+			}
+			if (mode === "half-open") {expect(breaker.isAvailable()).toBe(false); now += 30001; expect(breaker.isAvailable()).toBe(true);}
+			finishNext = true;
+			const later = await turn(); await later.text(); expect(later.status).toBe(200); expect(breaker.getState()).toBe("closed");
+		} finally {
+			for (const reader of readers) await reader.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null); await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["active", "abandoned", "partial-abandoned", "never-consumed", "cancelled", "reader-error", "ledger-held", "ledger-open", "ledger-mixed", "ledger-split", "ledger-multiline", "ledger-failed", "fallback-429", "fallback-500"])("settles actual plugin stream lifecycle once (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-stream-lifecycle-")), path = join(dir, "accounts.json");
+		const fallback = mode.startsWith("fallback-");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "stream-owner", accountId: "W1", refreshToken: "refresh-stream", accessToken: "access-stream", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: "stream-fallback", accountId: "W2", refreshToken: "refresh-fallback", accessToken: "access-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 1 : 0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const usageModule = await import("../lib/usage/index.js");
+		const {readUsageLedgerRows, summarizeUsageRows} = usageModule;
+		let releaseLedger: () => void = () => undefined, enteredLedger: () => void = () => undefined;
+		const ledgerGate = new Promise<void>(resolve => {releaseLedger = resolve;});
+		const ledgerReady = new Promise<void>(resolve => {enteredLedger = resolve;});
+		const ledgerError = Error("fixture original ledger failure");
+		const ledgerWarning = vi.spyOn(await import("../lib/logger.js"), "logWarn");
+		if (mode.startsWith("ledger-")) {
+			const append = usageModule.appendUsageLedgerRow;
+			vi.spyOn(usageModule, "appendUsageLedgerRow").mockImplementation(async row => {
+				enteredLedger(); await ledgerGate;
+				if (mode === "ledger-failed") throw ledgerError;
+				return append(row);
+			});
+		}
+		const {evaluateBudgetGuard} = await import("../lib/budget-guard.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const rateLimit = vi.spyOn(manager, "recordRateLimit"), failure = vi.spyOn(manager, "recordFailure");
+		const capability = vi.spyOn((await import("../lib/capability-policy.js")).CapabilityPolicyStore.prototype, "recordFailure");
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const cancel = vi.fn();
+		const originalError = Error("fixture original streaming reader error");
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback) {
+				if (bearer === "Bearer access-stream") return Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"Retry-After": "60"}});
+				expect(bearer).toBe("Bearer access-fallback");
+				return Response.json({error: {code: mode === "fallback-429" ? "usage_limit_reached" : "server_error"}}, {status: mode === "fallback-429" ? 429 : 500, headers: {"Retry-After": "60"}});
+			}
+			vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "Date"]});
+			return new Response(new ReadableStream<Uint8Array>({start(value) {
+				controller = value;
+				value.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({type: "response.created", response: {id: "long-lived", ...(mode === "partial-abandoned" ? {usage: {input_tokens: 17, output_tokens: 4, total_tokens: 21}} : {})}})}\n\n`));
+			}, cancel}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-stream", refresh: "refresh-stream", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			if (fallback) {
+				expect(response.status).toBe(mode === "fallback-429" ? 429 : 500);
+				await response.text();
+				expect(fetch).toHaveBeenCalledTimes(2);
+				if (mode === "fallback-429") {
+					expect(rateLimit.mock.calls.filter(([owner]) => owner === account)).toHaveLength(1);
+					expect(account.rateLimitResetTimes["gpt-5.2:gpt-5.1"]).toBeGreaterThan(Date.now());
+					expect(failure).not.toHaveBeenCalled();
+					expect(capability).not.toHaveBeenCalled();
+				} else {
+					expect(failure).toHaveBeenCalledWith(account, "gpt-5.2", "gpt-5.1", expect.objectContaining({halfOpen: false}));
+					expect(capability).toHaveBeenCalledTimes(1);
+					expect(account.cooldownReason).toBe("server-error");
+				}
+			} else {
+				reader = response.body!.getReader();
+				if (mode !== "never-consumed") await reader.read();
+				if (mode === "active" || mode.startsWith("ledger-")) {
+					for (let i = 0; i < (mode === "active" ? 96 : 0); i++) {
+						await vi.advanceTimersByTimeAsync(10000);
+						controller.enqueue(new TextEncoder().encode(': real progress\n\n'));
+						await reader.read();
+					}
+					expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
+					const terminal = mode === "ledger-multiline" ? 'data: {"type":"response.completed",\r\ndata: "response":{"id":"long-lived","status":"completed","text":"é","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\r\n\r\n' : 'data: {"type":"response.completed","response":{"id":"long-lived","status":"completed","text":"é","usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+					const bytes = new TextEncoder().encode(terminal);
+					if (mode === "ledger-mixed") {
+						controller.enqueue(new TextEncoder().encode(': ordinary progress\n\n' + terminal));
+						expect(new TextDecoder().decode((await reader.read()).value)).toBe(': ordinary progress\n\n');
+					} else if (mode === "ledger-split") {
+						const split = bytes.indexOf(0xc3) + 1;
+						controller.enqueue(bytes.subarray(0, split));
+						controller.enqueue(bytes.subarray(split));
+					} else controller.enqueue(bytes);
+					const open = ["ledger-open", "ledger-mixed", "ledger-split", "ledger-multiline"].includes(mode);
+					if (!open) controller.close();
+					let exposed = false;
+					const terminalRead = reader.read().then(next => {exposed = true; return next;});
+					if (mode.startsWith("ledger-")) {
+						await ledgerReady;
+						expect(exposed).toBe(false);
+						expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toEqual([]);
+						releaseLedger();
+					}
+					expect(new TextDecoder().decode((await terminalRead).value)).toBe(terminal);
+					expect((await reader.read()).done).toBe(true);
+					if (open) expect(cancel).toHaveBeenCalledOnce();
+				} else if (mode === "cancelled") await reader.cancel();
+				else if (mode === "reader-error") {
+					controller.error(originalError);
+					await expect(reader.read()).rejects.toBe(originalError);
+				} else {
+					await vi.advanceTimersByTimeAsync(900001);
+					vi.useRealTimers();
+					await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+					await expect((async () => {while (!(await reader!.read()).done) { /* Drain any prefetched bytes before the settled error. */ }})()).rejects.toThrow(/abandoned|stalled/);
+				}
+				expect(fetch).toHaveBeenCalledOnce();
+				if (mode !== "active" && !mode.startsWith("ledger-")) expect(cancel).toHaveBeenCalledTimes(mode === "reader-error" ? 0 : 1);
+			}
+			vi.useRealTimers();
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+			if (mode === "ledger-failed") {
+				expect(rows).toEqual([]);
+				expect(ledgerWarning).toHaveBeenCalledWith("Usage ledger settlement failed", {error: ledgerError});
+				return;
+			}
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({outcome: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") ? "success" : mode === "cancelled" ? "cancelled" : "failure", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 17 : 0, outputTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 4 : 0, totalTokens: mode === "active" || (mode.startsWith("ledger-") && mode !== "ledger-failed") || mode === "partial-abandoned" ? 21 : 0}});
+			const summary = summarizeUsageRows(rows);
+			expect(evaluateBudgetGuard({key: "*", window: "day", maxRequests: 1, updatedAt: 1}, summary).allowed).toBe(false);
+			if (mode === "active") expect(evaluateBudgetGuard({key: "*", window: "day", maxTokens: 21, updatedAt: 1}, summary).allowed).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			releaseLedger();
+			await reader?.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+
+	it.each(["none", "secondary", "plan"].flatMap(headers => [
+		...["usage_limit_reached", "rate_limit_exceeded"].flatMap(code => ["rotate", "older-body", "newer-body", "older-auth"].map(mode => ({headers, code, mode}))),
+		...["unrelated", "entitlement404", "entitlement403"].map(mode => ({headers, code: mode === "unrelated" ? "not_found" : "usage_not_included", mode})),
+	]))("preserves real body-classified quota order and rotation (%j)", async ({headers, code, mode}) => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-classified-quota-")), path = join(dir, "accounts.json"), now = Date.now();
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "classified-A", accountId: "W1", refreshToken: "refresh-classified", accessToken: "access-classified", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (mode === "rotate") storage.accounts.push({...storage.accounts[0]!, recordId: "classified-B", accountId: "W2", refreshToken: "refresh-B", accessToken: "access-B"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		for (const method of ["handleErrorResponse", "handleSuccessResponse", "createCodexHeaders"] as const) vi.spyOn(helpers, method).mockImplementation(actualHelpers[method] as never);
+		vi.spyOn(await import("../lib/request/rate-limit-backoff.js"), "getRateLimitShortRetryThresholdMs").mockReturnValue(0);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js"), receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const terminal = 'data: {"type":"response.completed","response":{"id":"classified-control","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const healthy = () => new Response(terminal, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20", "x-codex-primary-reset-after-seconds": "3600"}});
+		const sent: Array<(response: Response) => void> = [], bearers: Array<string | null> = [];
+		const overlapping = mode.includes("body") || mode === "older-auth";
+		globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			bearers.push(new Headers(init?.headers).get("authorization"));
+			if (sent.length >= (overlapping ? 2 : 1)) return healthy();
+			return new Promise<Response>(resolve => {sent.push(resolve);});
+		});
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		const quotaHeaders: Record<string, string> = headers === "secondary" ? {"x-codex-secondary-used-percent": "40", "x-codex-secondary-reset-after-seconds": "7200"} : headers === "plan" ? {"x-codex-plan-type": "plus"} : {};
+		const payload = JSON.stringify({error: {code, message: mode.startsWith("entitlement") ? "Model not available for your plan" : code}});
+		const rejected = () => mode.includes("body") ? new Response(new ReadableStream<Uint8Array>({async pull(controller) {entered(); await gate; controller.enqueue(Buffer.from(payload)); controller.close();}}, {highWaterMark: 0}), {status: 404, headers: quotaHeaders}) : new Response(payload, {status: mode === "entitlement403" ? 403 : 404, headers: quotaHeaders});
+		let ordinary!: ReadableStreamDefaultController<Uint8Array>, reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-classified", refresh: "refresh-classified", expires: now + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			const first = turn(); await vi.waitFor(() => expect(sent).toHaveLength(1));
+			const second = overlapping ? turn() : undefined;
+			if (second) await vi.waitFor(() => expect(sent).toHaveLength(2));
+			if (mode === "older-auth") {
+				const authorize = manager.withCurrentAccountCredential.bind(manager); let held = false;
+				vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {if (!held) {held = true; entered(); await gate;} return authorize(...args);});
+			}
+			if (mode === "newer-body") {
+				sent[0]!(new Response(new ReadableStream<Uint8Array>({start(controller) {ordinary = controller; controller.enqueue(Buffer.from(': ordinary\n\n'));}}, {highWaterMark: 0}), {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": "20"}}));
+				reader = (await first).body!.getReader(); await reader.read();
+				vi.spyOn(Date, "now").mockReturnValue(now - 1000); sent[1]!(rejected()); await ready;
+				ordinary.enqueue(Buffer.from(terminal)); ordinary.close();
+				expect(Buffer.from((await reader.read()).value!).toString()).toBe(terminal); expect((await reader.read()).done).toBe(true);
+				release();
+				const response = await second!; expect(response.ok).toBe(false); await response.text();
+			} else {
+				sent[0]!(rejected());
+				if (second) {
+					await ready;
+					vi.spyOn(Date, "now").mockReturnValue(now - 1000); sent[1]!(healthy());
+					expect(await (await second).text()).toBe(terminal);
+					release();
+				}
+				const response = await first;
+				if (mode === "rotate") {expect(response.status).toBe(200); expect(await response.text()).toBe(terminal); expect(bearers).toEqual(["Bearer access-classified", "Bearer access-B"]);}
+				else {expect(response.status).toBe(mode.startsWith("entitlement") ? 403 : mode === "unrelated" ? 404 : 429); await response.text();}
+			}
+			const restricted = mode === "rotate" || mode === "newer-body";
+			expect((account.rateLimitResetTimes["gpt-5.2:gpt-5.1"] ?? 0) > Date.now()).toBe(restricted);
+			await manager.flushPendingSave();
+			expect(((await realStorage.loadAccounts())?.accounts[0]?.rateLimitResetTimes?.["gpt-5.2:gpt-5.1"] ?? 0) > Date.now()).toBe(restricted);
+			const firstReceipt = receive.mock.calls.find(([, , owner]) => owner === receive.mock.calls[0]?.[2]);
+			const scheduler = receive.mock.contexts[0];
+			if (firstReceipt && scheduler instanceof PreemptiveQuotaScheduler) {
+				const snapshot = scheduler.getSnapshot(firstReceipt[0], firstReceipt[2]);
+				if (headers === "secondary") expect(snapshot?.secondary.usedPercent).toBe(40);
+				if (headers === "plan") expect(snapshot?.planType).toBe("plus");
+				if (mode === "unrelated" || mode.startsWith("entitlement")) expect(scheduler.getDeferral(firstReceipt[0]).defer).toBe(false);
+				if (headers === "none" && (mode === "unrelated" || mode.startsWith("entitlement"))) expect(snapshot).toBeUndefined();
+				if (headers === "none" && mode === "unrelated") {
+					const previousFetch = globalThis.fetch;
+					globalThis.fetch = vi.fn(async () => rejected());
+					try {
+						for (let i = 0; i < 12; i++) {
+							const completed = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: `gpt-5.1-no-signal-${i}`, stream: true})});
+							expect(completed.status).toBe(404);
+							await completed.text();
+						}
+						expect(Object.values(scheduler).filter(value => value instanceof Map).map(value => value.size)).toEqual([0]);
+					} finally {globalThis.fetch = previousFetch;}
+				}
+			}
+			if (!mode.startsWith("entitlement")) {
+				const count = bearers.length, probe = await turn();
+				if (mode === "newer-body") {expect(probe.ok).toBe(false); expect(bearers).toHaveLength(count);}
+				else {expect(await probe.text()).toBe(terminal); expect(bearers).toHaveLength(count + 1);}
+				if (mode === "rotate") expect(bearers.at(-1)).toBe("Bearer access-B");
+			}
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id) && row.tokens.totalTokens === 21);
+			expect(rows).toHaveLength(mode.startsWith("entitlement") ? 0 : mode === "newer-body" || mode === "unrelated" ? 1 : 2);
+			for (const row of rows) expect(row).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+		} finally {
+			release(); await reader?.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["healthy-exhausted", "exhausted-healthy", "independent", "held-error", "locked-error", "held-429", "later-429", "replacement", "expiry", "workspace", "metadata"])("orders actual plugin quota receipts across overlapping turns (%s)", async mode => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-quota-order-")), path = join(dir, "accounts.json");
+		const now = Date.now();
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "quota-owner", accountId: "W1", refreshToken: "refresh-quota", accessToken: "access-quota", expiresAt: now + 3600000, addedAt: 1, lastUsed: 1}]};
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		vi.spyOn((await import("../lib/accounts.js")).AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {PreemptiveQuotaScheduler} = await import("../lib/preemptive-quota-scheduler.js");
+		const receive = vi.spyOn(PreemptiveQuotaScheduler.prototype, "receive");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const completed = 'data: {"type":"response.completed","response":{"id":"quota-original","status":"completed","output":[],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}}\n\n';
+		const sends: Array<(response: Response) => void> = [];
+		globalThis.fetch = vi.fn(async () => {
+			if (sends.length >= 2) return new Response(completed, {headers: {"content-type": "text/event-stream"}});
+			return new Promise<Response>(resolve => {sends.push(resolve);});
+		});
+		let firstController!: ReadableStreamDefaultController<Uint8Array>;
+		const firstBody = new ReadableStream<Uint8Array>({start(controller) {
+			firstController = controller;
+			controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"quota-original"}}\n\n'));
+		}}, {highWaterMark: 0});
+		let release: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		let lock: Promise<void> | undefined;
+		const changedOwner = ["replacement", "expiry", "workspace"].includes(mode);
+		const firstError = ["held-error", "locked-error", "held-429"].includes(mode);
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client: {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}}} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-quota", refresh: "refresh-quota", expires: now + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const turn = () => sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream: true})});
+			const first = turn();
+			await vi.waitFor(() => expect(sends).toHaveLength(1));
+			const second = changedOwner ? undefined : turn();
+			if (second) await vi.waitFor(() => expect(sends).toHaveLength(2));
+			if (mode === "locked-error") {
+				let entered!: () => void;
+				const ready = new Promise<void>(resolve => {entered = resolve;});
+				lock = realStorage.withAccountStorageTransaction(async () => {entered(); await gate;});
+				await ready;
+			} else if (firstError) {
+				const authorize = manager.withCurrentAccountCredential.bind(manager);
+				let held = false;
+				vi.spyOn(manager, "withCurrentAccountCredential").mockImplementation(async (...args) => {
+					if (!held) {held = true; await gate;}
+					return authorize(...args);
+				});
+			}
+			const firstUsed = mode === "exhausted-healthy" || changedOwner ? 100 : 10;
+			const firstHeaders = {"content-type": firstError ? "application/json" : "text/event-stream", "x-codex-primary-used-percent": String(firstUsed), "x-codex-primary-reset-after-seconds": "3600", "x-codex-plan-type": "plus", ...(mode === "independent" ? {"x-codex-secondary-used-percent": "100", "x-codex-secondary-reset-after-seconds": "7200"} : {})};
+			sends[0]!(firstError ? Response.json({error: {code: mode === "held-429" ? "usage_limit_reached" : "bad_request"}}, {status: mode === "held-429" ? 429 : 400, headers: {...firstHeaders, "retry-after": "60"}}) : new Response(firstBody, {headers: firstHeaders}));
+			if (!firstError) {
+				reader = (await first).body!.getReader();
+				await reader.read();
+			} else await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1));
+			if (changedOwner || mode === "metadata") {
+				if (mode === "metadata") {account.email = "renamed@example.com"; storage.accounts[0]!.email = account.email;}
+				if (mode === "replacement") {account.access = "access-replaced"; storage.accounts[0]!.accessToken = account.access;}
+				if (mode === "expiry") {account.expires = now + 7200000; storage.accounts[0]!.expiresAt = account.expires;}
+				if (mode === "workspace") {account.accountId = "W2"; storage.accounts[0]!.accountId = "W2";}
+				await fs.writeFile(path, JSON.stringify(storage));
+			}
+			const next = second ?? turn();
+			await vi.waitFor(() => expect(sends).toHaveLength(2));
+			vi.spyOn(Date, "now").mockReturnValue(now - 1000);
+			const exhausted = ["healthy-exhausted", "held-error", "locked-error", "later-429", "metadata"].includes(mode);
+			sends[1]!(mode === "later-429" ? Response.json({error: {code: "usage_limit_reached"}}, {status: 429, headers: {"retry-after": "60"}}) : new Response(completed, {headers: {"content-type": "text/event-stream", "x-codex-primary-used-percent": exhausted ? "100" : "20", "x-codex-primary-reset-after-seconds": "3600"}}));
+			if (mode === "locked-error") {
+				await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(2));
+				release(); await lock;
+			}
+			const later = await next;
+			expect(later.status).toBe(mode === "later-429" ? 429 : 200);
+			if (mode !== "later-429") expect(await later.text()).toBe(completed);
+			if (firstError) {
+				release();
+				const original = await first;
+				expect(original.status).toBe(mode === "held-429" ? 429 : 400);
+				await original.text();
+			} else {
+				firstController.enqueue(new TextEncoder().encode(completed)); firstController.close();
+				expect(new TextDecoder().decode((await reader!.read()).value)).toBe(completed);
+				expect((await reader!.read()).done).toBe(true);
+			}
+			const last = receive.mock.calls.at(-1)!;
+			const scheduler = receive.mock.contexts.at(-1)!;
+			if (!(scheduler instanceof PreemptiveQuotaScheduler)) throw Error("No quota scheduler received the provider headers");
+			const snapshot = scheduler.getSnapshot(last[0], last[2]);
+			expect(snapshot?.primary.usedPercent).toBe(exhausted ? 100 : 20);
+			if (mode === "independent") expect(snapshot).toMatchObject({planType: "plus", secondary: {usedPercent: 100}});
+			if (changedOwner) expect(receive.mock.calls[0]![2]).not.toBe(last[2]);
+			const blocked = exhausted || mode === "independent";
+			const count = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+			const probe = await turn();
+			if (blocked) {expect(probe.ok).toBe(false); expect(globalThis.fetch).toHaveBeenCalledTimes(count);}
+			else {expect(probe.status).toBe(200); expect(await probe.text()).toBe(completed); expect(globalThis.fetch).toHaveBeenCalledTimes(count + 1);}
+			if (mode === "held-429") expect(account.rateLimitResetTimes["gpt-5.2:gpt-5.1"] ?? 0).toBe(0);
+			if (mode === "later-429") {
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+				const {getRateLimitBackoff} = await import("../lib/request/rate-limit-backoff.js");
+				expect(getRateLimitBackoff(0, "gpt-5.2:gpt-5.1", 60000, "W1").attempt).toBe(2);
+			}
+			const rows = (await readUsageLedgerRows()).filter(row => !before.has(row.id));
+			expect(rows.filter(row => row.tokens.totalTokens === 21)).toHaveLength((firstError ? 0 : 1) + (mode === "later-429" ? 0 : 1) + (blocked ? 0 : 1));
+			for (const row of rows.filter(row => row.tokens.totalTokens === 21)) expect(row).toMatchObject({outcome: "success", tokens: {inputTokens: 17, outputTokens: 4, totalTokens: 21}});
+		} finally {
+			release(); await lock;
+			await reader?.cancel().catch(() => undefined);
+			await firstBody.cancel().catch(() => undefined);
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each([false, true].flatMap(fallback => [false, true].flatMap(stream => ["healthy", "journal", "primary", "revocation", "circuit", "failed", "error", "eof", ...(!stream ? ["reader", "stall"] : [])].map(change => ({fallback, stream, change})))) )("preserves accepted plugin outcomes without unauthorized healing (%j)", async ({fallback, stream, change}) => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-${change}`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: `fallback-${stream}-${change}`, accountId: "W2", refreshToken: "refresh-outcome-fallback", accessToken: "access-outcome-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 1 : 0)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {getPendingAuthPath} = await import("../lib/storage/pending-auth.js");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const {getCircuitBreaker} = await import("../lib/circuit-breaker.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const logger = await import("../lib/logger.js");
+		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		const readError = Error("fixture accepted nonstream body failed");
+		if (change === "stall") vi.spyOn(await import("../lib/config.js"), "getStreamStallTimeoutMs").mockReturnValue(1000);
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback && bearer === "Bearer access-outcome") return new Response("safe explicit rejection", {status: 429, headers: {"Retry-After": "60"}});
+			expect(bearer).toBe(fallback ? "Bearer access-outcome-fallback" : "Bearer access-outcome");
+			account.consecutiveAuthFailures = 2;
+			if (change === "reader" || change === "stall") {
+				let pulls = 0;
+				return new Response(new ReadableStream<Uint8Array>({pull(controller) {
+					if (++pulls === 1) controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"accepted-original","usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n'));
+					else if (change === "reader") controller.error(readError);
+					else return new Promise<void>(() => {});
+				}}, {highWaterMark: 0}), {headers: {"Content-Type": "text/event-stream"}});
+			}
+			if (change === "journal") await fs.writeFile(getPendingAuthPath(path), "{");
+			if (change === "primary") await fs.writeFile(path, "{");
+			if (change === "revocation") {storage.accounts[fallback ? 1 : 0]!.authInvalidatedAt = Date.now(); storage.accounts[fallback ? 1 : 0]!.authInvalidationErrorCode = "token_invalidated"; await fs.writeFile(path, JSON.stringify(storage));}
+			if (change === "circuit") {
+				const breaker = getCircuitBreaker(account.circuitKeyId!);
+				for (let i = 0; i < 3; i++) breaker.recordFailure();
+				vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31000);
+				expect(breaker.tryCanExecute().ok).toBe(true);
+			}
+			const type = change === "failed" ? "response.failed" : change === "error" ? "error" : change === "eof" ? "response.created" : "response.completed";
+			return new Response(`data: ${JSON.stringify({type, response: {id: "accepted-original", status: change === "failed" ? "failed" : "completed", output: [], usage: {input_tokens: 7, output_tokens: 3, total_tokens: 10}}})}\n\n`, {headers: {"Content-Type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const pending = sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream})});
+			if (change === "reader") await expect(pending).rejects.toBe(readError);
+			else if (change === "stall") await expect(pending).rejects.toThrow(/stalled/);
+			else {
+				const response = await pending;
+				expect(response.status).toBe(!stream && (change === "failed" || change === "error") ? 502 : 200);
+				expect(await response.text()).toContain(!stream && (change === "failed" || change === "error") ? "sse_terminal_error" : "accepted-original");
+			}
+			expect(fetch).toHaveBeenCalledTimes(fallback ? 2 : 1); expect(account.consecutiveAuthFailures).toBe(change === "healthy" ? 0 : 2);
+			if (change === "journal" || change === "primary") {
+				const observation = logWarnSpy.mock.calls.find(call => call[0] === "Accepted response recovery authority could not be observed")?.[1] as {error?: Error} | undefined;
+				expect(observation?.error).toBeInstanceOf(Error);
+				expect(observation?.error?.cause).toBeInstanceOf(SyntaxError);
+			}
+			if (change === "circuit") expect(getCircuitBreaker(account.circuitKeyId!).getState()).toBe("half-open");
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))[0]).toMatchObject({outcome: ["failed", "error", "eof", "reader", "stall"].includes(change) ? "failure" : "success", account: {index: fallback ? 1 : 0, accountHash: (await import("../lib/usage/redaction.js")).hashUsageIdentifier(fallback ? "W2" : "W1")}, tokens: {inputTokens: 7, outputTokens: 3, totalTokens: 10}});
+		} finally {
+			if (change === "journal") await fs.unlink(getPendingAuthPath(path));
+			if (change === "primary") await fs.writeFile(path, JSON.stringify(storage));
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each([false, true].flatMap(fallback => ["healthy", "revocation", "circuit", "forget", "replacement"].map(change => ({fallback, change}))))("revalidates delayed stream affinity while preserving original bytes and usage (%j)", async ({fallback, change}) => {
+		const stream = true;
+		const previousThreadId = process.env.CODEX_THREAD_ID;
+		process.env.CODEX_THREAD_ID = "fixture-delayed-affinity";
+		const config = await import("../lib/config.js");
+		vi.spyOn(config, "getResponseContinuation").mockReturnValue(true);
+		const {SessionAffinityStore} = await import("../lib/session-affinity.js");
+		const selectionSpy = vi.spyOn(SessionAffinityStore.prototype, "getPreferredAccountIndex");
+		const updateSpy = vi.spyOn(SessionAffinityStore.prototype, "updateLastResponseId");
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-outcome-")), path = join(dir, "accounts.json");
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: `outcome-${stream}-${change}`, accountId: "W1", refreshToken: "refresh-outcome", accessToken: "access-outcome", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		if (fallback) storage.accounts.push({...storage.accounts[0]!, recordId: `fallback-${stream}-${change}`, accountId: "W2", refreshToken: "refresh-outcome-fallback", accessToken: "access-outcome-fallback"});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js"), realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage), account = manager.getAccountByIndex(fallback ? 1 : 0)!;
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js"), actualHelpers = await vi.importActual<typeof import("../lib/request/fetch-helpers.js")>("../lib/request/fetch-helpers.js");
+		vi.spyOn(helpers, "handleSuccessResponse").mockImplementation(actualHelpers.handleSuccessResponse);
+		vi.spyOn(helpers, "createCodexHeaders").mockImplementation(actualHelpers.createCodexHeaders);
+		const {getPendingAuthPath} = await import("../lib/storage/pending-auth.js");
+		const {readUsageLedgerRows} = await import("../lib/usage/index.js");
+		const {getCircuitBreaker} = await import("../lib/circuit-breaker.js");
+		const before = new Set((await readUsageLedgerRows()).map(row => row.id));
+		const logger = await import("../lib/logger.js");
+		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		const fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+			const bearer = new Headers(init?.headers).get("authorization");
+			if (fallback && bearer === "Bearer access-outcome") return new Response("safe explicit rejection", {status: 429, headers: {"Retry-After": "60"}});
+			expect(bearer).toBe(fallback ? "Bearer access-outcome-fallback" : "Bearer access-outcome");
+			account.consecutiveAuthFailures = 2;
+			return new Response('data: {"type":"response.completed","response":{"id":"accepted-original","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n', {headers: {"Content-Type": "text/event-stream"}});
+		});
+		globalThis.fetch = fetch;
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-outcome", refresh: "refresh-outcome", expires: Date.now() + 3600000, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", {body: JSON.stringify({model: "gpt-5.1", stream, prompt_cache_key: "fixture-delayed-affinity"})});
+			expect(response.status).toBe(200);
+			const context = selectionSpy.mock.contexts.find(value => value instanceof SessionAffinityStore);
+			if (!(context instanceof SessionAffinityStore)) throw Error("No actual affinity store was consulted");
+			const session = selectionSpy.mock.calls.find(call => call[0])?.[0];
+			expect(session).toBe("fixture-delayed-affinity");
+			account.consecutiveAuthFailures = 2;
+			if (change === "revocation") {storage.accounts[fallback ? 1 : 0]!.authInvalidatedAt = Date.now(); await fs.writeFile(path, JSON.stringify(storage));}
+			if (change === "replacement") {storage.accounts[fallback ? 1 : 0]!.accessToken = "fixture-replaced"; await fs.writeFile(path, JSON.stringify(storage));}
+			if (change === "circuit") for (let i = 0; i < 3; i++) getCircuitBreaker(account.circuitKeyId!).recordFailure();
+			if (change === "forget") context.forgetSession(session);
+			updateSpy.mockClear();
+			expect(await response.text()).toContain("accepted-original");
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			// Drain the same nonreentrant pool lane after the stream callback.
+			await realStorage.withAccountStorageTransaction(async () => undefined);
+			if (change === "healthy") await vi.waitFor(() => expect(context.getLastResponseId(session)).toBe("accepted-original"));
+			else {expect(context.getLastResponseId(session)).toBeNull(); if (change === "forget") expect(context.getPreferredAccountIndex(session)).toBeNull();}
+
+			expect(fetch).toHaveBeenCalledTimes(fallback ? 2 : 1); expect(account.consecutiveAuthFailures).toBe(change === "healthy" || change === "forget" ? 0 : 2);
+			if (change === "circuit") expect(getCircuitBreaker(account.circuitKeyId!).getState()).toBe("open");
+			await vi.waitFor(async () => expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))).toHaveLength(1));
+			expect((await readUsageLedgerRows()).filter(row => !before.has(row.id))[0]).toMatchObject({outcome: "success", account: {index: fallback ? 1 : 0}, tokens: {inputTokens: 7, outputTokens: 3, totalTokens: 10}});
+		} finally {
+			if (previousThreadId === undefined) delete process.env.CODEX_THREAD_ID; else process.env.CODEX_THREAD_ID = previousThreadId;
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); realStorage.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it.each(["primary", "safe-rejection-fallback", "accepted-empty"])("preserves raw refresh-only plugin accounts at the dispatch boundary (%s)", async route => {
+		const hooks = new Map(["SIGINT", "SIGTERM", "beforeExit"].map(event => [event, new Set(process.listeners(event))]));
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-first-token-"));
+		const path = join(dir, "accounts.json");
+		const firstRefresh = `fixture-first-refresh-${route}`;
+		const nextRefresh = `fixture-first-next-${route}`;
+		const firstAccess = `fixture-first-access-${route}`;
+		const firstRecordId = `first-token-${route}`;
+		const storage: import("../lib/storage.js").AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: firstRecordId, accountId: `workspace-first-${route}`, refreshToken: firstRefresh, addedAt: 1, lastUsed: 1}]};
+		if (route !== "primary") storage.accounts.unshift({recordId: "primary-token", accountId: "workspace-primary", refreshToken: "fixture-primary-refresh", accessToken: "fixture-primary-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1});
+		await fs.writeFile(path, JSON.stringify(storage));
+		const storageModule = await import("../lib/storage.js");
+		const realStorage = await vi.importActual<typeof import("../lib/storage.js")>("../lib/storage.js");
+		for (const method of ["getStoragePath", "loadAccounts", "saveAccounts", "withAccountStorageTransaction"] as const) {
+			vi.spyOn(storageModule, method).mockImplementation(realStorage[method] as never);
+		}
+		const realAccounts = await vi.importActual<typeof import("../lib/accounts.js")>("../lib/accounts.js");
+		realStorage.setStoragePathDirect(path);
+		const manager = new realAccounts.AccountManager(undefined, storage);
+		expect(manager.resolveSelectionStoragePath()).toBe(path);
+		expect(storageModule.getStoragePath()).toBe(path);
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager as never);
+		const helpers = await import("../lib/request/fetch-helpers.js");
+		const realRefresh = await import("../lib/request/token-refresh.js");
+		vi.mocked(helpers.shouldRefreshToken).mockImplementation(auth => auth.type !== "oauth" || !auth.access);
+		vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(realRefresh.refreshAndUpdateToken);
+		const {RefreshLeaseCoordinator} = await import("../lib/refresh-lease.js");
+		vi.spyOn(RefreshLeaseCoordinator.prototype, "acquire").mockResolvedValue({role: "leader", release: async () => undefined});
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn(async () => undefined)}};
+		const oauth = vi.fn(), inference = vi.fn();
+		globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+			if (String(input) === "https://auth.openai.com/oauth/token") {oauth(); return Response.json({access_token: firstAccess, refresh_token: nextRefresh, expires_in: 3600});}
+			inference();
+			if (route === "accepted-empty") return new Response("", {headers: {"Content-Type": "text/event-stream"}});
+			if (route === "safe-rejection-fallback") {
+				if (inference.mock.calls.length === 1) return Response.json({error: {code: "rate_limit_exceeded"}}, {status: 429, headers: {"retry-after": "60"}});
+				return new Response('data: {"type":"response.completed","response":{"id":"first-token","output":[],"usage":{"input_tokens":7,"output_tokens":3}}}\n\n', {headers: {"Content-Type": "text/event-stream"}});
+			}
+			return Response.json({id: "first-token", output: []});
+		});
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "", refresh: firstRefresh, expires: 0, multiAccount: true}), {options: {}, models: {}});
+			const response = await sdk.fetch!("https://example.com", route !== "primary" ? {body: JSON.stringify({model: "gpt-5.1", stream: true})} : {});
+			expect(response.status).toBe(200); const body = await response.text();
+			if (route === "safe-rejection-fallback") expect(body).toContain('"id":"first-token"');
+			if (route === "accepted-empty") expect(body).toBe("");
+			expect(oauth).toHaveBeenCalledTimes(route === "accepted-empty" ? 0 : 1);
+			expect(inference).toHaveBeenCalledTimes(route === "safe-rejection-fallback" ? 2 : 1);
+			expect(client.auth.set).toHaveBeenCalledTimes(route === "accepted-empty" ? 0 : 1);
+			expect(storageModule.getStoragePath()).toBe(path);
+			expect((await storageModule.loadAccounts())?.accounts.find(row => row.recordId === firstRecordId)?.refreshToken).toBe(route === "accepted-empty" ? firstRefresh : nextRefresh);
+		} finally {
+			vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => false);
+			vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(async auth => auth);
+			(await import("../lib/refresh-queue.js")).resetRefreshQueue();
+			await (await import("../lib/shutdown.js")).runCleanup();
+			for (const [event, previous] of hooks) for (const listener of process.listeners(event)) if (!previous.has(listener)) process.removeListener(event, listener);
+			await manager.flushPendingSave(); storageModule.setStoragePathDirect(null);
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
+	});
+
+	it("retains actual post-spend settlement failure without authentication removal or another OAuth spend", async () => {
+		const dir = await fs.mkdtemp(join(tmpdir(), "plugin-settlement-"));
+		const path = join(dir, "accounts.json");
+		const account = createMockAccount({recordId: "record-A", expires: 1, enabled: true, consecutiveAuthFailures: 2});
+		accountManagerState.accounts = [account];
+		accountManagerState.accountSelections = [account];
+		const {AccountManager} = await import("../lib/accounts.js");
+		vi.spyOn(AccountManager.prototype, "resolveSelectionStoragePath").mockReturnValue(path);
+		const helpers = await import("../lib/request/fetch-helpers.js");
+		const realRefresh = await import("../lib/request/token-refresh.js");
+		vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => true);
+		vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(realRefresh.refreshAndUpdateToken);
+		const {getPendingAuthPath, PendingAuthSettlementError} = await import("../lib/storage/pending-auth.js");
+		const {getRefreshQueue, resetRefreshQueue} = await import("../lib/refresh-queue.js");
+		const {RefreshLeaseCoordinator} = await import("../lib/refresh-lease.js");
+		vi.spyOn(RefreshLeaseCoordinator.prototype, "acquire").mockResolvedValue({role: "leader", release: async () => undefined});
+		await fs.writeFile(path, JSON.stringify({version: 3, activeIndex: 0, accounts: [{
+			recordId: "record-A", accountId: account.accountId, refreshToken: account.refreshToken, accessToken: account.access, expiresAt: 1, enabled: true, addedAt: 1, lastUsed: 1,
+		}]}));
+		const cause = Object.assign(Error("fixture settlement failed"), {code: "ENOSPC"});
+		const rename = fs.rename.bind(fs);
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === getPendingAuthPath(path)) throw cause;
+			return rename(from, to);
+		});
+		const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			expect(String(input)).toBe("https://auth.openai.com/oauth/token");
+			expect(new URLSearchParams(String(init?.body)).get("refresh_token")).toBe("refresh-token-account-1");
+			return Response.json({access_token: "fixture-new-access", refresh_token: "fixture-new-refresh", expires_in: 3600});
+		});
+		globalThis.fetch = fetch;
+		const client = {tui: {showToast: vi.fn()}, auth: {set: vi.fn()}};
+		try {
+			const {OpenAIAuthPlugin} = await import("../index.js");
+			const plugin = await OpenAIAuthPlugin({client} as never);
+			const sdk = await plugin.auth!.loader!(async () => ({type: "oauth", access: "access-token-account-1", refresh: "refresh-token-account-1", expires: 1, multiAccount: true}), {options: {}, models: {}});
+			const error = await sdk.fetch!("https://example.com", {}).catch(value => value);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toBe(cause);
+			expect(account).toMatchObject({access: "fixture-new-access", refreshToken: "fixture-new-refresh", consecutiveAuthFailures: 2, enabled: true});
+			expect(accountManagerState.accounts).toEqual([account]);
+			expect(client.auth.set).not.toHaveBeenCalled();
+			expect(accountManagerState.setAccountEnabledCalls).toEqual([]);
+			await expect(getRefreshQueue().refresh("refresh-token-account-1", path)).rejects.toBe(error);
+			expect(fetch).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.mocked(helpers.shouldRefreshToken).mockImplementation(() => false);
+			vi.mocked(helpers.refreshAndUpdateToken).mockImplementation(async auth => auth);
+			resetRefreshQueue();
+			await removeWithRetry(dir, {recursive: true, force: true});
+		}
 	});
 
 	it("waits and retries when all accounts are rate-limited", async () => {
@@ -597,7 +1621,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			const fetchPromise = sdk.fetch("https://example.com", {});
 			await Promise.resolve();
 			const response = await fetchPromise;
-			expect(response.status).toBe(429);
+			expect(response.status).toBe(503);
 			clearPoolExhaustionCooldown();
 		}
 
@@ -635,11 +1659,11 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			Promise.resolve(
 				new Response(
 					JSON.stringify({
-						error: { code: "server_error", message: "temporary outage" },
+						error: { code: "rate_limit_exceeded", message: "fixture quota refused" },
 					}),
 					{
-						status: 500,
-						headers: { "content-type": "application/json" },
+						status: 429,
+						headers: { "content-type": "application/json", "retry-after": "120" },
 					},
 				),
 			),
@@ -694,7 +1718,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		);
 	});
 
-	it("keeps the total request cap when empty-response retries and server-error rotation combine", async () => {
+	it("does not replay an accepted empty response into another account or server error", async () => {
 		const logger = await import("../lib/logger.js");
 		const logWarnSpy = vi.spyOn(logger, "logWarn").mockImplementation(() => {});
 
@@ -755,37 +1779,20 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 		const response = await sdk.fetch("https://example.com", {});
 		const payload = await response.json();
 
-		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(
 			fetchMock.mock.calls.map(
 				(call) => (call[1]?.headers as Headers).get("x-account-id"),
 			),
-		).toEqual([
-			"account-1",
-			"account-1",
-			"account-2",
-			"account-3",
-			"account-4",
-			"account-5",
-		]);
-		expect(response.status).toBe(503);
-		expect(payload).toEqual({
-			error: {
-				message:
-					"Request attempt budget exhausted after 6 outbound request(s). Try again after the current retries settle.",
-			},
-		});
-		expect(logWarnSpy).toHaveBeenCalledWith(
+		).toEqual(["account-1"]);
+		expect(response.status).toBe(200);
+		expect(payload).toEqual({});
+		expect(logWarnSpy).not.toHaveBeenCalledWith(
 			"Empty response received (attempt 1/2). Retrying...",
 		);
-		expect(logWarnSpy).toHaveBeenCalledWith(
+		expect(logWarnSpy).not.toHaveBeenCalledWith(
 			"Request attempt budget exhausted.",
-			expect.objectContaining({
-				reason: "primary",
-				accountIndex: 5,
-				budget: 6,
-				consumed: 6,
-			}),
+			expect.anything(),
 		);
 	});
 
@@ -913,7 +1920,7 @@ describe("OpenAIAuthPlugin rate-limit retry", () => {
 			index: 0,
 			enabled: false,
 		});
-		expect(accountManagerState.saveToDiskDebouncedCalls).toBeGreaterThanOrEqual(1);
+		expect(accountManagerState.durableRestrictionCommits).toBe(1);
 		expect(exhaustedAccount.enabled).toBe(false);
 
 		const firstHeaders = fetchMock.mock.calls[0]?.[1]?.headers as Headers;

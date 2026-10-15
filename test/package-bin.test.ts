@@ -69,5 +69,6 @@ describe("package bin entries", () => {
 			expect.arrayContaining(["scripts/preuninstall.js"]),
 		);
 	});
+
 });
 

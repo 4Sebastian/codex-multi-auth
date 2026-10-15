@@ -202,7 +202,7 @@ handler's use of it:
   half of the ask, matching how the failover scheduler's cooldowns clear
   themselves once the underlying signal recovers.
 
-## 4. Pipeline integration — TWO pipelines, not one
+## 4. Pipeline integration across forwarding paths
 
 The original draft of this plan only looked at `index.ts`'s plugin-loader
 `fetch()` override. Implementation surfaced a second, independent forwarding
@@ -231,7 +231,7 @@ instance — no shared mutable state between the two pipelines):
    `buildContextBudgetHeaders(advisory)` merged into its headers (cheap:
    `new Response(successResponse.body, { ...headers })`, no body buffering).
 
-**`lib/runtime-rotation-proxy.ts`** (`handleRequestInner`):
+**`lib/runtime-rotation-proxy.ts`** (HTTP/SSE in `handleRequestInner`):
 1. *Pre-flight* — right after the request `context` (with `sessionKey`,
    `model`) is built and policy-checked, before `buildUpstreamUrl`, gated on
    `isResponsesRequest`. A `"hard"` result records a `blocked` usage-ledger
@@ -246,6 +246,11 @@ instance — no shared mutable state between the two pipelines):
    in this file) gained an optional `extraHeaders` parameter; the
    responses-path call site passes `buildContextBudgetHeaders(advisory)` when
    the pre-flight advisory was `"soft"`.
+
+The same runtime-proxy guard also covers each persistent WebSocket `response.create`.
+Custom-provider/Pi sockets evaluate the stable session key before account selection. A hard advisory records a blocked request and closes the client connection; it does not emit a local pause event. Native OpenAI turns use the HTTP guard lifecycle through `ResponsesWebSocketGateway`. Both transports update the guard from normalized terminal Responses usage.
+Replay carries the prepared logical request, so account failover or a pre-event reconnect does not update the guard or usage ledger twice.
+Terminal usage is normalized through the shared Responses extraction path, so reasoning tokens are not counted twice as retained output and service-tier pricing metadata remains available to the usage ledger.
 
 Both pipelines reuse their existing session-identity concept as the guard's
 map key (`sessionAffinityKey` / `context.sessionKey`) — no new session-identity

@@ -20,12 +20,14 @@ import { isKnownServiceTier, type UsageTokenCounts } from "../lib/usage/types.js
  * published one, so any other tier is reported as unknown cost and the budget
  * guard fails closed, exactly as it does for an unpriced model.
  */
+// Input stays under 272K so these assert the short-context rate; long-context
+// pricing is covered in test/gpt6-sol-luna-models.test.ts.
 const TOKENS = {
-	inputTokens: 1_000_000,
+	inputTokens: 100_000,
 	cachedInputTokens: 0,
 	outputTokens: 1_000_000,
 	reasoningTokens: 0,
-	totalTokens: 2_000_000,
+	totalTokens: 1_100_000,
 };
 
 describe("service tier extraction", () => {
@@ -76,10 +78,10 @@ describe("service tier extraction", () => {
 
 describe("service tier pricing", () => {
 	it("prices Astra's Fast tier at the published 2x rate", () => {
-		expect(estimateUsageCostUsd("gpt-6-astra", TOKENS)).toBe(60);
+		expect(estimateUsageCostUsd("gpt-6-astra", TOKENS)).toBe(51);
 		expect(
 			estimateUsageCostUsd("gpt-6-astra", { ...TOKENS, serviceTier: "priority" }),
-		).toBe(120);
+		).toBe(102);
 	});
 
 	it("treats standard and an absent tier identically", () => {
@@ -119,23 +121,23 @@ describe("the tier reaches the ledger", () => {
 		const row = normalizeUsageLedgerRow({
 			outcome: "success",
 			model: "gpt-6-astra",
-			inputTokens: 1_000_000,
+			inputTokens: 100_000,
 			outputTokens: 1_000_000,
 			serviceTier: "priority",
 		});
 		expect(row.tokens.serviceTier).toBe("priority");
-		expect(row.costUsd).toBe(120);
+		expect(row.costUsd).toBe(102);
 	});
 
 	it("prices the same row at standard when no tier is reported", () => {
 		const row = normalizeUsageLedgerRow({
 			outcome: "success",
 			model: "gpt-6-astra",
-			inputTokens: 1_000_000,
+			inputTokens: 100_000,
 			outputTokens: 1_000_000,
 		});
 		expect(row.tokens.serviceTier).toBeUndefined();
-		expect(row.costUsd).toBe(60);
+		expect(row.costUsd).toBe(51);
 	});
 
 	it("survives the stream deferral, which is how a streamed row is written", () => {
@@ -151,17 +153,17 @@ describe("the tier reaches the ledger", () => {
 
 		deferral.defer({ outcome: "success", model: "gpt-6-astra" });
 		deferral.onUsage({
-			inputTokens: 1_000_000,
+			inputTokens: 100_000,
 			outputTokens: 1_000_000,
 			cachedInputTokens: 0,
 			reasoningTokens: 0,
-			totalTokens: 2_000_000,
+			totalTokens: 1_100_000,
 			serviceTier: "priority",
 		} satisfies UsageTokenCounts);
 
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.serviceTier).toBe("priority");
-		expect(normalizeUsageLedgerRow(recorded[0] as never).costUsd).toBe(120);
+		expect(normalizeUsageLedgerRow(recorded[0] as never).costUsd).toBe(102);
 	});
 });
 
@@ -187,14 +189,14 @@ describe("the tier survives the paths a real request takes", () => {
 		return recorder
 			.record({
 				outcome: "success",
-				inputTokens: 1_000_000,
+				inputTokens: 100_000,
 				outputTokens: 1_000_000,
 				serviceTier: "priority",
 			})
 			.then(() => {
 				expect(appended).toHaveLength(1);
 				expect(appended[0]?.serviceTier).toBe("priority");
-				expect(normalizeUsageLedgerRow(appended[0] as never).costUsd).toBe(120);
+				expect(normalizeUsageLedgerRow(appended[0] as never).costUsd).toBe(102);
 			});
 	});
 
@@ -229,14 +231,14 @@ describe("the tier survives a real ledger round-trip", () => {
 		await appendUsageLedgerRow({
 			outcome: "success",
 			model: "gpt-6-astra",
-			inputTokens: 1_000_000,
+			inputTokens: 100_000,
 			outputTokens: 1_000_000,
 			serviceTier: "priority",
 		});
 		const rows = await readUsageLedgerRows();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.tokens.serviceTier).toBe("priority");
-		expect(rows[0]?.costUsd).toBe(120);
+		expect(rows[0]?.costUsd).toBe(102);
 	});
 
 	it("drops an unrecognised tier that was edited into the file", async () => {
@@ -281,16 +283,16 @@ describe("tier spellings and cached rates", () => {
 		// tokens at the full input rate: a 10x over-statement that trips a
 		// maxCostUsd cap far too early.
 		const cachedOnly = {
-			inputTokens: 1_000_000,
-			cachedInputTokens: 1_000_000,
+			inputTokens: 100_000,
+			cachedInputTokens: 100_000,
 			outputTokens: 0,
 			reasoningTokens: 0,
-			totalTokens: 1_000_000,
+			totalTokens: 100_000,
 		};
-		expect(estimateUsageCostUsd("gpt-6-astra", cachedOnly)).toBe(1);
+		expect(estimateUsageCostUsd("gpt-6-astra", cachedOnly)).toBe(0.1);
 		expect(
 			estimateUsageCostUsd("gpt-6-astra", { ...cachedOnly, serviceTier: "priority" }),
-		).toBe(2);
+		).toBe(0.2);
 	});
 });
 

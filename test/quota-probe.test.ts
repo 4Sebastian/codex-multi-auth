@@ -68,6 +68,63 @@ describe("quota-probe", () => {
 		vi.useRealTimers();
 	});
 
+	it.each([false,true].flatMap(prime => ["response.failed", "response.done", "response.cancelled", "response.incomplete", "response.created", "empty", "response.completed"].map(type => ({prime,type}))))("requires successful probe completion independently of quota headers %j", async ({prime,type}) => {
+		const headers=makeQuotaHeaders({"content-type":"text/event-stream",...(prime ? {"x-codex-primary-used-percent":"0","x-codex-secondary-used-percent":"0","x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800"} : {})});
+		const body=type === "empty" ? "" : `data: ${JSON.stringify({type,response:{status:type === "response.completed" ? "completed" : "failed",error:{code:"token_invalidated"}}})}\r\n\r\n`;
+		const fetchMock=vi.fn(async()=>new Response(body,{status:200,headers})); vi.stubGlobal("fetch",fetchMock);
+		const result=await fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture",model:DEFAULT_PROBE_MODEL,primeUnusedSubscription:prime,fallbackModels:[]});
+		expect(result).toMatchObject({status:200,responseCompleted:type === "response.completed"});
+		if(prime) expect(result.primingCompleted === true).toBe(type === "response.completed");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+	it("does not start or retry a quota probe after cancellation",async()=>{
+      const controller=new AbortController();controller.abort();const fetchMock=vi.fn();vi.stubGlobal("fetch",fetchMock);
+      await expect(fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture",signal:controller.signal})).rejects.toMatchObject({name:"AbortError"});
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+	it.each(["prolite", "promax"])("finishes one tiny check probe when a %s subscription reports zero usage", async (plan) => {
+		const headers = makeQuotaHeaders({"x-codex-primary-used-percent":"0", "x-codex-secondary-used-percent":"0", "x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800", "x-codex-plan-type":plan, "content-type":"text/event-stream"});
+		const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => new Response('data: {"type":"response.completed","response":{"status":"completed"}}\n\n', {status:200,headers}));
+		vi.stubGlobal("fetch", fetchMock);
+		const snapshot = await fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture-token",primeUnusedSubscription:true});
+		expect(snapshot.primingCompleted).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(String(fetchMock.mock.calls[0]![1].body)).instructions).toBe(`instructions:${DEFAULT_PROBE_MODEL}`);
+        expect(getCodexInstructionsMock).toHaveBeenCalledWith(DEFAULT_PROBE_MODEL);
+	});
+
+	it("uses canonical instructions when a backend rejects replacement instructions",async()=>{
+ vi.stubGlobal("fetch",vi.fn(async(_url,init)=>{
+  const body=JSON.parse(String(init.body));
+  return body.instructions===`instructions:${body.model}`
+   ? new Response("",{status:200,headers:makeQuotaHeaders()})
+   : Response.json({detail:"Instructions are not valid"},{status:400});
+ }));
+ await expect(fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture",primeUnusedSubscription:true})).resolves.toMatchObject({status:200});
+ });
+
+	it("does not claim completion or retry another model when a first-use stream ends early", async () => {
+		const fetchMock = vi.fn(async () => new Response('data: {"type":"response.created"}\n\n', {status:200,headers:makeQuotaHeaders({"x-codex-primary-used-percent":"0","x-codex-secondary-used-percent":"0","x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800","content-type":"text/event-stream"})}));
+		vi.stubGlobal("fetch", fetchMock);
+		await expect(fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture-token",primeUnusedSubscription:true})).resolves.toMatchObject({status:200, primingFailure:"stream ended early"});
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["free", "unknown", "business", ""])("does not prime a %s plan", async plan => {
+		vi.stubGlobal("fetch", vi.fn(async () => new Response("",{status:200,headers:makeQuotaHeaders({"x-codex-primary-used-percent":"0","x-codex-secondary-used-percent":"0","x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800","x-codex-plan-type":plan})})));
+		const result = await fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture-token",primeUnusedSubscription:true});
+		expect(result.primingCompleted).toBeUndefined();
+		expect(result.primingFailure).toBeUndefined();
+	});
+
+	it("does not prime fractional usage rounded to zero in the display", async () => {
+		vi.stubGlobal("fetch", vi.fn(async () => new Response("",{status:200,headers:makeQuotaHeaders({"x-codex-primary-used-percent":"0.01","x-codex-secondary-used-percent":"0","x-codex-primary-reset-after-seconds":"18000","x-codex-secondary-reset-after-seconds":"604800"})})));
+		const result = await fetchCodexQuotaSnapshot({accountId:"fixture",accessToken:"fixture-token",primeUnusedSubscription:true});
+		expect(result.primingCompleted).toBeUndefined();
+		expect(result.primingFailure).toBeUndefined();
+	});
+
 	it("returns parsed quota snapshot from response headers", async () => {
 		const fetchMock = vi.fn(async () => new Response("", { status: 200, headers: makeQuotaHeaders() }));
 		vi.stubGlobal("fetch", fetchMock);
@@ -206,6 +263,28 @@ describe("quota-probe", () => {
 		expect(formatQuotaSnapshotLine(snapshot)).toContain("rate-limited");
 	});
 
+	it("rejects authentication failures even when quota headers are present", async () => {
+		const fetchMock = vi.fn(async () =>
+			new Response(
+				JSON.stringify({ error: { message: "Your authentication token has been invalidated." } }),
+				{
+					status: 401,
+					headers: makeQuotaHeaders({ "content-type": "application/json" }),
+				},
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(
+			fetchCodexQuotaSnapshot({
+				accountId: "acc-revoked",
+				accessToken: "token-revoked",
+				model: "gpt-5-codex",
+				fallbackModels: [],
+			}),
+		).rejects.toThrow("authentication token has been invalidated");
+	});
+
 	it("times out a stalled probe and surfaces abort failure", async () => {
 		vi.useFakeTimers();
 		const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
@@ -263,6 +342,24 @@ describe("quota-probe", () => {
 
 		expect(snapshot.primary.resetAtMs).toBe(primarySeconds * 1000);
 		expect(snapshot.secondary.resetAtMs).toBe(secondaryMs);
+	});
+
+	it("clamps absurd reset headers to the rate-limit horizon instead of an endless window", async () => {
+		const { MAX_RATE_LIMIT_DELAY_MS } = await import("../lib/constants.js");
+		const headers = new Headers({
+			"x-codex-primary-used-percent": "100",
+			"x-codex-primary-reset-after-seconds": "1" + "0".repeat(307),
+			"x-codex-secondary-used-percent": "100",
+			"x-codex-secondary-reset-at": "9".repeat(300),
+		});
+		vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 200, headers })));
+		const before = Date.now();
+		const snapshot = await fetchCodexQuotaSnapshot({ accountId: "acc-huge-reset", accessToken: "token-huge-reset", model: "gpt-5-codex", fallbackModels: [] });
+		for (const window of [snapshot.primary, snapshot.secondary]) {
+			expect(Number.isFinite(window.resetAtMs)).toBe(true);
+			expect(window.resetAtMs).toBeGreaterThanOrEqual(before + MAX_RATE_LIMIT_DELAY_MS);
+			expect(window.resetAtMs).toBeLessThanOrEqual(Date.now() + MAX_RATE_LIMIT_DELAY_MS);
+		}
 	});
 
 	it("keeps resetAt undefined for invalid reset-at values", async () => {

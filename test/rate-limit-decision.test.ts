@@ -5,6 +5,7 @@ import {
 	extractErrorCodeFromBody,
 	getQuotaNearExhaustionWaitMs,
 	isTokenInvalidationError,
+	isResponsesTokenInvalidationEvent,
 	isTokenRefreshRetryable,
 	normalizeExhaustionStatus,
 	parseRetryAfterBodyMs,
@@ -12,6 +13,14 @@ import {
 } from "../lib/request/rate-limit-decision.js";
 
 describe("isTokenInvalidationError", () => {
+	it.each([
+		{error: {code: "token_invalidated", message: "rejected"}},
+		{response: {error: {code: " TOKEN_INVALIDATED "}}},
+		{code: "token_invalidated"},
+		{error: {code: "authentication_error", message: "Your authentication token has been invalidated."}},
+	])("recognizes revocation across terminal and handshake envelopes %j", envelope => {
+		expect(isTokenInvalidationError(JSON.stringify(envelope))).toBe(true);
+	});
 	it("matches known invalidation phrases case-insensitively", () => {
 		expect(
 			isTokenInvalidationError('{"message":"Invalidated OAuth Token"}'),
@@ -24,6 +33,21 @@ describe("isTokenInvalidationError", () => {
 	it("does not match generic 401 bodies", () => {
 		expect(isTokenInvalidationError('{"message":"token expired"}')).toBe(false);
 		expect(isTokenInvalidationError("")).toBe(false);
+	});
+});
+
+describe("isResponsesTokenInvalidationEvent", () => {
+	it.each([
+		{type: "error", code: "token_invalidated"},
+		{type: "error", error: {message: "OAuth token has been invalidated"}},
+		{type: "response.failed", response: {error: {code: "token_invalidated"}}},
+		{type: "response.done", response: {status: "failed", error: {message: "Your authentication token has been invalidated"}}},
+	])("recognizes actual error fields %j", event => expect(isResponsesTokenInvalidationEvent(event)).toBe(true));
+	it.each(["response.done", "response.completed", "response.failed", "error"])("never classifies generated output as an auth error (%s)", type => {
+		expect(isResponsesTokenInvalidationEvent({type, response: {status: "completed", output: [{text: "OAuth token has been invalidated", code: "token_invalidated"}]}, error: {code: "server_error"}})).toBe(false);
+	});
+	it.each(["completed", "cancelled", "incomplete"])("ignores non-failed response.done status (%s)", status => {
+		expect(isResponsesTokenInvalidationEvent({type: "response.done", response: {status, error: {code: "token_invalidated"}}})).toBe(false);
 	});
 });
 

@@ -11,7 +11,7 @@ import type { UsageServiceTier, UsageTokenCounts } from "./types.js";
  */
 
 /** Cap on retained bytes so a hostile or unterminated body cannot grow forever. */
-const MAX_BUFFERED_BYTES = 1_048_576;
+const MAX_BUFFERED_BYTES = 64 * 1024 * 1024;
 /** Terminal Responses stream events that carry the final `usage` object. */
 const TERMINAL_EVENT_TYPES = new Set([
 	"response.completed",
@@ -143,7 +143,7 @@ export interface UsageStreamScanner {
 /**
  * Observe a forwarded response body and recover its token counts.
  *
- * SSE bodies are scanned line by line so only the current partial line is
+ * SSE bodies are scanned frame by frame so only the current bounded event is
  * retained; a full response can be gigabytes of deltas and must never be
  * buffered. Non-SSE JSON bodies have no incremental structure to exploit, so
  * they are accumulated up to `MAX_BUFFERED_BYTES` and parsed at the end —
@@ -152,18 +152,26 @@ export interface UsageStreamScanner {
  */
 export function createUsageStreamScanner(options: {
 	contentType?: string | null;
+	/** Observe parsed upstream events without reparsing the stream. */
+	onEvent?: (event: unknown) => void;
 }): UsageStreamScanner {
 	const sse = (options.contentType ?? "").toLowerCase().includes("text/event-stream");
 	const decoder = new TextDecoder("utf-8");
-	let pending = "";
+	let pending: string[] = [];
+	let pendingSize = 0;
 	let bufferedBytes = 0;
 	let overflowed = false;
 	let latest: UsageTokenCounts | null = null;
+	let eventData: string[] = [];
+	let eventSize = 0;
+    let droppingEvent = false;
+    let droppingLine = false;
 
-	const consumeLine = (line: string): void => {
-		const trimmed = line.trim();
-		if (!trimmed.startsWith("data:")) return;
-		const payload = trimmed.slice("data:".length).trim();
+	const consumeEvent = (): void => {
+        if (droppingEvent) {droppingEvent=false;eventData=[];eventSize=0;return;}
+		const payload = eventData.join("\n");
+		eventData = [];
+		eventSize = 0;
 		if (payload.length === 0 || payload === "[DONE]") return;
 		let parsed: unknown;
 		try {
@@ -171,6 +179,7 @@ export function createUsageStreamScanner(options: {
 		} catch {
 			return;
 		}
+		options.onEvent?.(parsed);
 		// Prefer terminal events, which carry the authoritative totals, but fall
 		// back to any event that reports usage so a stream that ends on a
 		// non-standard terminal type still records something.
@@ -182,31 +191,65 @@ export function createUsageStreamScanner(options: {
 		}
 	};
 
+	const consumeLine = (raw: string): void => {
+		const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+		if (line.length === 0) { consumeEvent(); return; }
+		if (droppingEvent || !line.startsWith("data:")) return;
+		const value = line.slice(5).replace(/^ /, "");
+		eventSize += Buffer.byteLength(value) + 1;
+		if (eventSize > MAX_BUFFERED_BYTES) {
+			droppingEvent = true; eventData = []; eventSize = 0; return;
+		}
+		eventData.push(value);
+	};
+
+	const retainFragment = (fragment: string): void => {
+		if (fragment.length === 0) return;
+		const last = pending.at(-1);
+		if (last !== undefined && last.length < 8192 && fragment.length < 8192) pending[pending.length - 1] = last + fragment;
+		else pending.push(fragment);
+	};
+
+	const appendPartialLine = (fragment: string): void => {
+		if (droppingLine) return;
+		pendingSize += Buffer.byteLength(fragment);
+		if (pendingSize > MAX_BUFFERED_BYTES) {
+			droppingEvent = true;
+			droppingLine = true;
+			eventData = [];
+			eventSize = 0;
+			pending = [];
+			pendingSize = 0;
+			return;
+		}
+		retainFragment(fragment);
+	};
+
 	return {
 		push: (chunk) => {
 			try {
 				if (overflowed || chunk.byteLength === 0) return;
-				bufferedBytes += chunk.byteLength;
-				pending += decoder.decode(chunk, { stream: true });
+				const text = decoder.decode(chunk, { stream: true });
 				if (!sse) {
+					bufferedBytes += chunk.byteLength;
 					if (bufferedBytes > MAX_BUFFERED_BYTES) {
 						overflowed = true;
-						pending = "";
-					}
+						pending = [];
+					} else retainFragment(text);
 					return;
 				}
-				let newlineAt = pending.indexOf("\n");
+				let offset = 0;
+				let newlineAt = text.indexOf("\n", offset);
 				while (newlineAt !== -1) {
-					consumeLine(pending.slice(0, newlineAt));
-					pending = pending.slice(newlineAt + 1);
-					newlineAt = pending.indexOf("\n");
+					appendPartialLine(text.slice(offset, newlineAt));
+					if (!droppingLine) consumeLine(pending.join(""));
+					droppingLine = false;
+					pending = [];
+					pendingSize = 0;
+					offset = newlineAt + 1;
+					newlineAt = text.indexOf("\n", offset);
 				}
-				// A single unterminated line this long is not SSE any more; stop
-				// retaining it rather than growing the buffer for the whole body.
-				if (pending.length > MAX_BUFFERED_BYTES) {
-					overflowed = true;
-					pending = "";
-				}
+				if (offset < text.length) appendPartialLine(text.slice(offset));
 			} catch {
 				// Usage accounting must never break the forwarded response.
 			}
@@ -214,16 +257,20 @@ export function createUsageStreamScanner(options: {
 		result: () => {
 			try {
 				if (overflowed) return latest;
-				pending += decoder.decode();
+				appendPartialLine(decoder.decode());
+				const payload = pending.join("");
+				pending = [];
+				pendingSize = 0;
 				if (sse) {
-					if (pending.length > 0) consumeLine(pending);
-					pending = "";
+					if (payload.length > 0 && !droppingLine) consumeLine(payload);
+					consumeEvent();
 					return latest;
 				}
-				if (pending.trim().length === 0) return latest;
-				const parsed: unknown = JSON.parse(pending);
-				pending = "";
-				return extractResponsesUsage(parsed) ?? latest;
+				if (payload.trim().length === 0) return latest;
+				const parsed: unknown = JSON.parse(payload);
+				options.onEvent?.(parsed);
+				latest = extractResponsesUsage(parsed) ?? latest;
+				return latest;
 			} catch {
 				return latest;
 			}

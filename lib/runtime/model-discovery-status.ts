@@ -1,0 +1,562 @@
+import { withFileTransactionLock } from "../storage/file-lock.js";
+import { styleReportText as paint } from "../ui/format.js";
+import { withCheckProgress } from "../ui/check-progress.js";
+import { mapWithConcurrency } from "../concurrency.js";
+import { ApiModelCapabilities } from "./api-model-capabilities.js";
+import { getAppBindStatus } from "./app-bind.js";
+import { isRecord } from "../utils.js";
+import { promises as fs, writeFileSync, renameSync } from "node:fs";
+import { captureRefreshCredentialAuthority } from '../storage/pending-auth.js';
+import { getRefreshQueue } from '../refresh-queue.js';
+import { join, dirname } from "node:path";
+import { z } from "zod";
+import { modelScopeId, workspaceModelScopes } from "./workspace-model-scopes.js";
+import { AccountManager,type ManagedAccount } from "../accounts.js";
+import type { TokenSuccess } from '../types.js';
+import { type AccountStorageV3, loadAccounts, getStoragePath } from "../storage.js";
+import {captureAuthorityRevision} from "../storage/authority-revision.js";
+import { getIntentionalResetMarkerPath } from "../storage/backup-paths.js";
+import {syncNativeAccountCredentials} from "./native-account-sync.js";
+import {
+	type ApiRouteCredential,
+	captureApiProbeAuthorization,
+	captureApiRouteAuthorization,
+	loadApiRoutes,
+	updateApiModelDiscovery,
+} from "../api-route-store.js";
+import { ApiModelRuntime, boundedJson } from "./api-model-runtime.js";
+import { AccountModelCatalog, CATALOG_AUTHORITY, withCatalogAuthority } from "./account-model-catalog.js";
+import { resolveCatalogClientVersion } from "./catalog-client-version.js";
+import { ensureFreshAccessToken } from "./rotation-token-refresh.js";
+import { createCodexHeaders } from "../request/headers.js";
+import { CODEX_BASE_URL } from "../constants.js";
+import { getCodexMultiAuthDir } from "../runtime-paths.js";
+import { tempPathFor } from "../temp-path.js";
+import { withRetry } from "../fs-retry.js";
+const printable = z
+	.string()
+	.max(256)
+	.regex(/^[^\x00-\x1f\x7f]*$/);
+const entitlementSchema = z.object({
+ model: printable, checkedAt: z.number().optional(),
+ probes: z.record(printable,z.enum(["verified","unsupported","unverified","downgraded"])).optional(),
+ serviceTiers: z.array(z.object({id:printable,name:printable})).max(100),
+ reasoningLevels:z.array(printable).max(100),accessPrograms:z.array(printable).max(100),
+});
+const entrySchema = z.object({
+ id: printable.optional(), routable:z.boolean().optional(), bound:z.boolean().optional(), selected:z.boolean().optional(),
+ changes:z.object({observedAt:z.number(),added:z.array(printable).max(10000),removed:z.array(printable).max(10000),capabilities:z.array(printable).max(10000)}).optional(),
+ lastSuccessful:z.object({models:z.array(printable).max(10000),entitlements:z.array(entitlementSchema).max(1000).optional()}).optional(),
+	label: printable,
+	kind: z.enum(["oauth", "api", "zdr"]),
+	enabled: z.boolean(),
+	checkedAt: z.number(),
+	error: z.boolean(),
+	models: z.array(printable).max(10000),
+	visibleModels: z.array(printable).max(10000),
+	entitlements: z.array(entitlementSchema).max(1000).optional(),
+});
+const schema = z.object({
+    apiConfigurationUnavailable: z.boolean().optional(),
+	version: z.literal(1),
+	checkedAt: z.number(),
+	clientVersion: z
+		.string()
+		.max(80)
+		.regex(/^[0-9A-Za-z.+_-]+$/)
+		.optional(),
+	entries: z.array(entrySchema).max(3000),
+});
+export type ModelInventory = Omit<z.infer<typeof schema>,'entries'> & {entries:(z.infer<typeof entrySchema> & {[CATALOG_AUTHORITY]?:()=>boolean})[]};
+export function captureCatalogAuthority(manager:AccountManager,account:ManagedAccount){
+ const path=manager.resolveSelectionStoragePath();let owned:TokenSuccess|undefined;
+ const retained={access:account.access,refresh:account.refreshToken,expires:account.expires};
+ const sourceCurrent=getRefreshQueue().captureSettlementAuthority(path,retained);
+ const membership=()=>manager.resolveSelectionStoragePath()===path&&getStoragePath()===path&&manager.getAccountByIndex(account.index)===account;
+ const current=sourceCurrent
+  ?(result?:TokenSuccess)=>membership()&&account.access===retained.access&&account.refreshToken===retained.refresh&&account.expires===retained.expires&&sourceCurrent(result)
+  :captureRefreshCredentialAuthority(account,membership);
+ return(result?:TokenSuccess)=>{const valid=current(result??owned);if(valid&&result)owned=result;return valid;};
+}
+export function revalidateModelInventory(value:ModelInventory):ModelInventory {
+ value.entries=value.entries.map(entry=>{
+  let current=false;try{current=entry[CATALOG_AUTHORITY]?.()===true;}catch{}
+  return current?entry:{...entry,enabled:false,routable:false,visibleModels:[],error:true,bound:false,selected:false};
+ });
+ return value;
+}
+const probeCacheSchema = z.object({
+	version: z.literal(1),
+	ownerLosses: z.array(z.tuple([z.string().regex(/^[0-9a-f]{64}$/), z.number().finite().nonnegative()])).max(1000).optional(),
+	entries: z.array(z.tuple([
+		z.string().regex(/^[0-9a-f]{64}$/),
+		z.object({ credentialOwner: z.string().regex(/^[0-9a-f]{64}$/).optional(), generationAt: z.number().finite().nonnegative().optional(), observedLossAt: z.number().finite().nonnegative().optional(), lostAt: z.number().finite().nonnegative().optional(), documented: z.array(printable).max(100).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
+	])).max(1000),
+});
+function probeCachePath(): string {
+	return join(getCodexMultiAuthDir(), "api-capability-probes.json");
+}
+async function loadProbeCache(): Promise<z.infer<typeof probeCacheSchema>> {
+	try {
+		const file = await fs.open(probeCachePath(), "r");
+		try {
+			if (!(await file.stat()).isFile()) throw Error("Invalid capability cache file");
+			const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
+			return probeCacheSchema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+		} finally {
+			await file.close();
+		}
+	} catch (error) {
+		if (isRecord(error) && error.code === "ENOENT") return {version: 1, entries: []};
+		throw error;
+	}
+}
+export async function discoverModelInventory(
+	storage: AccountStorageV3 | null,
+	routes: ApiRouteCredential[],
+	options: {
+		fetchImpl?: typeof fetch;
+		now?: () => number;
+		clientVersion?: string;
+		updateApiDiscovery?: typeof updateApiModelDiscovery;
+		/** Send billable API probes even when a result is inside the 15-minute cache. */
+		forceProbes?: boolean;
+		/** Share probe results with later CLI processes through the multi-auth directory. */
+		persistProbes?: boolean;
+		captureProbeAuthorization?: typeof captureApiProbeAuthorization;
+		captureRouteAuthorization?: typeof captureApiRouteAuthorization;
+	} = {},
+): Promise<ModelInventory> {
+	const fetcher = options.fetchImpl ?? fetch,
+		now = options.now ?? Date.now;
+	const probeAuthorities = new Map(routes.map(route => [route, (options.captureProbeAuthorization ?? captureApiProbeAuthorization)(route)]));
+	const routeAuthorities = new Map(routes.map(route => [route, (options.captureRouteAuthorization ?? captureApiRouteAuthorization)(route)]));
+	const capabilities = new ApiModelCapabilities(fetcher, now);
+	if (options.persistProbes) {
+		const cached = await loadProbeCache();
+		capabilities.importProbes(cached.entries, cached.ownerLosses);
+	}
+	const manager = new AccountManager(
+		undefined,
+		storage ?? {
+			version: 3,
+			accounts: [],
+			activeIndex: 0,
+			activeIndexByFamily: {},
+		},
+	);
+	const entries: ModelInventory["entries"] = [];
+	const scopes = manager.getAccountsSnapshot().flatMap(workspaceModelScopes).map(scope=>{
+  const account=manager.getAccountByIndex(scope.accountIndex);let original:ReturnType<typeof captureCatalogAuthority>|undefined;
+  try{if(account)original=captureCatalogAuthority(manager,account);}catch{}
+  return {...scope,original};
+ });
+	const clientVersion = scopes.some(scope => scope.enabled)
+		? await resolveCatalogClientVersion(options.clientVersion)
+		: options.clientVersion;
+ const catalog = new AccountModelCatalog(async (key) => {
+  const scope = scopes.find(item=>item.id===key);
+		const account = scope?.enabled ? manager.getAccountByIndex(scope.accountIndex) : null;
+		if (!account || account.enabled === false || manager.getManagedAccountRuntimeSkipReason(account, "codex", null)) throw Error("Account unavailable");
+		const sourceCurrent=scope?.original;if(!sourceCurrent)throw Error('Catalog authority unavailable');
+		const fresh = await ensureFreshAccessToken({
+			accountManager: manager,
+			account,
+			family: "codex",
+			model: null,
+			now: now(),
+			tokenRefreshSkewMs: 60000,
+			tokenInvalidationCooldownMs: 30000,
+			authorityCurrent:sourceCurrent,
+		});
+		if (!fresh.ok) throw Error("Authentication unavailable");
+		const id = scope?.accountId;
+		if (!id) throw Error("Identity unavailable");
+		const url = new URL(`${CODEX_BASE_URL}/codex/models`);
+		url.searchParams.set("client_version", clientVersion ?? "0.0.0");
+		const path = manager.resolveSelectionStoragePath();
+		const resetCurrent = captureAuthorityRevision([], [getIntentionalResetMarkerPath(path)]);
+		const binding = {recordId: account.recordId, accessToken: fresh.accessToken, refreshToken: account.refreshToken, expiresAt: account.expires, accountId: id};
+		const publicationCurrent=()=>sourceCurrent()&&resetCurrent()&&(binding.expiresAt??0)>now()&&account.access===binding.accessToken&&account.refreshToken===binding.refreshToken&&account.expires===binding.expiresAt&&!manager.isAccountAuthInvalidated(account)&&workspaceModelScopes(account).some(scope=>scope.id===key&&scope.routable);
+		const authorize = async (): Promise<void> => {
+			const snapshot = await manager.readDispatchAccountStorage();
+			if (snapshot) {
+				if (!snapshot.verified || !snapshot.storage) throw Error("Account authority unavailable");
+				syncNativeAccountCredentials(manager, snapshot.storage, snapshot.capturedAt);
+			}
+			const current = await manager.withCurrentAccountCredential(account, binding, () =>
+				resetCurrent() && manager.resolveSelectionStoragePath() === path && getStoragePath() === path &&
+				(account.expires ?? 0) > now() && !manager.getManagedAccountRuntimeSkipReason(account, "codex", null) &&
+				workspaceModelScopes(account).some(scope => scope.id === key && scope.accountId === id && scope.routable), false);
+			if (!current) throw Error("Account authority changed");
+		};
+		await authorize();
+		const response = await fetcher(url, {
+			headers: createCodexHeaders({
+				accountId: id,
+				accessToken: fresh.accessToken,
+			}),
+			redirect: "error",
+			signal: AbortSignal.timeout(15000),
+		});
+		if (!response.ok) {
+			await response.body?.cancel();
+			throw Error("Catalog unavailable");
+		}
+		const value = await boundedJson(response);
+		try {await authorize();}
+		catch (error) {catalog.invalidate(key); throw error;}
+		return withCatalogAuthority(value,publicationCurrent);
+	}, now);
+	try {
+  entries.push(...await mapWithConcurrency(scopes, 3, async scope=>{
+    if(scope.enabled) await catalog.list([scope.id]);
+    const snapshot = catalog.snapshot(scope.id);
+    const current = manager.getAccountsSnapshot().flatMap(workspaceModelScopes).find(item => item.id === scope.id);
+    const enabled = current?.enabled === true, routable = current?.routable === true && !snapshot.error;
+    return {id:scope.id,label:scope.label,kind:"oauth" as const,enabled,routable,bound:current?.bound ?? false,selected:current?.selected ?? false,
+     ...snapshot,error:scope.enabled && snapshot.error,checkedAt:now(),visibleModels:routable?snapshot.models:[]};
+   }));
+	} finally {
+		await manager.flushPendingSave();
+	}
+	const api = new ApiModelRuntime(
+		fetcher,
+		now,
+		options.updateApiDiscovery,
+		options.updateApiDiscovery
+			? (models, refresh, route, forceProbes, authorize) =>
+					capabilities.enrich(models, refresh, route, forceProbes, authorize)
+			: undefined,
+		undefined,
+		route => {
+			const original = routes.find(candidate => candidate.id === route.id && candidate.kind === route.kind && candidate.apiKey === route.apiKey);
+			const authorize = original && probeAuthorities.get(original);
+			if (!authorize) throw Error("API probe authority unavailable");
+			return authorize;
+		},
+		route => {
+			const authorize = routeAuthorities.get(route);
+			if (!authorize) throw Error("API catalog authority unavailable");
+			return authorize;
+		},
+	);
+	await api.catalogs(routes, true, options.forceProbes === true);
+	const publicationChecks = await Promise.all(routes.filter(route => route.enabled).map(async route => {
+		const authorize = routeAuthorities.get(route);
+		if (!authorize) throw Error("API catalog authority unavailable");
+		const current = await authorize();
+		if (options.updateApiDiscovery && route.probeCapabilities) {
+			const probe = probeAuthorities.get(route);
+			if (!probe) throw Error("API probe authority unavailable");
+			const consent = await probe();
+			return () => current() && consent();
+		}
+		return current;
+	}));
+	const requirePublication = () => {
+		if (publicationChecks.some(current => !current())) throw Error("API probe authority changed");
+	};
+	if (options.persistProbes) {
+		const path = probeCachePath();
+		const persisted = await withFileTransactionLock(path, async () => {
+			// Merge with the latest file: a concurrent check may have probed other
+			// credentials since this one loaded. The newer result wins per key.
+			const latest = await loadProbeCache();
+			const merged = new Map(latest.entries);
+			const updates = capabilities.exportProbes(), losses = new Map<string, number>();
+			for (const [owner, at] of [...(latest.ownerLosses ?? []), ...capabilities.exportOwnerLosses()]) losses.set(owner, Math.max(losses.get(owner) ?? 0, at));
+			for (const [, value] of [...merged, ...updates]) {
+				if (value.credentialOwner && value.lostAt !== undefined) losses.set(value.credentialOwner, Math.max(losses.get(value.credentialOwner) ?? 0, value.lostAt));
+			}
+			if (losses.size > 1000) throw Error("Capability loss authority exceeds capacity");
+			for (const [key, value] of updates) {
+				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
+				if (loss !== undefined && (value.observedLossAt ?? -Infinity) < loss && value.at > loss) continue;
+				const disk = merged.get(key);
+				if (!disk || disk.at <= value.at || (loss !== undefined && (value.observedLossAt ?? -Infinity) >= loss && (disk.observedLossAt ?? -Infinity) < loss)) merged.set(key, value);
+			}
+			for (const value of merged.values()) {
+				const loss = value.credentialOwner ? losses.get(value.credentialOwner) : undefined;
+				if (loss === undefined) continue;
+				value.lostAt = loss;
+				if ((value.observedLossAt ?? -Infinity) >= loss) continue;
+				value.at = loss;
+				value.levels = [...value.documented ?? []];
+				value.tiers = [];
+				for (const name of Object.keys(value.status)) if (value.status[name] === "verified") value.status[name] = "unverified";
+				value.status.retry = "transient";
+			}
+			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
+			const serialized = JSON.stringify(probeCacheSchema.parse({ version: 1, entries, ownerLosses: [...losses] })) + "\n";
+			if (Buffer.byteLength(serialized) > 4 * 1024 * 1024) throw Error("Capability cache exceeds size limit");
+			await writeFileAtomic(path, () => { requirePublication(); return serialized; });
+			return {entries, ownerLosses: [...losses]};
+		});
+		for (const catalog of api.cachedCatalogs()) {
+			const route = routes.find(route => route.id === catalog.id && route.kind === catalog.kind);
+			if (!route?.probeCapabilities) continue;
+			catalog.models.splice(0, catalog.models.length, ...capabilities.applyPersistedProbes(catalog.models, route, persisted.entries, persisted.ownerLosses));
+		}
+	}
+	requirePublication();
+	entries.push(
+		...api.statuses(routes).map((s, i) => ({
+			[CATALOG_AUTHORITY]: s[CATALOG_AUTHORITY],
+			id: modelScopeId(s.kind,s.id),
+   label: s.label,
+			kind: s.kind,
+			enabled: routes[i]?.enabled ?? false,
+			checkedAt: s.checkedAt,
+			error: s.error,
+			models: s.availableModels,
+			visibleModels: s.visibleModels,
+			entitlements: s.entitlements,
+		})),
+	);
+	return revalidateModelInventory({version:1,checkedAt:now(),clientVersion,entries});
+}
+function inventoryPath(): string {
+	return join(getCodexMultiAuthDir(), "model-discovery.json");
+}
+export async function loadModelInventory(): Promise<ModelInventory | null> {
+	try {
+		const file = await fs.open(inventoryPath(), "r");
+		try {
+			const buffer = Buffer.alloc(4 * 1024 * 1024 + 1);
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > 4 * 1024 * 1024) return null;
+			// Loaded entries are historical observations, not dispatch authority.
+			return schema.parse(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+		} finally {
+			await file.close();
+		}
+	} catch {
+		return null;
+	}
+}
+let inventoryWrites: Promise<void> = Promise.resolve();
+export function saveModelInventory(value: ModelInventory): Promise<void> {
+	const path = inventoryPath();
+	const pending = inventoryWrites.then(() =>
+		withFileTransactionLock(path, () => saveModelInventorySerial(value, path)),
+	);
+	inventoryWrites = pending.catch(() => undefined);
+	return pending.then(()=>{revalidateModelInventory(value);});
+}
+async function saveModelInventorySerial(
+	value: ModelInventory,
+	path: string,
+): Promise<void> {
+	const previous=await loadModelInventory();
+	await writeFileAtomic(path,()=>{
+	 const data=schema.parse(withInventoryChanges(revalidateModelInventory(value),previous));
+	 const serialized=JSON.stringify(data)+'\n';
+	 if(Buffer.byteLength(serialized)>4*1024*1024)throw Error('Model discovery status exceeds size limit');
+	 return serialized;
+	});
+}
+async function writeFileAtomic(path: string, serialized: string | (()=>string)): Promise<void> {
+	const temp = tempPathFor(path);
+	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const retry = { maxAttempts: 6, backoffMs: 25 };
+	try {
+		await fs.writeFile(temp, typeof serialized==='string'?serialized:serialized(), {
+			mode: 0o600,
+			flag: "wx",
+		});
+		await withRetry(() => {
+		 if(typeof serialized==='string')return fs.rename(temp,path);
+		 writeFileSync(temp,serialized(),{mode:0o600});renameSync(temp,path);
+		 return Promise.resolve();
+		}, retry);
+	} finally {
+		await withRetry(() => fs.unlink(temp), retry).catch((e) => {
+			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+		});
+	}
+}
+export function formatModelInventory(
+	inventory: ModelInventory | null,
+	now = Date.now(),
+): string[] {
+	if (!inventory) return [paint("Models: not checked; run codex-multi-auth check.", "warning")];
+	return [
+		paint("Model discovery (catalog access, not an inference probe):", "heading"),
+  ...inventoryHighlights(inventory),
+		...inventory.entries.flatMap((e) => [
+			`  ${paint(e.label, "heading")}${e.routable===true?" [routing eligible]":e.routable===false?" [discovery only]":""}${e.bound?" [stored binding]":""}${e.selected?" [preferred workspace]":""} [${e.kind.toUpperCase()}]: ${!e.enabled ? paint("disabled", "muted") : e.error ? paint("discovery failed", "danger") : paint(`${e.models.length} available`, "success")}; ${e.checkedAt ? new Date(e.checkedAt).toISOString() : "never checked"}${now - e.checkedAt > 60000 ? paint(" (stale; run check)", "warning") : ""}`,
+			`    ${paint("Available:", "muted")} ${e.models.join(", ") || "none"}`,
+			...(e.entitlements ?? []).map(
+				(m) =>
+					`    ${paint(m.model, "accent")}: speeds=${m.serviceTiers.map((t) => `${t.name} (${t.id})`).join(", ") || "not advertised"}; reasoning=${m.reasoningLevels.join(", ") || "not advertised"}; programs=${m.accessPrograms.join(", ") || "not advertised"}${
+						m.probes
+							? `; probes: ${Object.entries(m.probes)
+									.map(([k, v]) => `${k}=${paint(v, v === "verified" ? "success" : v === "unsupported" || v === "downgraded" ? "warning" : "muted")}`)
+									.join(", ")} (${new Date(m.checkedAt ?? 0).toISOString()})`
+							: ""
+					}`,
+			),
+			...(e.kind !== "oauth"
+				? [
+						`    ${paint("Visible:", "accent")} ${e.visibleModels.map((m) => `${e.kind}/${m}`).join(", ") || "none"}`,
+					]
+				: []),
+		]),
+	];
+}
+export async function refreshAndPrintModelInventory(
+	log: (message: string) => void,
+	deps: {
+		getBinding?: () => Promise<{
+			running: boolean;
+			state: {
+				nativeOpenai?: boolean;
+				baseUrl: string;
+				clientApiKey: string;
+			} | null;
+		}>;
+		fetchImpl?: typeof fetch;
+		loadInventory?: typeof loadModelInventory;
+		now?: () => number;
+		/** Only an explicit `check capabilities` bypasses the 15-minute probe cache. */
+		forceProbes?: boolean;
+	} = {},
+): Promise<boolean> {
+	try {
+		const load = deps.loadInventory ?? loadModelInventory;
+		const previous = await load();
+		const binding = await (deps.getBinding ?? getAppBindStatus)();
+		const clientVersion = await resolveCatalogClientVersion();
+		if (binding.running && binding.state?.nativeOpenai) {
+			const started = (deps.now ?? Date.now)();
+			const url = new URL(binding.state.baseUrl);
+			if (
+				url.protocol !== "http:" ||
+				!["127.0.0.1", "[::1]"].includes(url.hostname) ||
+				url.username ||
+				url.password ||
+				url.pathname !== "/" ||
+				url.search ||
+				url.hash
+			)
+				throw Error("Invalid local refresh address");
+			url.pathname = "/models";
+			url.searchParams.set("refresh_capabilities", "1");
+			if (deps.forceProbes) url.searchParams.set("force_probes", "1");
+			url.searchParams.set("client_version", clientVersion);
+   const clientApiKey = binding.state.clientApiKey;
+   const current = await withCheckProgress("Refreshing workspace catalogs and API/ZDR probes", async () => {
+			const response = await (deps.fetchImpl ?? fetch)(url, {
+				headers: { authorization: `Bearer ${clientApiKey}` },
+				redirect: "error",
+				signal: AbortSignal.timeout(60000),
+			});
+			if (!response.ok) {
+				await response.body?.cancel();
+				throw Error("Proxy refresh failed");
+			}
+			const body = await boundedJson(response);
+			if (!isRecord(body) || !Array.isArray(body.models))
+				throw Error("Invalid refreshed catalog");
+			const current = await load();
+			if (!current || current.checkedAt < started)
+				throw Error("Refreshed status unavailable");
+    return current;
+   }, log);
+			log(
+				"Running proxy model catalog refreshed. Desktop picks it up on its next response or scheduled catalog refresh.",
+			);
+			for (const line of formatModelInventory(withInventoryChanges(current,previous))) log(line);
+			return true;
+		}
+  const value = await withCheckProgress("Discovering workspace models and API/ZDR capabilities", async () => {
+        let apiConfigurationUnavailable = false;
+		const value = await discoverModelInventory(
+			await loadAccounts(),
+			await loadApiRoutes().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
+			{
+				clientVersion,
+				updateApiDiscovery: updateApiModelDiscovery,
+				forceProbes: deps.forceProbes === true,
+				persistProbes: true,
+			},
+		);
+        if(apiConfigurationUnavailable)value.apiConfigurationUnavailable=true;
+		await saveModelInventory(value);
+   return value;
+  }, log);
+		for (const line of formatModelInventory(withInventoryChanges(revalidateModelInventory(value),previous))) log(line);
+  return true;
+	} catch {
+		log(
+			"Model discovery failed; previous status may be stale. Check credentials and configuration.",
+		);
+  return false;
+	}
+}
+
+function entitlementFeatures(entry: NonNullable<ModelInventory["entries"][number]["entitlements"]>[number]): string[] {
+ return [...new Set([
+  ...entry.serviceTiers.map(t=>`speed ${t.id === "fast"?"priority":t.id}`),
+  ...entry.reasoningLevels.map(level=>`effort ${level}`),
+  ...entry.accessPrograms.map(program=>`program ${program}`),
+ ])].sort();
+}
+
+/** Compare stable credential/workspace scopes, keeping the last successful baseline through outages. */
+export function withInventoryChanges(current: ModelInventory, previous: ModelInventory | null): ModelInventory {
+ const prior = new Map(previous?.entries.filter(e=>e.id).map(e=>[e.id,e]));
+ const entries = current.apiConfigurationUnavailable
+  ? [...current.entries, ...(previous?.entries ?? []).filter(entry => entry.kind !== "oauth" && !current.entries.some(row => row.id === entry.id)).map(entry => ({...entry,error:true,routable:false,models:[],visibleModels:[]}))]
+  : current.entries;
+ return {...current, entries:entries.map(entry=>{
+  const old = entry.id ? prior.get(entry.id) : undefined;
+  const baseline = old?.lastSuccessful ?? (old?.enabled && !old.error ? {models:old.models,entitlements:old.entitlements} : undefined);
+  const recent = old?.changes && current.checkedAt-old.changes.observedAt < 24*60*60*1000 ? old.changes : undefined;
+  if(!entry.enabled || entry.error) return {...entry,lastSuccessful:baseline,changes:recent};
+  const lastSuccessful = {models:entry.models,entitlements:entry.entitlements};
+  if(!baseline) return {...entry,lastSuccessful,changes:undefined};
+  const added = entry.models.filter(m=>!baseline.models.includes(m)).sort();
+  const removed = baseline.models.filter(m=>!entry.models.includes(m)).sort();
+  const before = new Map(baseline.entitlements?.map(e=>[e.model,entitlementFeatures(e)]));
+  const capabilities = (entry.entitlements??[]).filter(e=>before.has(e.model) && JSON.stringify(before.get(e.model))!==JSON.stringify(entitlementFeatures(e))).map(e=>e.model).sort();
+  const changes = added.length || removed.length || capabilities.length ? {observedAt:current.checkedAt,added,removed,capabilities} : recent;
+  return {...entry,lastSuccessful,changes};
+ })};
+}
+
+function inventoryHighlights(inventory: ModelInventory): string[] {
+ const lines:string[] = [];
+ for(const entry of inventory.entries) {
+  const change=entry.changes;
+  if(!change) continue;
+  const stamp=new Date(change.observedAt).toISOString();
+  if(change.added.length) lines.push(paint(`  NEW on ${entry.label} (${stamp}): ${change.added.join(", ")}`, "success"));
+  if(change.removed.length) lines.push(paint(`  No longer advertised on ${entry.label} (${stamp}): ${change.removed.join(", ")}`, "warning"));
+  if(change.capabilities.length) lines.push(paint(`  CHANGED capabilities on ${entry.label} (${stamp}): ${change.capabilities.join(", ")}`, "accent"));
+ }
+ for(const kind of ["oauth","api","zdr"] as const) {
+  const enabled=inventory.entries.filter(e=>e.kind===kind && e.enabled);
+  const successful=enabled.filter(e=>!e.error);
+  if(enabled.length<2) continue;
+  const incomplete=enabled.length!==successful.length;
+  if(incomplete) lines.push(paint(`  ${kind.toUpperCase()} coverage incomplete; failed scopes have unknown access.`, "warning"));
+  const models=[...new Set(successful.flatMap(e=>e.models))].sort();
+  for(const model of models) {
+   const providers=successful.filter(e=>e.models.includes(model));
+   if(providers.length<enabled.length) lines.push(`  ${!incomplete && providers.length===1?"Only on":"Observed on"} ${providers.map(e=>e.label).join(", ")}: ${model}`);
+   const entitlements=providers.map(e=>({label:e.label,features:e.entitlements?.find(m=>m.model===model)}));
+   const features=[...new Set(entitlements.flatMap(e=>e.features?entitlementFeatures(e.features):[]))].sort();
+   for(const feature of features) {
+    const advertising=entitlements.filter(e=>e.features && entitlementFeatures(e.features).includes(feature));
+    if(advertising.length<providers.length) lines.push(`  ${model} ${feature}: ${advertising.map(e=>e.label).join(", ")} (not advertised by other scopes)`);
+   }
+  }
+ }
+ if(!lines.length) return [];
+ const maximum=40;
+ return [paint("Highlights (catalog observations; recent changes retained for 24h):", "heading"),...lines.slice(0,maximum),...(lines.length>maximum?[`  ${lines.length-maximum} more differences; see per-scope details below.`]:[])];
+}

@@ -5,7 +5,10 @@
  */
 
 import type { Auth, CodexClient } from "@codex-ai/sdk";
-import { queuedRefresh } from "../refresh-queue.js";
+import { captureRefreshCredentialAuthority, PendingAuthAdmissionError, PendingAuthSettlementError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { getStoragePath } from "../storage.js";
+import type { AccountManager, ManagedAccount } from "../accounts.js";
+import { getRefreshQueue, queuedRefresh } from "../refresh-queue.js";
 import type { TokenResult } from "../types.js";
 import { CodexAuthError } from "../errors.js";
 import { HTTP_STATUS, ERROR_MESSAGES } from "../constants.js";
@@ -30,8 +33,9 @@ interface CodexAuthSetter {
  * @param auth - Current authentication state
  * @returns True if token is expired or invalid
  */
-export function shouldRefreshToken(auth: Auth, skewMs = 0): boolean {
+export function shouldRefreshToken(auth: Auth, skewMs = 0, storagePath = getStoragePath()): boolean {
 	if (auth.type !== "oauth") return true;
+	if (getRefreshQueue().isRefreshing(auth.refresh, storagePath)) return true;
 	if (!auth.access) return true;
 
 	const safeSkewMs = Math.max(0, Math.floor(skewMs));
@@ -59,35 +63,6 @@ function isRetryableRefreshFailure(
 	}
 }
 
-function isRetryableAuthSetterError(error: unknown): boolean {
-	if (!error || typeof error !== "object") {
-		return false;
-	}
-
-	const candidate = error as {
-		code?: unknown;
-		status?: unknown;
-		cause?: unknown;
-	};
-	const code =
-		typeof candidate.code === "string"
-			? candidate.code.toUpperCase()
-			: undefined;
-	if (code === "EAGAIN" || code === "EBUSY" || code === "EPERM") {
-		return true;
-	}
-
-	if (candidate.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
-		return true;
-	}
-
-	if (candidate.cause && candidate.cause !== error) {
-		return isRetryableAuthSetterError(candidate.cause);
-	}
-
-	return false;
-}
-
 /**
  * Refreshes the OAuth token and updates stored credentials
  *
@@ -107,6 +82,7 @@ function isRetryableAuthSetterError(error: unknown): boolean {
 export async function refreshAndUpdateToken(
 	currentAuth: Auth,
 	client: CodexClient,
+	source?: {accountManager: AccountManager; account: ManagedAccount},
 ): Promise<Auth> {
 	const authSetter = (client as Partial<CodexAuthSetter>).auth;
 	if (!authSetter || typeof authSetter.set !== "function") {
@@ -116,34 +92,50 @@ export async function refreshAndUpdateToken(
 	}
 
 	const refreshToken = currentAuth.type === "oauth" ? currentAuth.refresh : "";
-	const refreshResult = await queuedRefresh(refreshToken);
-
-	if (refreshResult.type === "failed") {
-		throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
-			retryable: isRetryableRefreshFailure(refreshResult),
-			context: {
-				refreshFailureReason: refreshResult.reason,
-				statusCode: refreshResult.statusCode,
-			},
-		});
-	}
-
+	const storagePath = source?.accountManager.resolveSelectionStoragePath() ?? getStoragePath();
+	const sourceCurrent = () => !source || source.accountManager.getAccountByIndex(source.account.index) === source.account &&
+		source.accountManager.resolveSelectionStoragePath() === storagePath;
+	const submittedAuth = currentAuth.type === "oauth" ? {access: currentAuth.access, refresh: currentAuth.refresh, expires: currentAuth.expires} : null;
+	const authCurrent = source && submittedAuth
+		? (result?: Extract<TokenResult, {type: "success"}>) => sourceCurrent() && currentAuth.type === "oauth" &&
+			([submittedAuth, result].some(expected => expected && currentAuth.access === expected.access && currentAuth.refresh === expected.refresh && currentAuth.expires === expected.expires))
+		: currentAuth.type === "oauth" ? captureRefreshCredentialAuthority(currentAuth, sourceCurrent, undefined, storagePath) : () => true;
+	const accountCurrent = source ? captureRefreshCredentialAuthority(source.account, sourceCurrent, undefined, storagePath) : () => true;
+	const publish = async () => {
+		const result = await queuedRefresh(refreshToken, storagePath);
+		if (!authCurrent(result.type === "success" ? result : undefined) || !accountCurrent(result.type === "success" ? result : undefined)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed before publication"), {code: "ESTALE"}));
+		if (result.type === "failed") {
+			throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
+				retryable: isRetryableRefreshFailure(result),
+				context: {refreshFailureReason: result.reason, statusCode: result.statusCode},
+			});
+		}
+		try {
+			await authSetter.set({
+				path: {id: "openai"},
+				body: {type: "oauth", access: result.access, refresh: result.refresh, expires: result.expires, multiAccount: true},
+			});
+		} catch (error) {
+			throw new PendingAuthSettlementError(result, error, () => authCurrent(result) && accountCurrent(result), undefined, "journal");
+		}
+		if (!authCurrent(result) || !accountCurrent(result)) throw new PendingAuthAdmissionError(Object.assign(Error("Account authority changed during publication"), {code: "ESTALE"}));
+		return result;
+	};
+	const retainAuth = () => currentAuth.type === "oauth"
+		? withRefreshCredentialRetention(currentAuth, publish, sourceCurrent, undefined, storagePath)
+		: publish();
+	let refreshResult: Extract<TokenResult, {type: "success"}>;
 	try {
-		await authSetter.set({
-			path: { id: "openai" },
-			body: {
-				type: "oauth",
-				access: refreshResult.access,
-				refresh: refreshResult.refresh,
-				expires: refreshResult.expires,
-				multiAccount: true,
-			},
-		});
+		refreshResult = source
+			? await withRefreshCredentialRetention(source.account, publish, sourceCurrent, undefined, storagePath)
+			: await retainAuth();
 	} catch (error) {
-		throw new CodexAuthError(ERROR_MESSAGES.TOKEN_REFRESH_FAILED, {
-			retryable: isRetryableAuthSetterError(error),
-			cause: error,
-		});
+		if (source && currentAuth.type === "oauth" && error instanceof PendingAuthSettlementError) {
+			let retain = false;
+			try { retain = authCurrent(error.result) && accountCurrent(error.result); } catch { retain = false; }
+			if (retain) Object.assign(currentAuth, {access: error.result.access, refresh: error.result.refresh, expires: error.result.expires});
+		}
+		throw error;
 	}
 
 	// Update current auth reference if it's OAuth type

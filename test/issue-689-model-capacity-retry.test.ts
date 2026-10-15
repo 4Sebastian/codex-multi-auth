@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { AnyAccountStorageSchema } from "../lib/schemas.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,7 @@ import {
 	startRuntimeRotationProxy,
 	type RuntimeRotationProxyServer,
 } from "../lib/runtime-rotation-proxy.js";
-import { setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
+import { getStoragePath, setStoragePathDirect, type AccountStorageV3 } from "../lib/storage.js";
 
 const { saveAccountsMock, withAccountStorageTransactionMock } = vi.hoisted(
 	() => ({
@@ -65,10 +66,10 @@ const CAPACITY_BODY = JSON.stringify({
 	},
 });
 
-function capacityResponse(status: number): Response {
+function capacityResponse(status: number, retryAfter?: string): Response {
 	return new Response(CAPACITY_BODY, {
 		status,
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...(retryAfter ? {"retry-after-ms": retryAfter} : {}) },
 	});
 }
 
@@ -117,7 +118,7 @@ beforeEach(() => {
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockReset();
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
-		handler(null, async () => undefined),
+		handler(AnyAccountStorageSchema.parse(JSON.parse(readFileSync(getStoragePath(), "utf8"))), async () => undefined),
 	);
 	delete process.env.CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS;
 });
@@ -252,7 +253,6 @@ describe("runtime proxy waits out a model-capacity response", () => {
 			});
 			openServers.push(proxy);
 
-			const refundSpy = vi.spyOn(accountManager, "refundToken");
 			const response = await postResponses(proxy);
 
 			expect(response.status).toBe(200);
@@ -270,14 +270,17 @@ describe("runtime proxy waits out a model-capacity response", () => {
 			const account = accountManager.getAccountByIndex(0);
 			expect(account?.rateLimitResetTimes ?? {}).toEqual({});
 			expect(account?.coolingDownUntil).toBeUndefined();
-			// ...and the pool token the attempt debited must come back, or a
-			// sustained capacity event drains healthy accounts until later
-			// requests are refused admission with `token-exhausted`.
-			expect(refundSpy).toHaveBeenCalled();
+			// Capacity retries must not exhaust subsequent admission. The old
+			// refundable RPM bucket is gone; exercise the actual admission result.
+			for (const candidate of accountManager.getAccountsSnapshot()) {
+				for (let i = 0; i < 121; i++) {
+					expect(accountManager.consumeToken(candidate, "codex", "gpt-5.4")).toBe(true);
+				}
+			}
 		},
 	);
 
-	it("refunds the pool token for every capacity retry, not just the first", async () => {
+	it("preserves admission after repeated capacity retries without imposing an RPM cap", async () => {
 		const path = storagePath();
 		const storage = createStorage(2);
 		writeFileSync(path, JSON.stringify(storage), "utf8");
@@ -285,11 +288,10 @@ describe("runtime proxy waits out a model-capacity response", () => {
 
 		const accountManager = new AccountManager(undefined, storage);
 		const { fetchImpl, calls } = scriptedFetch([
-			() => capacityResponse(429),
-			() => capacityResponse(503),
+			() => capacityResponse(429, "1"),
+			() => capacityResponse(503, "1"),
 			() => streamResponse(),
 		]);
-		const refundSpy = vi.spyOn(accountManager, "refundToken");
 
 		const proxy = await startRuntimeRotationProxy({
 			accountManager,
@@ -301,10 +303,13 @@ describe("runtime proxy waits out a model-capacity response", () => {
 		openServers.push(proxy);
 
 		const response = await postResponses(proxy);
-
 		expect(response.status).toBe(200);
 		expect(calls()).toBe(3);
-		expect(refundSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+		for (const account of accountManager.getAccountsSnapshot()) {
+			for (let i = 0; i < 121; i++) {
+				expect(accountManager.consumeToken(account, "codex", "gpt-5.4")).toBe(true);
+			}
+		}
 	});
 
 	it("stops waiting when the client disconnects mid-wait", async () => {

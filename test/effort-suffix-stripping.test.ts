@@ -103,7 +103,7 @@ describe("the four call sites agree on one key per model", () => {
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			}),
-		).toBe("gpt-5.6-sol");
+		).toBe("gpt-6-sol");
 		expect(
 			resolveUnsupportedCodexFallbackModel({
 				requestedModel: "gpt-5.6-sol-ultra",
@@ -111,7 +111,7 @@ describe("the four call sites agree on one key per model", () => {
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			}),
-		).toBe("gpt-5.5");
+		).toBe("gpt-6-luna");
 	});
 
 	it("the fallback chain keeps Codex Max on its own row", () => {
@@ -121,8 +121,9 @@ describe("the four call sites agree on one key per model", () => {
 					"model is not supported when using codex with a chatgpt account",
 			},
 		};
-		// `codex-max` has its own chain row. Stripping its `-max` would look up
-		// `codex`, which has no row, and the fallback would vanish.
+		// `codex-max` has its own chain row (one hop to its replacement).
+		// Stripping its `-max` would look up `codex`, which has no row, and the
+		// fallback would vanish.
 		expect(
 			resolveUnsupportedCodexFallbackModel({
 				requestedModel: "codex-max",
@@ -130,7 +131,7 @@ describe("the four call sites agree on one key per model", () => {
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			}),
-		).toBe("gpt-5.3-codex");
+		).toBe("gpt-5.6-sol");
 	});
 
 	it("a config chain override keyed with an effort suffix still applies", () => {

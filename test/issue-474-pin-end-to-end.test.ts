@@ -329,13 +329,14 @@ describe("issue #474 — end-to-end pin honored over real HTTP proxy", () => {
 			expect(pinned).not.toBeNull();
 			if (!pinned) throw new Error("setup failed");
 			// Match the family the proxy will resolve from `model: "gpt-5-codex"`.
-			// `getModelFamily("gpt-5-codex")` returns "gpt-5-codex", not "codex",
-			// so the rate-limit must be keyed under that family for the runtime
-			// skip-reason check to detect it.
+			// That id is retired and runs on gpt-5.6-sol, so
+			// `getModelFamily("gpt-5-codex")` returns "gpt-5.2", not "codex" or
+			// "gpt-5-codex"; the rate-limit must be keyed under that family for the
+			// runtime skip-reason check to detect it.
 			accountManager.markRateLimitedWithReason(
 				pinned,
 				60_000,
-				"gpt-5-codex",
+				"gpt-5.2",
 				"quota",
 			);
 

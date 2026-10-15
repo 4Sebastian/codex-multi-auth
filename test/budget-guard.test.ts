@@ -79,6 +79,42 @@ describe("budget guard", () => {
 		expect(blocked.reasons.length).toBe(3);
 	});
 
+	it("re-applies update mutations over the freshest store", async () => {
+		const {
+			loadBudgetGuardStore,
+			updateBudgetGuardStore,
+			upsertBudgetLimit,
+		} = await import("../lib/budget-guard.js");
+		// Two sequential mutations through the update path behave like two
+		// processes serialized by the lockfile: each applies on the latest
+		// committed store, so the second cannot lose the first's key.
+		await updateBudgetGuardStore((store) => ({
+			result: upsertBudgetLimit(store, { key: "a", window: "day", maxRequests: 5 }, 1),
+			dirty: true,
+		}));
+		await updateBudgetGuardStore((store) => ({
+			result: upsertBudgetLimit(store, { key: "b", window: "week", maxTokens: 9 }, 2),
+			dirty: true,
+		}));
+		const loaded = await loadBudgetGuardStore();
+		expect(loaded.limits.a).toMatchObject({ maxRequests: 5 });
+		expect(loaded.limits.b).toMatchObject({ maxTokens: 9 });
+	});
+
+	it("skips the write when a budget mutation reports no change", async () => {
+		const { getBudgetGuardPath, updateBudgetGuardStore } = await import(
+			"../lib/budget-guard.js"
+		);
+		const result = await updateBudgetGuardStore(() => ({
+			result: null,
+			dirty: false,
+		}));
+		expect(result).toBeNull();
+		await expect(fs.stat(getBudgetGuardPath())).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+
 	it("refuses a cost budget it cannot evaluate", async () => {
 		// Unpriced models used to contribute $0, so a cost cap simply never
 		// tripped for them — `maxCostUsd` was unenforceable for every `pro` tier.
@@ -139,6 +175,130 @@ describe("budget guard", () => {
 		expect(new Date(getBudgetWindowStart("month", now)).toISOString()).toBe(
 			"2026-04-01T00:00:00.000Z",
 		);
+	});
+
+	it("survives a backward clock jump between writes (hybrid updatedAt floor)", async () => {
+		const {
+			loadBudgetGuardStore,
+			saveBudgetGuardStore,
+			upsertBudgetLimit,
+		} = await import("../lib/budget-guard.js");
+
+		// First write lands at wall time T2.
+		const first = await loadBudgetGuardStore();
+		upsertBudgetLimit(
+			first,
+			{ key: "proj", window: "day", maxRequests: 1, maxTokens: 1, maxCostUsd: 1 },
+			5_000,
+		);
+		await saveBudgetGuardStore(first);
+
+		// Clock regresses to T1 < T2; the reloaded store carries the T2 stamp,
+		// so the upsert clamps forward instead of losing the merge.
+		const reloaded = await loadBudgetGuardStore();
+		const mutated = upsertBudgetLimit(
+			reloaded,
+			{ key: "proj", window: "day", maxRequests: 9, maxTokens: 1, maxCostUsd: 1 },
+			100,
+		);
+		expect(mutated.updatedAt).toBe(5_001);
+		await saveBudgetGuardStore(reloaded);
+
+		const final = await loadBudgetGuardStore();
+		expect(final.limits.proj?.maxRequests).toBe(9);
+		expect(final.limits.proj?.updatedAt).toBe(5_001);
+	});
+
+	it("does not lose a deliberate edit that races a concurrent write under clock skew", async () => {
+		const {
+			loadBudgetGuardStore,
+			saveBudgetGuardStore,
+			upsertBudgetLimit,
+		} = await import("../lib/budget-guard.js");
+
+		// Seed the key at wall time T2.
+		const seed = await loadBudgetGuardStore();
+		upsertBudgetLimit(
+			seed,
+			{ key: "proj", window: "day", maxRequests: 1 },
+			5_000,
+		);
+		await saveBudgetGuardStore(seed);
+
+		// This writer loads its snapshot BEFORE the concurrent write lands.
+		const working = await loadBudgetGuardStore();
+		const baseline = structuredClone(working);
+
+		// A concurrent writer lands a newer entry first.
+		const raced = await loadBudgetGuardStore();
+		upsertBudgetLimit(
+			raced,
+			{ key: "proj", window: "day", maxRequests: 5 },
+			7_000,
+		);
+		await saveBudgetGuardStore(raced);
+
+		// The clock regressed to T1 << T2: the snapshot floor stamps 5_001,
+		// below the raced on-disk 7_000 — without a merge-time floor over the
+		// fresh disk entry this deliberate edit is silently dropped.
+		const mutated = upsertBudgetLimit(
+			working,
+			{ key: "proj", window: "day", maxRequests: 42 },
+			100,
+		);
+		expect(mutated.updatedAt).toBe(5_001);
+		await saveBudgetGuardStore(working, baseline);
+
+		const final = await loadBudgetGuardStore();
+		expect(final.limits.proj?.maxRequests).toBe(42);
+		expect(final.limits.proj?.updatedAt).toBe(7_001);
+	});
+
+	it("leaves a raced newer limit alone when the caller only carried it", async () => {
+		const {
+			loadBudgetGuardStore,
+			saveBudgetGuardStore,
+			upsertBudgetLimit,
+		} = await import("../lib/budget-guard.js");
+
+		const seed = await loadBudgetGuardStore();
+		upsertBudgetLimit(
+			seed,
+			{ key: "edited", window: "day", maxRequests: 1 },
+			5_000,
+		);
+		upsertBudgetLimit(
+			seed,
+			{ key: "carried", window: "day", maxRequests: 1 },
+			5_000,
+		);
+		await saveBudgetGuardStore(seed);
+
+		const working = await loadBudgetGuardStore();
+		const baseline = structuredClone(working);
+
+		// A concurrent writer moves ONLY the carried key to a newer entry.
+		const raced = await loadBudgetGuardStore();
+		upsertBudgetLimit(
+			raced,
+			{ key: "carried", window: "day", maxRequests: 9 },
+			9_000,
+		);
+		await saveBudgetGuardStore(raced);
+
+		// The caller edits only the other key; the carried snapshot copy must
+		// not be re-stamped over the raced write.
+		upsertBudgetLimit(
+			working,
+			{ key: "edited", window: "day", maxRequests: 3 },
+			100,
+		);
+		await saveBudgetGuardStore(working, baseline);
+
+		const final = await loadBudgetGuardStore();
+		expect(final.limits.edited?.maxRequests).toBe(3);
+		expect(final.limits.carried?.maxRequests).toBe(9);
+		expect(final.limits.carried?.updatedAt).toBe(9_000);
 	});
 });
 

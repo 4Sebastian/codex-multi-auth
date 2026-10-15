@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CircuitBreaker,
+  type CircuitAdmissionReceipt,
   CircuitOpenError,
   DEFAULT_CIRCUIT_BREAKER_CONFIG,
   getCircuitBreaker,
@@ -83,8 +84,10 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
 
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordSuccess();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordSuccess(admission);
     expect(breaker.getState()).toBe("closed");
     expect(breaker.canExecute()).toBe(true);
   });
@@ -96,9 +99,31 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
 
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordFailure();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordFailure(admission);
     expect(breaker.getState()).toBe("open");
+  });
+
+  it.each(["success", "failure"])("ignores stale %s receipts without settling a replacement half-open probe", outcome => {
+    const breaker = new CircuitBreaker({failureThreshold: 1});
+    let a: CircuitAdmissionReceipt | undefined, b: CircuitAdmissionReceipt | undefined;
+    breaker.recordFailure();
+    vi.setSystemTime(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1);
+    expect(breaker.tryCanExecute(receipt => {a = receipt;})).toEqual({ok: true});
+    vi.setSystemTime(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs * 2 + 2);
+    expect(breaker.tryCanExecute(receipt => {b = receipt;})).toEqual({ok: true});
+    expect(a).toBeDefined(); expect(b).toBeDefined();
+    if (!a || !b) throw new Error("Expected admitted probes");
+    if (outcome === "success") breaker.recordSuccess(a); else breaker.recordFailure(a);
+    expect(breaker.getState()).toBe("half-open");
+    expect(breaker.isAdmissionCurrent(b)).toBe(true);
+    expect(breaker.tryCanExecute().ok).toBe(false);
+    breaker.recordSuccess(b);
+    expect(breaker.getState()).toBe("closed");
+    breaker.recordFailure(b);
+    expect(breaker.getFailureCount()).toBe(0);
   });
 
   it("reset returns to closed and clears failures", () => {
@@ -137,8 +162,10 @@ describe("Circuit breaker", () => {
     breaker.recordFailure();
     breaker.recordFailure();
     vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
-    breaker.canExecute();
-    breaker.recordFailure();
+    let admission: CircuitAdmissionReceipt | undefined;
+    breaker.tryCanExecute(receipt => {admission = receipt;});
+    if (!admission) throw Error("Missing fixture probe");
+    breaker.recordFailure(admission);
     expect(() => breaker.canExecute()).toThrow(CircuitOpenError);
   });
 
@@ -302,5 +329,90 @@ describe("Circuit breaker", () => {
     expect(breaker.isAvailable()).toBe(true);
     expect(breaker.getTimeUntilAvailable()).toBe(0);
     expect(breaker.canExecute()).toBe(true);
+  });
+
+  describe("tryCanExecute", () => {
+    it("returns ok when closed", () => {
+      const breaker = new CircuitBreaker();
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+    });
+
+    it("rejects without throwing while open and reports retryAfterMs", () => {
+      const breaker = new CircuitBreaker();
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      vi.setSystemTime(new Date(10000));
+      const result = breaker.tryCanExecute();
+      expect(result.ok).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        reason: "open",
+        retryAfterMs: DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs - 10000,
+      });
+      // The throwing twin agrees on the gate that rejected.
+      expect(() => breaker.canExecute()).toThrow(CircuitOpenError);
+    });
+
+    it("rejects with half-open reason once the probe slot is consumed", () => {
+      const breaker = new CircuitBreaker();
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+      expect(breaker.getState()).toBe("half-open");
+
+      const second = breaker.tryCanExecute();
+      expect(second.ok).toBe(false);
+      if (!second.ok) {
+        expect(second.reason).toBe("half-open");
+        expect(second.retryAfterMs).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it("consumes the same half-open probe slot as canExecute", () => {
+      const breaker = new CircuitBreaker();
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
+      // Admission via the non-throwing path uses up the single probe attempt.
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+      expect(() => breaker.canExecute()).toThrow(CircuitOpenError);
+    });
+
+    it("admits a new half-open probe after the exhausted wait window", () => {
+      const breaker = new CircuitBreaker();
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+
+      vi.advanceTimersByTime(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs);
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+    });
+
+    it("keeps canExecute's throwing contract and messages when delegating", () => {
+      const breaker = new CircuitBreaker();
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      // Open rejection: default CircuitOpenError message.
+      vi.setSystemTime(new Date(5000));
+      expect(() => breaker.canExecute()).toThrow("Circuit is open");
+
+      // Half-open rejection after the probe slot is consumed keeps its
+      // distinct message.
+      vi.setSystemTime(new Date(DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1));
+      expect(breaker.tryCanExecute()).toEqual({ ok: true });
+      expect(() => breaker.canExecute()).toThrow("Circuit is half-open");
+    });
   });
 });

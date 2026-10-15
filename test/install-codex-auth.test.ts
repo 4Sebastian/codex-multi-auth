@@ -54,13 +54,31 @@ function decodeWindowsEncodedCommand(commandArgs: string): string {
 }
 
 describe("install-codex-auth script", () => {
-  it("uses lowercase config template filenames", () => {
-    const content = readFileSync(scriptPath, "utf8");
-    expect(content).toContain('"codex-legacy.json"');
-    expect(content).toContain('"codex-modern.json"');
-    expect(content).not.toContain('"Codex-legacy.json"');
-    expect(content).not.toContain('"Codex-modern.json"');
-  });
+	it.each(["modern", "legacy"])("installs the %s template into an empty fixture home", mode => {
+		const home = mkdtempSync(path.join(tmpdir(), "codex-install-template-"));
+		tempRoots.push(home);
+		const env = {
+			...process.env,
+			HOME: home,
+			USERPROFILE: home,
+			CODEX_HOME: path.join(home, ".codex"),
+			APPDATA: path.join(home, "roaming"),
+			LOCALAPPDATA: path.join(home, "local"),
+			CI: "1",
+			CODEX_MULTI_AUTH_APP_BIND_INSTALL: "0",
+			CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL: "0",
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+		};
+		const result = spawnSync(process.execPath, [scriptPath, `--${mode}`, "--no-cache-clear"], {
+			env, encoding: "utf8", timeout: 10000, windowsHide: true,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).toBe("");
+		const {configPath} = resolveInstallPaths(process.platform, env, home);
+		const installed = JSON.parse(readFileSync(configPath, "utf8"));
+		const template = JSON.parse(readFileSync(`config/codex-${mode}.json`, "utf8"));
+		expect(installed).toEqual({...template, plugin: ["codex-multi-auth"]});
+	});
 
 	it("normalizes plugin list with empty, duplicate, and non-string entries", () => {
 		expect(normalizePluginList(undefined)).toEqual(["codex-multi-auth"]);
@@ -121,8 +139,7 @@ describe("install-codex-auth script", () => {
 			APPDATA: appData,
 			LOCALAPPDATA: localAppData,
 		};
-		const configDir = path.join(appData, "Codex");
-		const configPath = path.join(configDir, "Codex.json");
+		const { configDir, configPath } = resolveInstallPaths(process.platform, env, home);
 		const initialConfig = JSON.stringify({ plugin: ["existing-plugin"] }, null, 2);
 
 		mkdirSync(configDir, { recursive: true });
@@ -162,8 +179,7 @@ describe("install-codex-auth script", () => {
 			APPDATA: appData,
 			LOCALAPPDATA: localAppData,
 		};
-		const configDir = path.join(appData, "Codex");
-		const configPath = path.join(configDir, "Codex.json");
+		const { configDir, configPath } = resolveInstallPaths(process.platform, env, home);
 		// An already-initialized config from before the GPT-5.6 tiers shipped: it
 		// has a user-customized known model and a bespoke custom model, but no 5.6.
 		const initialConfig = {
@@ -324,7 +340,7 @@ describe("codex app launcher installer", () => {
 		expect(plan.commandArgs).toContain("-EncodedCommand ");
 		const decodedCommand = decodeWindowsEncodedCommand(plan.commandArgs);
 		expect(decodedCommand).toContain(process.execPath);
-		expect(decodedCommand).toContain("scripts\\codex.js");
+		expect(decodedCommand).toContain(path.join("scripts", "codex.js"));
 		expect(decodedCommand).toContain(" app");
 
 		const psScript = createWindowsShortcutPowerShellScript(plan);
@@ -489,13 +505,25 @@ describe("thin postinstall notice", () => {
 		expect(runPostinstall({ env: {}, isTty: true, log })).toBe(0);
 	});
 
-	it("performs no detection, no dist imports, and no filesystem mutation", () => {
-		const content = readFileSync("scripts/postinstall.js", "utf8");
-
-		expect(content).toContain("process.exitCode = runPostinstall()");
-		expect(content).not.toContain("dist/lib");
-		expect(content).not.toContain("codex-app-launcher");
-		expect(content).not.toContain("bindCodexAppRuntimeRotation");
-		expect(content).not.toContain("node:fs");
+	it.each(["1", "false"])("runs the postinstall entrypoint without modifying fixture state (CI=%s)", ci => {
+		const home = mkdtempSync(path.join(tmpdir(), "codex-postinstall-"));
+		tempRoots.push(home);
+		const codexHome = path.join(home, ".codex");
+		mkdirSync(codexHome);
+		writeFileSync(path.join(codexHome, "config.toml"), "fixture = true\n");
+		const before = readdirSync(home, {recursive: true}).sort();
+		const result = spawnSync(process.execPath, ["scripts/postinstall.js"], {
+			env: {...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: codexHome,
+				APPDATA: path.join(home, "roaming"), LOCALAPPDATA: path.join(home, "local"),
+				XDG_DATA_HOME: path.join(home, "data"), CI: ci,
+				CODEX_MULTI_AUTH_APP_BIND_INSTALL: "0", CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL: "0",
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0"},
+			encoding: "utf8", timeout: 10000, windowsHide: true,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toBe("");
+		expect(readdirSync(home, {recursive: true}).sort()).toEqual(before);
+		expect(readFileSync(path.join(codexHome, "config.toml"), "utf8")).toBe("fixture = true\n");
 	});
 });

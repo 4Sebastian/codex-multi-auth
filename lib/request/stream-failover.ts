@@ -9,9 +9,25 @@ export interface StreamFailoverOptions {
 }
 
 const DEFAULT_MAX_FAILOVERS = 1;
+// Generous hard bound for the library API: the runtime path already clamps to
+// MAX_STREAM_FAILOVERS via capStreamFailoverMax, but a direct caller passing a
+// non-finite or huge value must not produce unbounded fallback churn.
+const MAX_FAILOVERS_HARD_BOUND = 32;
+
+function normalizeMaxFailovers(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value)) {
+		return DEFAULT_MAX_FAILOVERS;
+	}
+	return Math.max(0, Math.min(MAX_FAILOVERS_HARD_BOUND, Math.floor(value)));
+}
 const DEFAULT_STALL_TIMEOUT_MS = 45_000;
 const DEFAULT_SOFT_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_INSTANCE_ID_LENGTH = 64;
+// Node clamps setTimeout delays above 2^31-1 (~24.8 days) to ~1ms, so an
+// oversized-but-finite timeout would otherwise fire the stall window almost
+// immediately and churn fallovers. Cap effective delays at the supported
+// maximum.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 class StallTimeoutError extends Error {
 	readonly isStallTimeout = true;
@@ -105,14 +121,15 @@ async function readChunkWithSoftHardTimeout(
 }
 
 /**
- * Wraps an SSE-like streaming Response so the stream can switch to fallback sources on stalls or errors to keep the client session alive.
+ * Monitors an SSE-like Response and permits fallback only after an explicit HTTP rejection.
  *
  * The returned Response streams bytes from the initialResponse body and, when the stream stalls or errors, will attempt up to `maxFailovers` failovers by calling `getFallbackResponse(attempt, emittedBytes)`. On each successful failover a textual marker is injected into the stream identifying the failover attempt (and `requestInstanceId` when provided). The function performs best-effort cleanup of underlying readers and enforces soft/hard read timeouts as configured via `options`.
  *
 	 * Concurrency assumptions: the implementation expects a single consumer reading the returned Response body; callers must not concurrently read the same stream body from multiple consumers. Filesystem/platform note: behavior is platform-agnostic; no filesystem access is performed (Windows-specific filesystem semantics do not apply). Token redaction: any request identifiers embedded in the injected marker are limited to the normalized `requestInstanceId` (trimmed and truncated to 64 chars) to avoid leaking long tokens.
 	 *
 	 * Failover safety: once the wrapper has already emitted bytes from the primary stream,
-	 * it will stop attempting fallback replays. Reissuing the upstream request after partial
+	 * it will stop attempting fallback replays. An accepted response also cannot be replayed before output.
+	 * Reissuing the upstream request after partial
 	 * output can duplicate streamed text and any side-effectful tool activity.
  *
  * @param initialResponse - The original Response whose body will be streamed and monitored for stalls/errors.
@@ -125,15 +142,27 @@ export function withStreamingFailover(
 	getFallbackResponse: (attempt: number, emittedBytes: number) => Promise<Response | null>,
 	options: StreamFailoverOptions = {},
 ): Response {
-	const maxFailovers = Math.max(0, Math.floor(options.maxFailovers ?? DEFAULT_MAX_FAILOVERS));
-	const defaultHardTimeoutMs = options.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
-	const softTimeoutMs = Math.max(
-		1_000,
-		Math.floor(options.softTimeoutMs ?? Math.min(defaultHardTimeoutMs, DEFAULT_SOFT_TIMEOUT_MS)),
+	const maxFailovers = normalizeMaxFailovers(options.maxFailovers);
+	const stallTimeoutOption =
+		options.stallTimeoutMs !== undefined && Number.isFinite(options.stallTimeoutMs)
+			? options.stallTimeoutMs
+			: DEFAULT_STALL_TIMEOUT_MS;
+	const defaultHardTimeoutMs = stallTimeoutOption;
+	const softTimeoutOption =
+		options.softTimeoutMs !== undefined && Number.isFinite(options.softTimeoutMs)
+			? options.softTimeoutMs
+			: Math.min(defaultHardTimeoutMs, DEFAULT_SOFT_TIMEOUT_MS);
+	const softTimeoutMs = Math.min(
+		MAX_TIMER_DELAY_MS,
+		Math.max(1_000, Math.floor(softTimeoutOption)),
 	);
-	const hardTimeoutMs = Math.max(
-		softTimeoutMs,
-		Math.floor(options.hardTimeoutMs ?? defaultHardTimeoutMs),
+	const hardTimeoutOption =
+		options.hardTimeoutMs !== undefined && Number.isFinite(options.hardTimeoutMs)
+			? options.hardTimeoutMs
+			: defaultHardTimeoutMs;
+	const hardTimeoutMs = Math.min(
+		MAX_TIMER_DELAY_MS,
+		Math.max(softTimeoutMs, Math.floor(hardTimeoutOption)),
 	);
 	const requestInstanceId = normalizeRequestInstanceId(options.requestInstanceId);
 	const headers = ensureContentType(initialResponse.headers);
@@ -174,7 +203,8 @@ export function withStreamingFailover(
 	};
 	const body = new ReadableStream<Uint8Array>({
 		start(controller) {
-			let currentReader = initialResponse.body?.getReader() ?? null;
+			let currentResponse = initialResponse;
+			let currentReader = currentResponse.body?.getReader() ?? null;
 			let failoverAttempt = 0;
 			let emittedBytes = 0;
 
@@ -195,6 +225,7 @@ export function withStreamingFailover(
 			releaseCurrentReaderForCancel = releaseCurrentReader;
 
 			const tryFailover = async (): Promise<boolean> => {
+				if (![401, 403, 429].includes(currentResponse.status)) return false;
 				if (failoverAttempt >= maxFailovers) {
 					return false;
 				}
@@ -212,6 +243,7 @@ export function withStreamingFailover(
 					: `: codex-multi-auth failover ${failoverAttempt}\n\n`;
 				const marker = new TextEncoder().encode(markerLabel);
 				controller.enqueue(marker);
+				currentResponse = fallback;
 				currentReader = fallback.body.getReader();
 				return true;
 			};
@@ -275,13 +307,13 @@ export function withStreamingFailover(
 		pull() {
 			signalDemand();
 		},
-		cancel() {
+		async cancel() {
 			closed = true;
 			// Release a parked pump so it observes `closed` and unwinds instead
 			// of holding the upstream reader open for a demand that never comes.
 			signalDemand();
 			if (releaseCurrentReaderForCancel) {
-				void releaseCurrentReaderForCancel();
+				await releaseCurrentReaderForCancel();
 			}
 		},
 	});

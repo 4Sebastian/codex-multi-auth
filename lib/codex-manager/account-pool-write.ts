@@ -1,5 +1,8 @@
 import type { Workspace } from "../accounts.js";
-import type { AccountMetadataV3 } from "../storage/public-types.js";
+import type {
+	AccountMetadataV3,
+	CodexCliMirror,
+} from "../storage/public-types.js";
 
 /**
  * Outcome of folding a single login result into the saved account pool.
@@ -32,6 +35,8 @@ export interface ResolvedAccountWrite {
 	accessToken?: string;
 	expiresAt?: number;
 	workspaces?: Workspace[];
+	/** Set, keep (undefined) or clear (null) the saved CodexCliMirror. */
+	codexCliMirror?: CodexCliMirror | null;
 	/**
 	 * Keep the saved row's `enabled` flag instead of re-enabling it. A targeted
 	 * re-authentication only tops up credentials for a row the user named, so it
@@ -149,6 +154,7 @@ export function buildInsertedAccount(
 			lastUsed: write.now,
 			workspaces: write.workspaces,
 			currentWorkspaceIndex: initialWorkspaceIndex,
+			...(write.codexCliMirror ? { codexCliMirror: write.codexCliMirror } : {}),
 		},
 	};
 }
@@ -206,6 +212,10 @@ export function buildUpdatedAccount(
 			lastUsed: write.now,
 			workspaces: mergedWorkspaces,
 			currentWorkspaceIndex: nextCurrentWorkspaceIndex,
+			codexCliMirror:
+				write.codexCliMirror === null
+					? undefined
+					: (write.codexCliMirror ?? existing.codexCliMirror),
 		},
 	};
 }

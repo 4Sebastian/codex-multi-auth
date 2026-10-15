@@ -1,75 +1,83 @@
 # Error Contract Reference
 
-Error contract reference for user-facing CLI and exported helper behavior.
+Error contract reference for user-facing CLI behavior, JSON mode, the runtime
+rotation proxy, and exported helper call shapes.
 
 ---
 
-## CLI Error Contract
+## CLI error contract
 
-### Exit Codes
+### Exit codes
 
 - `0`: successful execution
 - `1`: usage error, invalid arguments, sync/persistence failure, or command failure
 
 Command-specific notes:
 
-- `why-selected`: `0` when an account is selected, `1` when the pool is empty or every candidate is cooled down / blocked
+- `why-selected`: `0` when an account is selected, `1` when the pool is empty or
+  every candidate is cooled down / blocked
 - `verify` / `verify-flagged`: `0` when all selected modes pass, `1` otherwise
-- `usage`: `0` for successful summary or rotation, `1` for invalid options or write failures
-- Forced `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` failures exit non-zero without launching Codex when the proxy is disabled or the selector does not match
+  (the exit code is the AND of the sub-reports)
+- `budget check`: `1` when the checked budget currently blocks requests
+- `usage`: `0` for a successful summary or rotation, `1` for invalid options or
+  write failures
+- Forced `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` failures exit non-zero
+  without launching Codex when the proxy is disabled or the selector matches no
+  account
 
 ### Streams
 
-- Human-readable command output is written to `stdout`.
-- Argument/usage and failure diagnostics are written to `stderr`.
-- On invalid command/arguments, usage text is printed with a non-zero exit code.
+- Human-readable command output → `stdout`
+- Argument/usage and failure diagnostics → `stderr`
+- Invalid command/arguments print usage and exit non-zero
 
-### Canonical Usage Errors
-
-Examples:
+### Canonical usage errors
 
 - unknown subcommand: `Unknown command: <name>` plus usage
-- `switch` with missing index: `Missing index. Usage: codex-multi-auth switch <index>`
-- `switch` with invalid index: `Invalid index: <value>`
+- `switch` missing index: `Missing index. Usage: codex-multi-auth switch <index>`
+- `switch` invalid index: `Invalid index: <value>`
 
 ---
 
-## JSON Mode Contract
+## JSON mode contract
 
 The authoritative list of common `--json` command surfaces is the Common Flags
 `--json` row in [commands.md](commands.md):
 
-`verify-flagged`, `verify`, `why-selected`, `best`, `forecast`, `report`,
-`usage`, `budget`, `models`, `monitor`, `integrations`, `fix`, `doctor`,
-`config explain`, `debug bundle`, `history`.
+`limits`, `verify-flagged`, `verify`, `why-selected`, `best`, `forecast`,
+`report`, `usage`, `budget`, `models`, `monitor`, `integrations`, `fix`,
+`doctor`, `config explain`, `debug bundle`, `history`.
 
-Those commands support `--json` / `-j` and produce pretty-printed JSON objects
-(or, for nested families such as `budget`, JSON payloads for the subcommands
-that accept the flag).
+Those commands accept `--json` / `-j` and emit pretty-printed JSON (for nested
+families such as `budget`, the subcommands that take the flag).
 
-Documented examples:
+Examples:
 
-- `codex-multi-auth forecast --json`
-- `codex-multi-auth report --json`
-- `codex-multi-auth fix --json`
-- `codex-multi-auth doctor --json`
-- `codex-multi-auth verify-flagged --json`
-- `codex-multi-auth verify --paths --json`
-- `codex-multi-auth why-selected --json`
-- `codex-multi-auth best --json`
-- `codex-multi-auth usage --json`
-- `codex-multi-auth budget list --json`
-- `codex-multi-auth models --json`
-- `codex-multi-auth monitor --json`
-- `codex-multi-auth integrations --json`
-- `codex-multi-auth config explain --json`
-- `codex-multi-auth debug bundle --json`
-- `codex-multi-auth history --json`
-- `codex-multi-auth history show <id> --json`
+```bash
+codex-multi-auth forecast --json
+codex-multi-auth report --json
+codex-multi-auth fix --json
+codex-multi-auth doctor --json
+codex-multi-auth limits --json
+codex-multi-auth verify-flagged --json
+codex-multi-auth verify --paths --json
+codex-multi-auth why-selected --json
+codex-multi-auth best --json
+codex-multi-auth usage --json
+codex-multi-auth budget list --json
+codex-multi-auth models --json
+codex-multi-auth monitor --json
+codex-multi-auth integrations --json
+codex-multi-auth config explain --json
+codex-multi-auth debug bundle --json
+codex-multi-auth history --json
+codex-multi-auth history show <id> --json
+```
 
-Additive JSON helpers also documented in the command reference (outside the
-compact Common Flags row):
+Additive `--json` surfaces outside the compact Common Flags row:
 
+- `codex-multi-auth list` / `status --json`
+- `codex-multi-auth bridge token ... --json`
 - `codex-multi-auth uninstall --json`
 - `codex-multi-auth rotation reset-rate-limits --json`
 - `codex-multi-auth rotation reset-runtime --json`
@@ -78,76 +86,108 @@ compact Common Flags row):
 Compatibility guarantees:
 
 - Output is valid JSON.
-- `command` field identifies the command family when the payload is a command result object.
-- Documented top-level sections remain stable unless a migration note is provided.
+- `command` identifies the command family when the payload is a command result
+  object.
+- Documented top-level sections remain stable unless a migration note is
+  provided.
 
 ---
 
-## HTTP/Error Mapping Contract (Fetch Helpers)
+## HTTP/error mapping contract (fetch helpers)
 
-### Entitlement Mapping
+### Entitlement mapping
 
-- Upstream entitlement-like 404 payloads are normalized to `403` with `entitlement_error` payloads.
+- Upstream entitlement-like 404 payloads normalize to `403` with
+  `entitlement_error` payloads.
 - Entitlement errors are not treated as rate limits.
 
-### Rate-Limit Mapping
+### Rate-limit mapping
 
 - Upstream usage-limit indicators normalize to rate-limit semantics.
 - `handleErrorResponse` may return parsed `rateLimit.retryAfterMs` metadata.
 
-### Response Normalization
+### Response normalization
 
-- Error responses are normalized to JSON error payloads with a stable `error.message` field.
+- Error responses normalize to JSON error payloads with a stable
+  `error.message` field.
 - Diagnostics may include request/correlation IDs when available.
 
-### Typed Errors
+### Typed errors
 
-The request layer's thrown errors are backed by the typed hierarchy in `lib/errors.ts` (base class `CodexError`, which extends `Error` and carries a stable `code` string):
+The request layer's thrown errors use the typed hierarchy in `lib/errors.ts`
+(base class `CodexError extends Error`, carrying a stable `code` string):
 
-- `refreshAndUpdateToken` throws `CodexAuthError` (`code: "CODEX_AUTH_ERROR"`) with the message `Failed to refresh token, authentication required` on any refresh failure. The error carries a `retryable` boolean (transient network/lock failures are retryable; invalid-grant style failures are not) and, where available, `cause` and `context` (`refreshFailureReason`, `statusCode`).
-- Catch sites may rely on `instanceof CodexAuthError` (or the structural `code` property) plus `retryable` to decide whether to re-attempt or force re-authentication.
-- HTTP error responses are returned as normalized `Response` payloads (see above), not thrown, so they intentionally have no `Error` class.
+- `refreshAndUpdateToken` throws `CodexAuthError`
+  (`code: "CODEX_AUTH_ERROR"`, message `Failed to refresh token,
+  authentication required`) on any refresh failure. It carries a `retryable`
+  boolean (transient network/lock failures retryable; invalid-grant style
+  failures not) plus, where available, `cause` and `context`
+  (`refreshFailureReason`, `statusCode`).
+- Catch sites may rely on `instanceof CodexAuthError` (or the structural `code`)
+  plus `retryable` to decide between re-attempting and forcing
+  re-authentication.
+- HTTP error responses are returned as normalized `Response` payloads, not
+  thrown, so they intentionally have no `Error` class.
 
 ---
 
-## Runtime Rotation Proxy Error Contract
+## Runtime rotation proxy error contract
 
-The default-on localhost Responses proxy returns JSON error payloads with a stable `error.code` field.
+The default-on localhost Responses proxy returns JSON error payloads with a
+stable `error.code` field.
 
 | Code | HTTP status | Meaning |
 | --- | --- | --- |
-| `runtime_rotation_proxy_not_found` | `404` | Request path or method is outside the supported Responses/model discovery surface |
-| `runtime_rotation_proxy_unauthorized` | `401` | Local request did not include the per-process proxy client key |
+| `runtime_rotation_proxy_not_found` | `404` | Path/method outside the supported Responses/model-discovery surface |
+| `runtime_rotation_proxy_unauthorized` | `401` | Local request missing the per-process proxy client key |
 | `runtime_rotation_proxy_payload_too_large` | `413` | Request body exceeded the proxy safety cap |
-| `codex_runtime_rotation_pool_exhausted` | `429` or `503` | No managed account can currently service the runtime request |
-| `codex_pinned_account_unavailable` | `503` | A pin is in force — either a manual pin (`codex-multi-auth switch`) or a forced pin set per invocation by the launcher (`--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) — but the pinned account remains rate-limited, cooling down, disabled, or blocked by policy after live blocker checks and any bounded retry attempts. Healthy pins can retry the same account a bounded number of times (at most four upstream attempts, whatever `retryAllAccountsMaxRetries` is set to, with a 250ms/500ms/1s backoff between them and an absolute 16-selection-pass safety ceiling over the loop); they never rotate to another account. The remedy depends on `pin_source`: a manual pin clears with `codex-multi-auth unpin`, a forced pin does not and needs a relaunch |
+| `codex_runtime_rotation_pool_exhausted` | `429` or `503` | No managed account can currently service the request |
+| `codex_pinned_account_unavailable` | `503` | A pin is in force (manual `codex-multi-auth switch`, or forced per-invocation via `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) but the pinned account stays rate-limited, cooling down, disabled, or policy-blocked after live blocker checks and bounded retries. Pins never rotate to another account |
 | `codex_runtime_rotation_proxy_error` | `500` | Proxy failed before forwarding the request |
 
-Pool exhaustion includes a `reason`, `retry_after_ms`, and a hint to run `codex-multi-auth rotation status`. Pinned-account-unavailable responses include a `pinnedAccountIndex` field identifying the pinned account, a structured `reason` field carrying the live blocker or final attempt verdict (for example `rate-limited`, `cooling-down:auth-failure`, `circuit-open`, `disabled`, `workspace-disabled`, `policy-blocked`, `missing`, `auth-failure`, `network-error`, or `server-error`) or `null` when no reason was recorded, and an `account_skip_reasons` map keyed by account index that mirrors the pool-exhausted response shape. The human-readable `message` appends the corresponding operator-facing blocker in parentheses when present (see issue #486).
+Pool-exhausted responses include `reason`, `retry_after_ms`, an
+`account_skip_reasons` map keyed by account index, and a hint to run
+`codex-multi-auth rotation status`. Pinned-account-unavailable responses mirror
+that shape plus `pinnedAccountIndex`, a structured `reason` (for example
+`rate-limited`, `cooling-down:auth-failure`, `circuit-open`, `disabled`,
+`workspace-disabled`, `policy-blocked`, `missing`, `auth-failure`,
+`network-error`, `server-error`, or `null` when none was recorded), and a
+human-readable `message` that appends the blocker in parentheses (issue #486).
 
-For pinned requests the attempt budget is `min(retryAllAccountsMaxRetries + 1, 4)`, not the raw setting: `retryAllAccountsMaxRetries` is the "retry when every account is rate-limited" POOL knob, and for a pin every unit of it would be another copy of the same non-idempotent request to the same upstream. The 16-selection-pass ceiling still bounds the whole loop, including branches that do not increment the transient-attempt counter.
+**Pinned retry budget:** for pinned requests the attempt budget is
+`min(retryAllAccountsMaxRetries + 1, 4)` with 250ms/500ms/1s backoff, not the
+raw setting — each retry is another copy of the same non-idempotent request to
+the same upstream. A 16-selection-pass ceiling bounds the whole loop, including
+branches that do not increment the transient-attempt counter.
 
-A pinned retry deliberately waives the pinned account's own **cooldown**, and only the cooldown. Every transient failure branch cools the account down before the next selection pass, so honoring it would end the loop after a single upstream attempt and make the attempt budget unreachable. Rate limits, an open circuit, a disabled account, workspace and policy blocks all still stop the retry, the cooldown stays on the account for other requests and for this response's `retry_after_ms`, and the waiver applies only from the second pass onward — a pin that is ALREADY cooling down when the request arrives still returns `codex_pinned_account_unavailable` without an upstream call.
+**Cooldown waiver:** a pinned retry waives the pinned account's own
+*cooldown*, and only the cooldown — every transient failure branch cools the
+account before the next pass, so honoring it would end the loop after one
+attempt. Rate limits, an open circuit, a disabled account, and workspace/policy
+blocks still stop the retry; the cooldown stays on the account for other
+requests and for `retry_after_ms`; and the waiver applies only from the second
+pass onward — a pin *already* cooling down when the request arrives returns
+`codex_pinned_account_unavailable` with no upstream call.
 
-Pinned-account-unavailable responses also carry three recovery fields:
+**Recovery fields on pinned responses:**
 
 | Field | Type | Meaning |
-|-------|------|---------|
-| `pin_source` | `"forced"` \| `"manual"` \| `null` | How the pin was set. `manual` came from `codex-multi-auth switch` and clears with `unpin`; `forced` came from this session's launcher (`--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) and `unpin` will NOT clear it — relaunch to select a different account. The `message` carries the matching remedy |
-| `reset_at` | ISO-8601 string \| `null` | When the pinned account next becomes selectable: the latest of its still-active rate-limit record for the request's family and model, any active cooldown, and its circuit breaker's next-admission deadline. `null` when nothing bounds recovery, and deliberately `null` under a permanent blocker (`disabled`, `workspace-disabled`, `policy-blocked`, `missing`, token invalidation), where no timer clears the condition |
-| `retry_after_ms` | number \| `null` | The same moment as milliseconds from now. Note this is the *latest* bound for the single pinned account, whereas `codex_runtime_rotation_pool_exhausted` reports the *earliest* recovery across the whole pool |
+| --- | --- | --- |
+| `pin_source` | `"forced"` \| `"manual"` \| `null` | How the pin was set. `manual` came from `codex-multi-auth switch` and clears with `unpin`; `forced` came from the session launcher (`--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) and `unpin` will NOT clear it — relaunch to select a different account. `message` carries the matching remedy |
+| `reset_at` | ISO-8601 string \| `null` | When the pinned account next becomes selectable: the latest of its active rate-limit record for the request's family+model, any active cooldown, and its circuit breaker's next-admission deadline. `null` when nothing bounds recovery, deliberately so under permanent blockers (`disabled`, `workspace-disabled`, `policy-blocked`, `missing`, token invalidation) |
+| `retry_after_ms` | number \| `null` | The same moment as ms from now. This is the *latest* bound for the single pinned account; `codex_runtime_rotation_pool_exhausted` reports the *earliest* recovery across the pool. Advisory only — never emitted as a `Retry-After` header |
 
-`retry_after_ms` is advisory; it is not emitted as a `Retry-After` header.
-
-Account policy pause/drain is enforced through runtime policy evaluation and contributes to selection skip reasons such as `policy-blocked`.
+Account policy pause/drain is enforced through runtime policy evaluation and
+contributes to selection skip reasons such as `policy-blocked`.
 
 ---
 
-## Options-Object Compatibility Contract
+## Options-object compatibility contract
 
-For selected exported helper APIs, options-object forms were added without removing positional signatures.
+For selected exported helpers, options-object forms were added without removing
+positional signatures.
 
-Supported dual-call forms include:
+Supported dual-call forms:
 
 - `selectHybridAccount(...)` and `selectHybridAccount({ ... })`
 - `exponentialBackoff(...)` and `exponentialBackoff({ ... })`
@@ -156,18 +196,33 @@ Supported dual-call forms include:
 - `getRateLimitBackoffWithReason(...)` and `getRateLimitBackoffWithReason({ ... })`
 - `transformRequestBody(...)` and `transformRequestBody({ ... })`
 
-Invalid named-parameter calls (missing or wrongly typed required fields, or unknown keys) throw a native `TypeError` with a `<helper> requires ...` message — for example, `createCodexHeaders` throws `TypeError: createCodexHeaders requires accountId and accessToken`. This is a deliberate, shared convention across the dual-call helpers and is not wrapped in a `CodexError` subclass.
+Invalid named-parameter calls (missing or wrongly typed required fields, or
+unknown keys) throw a native `TypeError` with a `<helper> requires ...`
+message — for example, `createCodexHeaders` throws
+`TypeError: createCodexHeaders requires accountId and accessToken`. This is a
+deliberate shared convention across the dual-call helpers, not wrapped in a
+`CodexError` subclass.
 
 ---
 
-## Typed Error Classes
+## Typed error classes
 
-`lib/errors.ts` exports a `CodexError` hierarchy (`CodexApiError`, `CodexAuthError`, `CodexNetworkError`, `CodexValidationError`, `CodexRateLimitError`, `StorageError`, `CodexUnavailableError`). Every subclass carries a stable string `code` (the `ErrorCode` constants) plus class-specific fields, so callers can branch on `instanceof` or `code` instead of message text.
+`lib/errors.ts` exports the `CodexError` hierarchy: `CodexApiError`,
+`CodexAuthError`, `CodexNetworkError`, `CodexValidationError`,
+`CodexRateLimitError`, `StorageError`, `CodexUnavailableError`. Every subclass
+carries a stable string `code` (the `ErrorCode` constants) plus class-specific
+fields, so callers branch on `instanceof` or `code` rather than message text.
 
 Startup-validation guarantees backed by these types:
 
-- `startRuntimeRotationProxy` throws `CodexValidationError` with `field: "clientApiKey"` when no client API key is supplied, and `CodexValidationError` with `field: "host"` (offending host in `context.host`) when asked to bind a non-loopback host. Messages are unchanged from earlier releases; only the class tightened.
-- `savePluginConfig` aborts with `StorageError` (`code: "UNREADABLE"`, `path` = the config file, actionable `hint`, read-classifier message as `cause`) when the existing config file cannot be read. Messages are unchanged from earlier releases; only the class tightened.
+- `startRuntimeRotationProxy` throws `CodexValidationError` with
+  `field: "clientApiKey"` when no client API key is supplied, and with
+  `field: "host"` (offending host in `context.host`) for a non-loopback bind.
+- `savePluginConfig` aborts with `StorageError` (`code: "UNREADABLE"`, `path` =
+  the config file, actionable `hint`, read-classifier message as `cause`) when
+  the existing config file cannot be read.
+
+Messages are unchanged from earlier releases; only the classes tightened.
 
 ---
 

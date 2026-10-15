@@ -1,7 +1,8 @@
 import { createLogger, logRequest, LOGGING_ENABLED } from "../logger.js";
 import { HTTP_STATUS, PLUGIN_NAME } from "../constants.js";
 import { isRecord } from "../utils.js";
-import { extractResponsesUsage } from "../usage/usage-extraction.js";
+import { createUsageStreamScanner, extractResponsesUsage } from "../usage/usage-extraction.js";
+import { ResponseOutcome, type StreamCompletion } from "./response-outcome.js";
 import type { UsageTokenCounts } from "../usage/types.js";
 
 import type { SSEEventData } from "../types.js";
@@ -787,13 +788,11 @@ export async function convertSseToJson(
 	options?: {
 		onResponseId?: (responseId: string) => void;
 		onUsage?: (usage: UsageTokenCounts) => void;
+		onCompletion?: (completion: StreamCompletion) => Promise<void>;
 		streamStallTimeoutMs?: number;
 	},
 ): Promise<Response> {
-	if (!response.body) {
-		throw new Error(`[${PLUGIN_NAME}] Response has no body`);
-	}
-	const reader = response.body.getReader();
+	const reader = response.body?.getReader();
 	const decoder = new TextDecoder();
 	// REQ-HIGH-03: Accumulate decoded chunks in an array instead of concatenating
 	// into a growing string. Repeated `fullText += chunk` is O(n) per append,
@@ -801,6 +800,20 @@ export async function convertSseToJson(
 	// pattern is O(n) total. The size check runs BEFORE appending so we never
 	// allocate a chunk that would exceed MAX_SSE_SIZE.
 	const chunks: string[] = [];
+	const outcome = new ResponseOutcome(true);
+	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => outcome.observe(event)});
+	let settled = false;
+	const finish = async (failure?: "failure" | "cancelled", finalUsage?: UsageTokenCounts | null) => {
+		if (settled) return;
+		settled = true;
+		const scannedUsage = scanner.result();
+		const usage = failure || options?.onCompletion ? finalUsage ?? scannedUsage : finalUsage;
+		try {if (usage) options?.onUsage?.(usage);}
+		catch (error) {log.warn("Accepted response usage could not be settled", {error});}
+		const completion = outcome.finish();
+		try {await options?.onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
+		catch (error) {log.warn("Accepted response completion could not be settled", {error});}
+	};
 	let totalSize = 0;
 	const streamStallTimeoutMs = Math.max(
 		1_000,
@@ -810,6 +823,7 @@ export async function convertSseToJson(
 	);
 
 	try {
+		if (!reader) throw new Error(`[${PLUGIN_NAME}] Response has no body`);
 		// Consume the entire stream
 		while (true) {
 			const { done, value } = await readWithTimeout(
@@ -825,8 +839,10 @@ export async function convertSseToJson(
 			if (totalSize + decodedBytes > MAX_SSE_SIZE) {
 				throw new Error(`SSE response exceeds ${MAX_SSE_SIZE} bytes limit`);
 			}
+			if (value) scanner.push(value);
 			chunks.push(decoded);
 			totalSize += decodedBytes;
+			if (outcome.hasTerminal()) break;
 		}
 
 		const fullText = chunks.join("");
@@ -840,6 +856,8 @@ export async function convertSseToJson(
 			fullText,
 			options?.onResponseId,
 		);
+
+		await finish(undefined, finalResponse ? extractResponsesUsage(finalResponse) : null);
 
 		// A terminal failure event (mid-stream `error`, `response.failed`, or
 		// `response.incomplete`) means the upstream turn failed even though HTTP
@@ -891,14 +909,6 @@ export async function convertSseToJson(
 		}
 		logStreamDiagnostics(finalResponse);
 
-		if (options?.onUsage) {
-			// The non-streaming branch already holds the assembled response, so
-			// the token counts come straight off it. Reported even though the
-			// caller sees JSON rather than SSE: the usage ledger (and therefore
-			// the maxTokens / maxCostUsd budget caps) needs both shapes.
-			const usage = extractResponsesUsage(finalResponse);
-			if (usage) options.onUsage(usage);
-		}
 		// Return as plain JSON (not SSE)
 		const jsonHeaders = new Headers(headers);
 		jsonHeaders.set("content-type", "application/json; charset=utf-8");
@@ -911,13 +921,14 @@ export async function convertSseToJson(
 	} catch (error) {
 		log.error("Error converting stream", { error: String(error) });
 		logRequest("stream-error", { error: String(error) });
-		if (typeof reader.cancel === "function") {
-			await reader.cancel(String(error)).catch(() => {});
+		await finish(error instanceof Error && error.name === "AbortError" ? "cancelled" : "failure");
+		if (typeof reader?.cancel === "function") {
+			await reader.cancel(error).catch(() => {});
 		}
 		throw error;
 	} finally {
-		// Release the reader lock to prevent resource leaks
-		reader.releaseLock();
+		if (typeof reader?.cancel === "function") await reader.cancel().catch(() => undefined);
+		reader?.releaseLock();
 	}
 }
 
@@ -925,70 +936,155 @@ function createResponseIdCapturingStream(
 	body: ReadableStream<Uint8Array>,
 	onResponseId?: (responseId: string) => void,
 	onUsage?: (usage: UsageTokenCounts) => void,
+	onCompletion?: (completion: StreamCompletion) => Promise<void>,
+	streamStallTimeoutMs = DEFAULT_STREAM_STALL_TIMEOUT_MS,
+	streamIdleTimeoutMs?: number,
 ): ReadableStream<Uint8Array> {
-	const decoder = new TextDecoder();
-	let bufferedText = "";
-	let loggedMalformedStreamChunk = false;
+	const reader = body.getReader();
 	const state = createParsedResponseState();
-
-	const processBufferedLines = (flush = false): void => {
-		if (state.encounteredError) return;
-		const lines = bufferedText.split(/\r?\n/);
-		if (!flush) {
-			bufferedText = lines.pop() ?? "";
-		} else {
-			bufferedText = "";
-		}
-
-		for (const rawLine of lines) {
-			const trimmedLine = rawLine.trim();
-			if (!trimmedLine.startsWith("data:")) continue;
-			const payload = trimmedLine.slice(5).trim();
-			if (!payload || payload === "[DONE]") continue;
+	const outcome = new ResponseOutcome(true);
+	const observeEvent = (event: unknown): void => {
+		outcome.observe(event);
+		try {
+			if (!state.encounteredError && isRecord(event)) maybeCaptureResponseEvent(state, event as SSEEventData, onResponseId);
+			const usage = extractResponsesUsage(event);
+			if (usage && !onCompletion) onUsage?.(usage);
+		} catch (error) {log.warn("Accepted stream observation could not be captured", {error});}
+	};
+	const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: onCompletion ? observeEvent : undefined});
+	const observeFrame = (frame: Uint8Array): void => {
+		scanner.push(frame);
+		// The compatibility capture-only interface accepts one JSON event per data line.
+		if (onCompletion) return;
+		const line = Buffer.from(frame).toString("utf8").trim();
+		if (!line.startsWith("data:")) return;
+		const payload = line.slice(5).trim();
+		if (!payload || payload === "[DONE]") return;
+		try {observeEvent(JSON.parse(payload));} catch { /* Preserve malformed bytes without publishing an event. */ }
+	};
+	let pending: Uint8Array[] = [], pendingSize = 0, lineSize = 0, lastByte = 0;
+	let currentChunk: Uint8Array | undefined, currentOffset = 0;
+	const retain = (value: Uint8Array) => {
+		pendingSize += value.byteLength;
+		if (pendingSize > 64 * 1024 * 1024) throw Error("upstream response frame exceeds size limit");
+		pending.push(value);
+	};
+	const takePending = () => {
+		const frame = Buffer.concat(pending);
+		pending = []; pendingSize = 0;
+		return frame;
+	};
+	let finished = false;
+	let finishing: Promise<void> | undefined;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	let released = false;
+	const release = () => {
+		if (released) return;
+		released = true;
+		reader.releaseLock();
+	};
+	const finish = (failure?: "failure" | "cancelled"): Promise<void> => {
+		if (finishing) return finishing;
+		finished = true;
+		clearTimeout(idleTimer);
+		finishing = (async () => {
+			if (pendingSize) observeFrame(takePending());
+			if (failure && currentChunk) scanner.push(currentChunk.subarray(currentOffset));
+			const usage = scanner.result();
+			try {if (usage && onCompletion) onUsage?.(usage);}
+			catch (error) {log.warn("Accepted stream usage could not be settled", {error});}
+			const completion = outcome.finish();
+			try {await onCompletion?.(failure ? {...completion, success: false, outcome: failure, errorCode: failure === "cancelled" ? "client_cancelled" : "stream_read_failed"} : completion);}
+			catch (error) {log.warn("Accepted stream completion could not be settled", {error});}
+		})();
+		return finishing;
+	};
+	const armIdleTimeout = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+		clearTimeout(idleTimer);
+		if (streamIdleTimeoutMs === undefined || finished) return;
+		idleTimer = setTimeout(() => {
+			const error = Error("Accepted stream abandoned without read progress");
+			void (async () => {
+				try {await finish("failure");}
+				finally {
+					await reader.cancel(error).catch(() => undefined);
+					release();
+					controller.error(error);
+				}
+			})();
+		}, streamIdleTimeoutMs);
+		idleTimer.unref?.();
+	};
+	return new ReadableStream<Uint8Array>({
+		start(controller) {armIdleTimeout(controller);},
+		async pull(controller) {
 			try {
-				const data = JSON.parse(payload) as SSEEventData;
-				if (onResponseId) {
-					maybeCaptureResponseEvent(state, data, onResponseId);
+				while (!finished) {
+					if (!currentChunk) {
+						const {done, value} = await readWithTimeout(reader, streamStallTimeoutMs);
+						if (finished) return;
+						if (done) {
+							const tail = takePending();
+							if (tail.byteLength) observeFrame(tail);
+							await finish();
+							release();
+							if (tail.byteLength) controller.enqueue(tail);
+							controller.close();
+							return;
+						}
+						if (!value?.byteLength) continue;
+						armIdleTimeout(controller);
+						currentChunk = value; currentOffset = 0;
+					}
+					const value = currentChunk, start = currentOffset;
+					for (const [offset, byte] of value.subarray(start).entries()) {
+						const index = start + offset;
+						if (byte === 10) {
+							const boundary = !onCompletion || lineSize === 0 || (lineSize === 1 && lastByte === 13);
+							lineSize = 0;
+							if (boundary) {
+								retain(value.subarray(start, index + 1));
+								const frame = takePending();
+								currentOffset = index + 1; lastByte = byte;
+								if (currentOffset === value.length) currentChunk = undefined;
+								observeFrame(frame);
+								if (onCompletion && outcome.hasTerminal()) {
+									await finish();
+									await reader.cancel().catch(() => undefined);
+									release();
+									controller.enqueue(frame);
+									if (currentOffset < value.length) controller.enqueue(value.subarray(currentOffset));
+									currentChunk = undefined;
+									controller.close();
+									return;
+								}
+								armIdleTimeout(controller);
+								controller.enqueue(frame);
+								return;
+							}
+						} else lineSize += 1;
+						lastByte = byte;
+					}
+					retain(value.subarray(start)); currentChunk = undefined;
 				}
-				if (onUsage) {
-					// Reuse the JSON this loop already parsed rather than scanning
-					// the stream twice. Without these counts every usage-ledger row
-					// lands with zero tokens and zero cost, which silently disables
-					// the maxTokens / maxCostUsd budget caps.
-					const usage = extractResponsesUsage(data);
-					if (usage) onUsage(usage);
-				}
-				if (state.encounteredError) break;
 			} catch (error) {
-				// AUDIT-H9 / H-03: stream passthrough. The raw bytes still
-				// reach the downstream consumer so malformed JSON does not
-				// break streaming — but we now warn ONCE with bounded
-				// context so operators can see the event rather than it
-				// being a silent black hole in the logs.
-				if (!loggedMalformedStreamChunk) {
-					loggedMalformedStreamChunk = true;
-					log.warn("SSE malformed JSON chunk in stream passthrough", {
-						reason: error instanceof Error ? error.message : String(error),
-						sample: payload.slice(0, 120),
-					});
+				if (finished) return;
+				try {await finish("failure");}
+				finally {
+					await reader.cancel(error).catch(() => undefined);
+					release();
+					controller.error(error);
 				}
 			}
-		}
-	};
-
-	return body.pipeThrough(
-		new TransformStream<Uint8Array, Uint8Array>({
-			transform(chunk, controller) {
-				bufferedText += decoder.decode(chunk, { stream: true });
-				processBufferedLines();
-				controller.enqueue(chunk);
-			},
-			flush() {
-				bufferedText += decoder.decode();
-				processBufferedLines(true);
-			},
-		}),
-	);
+		},
+		async cancel(reason) {
+			try {await finish("cancelled");}
+			finally {
+				await reader.cancel(reason).catch(() => undefined);
+				release();
+			}
+		},
+	});
 }
 
 /**
@@ -1088,8 +1184,11 @@ export function attachResponseIdCapture(
 	headers: Headers,
 	onResponseId?: (responseId: string) => void,
 	onUsage?: (usage: UsageTokenCounts) => void,
+	onCompletion?: (completion: StreamCompletion) => Promise<void>,
+	streamStallTimeoutMs?: number,
+	streamIdleTimeoutMs?: number,
 ): Response {
-	if (!response.body || (!onResponseId && !onUsage)) {
+	if (!response.body || (!onResponseId && !onUsage && !onCompletion)) {
 		return new Response(response.body, {
 			status: response.status,
 			statusText: response.statusText,
@@ -1098,7 +1197,7 @@ export function attachResponseIdCapture(
 	}
 
 	return new Response(
-		createResponseIdCapturingStream(response.body, onResponseId, onUsage),
+		createResponseIdCapturingStream(response.body, onResponseId, onUsage, onCompletion, streamStallTimeoutMs, streamIdleTimeoutMs),
 		{
 			status: response.status,
 			statusText: response.statusText,

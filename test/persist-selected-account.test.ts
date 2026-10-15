@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+import { getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
+useAccountSourceFixtures();
 import { MODEL_FAMILIES } from "../lib/prompts/codex.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../lib/storage.js";
 
@@ -28,7 +31,7 @@ vi.mock("../lib/storage.js", async (importOriginal) => {
 	return {
 		...actual,
 		saveAccounts: saveAccountsMock,
-		getStoragePath: () => "/tmp/accounts.json",
+		getStoragePath: getAuthorityStoragePath,
 		readAffinityGenerationFromDisk: readAffinityGenerationFromDiskMock,
 	};
 });
@@ -62,7 +65,9 @@ function storageWith(
 	activeIndex = 0,
 	activeIndexByFamily: Record<string, number> = {},
 ): AccountStorageV3 {
-	return { version: 3, activeIndex, activeIndexByFamily, accounts };
+	const storage = { version: 3 as const, activeIndex, activeIndexByFamily, accounts };
+	writeAccountSourceFixture(storage);
+	return storage;
 }
 
 // Token inside the 5-minute freshness window forces the validation refresh.
@@ -124,7 +129,7 @@ describe("persistAndSyncSelectedAccount", () => {
 			accessToken: "access-b",
 			refreshToken: "refresh-b",
 			expiresAt: storage.accounts[1].expiresAt,
-		});
+		}, expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("re-enables a disabled account and reports it", async () => {
@@ -176,7 +181,7 @@ describe("persistAndSyncSelectedAccount", () => {
 			refreshToken: "refresh-new",
 			expiresAt: REAL_NOW + 7_200_000,
 			idToken: "id-new",
-		});
+		}, expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("warns and syncs the old tokens when the validation refresh fails", async () => {
@@ -204,8 +209,7 @@ describe("persistAndSyncSelectedAccount", () => {
 		expect(storage.accounts[0].refreshToken).toBe("refresh-a");
 		expect(saveAccountsMock).toHaveBeenCalledTimes(1);
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ accessToken: "access-a" }),
-		);
+			expect.objectContaining({ accessToken: "access-a" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("preserves per-family selections when re-selecting the active account", async () => {
@@ -285,7 +289,7 @@ describe("persistAndSyncSelectedAccount", () => {
 
 		expect(storage.affinityGeneration).toBe(8);
 		expect(readAffinityGenerationFromDiskMock).toHaveBeenCalledWith(
-			"/tmp/accounts.json",
+			getAuthorityStoragePath(),
 		);
 	});
 
@@ -358,8 +362,7 @@ describe("persistAndSyncSelectedAccount", () => {
 		});
 
 		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
-			expect.objectContaining({ idToken: "id-initial" }),
-		);
+			expect.objectContaining({ idToken: "id-initial" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 
 	it("reports synced=false when the CLI write is skipped", async () => {
@@ -374,5 +377,31 @@ describe("persistAndSyncSelectedAccount", () => {
 		});
 
 		expect(result.synced).toBe(false);
+	});
+});
+
+// An explicit id the backend refused is saved as chosen; switching to it must
+// hand ~/.codex/auth.json the authorized id from its CodexCliMirror.
+describe("persistAndSyncSelectedAccount with a Codex CLI mirror", () => {
+	it("syncs the mirror id, not the saved explicit id", async () => {
+		const storage = storageWith([
+			account("a"),
+			account("b", {
+				accountId: "ws-team",
+				accountIdSource: "manual",
+				codexCliMirror: { forAccountId: "ws-team", accountId: "ws-authorized" },
+			}),
+		]);
+
+		await persistAndSyncSelectedAccount({
+			storage,
+			targetIndex: 1,
+			parsed: 2,
+			switchReason: "manual",
+		});
+
+		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
+		expect(storage.accounts[1]?.accountId).toBe("ws-team");
 	});
 });

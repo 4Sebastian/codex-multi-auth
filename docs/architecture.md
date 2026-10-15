@@ -1,22 +1,21 @@
 # codex-multi-auth Architecture
 
-Public overview of how `codex-multi-auth` fits around the official Codex CLI: account manager, optional forwarding wrappers, local storage, runtime Responses rotation, local governance, optional bridge, reversible app bind, and optional plugin-host path.
+How `codex-multi-auth` fits around the official Codex CLI: which binaries exist, what each one does, how a forwarded request travels through the loopback rotation proxy to a managed account, and where state lives.
+
+For the maintainer-level module map, see [development/ARCHITECTURE.md](development/ARCHITECTURE.md).
 
 ---
 
 ## The Short Version
 
-`codex-multi-auth` is a multi-account OAuth manager for the official `@openai/codex` CLI.
+`codex-multi-auth` is a multi-account OAuth manager for the official `@openai/codex` CLI. It keeps a pool of ChatGPT-backed Codex accounts on disk, picks the healthiest one for each request, and keeps the official CLI in charge of everything else.
 
-- `codex-multi-auth ...` commands are handled locally by the account manager.
-- `codex-multi-auth-codex ...` is the optional forwarding wrapper for official Codex CLI commands.
-- `mcodex ...` is a convenience launcher over that wrapper (`--monitor`, `--tmux` / `-t`).
-- The package does **not** publish a global `codex` binary; that name stays owned by the official Codex install path.
-- Account, settings, quota, usage, policy, backup, and diagnostic state live under `~/.codex/multi-auth`.
-- Runtime rotation is **default-on** for request-bearing sessions launched through this package's wrapper or app bind.
-- When runtime rotation is enabled, forwarded Codex CLI/app sessions can send Responses traffic through a localhost-only proxy that selects managed accounts per request.
-- Local governance (usage ledger, budgets, account pause/drain, routing profiles, capability matrix) is enforced at runtime via `evaluateRuntimePolicy` on the rotation path.
-- The plugin-host entrypoint remains available for advanced host integrations, but it is not required for normal CLI use.
+- `codex-multi-auth ...` runs the local account manager (login, switch, health, repair, governance).
+- `codex-multi-auth-codex ...` is the opt-in forwarding wrapper: `auth ...` commands stay local, everything else is forwarded to the official Codex CLI with runtime rotation applied.
+- `mcodex ...` is a convenience launcher over that same wrapper.
+- The package does **not** publish a global `codex` binary; that name stays owned by the official Codex install.
+- Runtime rotation is **default-on**: request-bearing sessions launched through the wrapper (or the packaged-app bind) send Responses traffic through a localhost-only proxy that selects a managed account per request.
+- All state — accounts, settings, quota cache, usage ledger, policies, backups — lives under `~/.codex/multi-auth`. Official Codex state stays under `~/.codex`.
 
 ---
 
@@ -26,244 +25,185 @@ Public overview of how `codex-multi-auth` fits around the official Codex CLI: ac
 
 | Binary | Script | Role |
 | --- | --- | --- |
-| `codex-multi-auth` | `scripts/codex-multi-auth.js` | Account manager only. Bare subcommands (`status`, `login`, …) normalize to the local auth manager. |
-| `codex-multi-auth-codex` | `scripts/codex.js` | Wrapper: `auth ...` stays local; every other command forwards to official Codex with optional runtime rotation, over a shadow or canonical `CODEX_HOME` depending on the command. |
-| `mcodex` | `scripts/mcodex.js` | Convenience over `codex.js`: default forward, `--monitor` (live `list` via `watch`), `--tmux` / `-t` (optional `--live-accounts`). |
-| `codex-multi-auth-app-launcher` | `scripts/codex-app-launcher.js` | Desktop launcher helper for supported user-level shortcuts / managed macOS wrapper apps. |
+| `codex-multi-auth` | `scripts/codex-multi-auth.js` | Account manager only. Bare subcommands normalize to `auth` subcommands, so `codex-multi-auth status` and `codex-multi-auth auth status` are the same call. |
+| `codex-multi-auth-codex` | `scripts/codex.js` | Wrapper/forwarder. `auth ...` runs locally; every other command resolves the real official Codex binary and forwards to it, with runtime rotation wired in when enabled. |
+| `mcodex` | `scripts/mcodex.js` | Convenience launcher. Forwards to `codex.js`; adds `--monitor` (watch `codex-multi-auth list`) and `--tmux` / `-t` session helpers. Contains no account logic. |
+| `codex-multi-auth-app-launcher` | `scripts/codex-app-launcher.js` | OS-level launcher routing: retargets supported user-level shortcuts or installs a managed wrapper app. |
 
-The standalone manager normalizes bare account-manager commands, so both `codex-multi-auth status` and `codex-multi-auth auth status` reach the same local manager. The forwarding wrapper handles `auth ...` locally, forwards every other command to the official Codex CLI, and injects runtime-rotation provider settings when rotation is enabled.
+A fifth shipped script, `scripts/codex-app-router.js`, is the persistent localhost router used by the packaged-app bind — it is spawned, not a bin.
 
 ---
 
-## Main Components
+## The Request Path, End to End
+
+The default rotation path for a forwarded request-bearing command (for example `codex-multi-auth-codex exec "…"`):
+
+```text
+You
+ |
+ | codex-multi-auth-codex exec "..."      (or mcodex, or the bound Codex app)
+ v
+scripts/codex.js  ─── auth ...? ──yes──> local account manager (lib/codex-manager.ts)
+ |
+ | no: resolve official Codex binary
+ | build shadow CODEX_HOME (or canonical home + -c overrides for TUI/resume/app-server)
+ | model_provider = "codex-multi-auth-runtime-proxy", base_url = http://127.0.0.1:<port>
+ | inject per-launch client key via OPENAI_API_KEY
+ v
+Official Codex CLI ──POST /responses──>
+ |
+ v
+Runtime rotation proxy (loopback only)
+ |
+ | 1. authenticate client (per-launch key, timing-safe compare)
+ | 2. gate method/path/body (Responses, models, images, thread-goal only)
+ | 3. evaluateRuntimePolicy: model allow/deny, budgets, pause/drain, tags
+ | 4. choose account: pin → priority → sequential|affinity → hybrid → scan
+ | 5. refresh access token if inside the 60s skew window
+ | 6. forward upstream (redirects never followed)
+ | 7. on retryable failure mark + rotate to next eligible account
+ v
+https://chatgpt.com/backend-api (official upstream)
+ |
+ | stream back: strip hop-by-hop + private headers, scan usage, record ledger row
+ v
+Your terminal
+```
+
+Details worth knowing:
+
+- **Loopback only.** The proxy refuses non-loopback binds and authenticates every request with a random per-launch key. Your account tokens are injected upstream; they never appear in client-facing responses.
+- **Auth before routing.** An unauthenticated request gets `401 runtime_rotation_proxy_unauthorized` before the path is even inspected.
+- **Redirects are never followed** (`redirect: "error"`), so a Bearer token cannot be exfiltrated to a redirected host.
+- **Failure is never a silent hang.** Transient failures rotate to another account; true exhaustion returns `503 codex_runtime_rotation_pool_exhausted` with per-account skip reasons and `retry_after_ms`, and points at `codex-multi-auth rotation status`.
+- **Two homes.** Non-interactive commands get a throwaway shadow `CODEX_HOME` (state synced back on exit). Interactive TUI, `resume`/`fork`, and `app-server` run against the canonical `CODEX_HOME` with the provider injected as `-c` overrides, so session history is not copied and reindexed on every launch. `codex app` also gets a shadow home through the app-helper context unless `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME=1`.
+- **Opt-out.** `codex-multi-auth rotation disable` or `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` returns to plain forwarding.
+
+### Account selection, in one breath
+
+Per request the proxy tries, in order: a soft pin left by `codex-multi-auth switch`, policy priority tiers (lower `account priority` numbers first), a hard pin from `--account`/`CODEX_MULTI_AUTH_FORCE_ACCOUNT`, the sequential stick-until-exhausted cursor, session affinity (20-minute sticky sessions), a hybrid score (`health*2 + tokens*5 + hoursSinceUsed*2 + capability boost`), and finally a linear scan. An account is skipped when it is disabled, workspace-disabled, token-invalid, rate-limited, cooling down, or has an open circuit breaker. Equal hybrid scores use the committed rotation cursor as the tie-breaker, so concurrent selections in the same clock tick do not repeatedly choose the first stored account.
+
+HTTP and WebSocket requests retain their circuit admission receipt through completion. Client cancellation settles the original partial usage without failing or healing the account. A cancelled half-open probe retains the breaker's bounded probe-wait behavior; it neither reopens nor closes the circuit as provider evidence. An HTTP 200 or socket upgrade is not successful inference completion: failed, errored, truncated, stalled or disconnected responses cannot heal completion-dependent health, circuit, capability or affinity state. OAuth refresh has no inference admission receipt and cannot settle another request's half-open probe. A success or failure from an older circuit epoch cannot settle a newer half-open probe. Successful completion also checks the submitted account credential binding before healing account health. Capability denials learned from HTTP errors or SSE terminal errors use a hashed key of the submitted workspace, access token, refresh token and expiry. Routing reads that evidence for the current credential generation. A delayed denial from an older generation cannot restrict replacement credentials, while denial for the unchanged generation still blocks repeated sends. The cache retains its existing size and expiry bounds.
+
+Quota headers and stream events may supply primary, secondary and plan fields independently. HTTP and rejected-handshake headers reserve their receipt position before asynchronous body classification. A body-classified restriction supplies its primary field at that original position, and the guarded source transaction checks that field's authority before changing either the scheduler or account cooldown. Custom and native terminal restrictions use the same ordering. Explicitly disabling capacity retries preserves the legacy non-native account-wide 429 behavior; enabled capacity retries do not treat provider capacity as account quota. Shared quota observations preserve the latest supplied field in receipt order, including equal-clock events and transactions that finish out of order. A response carries only unconsumed deltas, so unrelated partial updates cannot erase exhaustion or replay an older blocker. The credential-scoped worker consumes pending deltas even after an earlier write fails. Failed exhaustion remains scoped to the submitted credentials through its reset window; a settled newer healthy observation can replace it. Admission can read received fields through the existing credential-scoped receipt epoch before the worker persists them. Reset recovery rechecks that effective quota inside its credential transaction and does not clear the receipt epoch. A native usage-read response receives its own ordered quota receipt; a newer independent event can replace its supplied fields before publication. Terminal delivery waits for its restriction and ledger attempt, not an independently held quota worker; unsettled quota work cannot authorize health healing. Terminal accounting retains the original persistence error without losing the upstream outcome or billed usage. Native admission evaluates the selected workspace's baseline and failed receipts, not a sibling's shared account/model snapshot. Workspace-local exhaustion and 429 responses do not create account-wide restrictions that bench eligible siblings; legacy accounts without workspace records retain their account-wide 429 restriction.
+
+Terminal usage remains attributed to the immutable submitted account index, account ID and email even when accounts are reindexed or its circuit receipt is no longer current. After an upstream stream error, the forwarding boundary awaits the credential-scoped failure restriction before exposing the broken body to the client. Plugin streaming rows settle from the actual completion rather than a fixed elapsed-time fallback. Read progress keeps a live stream open; abandonment cancels its owned reader and settles one failure row with any reported usage. Ledger settlement is awaited before body completion, and local write failures are logged separately without replacing the provider outcome. Accepted plugin responses never prepare a replay candidate; the public stream helper retains explicit-rejection handling and bounded timeout and backpressure behavior.
+
+HTTP, native OAuth, API and ZDR streaming paths withhold terminal bytes and body completion until their owned restriction and ledger attempt settle. Ordinary nonterminal SSE events retain backpressure and stream incrementally; split and multiline terminal frames retain their original bytes. After settling and forwarding a protocol terminal, the owned HTTP reader is cancelled and released without another transport read. An open transport or later read failure cannot relabel that completed response. The capture-only compatibility interface still accepts line-delimited JSON events without requiring blank frame separators. The next sequential turn therefore sees the preceding usage row before budget admission.
+
+Refresh guardian outcomes retain the credential and storage path captured before the first await. Every failure mutation runs under the existing credential transaction; a replaced credential or manager cannot inherit an older failure, and independently newer cooldowns remain intact. OAuth catalog discovery revalidates durable credential, journal, reset and workspace authority after reading the response body. Inventory and visible-model publication retain the accepted catalog's original authority through unrelated discovery work, the publication queue and file-lock waits, and the final file rename. Lost authority removes routing eligibility and picker models while permitted historical observations remain available. Background API enrichment rechecks the same OAuth proof before publishing an inventory or ETag. Installed catalog-version discovery shares the forwarding executable resolver, including Windows shim and Node-entry handling, with a three-second deadline and bounded output.
+
+Custom WebSocket terminal frames wait for their owned restriction and ledger attempt before forwarding the original bytes. The upstream socket pauses during settlement. Already-received trailing frames remain ordered in a bounded queue using the existing frame and byte limits. Restriction-write failure still forwards the original terminal frame, records its reported usage and closes the socket rather than draining queued requests. Subsequent admission continues to reject unreadable journal authority.
+
+---
+
+## Components
 
 ### 1. Account manager
 
-`lib/codex-manager.ts` and `lib/codex-manager/commands/` provide the local dashboard and CLI surface, including:
+`codex-multi-auth <command>` dispatches to `lib/codex-manager.ts` + `lib/codex-manager/commands/`:
 
-| Area | Examples |
+| Area | Commands |
 | --- | --- |
-| Accounts | `login`, `list`, `status`, `switch`, `unpin`, `workspace` |
+| Accounts | `login`, `list`, `status`, `switch <index>`, `unpin`, `workspace` |
 | Health / selection | `check`, `forecast`, `best`, `report`, `why-selected` |
-| Repair | `fix`, `doctor`, `verify` / `verify-flagged` |
-| Rotation | `rotation status\|enable\|disable\|bind-app\|unbind-app\|…` |
-| Governance | `usage`, `budget`, `account` (tag/weight/pause/drain), `models`, `monitor` |
+| Repair | `fix`, `doctor`, `verify`, `verify-flagged` |
+| Rotation | `rotation status\|enable\|disable\|bind-app\|unbind-app\|reset-runtime` |
+| Governance | `usage`, `budget`, `account` (tag/weight/priority/pause/drain/note), `models`, `monitor` |
 | Bridge / integrations | `bridge token …`, `integrations` |
-| Sessions | `history` (provider-agnostic local rollout browser) |
-| Config / debug | `config`, `init-config`, `debug bundle`, `uninstall` |
+| Sessions / config | `history`, `config explain`, `init-config`, `debug bundle`, `uninstall` |
 
-### 2. Optional wrapper + shadow `CODEX_HOME`
+On an interactive terminal with a populated pool, bare `codex-multi-auth login` opens the dashboard instead of a bare sign-in; `--device-auth` covers headless/remote logins, and `--manual`/`--no-browser` prints a paste-back flow. The OAuth callback server binds port `1455` on both `::1` and `127.0.0.1` — the registered redirect URI is fixed, so a conflict on either family is fatal rather than silently degraded.
 
-`codex-multi-auth-codex` (`scripts/codex.js`):
+### 2. Wrapper and shadow `CODEX_HOME`
 
-- Resolves the real official Codex binary on `PATH`.
-- Handles multi-auth `auth` subcommands locally.
-- Forwards non-auth commands to official Codex.
-- For request-bearing sessions with runtime rotation enabled, creates a temporary shadow `CODEX_HOME`, writes a local provider (`codex-multi-auth-runtime-proxy`), and starts a loopback proxy for that process.
-- For interactive TUI sessions (with or without the optional initial `[PROMPT]`), `resume`/`fork`, and `codex app-server`, keeps the canonical `CODEX_HOME` and passes the same provider as `-c` overrides instead, so session history and SQLite state are not copied into a shadow and reindexed on every launch. A resident `app-server` needs the canonical home for a stronger reason than convenience: it cannot start at all on a shadow home whose `app-server-control` is a symlink, and a shadow thread index would stay frozen for the life of the process (#659).
-- Keeps forwarded sessions on file-backed auth state unless the caller opts out.
-- Supports ephemeral force-pin: `codex-multi-auth-codex --account <index|email|id>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) for a single invocation only — never mutates the persisted `switch` pin.
+`codex-multi-auth-codex` resolves the real official Codex binary (env override → installed package → global npm root → `PATH`), then:
 
-`mcodex` is a thin convenience entry over the same wrapper script (spawned via `node` + sibling `codex.js`, not via a PATH shim).
+- reconciles `cli_auth_credentials_store = "file"` in `~/.codex/config.toml` so forwarded sessions use file-backed auth (opt out with `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0`),
+- resolves an ephemeral `--account <index|email|id>` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` pin (never mutates the persisted `switch` pin),
+- starts the loopback rotation proxy and points the Codex provider config at it,
+- spawns official Codex (with bounded retries and an unsupported-model fallback chain), and
+- syncs refreshed official state back out of the shadow home on exit.
+
+Stale-home sweeps delete only empty owned shells after affirmative evidence that both the recorded wrapper and child have stopped. Process death does not prove sync-back completed; any remaining state file retains the home. Missing, corrupt or unreadable ownership markers, unknown process identity, and wrapper-only markers retain the home regardless of directory age. Failure to record a spawned child must not authorize deletion of its unsynced state. The launching wrapper still synchronizes its own state before cleanup.
 
 ### 3. Runtime rotation proxy
 
-When `codexRuntimeRotationProxy` is enabled (default), the wrapper starts a loopback Responses-compatible proxy and points a temporary shadow config at the local provider:
+`lib/runtime-rotation-proxy.ts`, provider id `codex-multi-auth-runtime-proxy`. It forwards only these routes: `POST /responses` (+ `/codex/`, `/v1/` aliases), `GET /models` (+ `/v1`), [image generation/edit routes](reference/image-routes.md), and `GET|POST /thread/goal/*`. Everything else is a 404. Bodies are capped at 64 MiB; gzip/deflate/br/zstd request encodings are decoded.
 
-`codex-multi-auth-runtime-proxy`
+Per request it applies policy before picking an account, refreshes tokens through a deduplicating queue (one in-flight refresh per token, cross-process leases so two CLIs do not double-refresh), classifies upstream responses into rotation marks (rate-limit, cooldown, circuit breaker, workspace disable, token invalidation), and streams successful bytes back with stall detection and backpressure. Runtime counters land in `runtime-observability.json` for `status`, `report`, `monitor`, `rotation status`, and `why-selected`.
 
-The proxy:
+The local Pi integration also accepts authenticated WebSocket upgrades on the Responses routes. Custom-provider sockets keep their upstream account until it becomes unavailable, using drain-first selection independently of HTTP scheduling. Each `response.create` rechecks policy, circuit-breaker admission, and the optional context budget guard, and records normalized usage including reasoning tokens and service tier. Lost connection-scoped continuations return `previous_response_not_found` so the client can resend complete context. Native OpenAI sockets instead use `lib/runtime/responses-websocket.ts` and the native HTTP routing boundary, including workspace capabilities and explicit API/ZDR pools. Only one transport handles each upgrade.
 
-- accepts only local authenticated client requests (per-process client token)
-- forwards Responses API, model discovery, and thread-goal routes (`/responses`, `/models`, `/thread/goal/*`, and `/codex/...` variants)
-- forwards authenticated [image generation/edit routes](reference/image-routes.md), including `/v1` aliases, through the same account and policy machinery
-- authenticates local clients with a per-process token via `Authorization: Bearer` or `x-api-key` (timing-safe compare); refuses non-loopback binds
-- caps request bodies at 64 MiB
-- replaces upstream auth headers with the selected managed account (no account emails in client-facing headers)
-- runs `evaluateRuntimePolicy` before account selection (pause/drain, budgets, routing profiles, capability matrix)
-- rotates accounts on rate limits, auth refresh failures, network errors, and server errors before response bytes are streamed
-- strips hop-by-hop and stale decoded response headers before returning data to the local Codex client
-- records runtime status for `codex-multi-auth status`, `codex-multi-auth report`, and `codex-multi-auth rotation status`
-- appends redacted usage ledger rows after request completion or failure
-- when the experimental **context budget guard** is enabled (`contextBudgetGuardEnabled`, disabled by default), pauses the next request on a session that has crossed a hard context-usage threshold, before it reaches upstream — see [features.md](features.md#context-budget-guard-experimental)
+Runtime admission does not impose a synthetic requests-per-minute cap. Upstream quota responses, cooldowns, account policies, and circuit breakers still apply. Explicit recovery requires successful refresh or a completed live response probe. A later JWT timestamp alone does not clear revocation, and quota headers on a 401 do not prove recovery.
+
+HTTP dispatch and each WebSocket create require a readable pending-auth journal. An unreadable or corrupt journal denies dispatch rather than trusting cached credentials. A request binds its manager, record generation, credential, expiry, and workspace; dispatch checks that binding again after asynchronous preparation. Native WebSocket creates and API/ZDR HTTP fallback re-enter request-local routing authorization after the upstream handshake. API selection identifies a candidate but does not count as inference submission. Typed pre-send denials retain their original status and code; HTTP POST or WebSocket create accounting runs only at the authorized send boundary. A rejected native handshake retains only recognized workspace, model or setting decision codes and the required setting parameter. Its bounded diagnostic body is never forwarded; unknown or malformed decisions remain generic. Eligible siblings can recover before any upstream create, without HTTP replay. Custom sockets validate their original credential and workspace on later turns, replacing stale idle bindings only for requests without connection-scoped continuations. Circuit admission receipts identify the breaker and its epoch: a genuine half-open probe retains its slot, but an earlier closed-state admission cannot borrow another request's probe. Native primary reconciliation and journal eligibility also reject replaced credentials and foreign or deleted manager members. Native routing permits up to 30 seconds of primary-file availability grace for independently authenticated clients, but still reconciles the journal on every read. The grace uses a monotonic clock, never extends on failed reads, and cannot authenticate a managed bearer.
 
 ### 4. Local governance
 
-Local-only controls under `~/.codex/multi-auth`:
+File-backed, local-only, and enforced on the rotation path by `evaluateRuntimePolicy` (`lib/policy/runtime-policy.ts`):
 
-| Concern | Storage / module | CLI |
+| Concern | Storage under `~/.codex/multi-auth` | CLI |
 | --- | --- | --- |
-| Usage ledger | `usage/usage-ledger.jsonl` | `codex-multi-auth usage` |
+| Usage ledger | `usage/usage-ledger.jsonl` (+ rotated archives) | `codex-multi-auth usage` |
 | Budget guards | `budget-guards.json` | `codex-multi-auth budget` |
-| Account policy (tags, weight, pause, drain, notes) | `account-policies.json` | `codex-multi-auth account …` |
-| Routing profiles | `routing-profiles.json` | project-aware resolution + `monitor` |
-| Model / account capability matrix | derived + capability policy cache | `codex-multi-auth models` |
-| Aggregated operator view | runtime observability + above | `codex-multi-auth monitor` |
+| Account policy (tags, weight, priority, pause/drain, notes) | `account-policies.json` | `codex-multi-auth account …` |
+| Routing profiles (per-project allow/deny, tag weights, budget key) | `routing-profiles.json` | file-only writes; `monitor` reads |
+| Quota snapshots | `quota-cache.json` | `limits`, `check`, `forecast --live`, `report` |
+| Operator view | runtime observability + all of the above | `codex-multi-auth monitor` |
 
-**Pause and drain are enforced at runtime.** `evaluateRuntimePolicy` marks paused or drained accounts as blocked for rotation selection on the runtime proxy (and plugin-host) path. Budgets are best-effort guards (eventually consistent under concurrency); they are not a hard multi-process reservation system.
+Actual-send governance reads distinguish absent policy stores from malformed or unreadable authority. Account policies, budget guards and routing profiles use strict observation at this boundary; failures deny dispatch rather than supplying empty defaults. Cached reads require a stable file revision. Project revision watches stop at the established Git root, but still observe lower markers and all ancestors when no Git boundary exists.
 
-### 5. Local bridge + client tokens
+Budgets are **advisory**: evaluations read a pre-request ledger snapshot, so racing requests can briefly overshoot a limit. Ledger rows are redacted — hashed account identity and request metadata, never prompts or credentials.
 
-Optional loopback bridge (`lib/local-bridge.ts`) exposes `/health`, `/v1/models`, and `/v1/responses`, forwarding to a configured runtime base URL.
+### 5. Local bridge (optional)
 
-- Client tokens are `cma_local_*` values; only SHA-256 hashes and prefixes are stored (`local-client-tokens.json`).
-- Manage tokens with `codex-multi-auth bridge token create|list|rotate|revoke`.
-- Plain token is shown only once at create/rotate.
-- Integration snippet helpers: `codex-multi-auth integrations`.
+`lib/local-bridge.ts` exposes a loopback-only OpenAI-compatible surface (`/health`, `/v1/models`, `/v1/responses`) that forwards to a runtime proxy base URL. Client tokens are `cma_local_*` values; only SHA-256 hashes and prefixes are stored in `local-client-tokens.json`, and the plaintext is shown once at `codex-multi-auth bridge token create|rotate`.
 
-### 6. Storage V3, project pools, worktree identity
+### 6. Storage and project pools
 
-Account storage uses the V3 on-disk format (`AccountStorageV3`).
+Account storage uses the V3 format (`AccountStorageV3`) under the multi-auth root:
 
-- Default pool: `~/.codex/multi-auth/openai-codex-accounts.json`
-- Optional project-scoped pools: `~/.codex/multi-auth/projects/<project-key>/…`
-- Linked Git worktrees share repo identity so account pools are not split per worktree path
-- WAL, `.bak` snapshots, named backups, and flagged-account recovery support repair flows
-- Selected account can be synced into official Codex CLI files under `~/.codex` so plain forwarded Codex commands keep the intended account
+- Global pool: `~/.codex/multi-auth/openai-codex-accounts.json`
+- Per-project pools: `~/.codex/multi-auth/projects/<project-key>/openai-codex-accounts.json`, keyed by repo identity root so linked Git worktrees share one pool
+- Durability: write-ahead journal (`.wal`), temp-file-then-rename writes `0600`, and a throttled `.bak`/`.bak.1`/`.bak.2` rotation, plus named backups under `backups/`
+- Recovery: flagged-account sidecar (`openai-codex-flagged-accounts.json`), pending-auth journal, and `verify`/`fix`/`doctor` repair commands. Journal retention scans every predecessor that a recovery loader can restore, including flagged `.bak`, `.bak.1`, and `.bak.2` files.
 
-### 7. Reversible app bind
+Refresh admission holds the existing pool and journal locks, in that order, from before OAuth refresh until the returned credentials are journaled. A post-refresh settlement failure retains the new credential and original persistence error without publishing a successful lease or treating the failure as authentication refusal. The shared queue keeps at most 1,000 unsettled owners without age eviction; calls using either the spent token or its replacement retry persistence, not OAuth. A committer whose primary and journal writes both fail retains the original source proof and exact returned credential in that same queue only while the captured source remains authoritative. Retry must publish to the existing journal before catalog authorization. An unchanged primary with its captured predecessor copied into a known backup consumes the single owned-publication transition, not the single external metadata reconciliation. Callers retain token material only on the captured live binding, without clearing restrictions or healing health. Managed refresh requires its current primary member, not a memory-only account or backup-only lineage. Recovery discovery streams directory entries and rejects proofs exceeding 1,000 source paths or distinct retained credentials without truncation. The exact automatic-check history sidecar is not a credential recovery source; unknown account-prefixed files still require valid recovery data. This protects a running process, not the gap between remote acceptance and local receipt or survival across a process crash.
 
-`lib/runtime/app-bind.ts` and `scripts/codex-app-router.js` support packaged Codex desktop app routing:
+Delayed refusals and authentication cooldowns may restrict only their submitted record, credential pair, expiry, and workspace. The account storage transaction verifies current durable credentials and expiry, then rechecks the live binding after journal observation before applying those restrictions, so an older response cannot disable a recovery committed by another manager. New custom HTTP requests reconcile durable credentials before selection; the final send still validates its captured binding. A metadata-only authority change permits at most one complete same-binding revalidation. Observing publication of the captured OAuth result is a separate, single transition; it cannot authorize another generation or a new revocation marker. Continued metadata changes fail closed. A known runtime blocker may select another account only before dispatch authorization and before any WebSocket send; it cannot replay an authorized request. A memory-only refresh still honors newly observed primary revocation, while an unchanged pre-recovery marker does not revoke its replacement again. Proxy catalog discovery also consumes the shared validator's runtime rejection before sending an authenticated request. Standalone OAuth discovery rejects invalidation, cooldown and quota restrictions, then rechecks durable record, credential, expiry, workspace and journal authority after token preparation and immediately before its catalog GET. Automatic subscription probes also recheck their original owner and opt-in policy immediately before every primary or fallback send. Every plugin authenticated send, including compaction and explicit-safe-rejection fallback, checks durable membership, credential, exact expiry, journal and policy authority after preparation awaits. A later local observation error is reported separately rather than replacing the original provider response or transport exception. Delayed plugin stream response IDs require current credential and circuit authority and their original affinity-entry ownership; they cannot recreate a forgotten session. A flagged cached access token, even with a future expiry, does not prove recovery. Flagged publication rechecks the original durable flagged source and captured reset/journal proof inside the final storage transaction. Both plugin and CLI restoration retain the verified source's stable record ID, original added-at timestamp and workspace restrictions; recovery cannot take over another primary record. Native reads preserve raw revocation evidence before normalization and journal overlay. An orphaned code-only marker cannot produce a verified snapshot or reuse an older healthy cache through routing grace. Nonstream conversion collects billed usage while reading and settles read, stall and size-limit failures before propagating the original body error. Persisted API capability recovery accepts fresh forced verification that observed the current loss barrier even when the wall clock stays equal or moves backward. Writers that did not observe a newer loss still cannot restore inherited positives. Pre-send observation errors remain typed local failures, and every dispatch receipt must belong to the account's currently registered breaker, not an evicted object.
 
-- real Codex `config.toml` is backed up before modification
-- a localhost router is started for the app
-- a user login startup entry keeps the router available
-- `codex-multi-auth rotation disable` or `codex-multi-auth rotation unbind-app` restores the backup and removes the startup entry
-- official app binaries are **not** patched
+Capability probe revocation affects only evidence attributable to the failing credential. Invalidated evidence carries the loss observation timestamp through export and persisted merges. The private probe cache also records the loss barrier observed by each generation. Under its existing file transaction, a late writer that did not observe a newer credential loss cannot republish earlier verification merely because its inconclusive probes finished later. Owner-loss authority survives model and credential-group eviction in the existing private store and in-memory reader. Its independent 1,000-owner bound rejects overflow without replacing committed authority; loss barriers do not expire with model cache entries. Reloaded caches restore that barrier, and the publishing caller renders the accepted cache results without additional provider requests. A missing accepted result strips inherited probe verification and tiers while preserving documented capabilities. An explicit forced check starts a fresh probe generation, even when an earlier healthy batch is still in flight. Retired batches cannot borrow or mutate a newer generation's cached evidence after delayed documentation reads, reuse denied in-flight results, or revive late successes from that generation. Independent imported credentials and documented capabilities remain intact.
 
-`codex-multi-auth-app-launcher` retargets supported user-level shortcuts or creates a managed macOS wrapper app.
+Durable cooldowns and quota reset times reconcile even when credentials and expiry are unchanged. The runtime compares each observed primary snapshot with local observations, preserving concurrent restrictions while honoring explicit clears. Replaying a journal self-mapping does not clear a later current-primary authentication cooldown; credential replacement or verified historical recovery may clear an obsolete one.
 
-### 8. Lazy first-run setup (shipped)
+Each credential rotation advances every retained predecessor to the newest credential. Pruning retains predecessors that backups or the WAL can restore. Only verified primary saves establish committed recovery authorization. Unchanged aliases preserve that authorization, while current primary disablement and revocation remain authoritative.
 
-`npm` postinstall is **notice-only** (no app detection or filesystem mutation). App bind and launcher setup run once on the first `codex-multi-auth` invocation from a durable global install, recorded in:
+The active selection is mirrored into the official `~/.codex/auth.json` / `accounts.json` so plain forwarded Codex commands keep the intended account.
 
-`~/.codex/multi-auth/first-run-setup.json`
+### 7. Reversible packaged-app bind
 
-- Skipped for CI, `npx`, and project-local installs (marker is not consumed in those cases).
-- Opt-outs: `CODEX_MULTI_AUTH_APP_BIND` / `CODEX_MULTI_AUTH_APP_BIND_INSTALL`, `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL`.
-- Failures are best-effort and never block the command.
+`codex-multi-auth rotation bind-app` backs up the real `~/.codex/config.toml`, points the packaged Codex desktop app at a persistent localhost router (`scripts/codex-app-router.js`), and installs a user-level startup entry. `rotation unbind-app` / `rotation disable` restores the backup. Official app binaries are never patched.
 
-### 9. Optional plugin-host runtime
+### 8. Lazy first-run setup
 
-The package root still exports the plugin-host entrypoint for integrations that load `index.ts`.
+`npm` postinstall is notice-only. On the first `codex-multi-auth` invocation from a durable global install, `lib/runtime/first-run.ts` claims `first-run-setup.json` once and runs three best-effort steps: app bind, launcher install, and the `cli_auth_credentials_store` pin. Skipped under CI, `npx`, and project-local installs; failures never block the command.
 
-That path reuses the same account pool for:
+### 9. Plugin-host entry (compatibility)
 
-- request transformation
-- token refresh
-- retry and failover
-- session affinity
-- live account sync
-- quota-aware selection
-- the same runtime policy evaluation surface as the rotation proxy
-
-Normal `codex-multi-auth ...` usage and wrapper forwarding do not require this host mode.
-
----
-
-## Request Flow
-
-### Account manager
-
-```text
-Terminal user
-  |
-  | codex-multi-auth status|login|forecast|…
-  v
-scripts/codex-multi-auth.js
-  |
-  | bare cmds normalize to auth manager
-  v
-lib/codex-manager.ts + commands/
-  |
-  v
-~/.codex/multi-auth (accounts, settings, caches, governance)
-```
-
-### Forwarding wrapper (no rotation / non-request path)
-
-```text
-Terminal user
-  |
-  | codex-multi-auth-codex …   or   mcodex …
-  v
-scripts/codex.js  (mcodex forwards here)
-  |
-  | auth … → local manager
-  | else → official Codex CLI
-  v
-Official Codex CLI
-```
-
-### Default runtime rotation path
-
-```text
-Terminal user or Codex app
-  |
-  v
-codex-multi-auth-codex wrapper / app bind / mcodex
-  |
-  | shadow CODEX_HOME (request commands, codex app)
-  |   or canonical CODEX_HOME + -c overrides (TUI, resume/fork, app-server)
-  | provider: codex-multi-auth-runtime-proxy
-  v
-localhost Responses proxy (client token)
-  |
-  | evaluateRuntimePolicy → select managed account
-  | replace Authorization with account token
-  v
-Official Codex / ChatGPT-backed backend
-  |
-  | usage ledger row (redacted)
-  v
-Local client
-```
-
-### Optional local bridge
-
-```text
-Local client (curl / script / tool)
-  |
-  | Bearer cma_local_*
-  v
-local bridge (loopback: /health, /v1/models, /v1/responses)
-  |
-  | runtime client token
-  v
-runtime rotation proxy (or configured runtime base URL)
-  |
-  v
-Official backend via selected managed account
-```
-
-### Optional plugin-host path
-
-```text
-Plugin host
-  |
-  v
-codex-multi-auth plugin runtime (index.ts)
-  |
-  | same account pool + refresh / retry / failover / policy
-  v
-Codex or ChatGPT-backed request flow
-```
+The package root still exports a plugin-host runtime (`index.ts`) for hosts that load plugins: it reuses the same pool, refresh queue, request transformer, and policy evaluation. Normal `codex-multi-auth ...` use does not require it.
 
 ---
 
 ## Design Constraints
 
-- The official OAuth flow remains the source of authentication.
-- The canonical command family is `codex-multi-auth ...`.
-- The package does not publish a global `codex` binary.
-- The OAuth callback port remains `1455` (provider-registered redirect URI).
-- Runtime rotation is default-on and localhost-only.
+- The official OAuth flow remains the source of authentication; the callback port stays `1455`.
+- The canonical command family is `codex-multi-auth ...`; no global `codex` bin is published.
+- Runtime rotation is default-on, loopback-only, and authenticated with a per-launch client key.
+- Proxied Responses requests are forced to `stream: true` and `store: false` (stateless compatibility), with `reasoning.encrypted_content` included, unless background-response compatibility is explicitly enabled.
 - Credentials and governance state stay local under `~/.codex/multi-auth`.
-- Pause/drain and other runtime policy checks apply on the rotation/proxy path via `evaluateRuntimePolicy`.
 - The desktop app bind is reversible and does not patch official app files.
-- First-run app integration is lazy (postinstall is notice-only).
-- Local storage and repair tooling target personal operator workflows, not hosted multi-user services.
-- Default general model routing uses `gpt-5.5`; diagnostic live/quota probes lead with `gpt-5.6-sol`.
+- Default general model routing uses `gpt-6.1-sol`; diagnostic live/quota probes lead with `gpt-5.6-sol`.
 
 ---
 
@@ -271,8 +211,8 @@ Codex or ChatGPT-backed request flow
 
 - [getting-started.md](getting-started.md)
 - [features.md](features.md)
-- [faq.md](faq.md)
 - [configuration.md](configuration.md)
+- [faq.md](faq.md)
 - [reference/commands.md](reference/commands.md)
 - [reference/storage-paths.md](reference/storage-paths.md)
 - [development/ARCHITECTURE.md](development/ARCHITECTURE.md)

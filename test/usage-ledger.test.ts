@@ -218,30 +218,98 @@ describe("usage ledger core", () => {
 		});
 	});
 
-	it("exports pricing helpers with deterministic estimates", async () => {
-		const { estimateUsageCostUsd, listUsageModelPricing } = await import(
-			"../lib/usage/index.js"
-		);
+	it.each((["api", "zdr"] as const).flatMap(kind => ["", "speed/fast/", "speed/ultrafast/"].flatMap(speed => ["gpt-5.5-pro", "gpt-6-astra"].map(model => ({kind, speed, model})))))
+	("prices the actual API payload and persisted usage without OAuth replacement: %j", async ({kind, speed, model}) => {
+		const {ApiModelRuntime} = await import("../lib/runtime/api-model-runtime.js");
+		const {appendUsageLedgerRow, readUsageLedgerRows, summarizeUsageRows, extractResponsesUsage} = await import("../lib/usage/index.js");
+		const {evaluateBudgetGuard} = await import("../lib/budget-guard.js");
+		const sent: unknown[] = [];
+		const runtime = new ApiModelRuntime(async (_url, init) => {
+			if (init?.method !== "POST") return Response.json({data: [{id: model}]});
+			sent.push(JSON.parse(String(init.body)));
+			return Response.json({service_tier: speed === "speed/fast/" ? "priority" : speed ? "ultrafast" : "default", usage: {input_tokens: 1000, output_tokens: 100, total_tokens: 1100}});
+		}, Date.now, undefined, async models => models.map(item => ({...item, service_tiers: [{id: "priority", name: "Fast", description: "Fixture"}, {id: "ultrafast", name: "Ultrafast", description: "Fixture"}]})));
+		const alias = `${kind}/${speed}${model}`;
+		const {saveApiRoutes} = await import("../lib/api-route-store.js");
+		const routes = [{id: "priced-fixture", label: "Fixture", kind, apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: [model]}];
+		await saveApiRoutes(routes);
+		const response = await runtime.request(alias, {model: alias, input: "Fixture"}, routes);
+		expect(response.status).toBe(200);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({model, store: false, ...(speed ? {service_tier: speed === "speed/fast/" ? "priority" : "ultrafast"} : {})});
+		const usage = extractResponsesUsage(await response.json());
+		expect(usage).toMatchObject({inputTokens: 1000, outputTokens: 100, totalTokens: 1100});
+		const row = await appendUsageLedgerRow({id: "actual-api-model", source: "runtime-proxy", operation: "responses", outcome: "success", model: alias, ...usage});
+		const cost = model === "gpt-5.5-pro" || speed === "speed/ultrafast/" ? null : speed ? 0.03 : 0.015;
+		expect(row.costUsd).toBe(cost);
+		const persisted = (await readUsageLedgerRows()).filter(item => item.id === row.id);
+		expect(persisted).toEqual([row]);
+		const budget = evaluateBudgetGuard({key: "*", window: "day", maxCostUsd: 1, updatedAt: 1}, summarizeUsageRows(persisted));
+		expect(budget.allowed).toBe(cost !== null);
+		expect(budget.usage.unpricedRequests).toBe(cost === null ? 1 : 0);
+		if (cost === null) expect(budget.reasons.join(" ")).toContain("cost limit cannot be evaluated");
+	});
 
-		expect(Object.keys(listUsageModelPricing())).toContain("gpt-5.3-codex");
+	it("keeps malformed and prototype API prices unknown and historical costs unchanged", async () => {
+		const {getUsageModelPricing, appendUsageLedgerRow, readUsageLedgerRows, estimateUsageCostUsd} = await import("../lib/usage/index.js");
+		for (const model of ["api/constructor", "zdr/toString", "api/speed/fast/__proto__", "api/speed/fast/", "api/zdr/gpt-6-astra", "api/speed/fast/zdr/gpt-6-astra", "api/astra", "api/gpt-6.2-sol"]) expect(getUsageModelPricing(model)).toBeNull();
+		expect(estimateUsageCostUsd("gpt-5.5-pro", {inputTokens: 1000, outputTokens: 100, cachedInputTokens: 0, reasoningTokens: 0, totalTokens: 1100})).toBe(0.015);
+		const historical = await appendUsageLedgerRow({id: "historical-api-price", model: "api/gpt-5.5-pro", inputTokens: 1000, outputTokens: 100, costUsd: 0.123, outcome: "success"});
+		expect(historical.costUsd).toBe(0.123);
+		expect((await readUsageLedgerRows()).find(row => row.id === historical.id)?.costUsd).toBe(0.123);
+	});
+
+	it("exports pricing helpers with deterministic estimates", async () => {
+		const { estimateUsageCostUsd, getUsageModelPricing, listUsageModelPricing } =
+			await import("../lib/usage/index.js");
+
+		expect(Object.keys(listUsageModelPricing())).toContain("gpt-6.1-sol");
+		// Bare aliases reach the ledger raw (the proxy records the client's model
+		// string verbatim) but price through their canonical card — an unresolved
+		// alias would read as unpriced and fail a cost budget closed.
+		expect(getUsageModelPricing("gpt-6.1")).toEqual(
+			getUsageModelPricing("gpt-6.1-sol"),
+		);
+		expect(getUsageModelPricing("gpt-6")).toEqual(
+			getUsageModelPricing("gpt-6-astra"),
+		);
+		expect(getUsageModelPricing("gpt-5.6")).toEqual(
+			getUsageModelPricing("gpt-5.6-sol"),
+		);
+		expect(getUsageModelPricing("gpt-6.1-sol-max")).toEqual(
+			getUsageModelPricing("gpt-6.1-sol"),
+		);
 		expect(
-			estimateUsageCostUsd("gpt-5.3-codex", {
+			estimateUsageCostUsd("gpt-6.1", {
+				inputTokens: 100_000,
+				outputTokens: 1_000_000,
+				cachedInputTokens: 0,
+				reasoningTokens: 0,
+				totalTokens: 1_100_000,
+			}),
+		).toBeCloseTo(10.2, 10);
+		// Unknown ids still price as unknown rather than at the default's rate.
+		expect(getUsageModelPricing("gpt-6.2-sol")).toBeNull();
+		// Retired gpt-5.5 prices through its replacement card (gpt-6-sol);
+		// 1M input crosses the 272K long-context threshold ($4/$15/$0.40).
+		expect(
+			estimateUsageCostUsd("gpt-5.5", {
 				inputTokens: 1_000_000,
 				outputTokens: 1_000_000,
 				cachedInputTokens: 1_000_000,
 				reasoningTokens: 1_000_000,
 				totalTokens: 4_000_000,
 			}),
-		).toBe(20.125);
+		).toBe(30.4);
 		expect(
-			estimateUsageCostUsd("gpt-5.3-codex", {
+			estimateUsageCostUsd("gpt-5.5", {
 				inputTokens: 1_000,
 				outputTokens: 200,
 				cachedInputTokens: 50,
 				reasoningTokens: 25,
 				totalTokens: 1_225,
 			}),
-		).toBe(0.00344375);
+		).toBe(0.00416);
 		expect(
 			estimateUsageCostUsd(null, {
 				inputTokens: 1,

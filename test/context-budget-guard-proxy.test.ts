@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { AccountManager } from "../lib/accounts.js";
 import { HTTP_STATUS } from "../lib/constants.js";
 import {
@@ -10,6 +13,7 @@ import { __resetRoutingMutexForTests } from "../lib/routing-mutex.js";
 import { resetRefreshQueue } from "../lib/refresh-queue.js";
 import { resetTrackers } from "../lib/rotation.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 
 const { refreshAccessTokenMock, saveAccountsMock, withAccountStorageTransactionMock } =
 	vi.hoisted(() => ({
@@ -37,12 +41,15 @@ const openServers: RuntimeRotationProxyServer[] = [];
 const openManagers: AccountManager[] = [];
 
 /**
- * 205k of carried context (input + non-reasoning output) against the 260k
- * estimate for the codex family: 78.8%, comfortably past the 69% default hard
- * threshold. The 60k of `reasoning_tokens` is deliberately large — it is in
- * `total_tokens` but is NOT resent as context next turn, so a guard that read
- * `total_tokens` would score this turn at 102% and a guard that reads
- * input+output scores it at 78.8%.
+ * 205k of carried context (input + non-reasoning output) against a 260k
+ * window override for gpt-5.5: 78.8%, comfortably past the 69% default hard
+ * threshold. No routable model ships a built-in estimate anymore (the table is
+ * deliberately empty), so the window comes from
+ * `contextBudgetGuardModelWindowOverrides` in the plugin config this file
+ * points CODEX_MULTI_AUTH_CONFIG_PATH at. The 60k of `reasoning_tokens` is
+ * deliberately large — it is in `total_tokens` but is NOT resent as context
+ * next turn, so a guard that read `total_tokens` would score this turn at
+ * 102% and a guard that reads input+output scores it at 78.8%.
  */
 const HEAVY_USAGE_STREAM =
 	'data: {"type":"response.output_text.delta","delta":"hi"}\n\n' +
@@ -118,7 +125,12 @@ async function postResponses(
 	return { status: response.status, text: await response.text() };
 }
 
-beforeEach(() => {
+const guardConfigPath = join(
+	tmpdir(),
+	`context-budget-guard-proxy-${process.pid}.json`,
+);
+
+beforeEach(async () => {
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
@@ -130,6 +142,14 @@ beforeEach(() => {
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
 		handler(null, async () => undefined),
 	);
+	await fs.writeFile(
+		guardConfigPath,
+		JSON.stringify({
+			contextBudgetGuardModelWindowOverrides: { "gpt-5.5": 260_000 },
+		}),
+		"utf-8",
+	);
+	process.env.CODEX_MULTI_AUTH_CONFIG_PATH = guardConfigPath;
 	process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED = "true";
 });
 
@@ -146,6 +166,8 @@ afterEach(async () => {
 	__resetRoutingMutexForTests();
 	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_GUARD_ENABLED;
 	delete process.env.CODEX_AUTH_CONTEXT_BUDGET_HARD_PCT;
+	delete process.env.CODEX_MULTI_AUTH_CONFIG_PATH;
+	await removeWithRetry(guardConfigPath, { force: true }).catch(() => {});
 });
 
 describe("context budget guard on the rotation proxy path", () => {
@@ -153,7 +175,7 @@ describe("context budget guard on the rotation proxy path", () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
 		const { calls, fetchImpl } = createRecordingFetch(HEAVY_USAGE_STREAM);
 		const proxy = await startProxy(accountManager, fetchImpl);
-		const turn = { model: "gpt-5-codex", stream: true, prompt_cache_key: "sess-1" };
+		const turn = { model: "gpt-5.5", stream: true, prompt_cache_key: "sess-1" };
 
 		const first = await postResponses(proxy, turn);
 		expect(first.status).toBe(HTTP_STATUS.OK);
@@ -183,7 +205,7 @@ describe("context budget guard on the rotation proxy path", () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
 		const { calls, fetchImpl } = createRecordingFetch(HEAVY_USAGE_STREAM);
 		const proxy = await startProxy(accountManager, fetchImpl);
-		const turn = { model: "gpt-5-codex", stream: true, prompt_cache_key: "sess-2" };
+		const turn = { model: "gpt-5.5", stream: true, prompt_cache_key: "sess-2" };
 
 		await postResponses(proxy, turn);
 		const second = await postResponses(proxy, turn);
@@ -199,12 +221,12 @@ describe("context budget guard on the rotation proxy path", () => {
 		const proxy = await startProxy(accountManager, fetchImpl);
 
 		await postResponses(proxy, {
-			model: "gpt-5-codex",
+			model: "gpt-5.5",
 			stream: true,
 			previous_response_id: "resp_a",
 		});
 		const second = await postResponses(proxy, {
-			model: "gpt-5-codex",
+			model: "gpt-5.5",
 			stream: true,
 			previous_response_id: "resp_a",
 		});
@@ -222,7 +244,7 @@ describe("context budget guard on the rotation proxy path", () => {
 		const proxy = await startProxy(accountManager, fetchImpl);
 
 		await postResponses(proxy, {
-			model: "gpt-5-codex",
+			model: "gpt-5.5",
 			stream: true,
 			prompt_cache_key: "sess-switch",
 		});
@@ -240,7 +262,7 @@ describe("context budget guard on the rotation proxy path", () => {
 		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
 		const { calls, fetchImpl } = createRecordingFetch(HEAVY_USAGE_STREAM);
 		const proxy = await startProxy(accountManager, fetchImpl);
-		const turn = { model: "gpt-5-codex", stream: true, prompt_cache_key: "sess-3" };
+		const turn = { model: "gpt-5.5", stream: true, prompt_cache_key: "sess-3" };
 
 		await postResponses(proxy, turn);
 		const second = await postResponses(proxy, turn);

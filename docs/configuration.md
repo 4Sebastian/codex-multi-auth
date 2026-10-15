@@ -1,20 +1,54 @@
 # Configuration
 
-Runtime configuration is resolved from unified settings, optional override files, and environment variables.
+Runtime configuration is resolved from one canonical settings file, an optional env-pointed override file, legacy compatibility files, and per-setting environment overrides. This guide covers what a user needs day to day; the complete field-by-field inventory (including every internal env name) lives in [development/CONFIG_FIELDS.md](development/CONFIG_FIELDS.md), and the maintainer-level resolution walkthrough lives in [development/CONFIG_FLOW.md](development/CONFIG_FLOW.md).
 
 ---
 
-## Canonical Files
+## Resolution order
+
+`pluginConfig` (the persisted name for runtime settings) resolves in this order:
+
+```text
+CODEX_MULTI_AUTH_CONFIG_PATH set AND the file exists?
+  │  yes → load that file as the config source (also the save target)
+  │  no
+  ▼
+<multi-auth root>/settings.json → pluginConfig section valid?
+  │  yes → load it
+  │  no / absent
+  ▼
+legacy config ladder (config.json, codex-multi-auth-config.json,
+openai-codex-auth-config.json under the Codex home roots)
+  │  none found
+  ▼
+DEFAULT_PLUGIN_CONFIG (hardcoded defaults)
+```
+
+After a source is selected, each field is schema-validated, merged over `DEFAULT_PLUGIN_CONFIG`, and then **environment variables apply per-setting overrides** — env wins over the file, the file wins over the default. Numeric values are clamped to their documented bounds.
+
+Two behaviors worth knowing:
+
+- A `CODEX_MULTI_AUTH_CONFIG_PATH` that is set but does not exist yet is skipped on load; the next config save still creates/writes that path while the variable remains set.
+- `CODEX_MULTI_AUTH_DIR` re-homes every multi-auth-owned file. When `CODEX_HOME` points at a non-default directory, the multi-auth root resolves strictly to `$CODEX_HOME/multi-auth` — no other roots are scanned for an existing account pool.
+
+Dashboard display settings (`dashboardDisplaySettings` in the same `settings.json`) are resolved separately: persisted values first, then normalized defaults.
+
+---
+
+## Where the files live
 
 | Layer | Path | Purpose |
 | --- | --- | --- |
-| Unified settings | `~/.codex/multi-auth/settings.json` | Dashboard display and runtime `pluginConfig` |
-| Optional config override | `CODEX_MULTI_AUTH_CONFIG_PATH=<path>` | External config file source |
-| Root override | `CODEX_MULTI_AUTH_DIR=<path>` | Re-home settings/accounts/cache/log directories |
+| Multi-auth root | `~/.codex/multi-auth/` (override with `CODEX_MULTI_AUTH_DIR`) | Accounts, settings, cache, logs, governance state |
+| Unified settings | `<multi-auth root>/settings.json` | `pluginConfig` + `dashboardDisplaySettings`; a `.bak` sibling is kept for recovery |
+| Optional config file | `CODEX_MULTI_AUTH_CONFIG_PATH=<path>` | Standalone config source and save target |
+| Global account pool | `<multi-auth root>/openai-codex-accounts.json` | Managed OAuth accounts |
+| Per-project pools | `<multi-auth root>/projects/<project-key>/` | Project-scoped accounts when `perProjectAccounts` is on and CLI sync is off |
+| Official Codex state | `~/.codex/auth.json`, `~/.codex/accounts.json`, `~/.codex/config.toml` | Synced by `CODEX_MULTI_AUTH_SYNC_CODEX_CLI`; paths overridable via `CODEX_CLI_*_PATH` |
 
----
+Full path reference: [reference/storage-paths.md](reference/storage-paths.md).
 
-## Settings Shape
+## Settings shape
 
 ```json
 {
@@ -40,124 +74,111 @@ Runtime configuration is resolved from unified settings, optional override files
 }
 ```
 
----
-
-## Resolution Precedence
-
-Runtime config **source selection** is resolved in this order. The persisted object is still named `pluginConfig` for compatibility with earlier releases.
-
-1. File from `CODEX_MULTI_AUTH_CONFIG_PATH` when that env var is set **and the file already exists** (preferred load path; also the save target when set).
-2. Unified settings `pluginConfig` from `settings.json` under the multi-auth root (when present and valid).
-3. Legacy compatibility config files when unified settings are absent/invalid.
-4. Hardcoded defaults in `DEFAULT_PLUGIN_CONFIG`.
-
-After a config source is selected, environment variables override individual runtime settings.
-Dashboard display values are resolved from persisted `dashboardDisplaySettings` and then normalized defaults.
-
-Notes:
-
-- A set-but-missing `CODEX_MULTI_AUTH_CONFIG_PATH` is ignored for load until the file is created; the next save still writes to that path when the env var is set.
-- `CODEX_MULTI_AUTH_DIR` re-homes multi-auth-owned files. If `CODEX_HOME` is set to a non-default directory, multi-auth resolves strictly to `$CODEX_HOME/multi-auth` without scanning other roots for existing pools.
+Boolean env overrides accept `1`/`0`, `true`/`false`, `yes`/`no` (case-insensitive). Unparseable env values are ignored with a one-time warning rather than disabling the setting.
 
 ---
 
-## Stable Environment Overrides
+## Stable environment overrides
 
-These are safe for most operators and frequently used in day-to-day workflows.
+These are safe for most operators and cover the common day-to-day adjustments.
 
 | Variable | Effect |
 | --- | --- |
-| `CODEX_MULTI_AUTH_DIR` | Override root directory for multi-auth-managed runtime files |
-| `CODEX_MULTI_AUTH_CONFIG_PATH` | Load configuration from alternate path |
-| `CODEX_MODE=0/1` | Disable or enable Codex mode |
-| `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0/1` | Opt out/in of live Codex Responses routing through the localhost account-rotation proxy |
-| `CODEX_MULTI_AUTH_FORCE_ACCOUNT=<index\|email\|id>` | Force one account for a single forwarded `codex-multi-auth-codex` run (equivalent to the `--account` flag, which wins when both are set). Ephemeral and fail-hard; requires the runtime rotation proxy. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation) |
-| `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS=<ms>` | Override idle shutdown for the wrapper-launched Codex app helper |
-| `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS=<ms>` | Absolute ceiling on a runtime helper's life regardless of activity (default 24h; `0` disables) |
-| `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS=<ms>` | Idle window that applies once a helper's launcher is gone, nothing is connected, and the helper has never served a request (default 15m; `0` restores the full idle timeout) |
-| `CODEX_MULTI_AUTH_APP_BIND=0/1` | Alias-style opt-out for first-run packaged Codex app bind (see also `CODEX_MULTI_AUTH_APP_BIND_INSTALL`) |
-| `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0/1` | Opt out/in of packaged Codex app bind self-heal on first durable CLI run or rotation enable |
-| `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0/1` | Opt out/in of supported user-level launcher routing on first durable CLI run or rotation enable |
-| `CODEX_TUI_V2=0/1` | Disable or enable TUI v2 |
-| `CODEX_TUI_COLOR_PROFILE=truecolor|ansi256|ansi16` | Color profile selection |
-| `CODEX_TUI_GLYPHS=ascii|unicode|auto` | Glyph mode selection |
-| `CODEX_AUTH_FETCH_TIMEOUT_MS=<ms>` | HTTP request timeout override |
-| `CODEX_AUTH_STREAM_STALL_TIMEOUT_MS=<ms>` | Stream stall timeout override |
-| `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS=<ms>` | Minimum time between global account switches (default `60000`). The proxy biases selection toward the last-served account within this window to reduce the rate at which different OAuth tokens appear from the same IP. Set to `0` to disable. |
-| `CODEX_AUTH_SCHEDULING_STRATEGY=hybrid/sequential` | Account scheduling strategy (default `hybrid`). `sequential` (drain-first) keeps one active account until it is fully exhausted before advancing to the next; see [Sequential / drain-first scheduling](#sequential--drain-first-scheduling). |
-| `CODEX_AUTH_TOKEN_INVALIDATION_COOLDOWN_MS=<ms>` | Cooldown applied to an account when the upstream or token-refresh endpoint explicitly revokes its OAuth token (default `300000`, 5 minutes). Raise this if accounts continue to be re-invalidated after re-login. |
+| `CODEX_MULTI_AUTH_DIR` | Re-home the multi-auth root (settings/accounts/cache/logs) |
+| `CODEX_MULTI_AUTH_CONFIG_PATH` | Load config from an alternate file; becomes the save target while set |
+| `CODEX_MODE=0/1` | Toggle Codex mode |
+| `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0/1` | Opt out/in of routing forwarded Codex traffic through the localhost account-rotation proxy |
+| `CODEX_MULTI_AUTH_FORCE_ACCOUNT=<index\|email\|id>` | Force one account for a single forwarded `codex-multi-auth-codex` run (equivalent to `--account`, which wins when both are set). Ephemeral and fail-hard; requires the runtime rotation proxy. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation) |
+| `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS=<ms>` | Idle shutdown for the wrapper-launched Codex app helper (default 12h) |
+| `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS=<ms>` | Absolute ceiling on a helper's life regardless of activity (default 24h; `0` disables) |
+| `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS=<ms>` | Idle window once a helper's launcher is gone, nothing is connected, and the helper has never served a request (default 15m; `0` restores the full idle timeout) |
+| `CODEX_MULTI_AUTH_APP_BIND=0/1` | Opt out/in of the first-run packaged Codex app bind (checked before `CODEX_MULTI_AUTH_APP_BIND_INSTALL`) |
+| `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0/1` | Opt out/in of packaged Codex app bind self-heal on first durable CLI run or `rotation enable` |
+| `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0/1` | Opt out/in of user-level launcher routing on first durable CLI run or `rotation enable` |
+| `CODEX_TUI_V2=0/1` | Toggle TUI v2 |
+| `CODEX_TUI_COLOR_PROFILE=truecolor\|ansi256\|ansi16` | TUI color profile |
+| `CODEX_TUI_COLOR_MODE=auto\|dark\|light` | TUI background mode; `auto` detects light backgrounds from `COLORFGBG` |
+| `CODEX_TUI_GLYPHS=ascii\|unicode\|auto` | TUI glyph mode (`auto` detects from `WT_SESSION`/`TERM_PROGRAM`/`TERM`) |
+| `CODEX_AUTH_FETCH_TIMEOUT_MS=<ms>` | HTTP request timeout (default `60000`, min `1000`) |
+| `CODEX_AUTH_STREAM_STALL_TIMEOUT_MS=<ms>` | Stream stall timeout (default `45000`, min `1000`) |
+| `CODEX_AUTH_SCHEDULING_STRATEGY=hybrid\|sequential` | Account scheduling strategy (default `hybrid`); see [Sequential / drain-first scheduling](#sequential--drain-first-scheduling) |
+| `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS=<ms>` | Minimum time between global account switches (default `60000`; `0` disables the last-served bias) |
+| `CODEX_AUTH_TOKEN_INVALIDATION_COOLDOWN_MS=<ms>` | Cooldown after an explicit upstream token revocation (default `300000`) |
+| `CODEX_AUTH_PID_OFFSET_ENABLED=0/1` | Per-process account-selection bias for parallel agents (default on) |
+| `CODEX_AUTH_ROUTING_MUTEX=legacy\|enabled` | Serialize account selection within a single process (default `legacy`) |
+| `CODEX_AUTH_BACKGROUND_RESPONSES=0/1` | Stateful `background: true` Responses compatibility (default off) |
+| `CODEX_AUTH_NO_BROWSER=1` | Suppress browser launch for headless login |
 
 ---
 
-## Advanced and Internal Overrides
+## Advanced and internal overrides
 
-Use these only when debugging, controlled benchmarking, or maintainer workflows.
-The complete `pluginConfig` ↔ env accessor matrix is in [development/CONFIG_FIELDS.md](development/CONFIG_FIELDS.md).
+Use these only for debugging, controlled benchmarking, sandboxed tests, or maintainer workflows. The complete `pluginConfig` ↔ env matrix plus every wrapper/proxy/internal env name is in [development/CONFIG_FIELDS.md](development/CONFIG_FIELDS.md).
 
 | Variable | Effect |
 | --- | --- |
-| `CODEX_MULTI_AUTH_SYNC_CODEX_CLI` | Force/disable active-account sync into official Codex CLI files |
-| `CODEX_MULTI_AUTH_REAL_CODEX_BIN` | Override official Codex binary discovery path |
+| `CODEX_MULTI_AUTH_SYNC_CODEX_CLI` | Force/disable active-account sync into official Codex CLI files (default on; legacy `CODEX_AUTH_SYNC_CODEX_CLI` still read with a warning) |
+| `CODEX_MULTI_AUTH_REAL_CODEX_BIN` | Override official Codex binary discovery (absolute path required) |
 | `CODEX_MULTI_AUTH_BYPASS=1` | Skip multi-auth intercept; forward everything to official Codex |
-| `CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX` | Internal 0-based pin published by the wrapper after `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` resolution |
-| `CODEX_MULTI_AUTH_STATUSLINE=0/1` | Disable/enable forwarded-session status line |
-| `CODEX_MULTI_AUTH_AUTO_SYNC_ON_STARTUP=0/1` | Control startup account sync |
-| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0/1` | Opt out of the wrapper-injected `-c` file auth store override and the wrapper-startup `config.toml` reconcile |
-| `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0/1` | Opt out of every persisted `cli_auth_credentials_store = "file"` rewrite in `~/.codex/config.toml` (first-run, switch/login sync, `doctor --fix`) |
+| `CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX` | Internal 0-based pin published by the wrapper after `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` resolution — not meant to be set by hand |
+| `CODEX_MULTI_AUTH_STATUSLINE=0/1` | Disable/enable the forwarded-session status line |
+| `CODEX_MULTI_AUTH_AUTO_SYNC_ON_STARTUP=0` | Skip best-effort active-account sync around forwarded launches |
+| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0` | Skip the wrapper-injected `-c cli_auth_credentials_store="file"` and the startup `config.toml` reconcile |
+| `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` | Opt out of every persisted `cli_auth_credentials_store = "file"` rewrite in `~/.codex/config.toml` |
 | `CODEX_MULTI_AUTH_DEBUG=1` | Verbose wrapper/debug notices |
-| `CODEX_AUTH_FAST_SESSION*` | Fast-session trimming knobs |
-| `CODEX_AUTH_RETRY_ALL_*` | All-accounts rate-limit wait/retry budgets |
-| `CODEX_AUTH_UNSUPPORTED_MODEL_POLICY` / `CODEX_AUTH_FALLBACK_*` | Unsupported Codex model policy |
-| `CODEX_AUTH_TOKEN_REFRESH_SKEW_MS` | Refresh-before-expiry skew |
-| `CODEX_AUTH_SESSION_RECOVERY` / `CODEX_AUTH_AUTO_RESUME` | Session recovery toggles |
-| `CODEX_AUTH_PER_PROJECT_ACCOUNTS` | Project-scoped pools |
-| `CODEX_AUTH_PARALLEL_PROBING*` / `CODEX_AUTH_EMPTY_RESPONSE_*` | Probe concurrency and empty-response retries |
-| `CODEX_AUTH_RATE_LIMIT_*` | Rate-limit windows, backoff, toast debounce |
-| `CODEX_AUTH_LIVE_ACCOUNT_SYNC*` / `CODEX_AUTH_SESSION_AFFINITY*` | Live sync and sticky sessions |
-| `CODEX_AUTH_RESPONSE_CONTINUATION` / `CODEX_AUTH_PROACTIVE_GUARDIAN*` / `CODEX_AUTH_PREEMPTIVE_QUOTA_*` | Continuation, guardian, quota deferral |
-| `CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS` / `CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS` | Failure cooldowns |
-| `CODEX_AUTH_STORAGE_BACKUP_ENABLED` / `CODEX_AUTH_TOAST_DURATION_MS` | Storage backups and toast duration |
-| `CODEX_AUTH_PID_OFFSET_ENABLED` / `CODEX_AUTH_ROUTING_MUTEX` / `CODEX_AUTH_BACKGROUND_RESPONSES` | Swarm bias, selection mutex, background Responses |
-| `CODEX_CLI_ACCOUNTS_PATH` / `CODEX_CLI_AUTH_PATH` | Override official Codex account/auth file paths |
-| `CODEX_AUTH_REFRESH_LEASE*` | Cross-process refresh lease directory/TTL/wait/poll knobs |
+| `CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL` | Pin the proxy upstream to an explicit-port `http://127.0.0.1:<port>` URL (numeric loopback only; fails closed when set but the command does not route) |
+| `CODEX_CLI_AUTH_PATH` / `CODEX_CLI_ACCOUNTS_PATH` / `CODEX_CLI_CONFIG_PATH` | Override official Codex `auth.json` / `accounts.json` / `config.toml` paths (sandboxes and tests) |
+| `CODEX_AUTH_*` per-field names | Every `pluginConfig` field has an env accessor — see the [full matrix](development/CONFIG_FIELDS.md#pluginconfig-fields) |
+| `CODEX_AUTH_REFRESH_LEASE*` | Cross-process refresh coordination knobs |
 | `MCODEX_MONITOR_INTERVAL` / `MCODEX_TMUX_SESSION` / `MCODEX_TMUX_HISTORY_LIMIT` | `mcodex` convenience launcher knobs |
-| `CODEX_AUTH_NO_BROWSER` | Suppress browser launch for automation/headless login |
-
-Full inventory: [development/CONFIG_FIELDS.md](development/CONFIG_FIELDS.md)
+| `CODEX_MULTI_AUTH_TEST_*` | Test-only fault injectors — never set in normal use |
 
 ---
 
-## Recommended Defaults
+## Debugging the effective config
 
-Keep these enabled for most environments:
+```bash
+codex-multi-auth config explain          # every field: value, default, source (env|unified|file|default)
+codex-multi-auth config explain --json   # machine-readable form
+codex-multi-auth config template         # print a starter config (modern|legacy|minimal)
+codex-multi-auth status                  # pool + quota + runtime markers
+codex-multi-auth rotation status         # runtime proxy state
+```
 
-- `menuAutoFetchLimits`
-- `menuSortEnabled`
-- `liveAccountSync`
-- `sessionAffinity`
-- `proactiveRefreshGuardian`
-- `preemptiveQuotaEnabled`
+`config explain` mirrors the real load precedence, so the file and source it reports are exactly what the wrapper resolves — including the `CODEX_MULTI_AUTH_CONFIG_PATH` env-path override. Use it before and after setting an env override to confirm the override landed.
 
 ---
 
-## Runtime Rotation Proxy
+## Runtime rotation proxy
 
 `codexRuntimeRotationProxy` is enabled by default. When enabled through defaults, settings, `codex-multi-auth rotation enable`, or `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=1`, the `codex-multi-auth-codex` wrapper starts a localhost-only Responses proxy for forwarded official Codex sessions, including CLI request commands, `codex app-server`, and `codex app` launches through the wrapper. For non-interactive request commands and `codex app`, the wrapper writes a temporary shadow `CODEX_HOME/config.toml` that selects a custom provider named `codex-multi-auth-runtime-proxy`, launches the official Codex surface against that provider, and removes the shadow home after the owning process exits. Interactive TUI sessions (with or without the optional initial prompt), `resume`/`fork`, and `codex app-server` instead stay on the canonical `CODEX_HOME` and receive the same provider through `-c` overrides, which avoids reindexing session history on every launch and leaves the real `config.toml` untouched. Set `codexRuntimeRotationProxy=false`, run `codex-multi-auth rotation disable`, or set `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` to bypass the proxy.
 
 A single forwarded run can be pinned to one account with `codex-multi-auth-codex --account <selector>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`). The pin is applied per-invocation by that run's own proxy instance, so it never touches the persisted `switch` pin and cannot leak across concurrent sessions. Because the proxy is required for the pin to take effect, `--account` fails hard when the proxy is disabled rather than silently using a rotated account. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation).
 
-The proxy preserves request bodies and streaming responses, replaces outbound auth headers with the selected managed account, and rotates to another account before response bytes are streamed when it sees rate limits, server errors, network failures, or refresh failures. It removes hop-by-hop headers, private account metadata headers, and stale decoded `content-encoding` from client responses. If every account is unavailable, the proxy returns a structured pool-exhaustion error that points to `codex-multi-auth rotation status`.
+For HTTP/SSE traffic, the proxy preserves request bodies and streaming responses and replaces outbound auth headers with the selected managed account. Rotation is limited to pre-send eligibility failures and explicit safe upstream rejections. A transport failure after authorized dispatch, or an accepted stream that fails before emitting bytes, ends that request without replay; a later independent request may select another account.
+It removes hop-by-hop headers, private account metadata headers, and stale decoded `content-encoding` from HTTP client responses.
+If every account is unavailable, the proxy returns a structured pool-exhaustion error that points to `codex-multi-auth rotation status`.
 
-**Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes two mitigations:
+The generated provider configuration declares `supports_websockets = true`, so WebSocket-capable Codex clients can keep a persistent Responses connection through the same loopback proxy.
+For custom-provider/Pi sockets, the first `response.create` evaluates runtime policy before selecting and authenticating one managed account for the upstream connection. Native OpenAI sockets use `ResponsesWebSocketGateway`; each turn routes through native HTTP policy, authentication, catalog, and account or API pools.
+Every `response.create`, including the first, passes the runtime policy, quota/cooldown, and circuit-breaker availability gates and records exactly one redacted usage row for its final outcome.
+Upstream handshake failures can try another eligible account up to `maxRuntimeAccountAttempts`, but explicit token invalidation stops failover to prevent an invalid-token cascade.
+Custom-provider/Pi WebSockets use drain-first account selection regardless of the HTTP/SSE scheduling strategy: all new custom sockets share the active account until it becomes unavailable. This prevents long-lived sockets from interleaving different OAuth tokens from one IP after the ordinary rotation-throttle window expires.
+Each healthy custom upstream WebSocket remains bound to one account. The persistent local connection can replace an idle upstream when its account becomes unavailable. Submitted turns never replay after a disconnect, even when no response event arrived. They fail with `upstream_websocket_closed`, including submitted continuations. If account replacement would interrupt an active turn, the proxy closes the local client and fails the outstanding requests without replay. Native turns never replay an ambiguously sent create.
+Genuinely unsent connection-scoped continuations are not forwarded to a replacement upstream; the proxy emits `previous_response_not_found` so the client can rebuild a full request.
+Rate-limit terminal events honor retry headers and reset metadata when calculating that cooldown.
+
+**Anti-abuse protection.** Rapidly switching OAuth tokens from the same IP can trigger OpenAI's anti-abuse detection and cause accounts to be invalidated in sequence. The proxy includes three mitigations:
 
 - **Token-invalidation detection**: when the upstream or the token-refresh endpoint returns an explicit OAuth revocation message, the proxy returns the error directly to the client instead of rotating to the next account. The affected account receives a 5-minute cooldown (`tokenInvalidationCooldownMs`, default `300000`) instead of the generic 30-second auth-failure cooldown. Configure via `CODEX_AUTH_TOKEN_INVALIDATION_COOLDOWN_MS`.
-- **Rotation-rate throttle**: the proxy biases account selection toward the last-served account for a configurable window (default 60 seconds, `minRotationIntervalMs`). Accounts that are rate-limited or cooling down are still rotated around. Configure via `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS` or set to `0` to disable.
+- **Replacement-token recovery**: an invalidation belongs to the access-token generation that received it. Loading or reconciling a newer token clears the older marker, and a successful live Responses probe also clears and persists stale invalidation state.
+- **Rotation-rate throttle and WebSocket drain-first routing**: HTTP/SSE selection biases toward the last-served account for a configurable window (default 60 seconds, `minRotationIntervalMs`). Custom-provider/Pi WebSockets share one drain-first active account because a finite sticky window cannot constrain already-open sockets. Native WebSocket turns use native HTTP account selection rather than connection-bound drain-first routing. Accounts that are rate-limited or cooling down are still rotated around. Configure the HTTP/SSE throttle via `CODEX_AUTH_MIN_ROTATION_INTERVAL_MS` or set it to `0` to disable.
 
 ### Sequential / drain-first scheduling
 
 `schedulingStrategy` controls how the proxy picks an account for each request:
 
-- `hybrid` (default) spreads load across all available accounts using a weighted health/token/freshness score. Both accounts tend to consume quota at a similar pace.
+- `hybrid` (default) spreads load across all available accounts using a weighted health/freshness score. Both accounts tend to consume quota at a similar pace.
 - `sequential` (drain-first) routes every new request to one active account and only advances to the next available account once the current one is fully exhausted (rate-limited, cooling down, or circuit-open). Because the scan wraps the pool, an earlier account that has recovered its quota window is reclaimed as soon as the current account drains. This staggers quota recovery across accounts for longer uninterrupted sessions.
 
 In `sequential` mode a manual pin (`codex-multi-auth switch <index>`) still takes precedence and is never overridden. Sequential mode intentionally ignores per-session affinity: once the active account changes, all subsequent requests follow the new active account regardless of which account originally handled a conversation. Enable it with `schedulingStrategy: "sequential"` in settings or `CODEX_AUTH_SCHEDULING_STRATEGY=sequential` for a per-process trial.
@@ -170,7 +191,7 @@ When you drive many agents in parallel (for example a swarm of deep agents), eac
 - `retryAllAccountsRateLimited` (default `false`), with `retryAllAccountsMaxRetries` (default `0`) and `retryAllAccountsMaxWaitMs` (default `0`): when every account is momentarily rate-limited, wait for the soonest quota window and retry instead of returning pool-exhaustion immediately. Keep the retry/wait budgets bounded so a blocking wait does not exceed the host client's own request timeout.
 - `routingMutex` (default `legacy`, env `CODEX_AUTH_ROUTING_MUTEX`): set to `enabled` to serialize account selection *within a single process*. It has no effect across separate agent processes.
 
-The structural fix is more accounts: with N accounts and M ≫ N concurrent agents, roughly `M/N` agents share each account, so rate-limit pressure only drops as N grows. See [High parallelism / swarms of agents](troubleshooting.md#high-parallelism--swarms-of-agents) for the full playbook, including the host-client-side `Provider response headers timed out after 10000ms` timeout (which this plugin cannot change).
+The structural fix is more accounts: with N accounts and M ≫ N concurrent agents, roughly `M/N` agents share each account, so rate-limit pressure only drops as N grows. See [High parallelism / swarms of agents](troubleshooting.md#high-parallelism--agent-swarms) for the full playbook, including the host-client-side `Provider response headers timed out after 10000ms` timeout (which this plugin cannot change).
 
 Microsoft/Outlook SSO accounts may be more sensitive to proxy-mediated token use. If an Outlook-linked account is invalidated on every first request through the proxy but works normally on ChatGPT web, the root cause is likely IP or device binding on the Microsoft side. Raising `CODEX_AUTH_TOKEN_INVALIDATION_COOLDOWN_MS` and re-logging in the affected account typically resolves the cascade. If the problem persists, consider excluding the Microsoft account from the rotation pool via `codex-multi-auth switch`.
 
@@ -190,41 +211,25 @@ Some Windows installs expose Codex only as a packaged `shell:AppsFolder` app ent
 
 ---
 
-## Shipped Templates
+## Recommended defaults
+
+Keep these enabled for most environments:
+
+- `menuAutoFetchLimits`
+- `menuSortEnabled`
+- `liveAccountSync`
+- `sessionAffinity`
+- `proactiveRefreshGuardian`
+- `preemptiveQuotaEnabled`
+- `pidOffsetEnabled`
+
+---
+
+## Shipped templates
 
 The shipped config templates expose first-class current OpenAI model aliases:
 
-- both templates lead with GPT-6 Astra: `gpt-6-astra` and the long-horizon `gpt-6-astra-aeon`. Bare `gpt-6` and `astra` resolve to the flagship, `astra-aeon` to the long-horizon variant. Astra takes the same reasoning ladder as GPT-5.6 (`low` through `max`, plus `ultra`) and rejects `none`/`minimal`, which are coerced up to `low`
-- any GPT-6 id the alias table does not name resolves to Astra rather than falling back to GPT-5.5. That covers the `gpt-6-astra-pro` plan tier, dated snapshots such as `gpt-6-astra-2026-09-03`, and tiers added after this release. An id carrying `aeon` stays on `gpt-6-astra-aeon`, because it is a different model rather than a rename of the flagship
-- the Daybreak cyber models (`gpt-daybreak-blue-latest`, `gpt-daybreak-red-latest`, shorthand `daybreak-blue` / `daybreak-red`) resolve to their own ids but are not listed in the templates, matching their hidden visibility in the upstream Codex picker. An unrecognised Daybreak id resolves to `blue`, the defensive variant
-- both `config/codex-modern.json` and `config/codex-legacy.json` include the GPT-5.6 tiers (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`), plus `gpt-5.5` and `gpt-5.5-pro`. The modern template collapses each tier's efforts into `variants`; the legacy template lists one entry per effort (for example `gpt-5.6-sol-high`) for Codex builds that predate the `variants` picker
-- GPT-5.6 adds two reasoning tiers above `xhigh`: `max`, and `ultra` on Sol/Terra only. `ultra` selects Codex's automatic subagent delegation and is sent to the API as `max`, mirroring upstream Codex
-- no GPT-5.6 tier accepts `none` or `minimal` reasoning effort; requests using them are coerced up to `low`
-- `gpt-5.6` on its own resolves to Sol, the flagship tier; the legacy `gpt-5` alias still resolves to `gpt-5.5`
-- `config/codex-modern.json` and `config/codex-legacy.json` expose current documented GPT-5.5, GPT-5.4, and GPT-5.3 Codex model IDs
-- deprecated Codex selectors such as `gpt-5-codex` and `gpt-5.1-codex*` are treated as compatibility aliases and retried on the current documented Codex model when the ChatGPT Codex surface rejects them
-- the wrapper and optional plugin-host runtime try those models directly and only fall back to `gpt-5.4` after a real ChatGPT Codex unsupported-model response
-- GPT-6 Astra has its own entry in that chain: `gpt-6-astra` steps to `gpt-5.6-sol`, `gpt-5.6-sol` steps to `gpt-5.5`, and `gpt-6-astra-aeon` steps to `gpt-6-astra` first. Astra rolls out org by org, so an account without entitlement gets a real unsupported-model response for it. It never fires pre-emptively, only after that response
-- the two paths gate it differently, which is easy to get wrong. In the plugin-host runtime the chain applies only when `fallbackOnUnsupportedCodexModel` is on, and it defaults to `false`. The `codex-multi-auth-codex` wrapper has always retried unconditionally on an unsupported-model response from the real Codex CLI, with no setting to consult; it prints `model <name> is unsupported on this ChatGPT Codex surface. Retrying with <fallback>.` to stderr each time
-- the chain is walked one hop at a time: each unsupported response resolves from the model that just failed, not from the one you originally asked for. A model with no entry of its own ends the walk, which is why `gpt-5.6-sol` carries one. `unsupportedCodexFallbackChain` overrides follow the same rule, so a multi-hop path needs an entry per hop
-- depth costs attempts. Every hop spends one of the shared per-request outbound attempts, and a single-account balanced session has a budget of 5. The longest Astra walk (`gpt-6-astra-aeon` through to `gpt-5.4`) uses exactly 5, so a session that also spends an attempt on a retry or stream failover ends in an attempt-budget-exhausted 503 rather than reaching the last hop. That needs an account entitled to none of aeon, Astra, Sol or 5.5
-
----
-
-## Validate Effective Configuration
-
-```bash
-codex-multi-auth status
-codex-multi-auth list
-codex-multi-auth check
-codex-multi-auth forecast --live
-```
-
----
-
-## Related
-
-- [reference/settings.md](reference/settings.md)
-- [reference/storage-paths.md](reference/storage-paths.md)
-- [upgrade.md](upgrade.md)
-- [development/CONFIG_FLOW.md](development/CONFIG_FLOW.md)
+- both templates lead with GPT-6.1 Sol (`gpt-6.1-sol`, the upstream catalog's default and priority-1 model), followed by GPT-6 Astra (`gpt-6-astra`). Bare `gpt-6.1` resolves to `gpt-6.1-sol`; bare `gpt-6` and `astra` resolve to the flagship Astra. The full current ladder — 6.1 Sol, Astra, Sol and Luna — takes `low` through `ultra` (Luna stops at `max`) and rejects `none`/`minimal`, which are coerced up to `low`
+- both templates also list GPT-6 Sol (`gpt-6-sol`, the everyday workhorse) and GPT-6 Luna (`gpt-6-luna`, the small, cheap tier), added to the upstream Codex catalog on 2026-09-22. Sol takes `low` through `ultra`; Luna stops at `max`, the same split as the 5.6 tiers. There is no GPT-6 Terra: an id such as `gpt-6-terra` resolves to Sol, which is where upstream Codex migrates `gpt-5.6-terra` users. Bare `sol` and `luna` are not aliases for the GPT-6 tiers
+- any GPT-6 id the alias table does not name resolves to Astra rather than falling back to the previous generation, unless it carries a `sol` or `luna` tier token, which picks that tier (`gpt-6-sol-2026-09-22` stays on Sol), or a `6.N` minor token other than `6.1` (`gpt-6.2` stays on Astra). That covers the `gpt-6-astra-pro` plan tier, dated snapshots such as `gpt-6-astra-2026-09-03`, and tiers added after this release. An id carrying `aeon` resolves to `gpt-6-astra` — the leaked `gpt-6-astra-aeon` slug was never a durable catalog model and is retired onto the flagship
+- `gpt-5.5` and `gpt-5.5-pro` (including dated snapshot ids) resolve to `gpt-6-sol` and `gpt-6-astra` respectively — upstream's migration targets ahead of the 2026-10-14 OAuth retirement — rather than being sent to the backend verbatim

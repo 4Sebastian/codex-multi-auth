@@ -18,7 +18,30 @@ const TOKEN_INVALIDATION_PHRASES = [
 
 export function isTokenInvalidationError(bodyText: string): boolean {
 	const lower = bodyText.toLowerCase();
-	return TOKEN_INVALIDATION_PHRASES.some((phrase) => lower.includes(phrase));
+	if (TOKEN_INVALIDATION_PHRASES.some((phrase) => lower.includes(phrase))) return true;
+	try {
+		const parsed: unknown = JSON.parse(bodyText);
+		if (!isRecord(parsed)) return false;
+		const response = isRecord(parsed.response) ? parsed.response : undefined;
+		const error = isRecord(response?.error) ? response.error : isRecord(parsed.error) ? parsed.error : parsed;
+		return typeof error.code === "string" && error.code.trim().toLowerCase() === "token_invalidated";
+	} catch {
+		return false;
+	}
+}
+
+/** Response output is untrusted text, never evidence of credential revocation. */
+export function isResponsesTokenInvalidationEvent(event: unknown): boolean {
+	if (!isRecord(event)) return false;
+	const response = isRecord(event.response) ? event.response : undefined;
+	if (event.type !== "error" && event.type !== "response.failed" &&
+		!(event.type === "response.done" && response?.status === "failed")) return false;
+	const error = response?.error ?? event.error ?? (event.type === "error" ? event : undefined);
+	if (typeof error === "string") return isTokenInvalidationError(error);
+	if (!isRecord(error)) return false;
+	const message = typeof error.message === "string" ? error.message.toLowerCase() : "";
+	return (typeof error.code === "string" && error.code.trim().toLowerCase() === "token_invalidated") ||
+		TOKEN_INVALIDATION_PHRASES.some(phrase => message.includes(phrase));
 }
 
 export function isTokenRefreshRetryable(result: Extract<TokenResult, { type: "failed" }>): boolean {

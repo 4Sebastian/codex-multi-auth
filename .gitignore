@@ -1,4 +1,7 @@
 node_modules/
+*.tsbuildinfo
+__pycache__/
+*.pyc
 bun.lockb
 pnpm-lock.yaml
 dist/
@@ -35,3 +38,6 @@ test-results.md
 
 # OMC session scratch (never publish)
 .omc/
+
+# worktrees (git worktree add .worktrees/...)
+.worktrees/

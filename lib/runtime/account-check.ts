@@ -1,9 +1,11 @@
+import { PendingAuthLocalError, withRefreshCredentialRetention } from "../storage/pending-auth.js";
 import { maskEmail } from "../logger.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../quota-probe.js";
 import { isCodexUnavailableError } from "../errors.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import {
 	type AccountStorageV3,
+	cloneTrackedAccountStorage,
 	bumpStorageAffinityGeneration,
 	type FlaggedAccountMetadataV1,
 	reconcilePinnedAccountIndex,
@@ -85,13 +87,7 @@ export async function runRuntimeAccountCheck(
 ): Promise<void> {
 	const loadedStorage = await deps.hydrateEmails(await deps.loadAccounts());
 	const workingStorage = loadedStorage
-		? {
-				...loadedStorage,
-				accounts: loadedStorage.accounts.map((account) => ({ ...account })),
-				activeIndexByFamily: loadedStorage.activeIndexByFamily
-					? { ...loadedStorage.activeIndexByFamily }
-					: {},
-			}
+		? cloneTrackedAccountStorage(loadedStorage)
 		: deps.createEmptyStorage();
 
 	if (workingStorage.accounts.length === 0) {
@@ -196,7 +192,7 @@ export async function runRuntimeAccountCheck(
 			}
 
 			if (!accessToken) {
-				const refreshResult = await deps.queuedRefresh(account.refreshToken);
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => workingStorage.accounts.includes(account));
 				if (refreshResult.type !== "success") {
 					state.errors += 1;
 					const message =
@@ -301,6 +297,7 @@ export async function runRuntimeAccountCheck(
 					`[${i + 1}/${total}] ${label}: ${deps.formatCodexQuotaLine(snapshot)}`,
 				);
 			} catch (error) {
+				if (error instanceof PendingAuthLocalError) throw error;
 				if (isCodexUnavailableError(error)) {
 					state.warnings += 1;
 					state.ok += 1;
@@ -316,6 +313,7 @@ export async function runRuntimeAccountCheck(
 				}
 			}
 		} catch (error) {
+			if (error instanceof PendingAuthLocalError) throw error;
 			state.errors += 1;
 			const message = error instanceof Error ? error.message : String(error);
 			deps.showLine(

@@ -1,135 +1,99 @@
-# Privacy and Data Handling
+# Privacy And Data Handling
 
-`codex-multi-auth` is local-first: account/session state is stored on your machine under the configured runtime root.
+`codex-multi-auth` is local-first. Every file it owns lives under `~/.codex/multi-auth` (or `CODEX_MULTI_AUTH_DIR` if you override it), with `0600`/`0700` permissions on credential material. There is no telemetry pipeline and no project-run remote service — nothing reports home, because there is no home.
 
 ---
 
 ## Telemetry
 
-- No custom analytics pipeline in this repository.
-- No project-owned remote database.
-- Network calls are limited to required OAuth/backend/update endpoints.
+- No analytics, no crash reporting, no usage phone-home.
+- No project-owned remote database or dashboard.
+- Network calls go only to the endpoints listed below.
 
 ---
 
-## Canonical Local Files
+## What It Stores, And Where
 
-| Data | Default path | Purpose |
+| Data | Default path | Notes |
 | --- | --- | --- |
-| Unified settings | `~/.codex/multi-auth/settings.json` | Dashboard and backend configuration |
-| Accounts | `~/.codex/multi-auth/openai-codex-accounts.json` | Primary saved account pool (V3 JSON) |
-| Flagged accounts | `~/.codex/multi-auth/openai-codex-flagged-accounts.json` | Accounts with hard auth failures |
-| Quota cache | `~/.codex/multi-auth/quota-cache.json` | Cached quota snapshots |
-| Runtime observability | `~/.codex/multi-auth/runtime-observability.json` | Local request counters and last-account metadata for status/report output |
-| First-run setup marker | `~/.codex/multi-auth/first-run-setup.json` | One-time durable-install app bind / launcher setup claim; not secrets |
-| Cross-process refresh leases | `~/.codex/multi-auth/refresh-leases/` | Short-lived lease files that dedupe concurrent token refresh |
-| Usage ledger | `~/.codex/multi-auth/usage/usage-ledger.jsonl` | Local request metadata summaries; email stored hashed; no prompts, auth headers, or raw sensitive account ids |
-| Account policies | `~/.codex/multi-auth/account-policies.json` | Local tags, weights, pause/drain state, and notes keyed by hashed account identity |
-| Routing profiles | `~/.codex/multi-auth/routing-profiles.json` | Project-aware local routing preferences keyed by project identity |
-| Budget guards | `~/.codex/multi-auth/budget-guards.json` | Local request/token/cost limits for runtime blocking |
-| Local bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` | SHA-256 token hashes plus prefixes and labels; plaintext tokens are shown only on create/rotate |
-| Named backups | `~/.codex/multi-auth/backups/` | Operator-exported named account-pool backups |
-| Project account pools | `~/.codex/multi-auth/projects/<project-key>/` | Per-repo account pools when project scope is enabled |
-| Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` (one per helper; plus the legacy un-suffixed file from older versions) | Local helper status for wrapper-launched Codex app sessions |
-| Runtime app helper owner identity | `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` (one per helper) | Local identity token and launcher PID, so a helper can tell its own launcher from a recycled PID; removed on helper exit and swept once the PID is dead |
-| Persistent app bind state/logs | `~/.codex/multi-auth/app-bind/` | Reversible packaged-app router state, backup metadata, and local router log |
+| Account pool | `~/.codex/multi-auth/openai-codex-accounts.json` | V3 JSON, mode `0600`; holds OAuth tokens. Backed by a WAL and rotating `.bak` snapshots |
+| Flagged accounts | `~/.codex/multi-auth/openai-codex-flagged-accounts.json` | Accounts sidelined by hard auth failures |
+| Settings | `~/.codex/multi-auth/settings.json` | Dashboard + backend config, `.bak` fallback |
+| Quota cache | `~/.codex/multi-auth/quota-cache.json` | Cached quota snapshots for fast forecasts |
+| Runtime observability | `~/.codex/multi-auth/runtime-observability.json` | Local request counters; feeds `status`/`report` |
+| Usage ledger | `~/.codex/multi-auth/usage/usage-ledger.jsonl` | Redacted request metadata: hashed account/email identifiers, no prompts, no auth headers |
+| Account policies | `~/.codex/multi-auth/account-policies.json` | Tags, weights, pause/drain, notes — keyed by hashed account identity |
+| API routes | `~/.codex/multi-auth/api-routes.json` | Optional non-OAuth route definitions; holds raw `apiKey` values — treat as credential material |
+| Reset credits | `~/.codex/multi-auth/reset-credits.json` | Reset-credit availability snapshots, keyed by account identity |
+| Budget guards | `~/.codex/multi-auth/budget-guards.json` | Local request/token/cost limits |
+| Routing profiles | `~/.codex/multi-auth/routing-profiles.json` | Project-aware preferences, keyed by project identity |
+| Bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` | SHA-256 hashes + prefixes only; plaintext `cma_local_*` tokens show once at creation |
+| Refresh leases | `~/.codex/multi-auth/refresh-leases/` | Short-lived cross-process refresh locks |
+| Named backups | `~/.codex/multi-auth/backups/` | Operator-exported pool backups |
+| Per-project pools | `~/.codex/multi-auth/projects/<project-key>/` | Repo-keyed account pools |
+| App bind state | `~/.codex/multi-auth/app-bind/` | Reversible router state, backup metadata, local log |
+| App helper status | `~/.codex/multi-auth/runtime-rotation-app-helper*.<pid>.json` | Per-helper status + owner files; cleaned on exit |
+| First-run marker | `~/.codex/multi-auth/first-run-setup.json` | One-time setup claim; not a secret |
 | Logs | `~/.codex/multi-auth/logs/codex-plugin/` | Optional diagnostics |
-| Prompt/cache files | `~/.codex/multi-auth/cache/` | Cached prompt/template metadata |
-| Codex CLI state | `~/.codex/accounts.json`, `~/.codex/auth.json`, `~/.codex/config.toml` | Official Codex CLI files |
+| Prompt cache | `~/.codex/multi-auth/cache/` | Cached prompt/template metadata |
+| Official Codex state | `~/.codex/auth.json`, `~/.codex/accounts.json`, `~/.codex/config.toml` | Owned by the official CLI; `codex-multi-auth` syncs the active account into `auth.json` |
 
-If `CODEX_MULTI_AUTH_DIR` is set, multi-auth-owned paths move under that root.
-If `CODEX_MULTI_AUTH_CONFIG_PATH` is set, configuration file loading uses that path.
-For cleanup, apply the same deletions to resolved override roots (including
-Windows override locations).
-
-Runtime rotation uses loopback-only local HTTP listeners. The per-session proxy and persistent app router forward requests to the official Codex backend with the selected managed account token, but the project does not operate a remote telemetry service.
-
-The optional local bridge is also loopback-only and exposes only `/health`,
-`/v1/models`, and `/v1/responses`. It requires a local bearer token by default.
-The token file stores SHA-256 hashes, not plaintext tokens.
+`CODEX_MULTI_AUTH_DIR` moves every `multi-auth` path above. `CODEX_MULTI_AUTH_CONFIG_PATH` overrides where configuration loads from.
 
 ---
 
-## Network Destinations
+## What Leaves The Machine
 
-Current external destinations:
+| Destination | Why |
+| --- | --- |
+| `auth.openai.com` | OAuth sign-in, device-code flow, token refresh |
+| ChatGPT/Codex backend | The requests you make through Codex, carrying the selected account's token |
+| GitHub (raw/releases) | Prompt-template sync with ETag caching |
+| npm registry | Optional best-effort daily version check during forwarded wrapper startup |
 
-- OpenAI OAuth endpoints (`auth.openai.com`)
-- OpenAI Codex/ChatGPT backend endpoints
-- GitHub raw/releases endpoints for prompt template sync
+Local listeners — the OAuth callback on `localhost:1455`, the rotation proxy, the app router, and the optional local bridge — are loopback-only. The proxy and router authenticate local clients with a per-process random token and forward upstream; the bridge requires a bearer token.
 
 ---
 
-## Sensitive Logging
+## Tokens And Logs
 
-`ENABLE_PLUGIN_REQUEST_LOGGING=1` enables request logging metadata.
-`CODEX_PLUGIN_LOG_BODIES=1` enables raw request/response body logging.
+- Access and refresh tokens exist only in the pool file and the official `~/.codex/auth.json` they sync to.
+- Tokens are **never** written to logs. Where a log must identify a token, it prints an 8-character SHA-256 fingerprint — never the value.
+- OAuth URLs printed to the terminal redact `state`, `code`, and PKCE parameters. The exception is `--manual` mode, which must print the full URL for you to copy.
+- The device-code flow's PKCE verifier is never persisted — it goes straight to the token exchange.
+- Usage-ledger rows carry hashed identifiers only: no prompts, no auth headers, no raw account ids.
 
-Raw body logs may contain sensitive payload text. Treat logs as sensitive data and rotate/delete as needed.
+Optional debug logging:
+
+| Variable | Effect |
+| --- | --- |
+| `ENABLE_PLUGIN_REQUEST_LOGGING=1` | Log request metadata |
+| `CODEX_PLUGIN_LOG_BODIES=1` | Also log raw request/response bodies — these can contain sensitive text; treat the logs as secrets and rotate or delete them as needed |
 
 ---
 
 ## Data Cleanup
 
-Bash:
+A shared storage root can contain data owned by other applications. Neither a default directory name nor an environment override proves that its contents belong to this installation. Do not recursively delete the root or use filename-prefix globs.
 
-```bash
-rm -f ~/.codex/multi-auth/settings.json
-rm -f ~/.codex/multi-auth/openai-codex-accounts.json
-rm -f ~/.codex/multi-auth/openai-codex-flagged-accounts.json
-rm -f ~/.codex/multi-auth/quota-cache.json
-rm -f ~/.codex/multi-auth/runtime-observability.json
-rm -f ~/.codex/multi-auth/first-run-setup.json
-rm -f ~/.codex/multi-auth/config.json
-rm -f ~/.codex/multi-auth/account-policies.json
-rm -f ~/.codex/multi-auth/routing-profiles.json
-rm -f ~/.codex/multi-auth/budget-guards.json
-rm -f ~/.codex/multi-auth/local-client-tokens.json
-rm -rf ~/.codex/multi-auth/refresh-leases
-rm -rf ~/.codex/multi-auth/usage
-rm -rf ~/.codex/multi-auth/backups
-rm -rf ~/.codex/multi-auth/projects
-rm -f ~/.codex/multi-auth/runtime-rotation-app-helper.json ~/.codex/multi-auth/runtime-rotation-app-helper.*.json ~/.codex/multi-auth/runtime-rotation-app-helper-owner.*.json
-rm -rf ~/.codex/multi-auth/app-bind
-rm -rf ~/.codex/multi-auth/logs/codex-plugin
-rm -rf ~/.codex/multi-auth/cache
-# Override-root cleanup examples (if overrides are set):
-[ -n "${CODEX_MULTI_AUTH_DIR:-}" ] && [ -d "$CODEX_MULTI_AUTH_DIR/logs/codex-plugin" ] && rm -rf "$CODEX_MULTI_AUTH_DIR/logs/codex-plugin"
-[ -n "${CODEX_MULTI_AUTH_CONFIG_PATH:-}" ] && [ -f "$CODEX_MULTI_AUTH_CONFIG_PATH" ] && rm -f "$CODEX_MULTI_AUTH_CONFIG_PATH"
-```
+Before manually removing data:
 
-PowerShell:
+1. Run `codex-multi-auth verify --paths` and record the resolved paths. Check `CODEX_MULTI_AUTH_DIR`, `CODEX_HOME`, and any separate `CODEX_MULTI_AUTH_CONFIG_PATH` override. Existing legacy installations can resolve outside the default `~/.codex/multi-auth` directory.
+2. Stop this installation's writers before removing their data. Back up the files you intend to change to a private location. Backups can contain credentials.
+3. Inspect each exact file or directory and establish that it belongs exclusively to this installation. Use the storage table above and [storage paths reference](reference/storage-paths.md) as an inventory, not as ownership proof. If ownership is uncertain, leave the entry alone.
+4. Remove only the entries whose ownership you verified. Preserve shared `logs`, `cache`, `tmp`, and `.gitignore` entries and similarly prefixed unrelated files. A shared directory must not be removed merely because it contains some multi-auth files.
 
-```powershell
-Remove-Item "$HOME\.codex\multi-auth\settings.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\openai-codex-accounts.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\openai-codex-flagged-accounts.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\quota-cache.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\runtime-observability.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\first-run-setup.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\config.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\account-policies.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\routing-profiles.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\budget-guards.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\local-client-tokens.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\refresh-leases" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\usage" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\backups" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\projects" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\runtime-rotation-app-helper*.json","$HOME\.codex\multi-auth\runtime-rotation-app-helper-owner*.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\app-bind" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\logs\codex-plugin" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\cache" -Recurse -Force -ErrorAction SilentlyContinue
-# Override-root cleanup examples (if overrides are set):
-if ($env:CODEX_MULTI_AUTH_DIR) { Remove-Item "$env:CODEX_MULTI_AUTH_DIR\\*" -Recurse -Force -ErrorAction SilentlyContinue }
-if ($env:CODEX_MULTI_AUTH_CONFIG_PATH) { Remove-Item "$env:CODEX_MULTI_AUTH_CONFIG_PATH" -Force -ErrorAction SilentlyContinue }
-```
+Do not remove the official CLI's `auth.json`, `accounts.json`, `config.toml`, sessions, or history as part of this procedure. An old installation can share the official CLI directory.
+
+A [soft reset](troubleshooting.md#soft-reset-pool--settings-only) is not secure credential erasure. Backups, WAL files, pending-auth journals, per-project pools, and exported copies can retain credentials or restore active state. Inspect those copies separately rather than assuming that deleting the active JSON files removes every copy.
+
+For package removal, review the [uninstall guidance](troubleshooting.md#uninstall-completely). Its dry-run preview is not ownership proof, and `--clear-accounts` is not a complete wipe or a secure-erasure guarantee.
 
 ---
 
 ## Policy Responsibility
 
-Usage must comply with OpenAI policies:
+Your use of OpenAI services is governed by OpenAI's policies:
 
 - https://openai.com/policies/terms-of-use/
 - https://openai.com/policies/privacy-policy/

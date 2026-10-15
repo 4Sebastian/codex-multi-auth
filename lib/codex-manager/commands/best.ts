@@ -1,3 +1,9 @@
+import type { CodexCliSelectionSource } from "../../codex-cli/writer.js";
+import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
+import {
+	codexCliAccountIdFor,
+	shouldUpdateAccountIdFromToken,
+} from "../../auth/token-utils.js";
 import type { ForecastAccountResult } from "../../forecast.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
 import {
@@ -152,7 +158,7 @@ export interface BestCommandDeps {
 		refreshToken: string;
 		expiresAt?: number;
 		idToken?: string;
-	}) => Promise<boolean>;
+	}, source?: CodexCliSelectionSource) => Promise<boolean>;
 	logInfo?: (message: string) => void;
 	logWarn?: (message: string) => void;
 	logError?: (message: string) => void;
@@ -220,7 +226,7 @@ export async function runBestCommand(
 		let probeAccountId =
 			account.accountId ?? deps.extractAccountId(account.accessToken);
 		if (!deps.hasUsableAccessToken(account, now)) {
-			const refreshResult = await deps.queuedRefresh(account.refreshToken);
+			const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 			if (refreshResult.type !== "success") {
 				refreshFailures.set(i, {
 					...refreshResult,
@@ -246,7 +252,12 @@ export async function runBestCommand(
 			account.accessToken = refreshResult.access;
 			account.expiresAt = refreshResult.expires;
 			if (refreshedEmail) account.email = refreshedEmail;
-			if (refreshedAccountId) {
+			// Same rule as every other refresh path: only a token-derived id
+			// follows the new token; an explicit (manual) or org binding stays.
+			if (
+				refreshedAccountId &&
+				shouldUpdateAccountIdFromToken(account.accountIdSource, account.accountId)
+			) {
 				account.accountId = refreshedAccountId;
 				account.accountIdSource = "token";
 			}
@@ -357,7 +368,11 @@ export async function runBestCommand(
 		});
 		if (shouldSyncCurrentBest) {
 			alreadyBestSynced = await deps.setCodexCliActiveSelection({
-				accountId: bestAccount.accountId,
+				accountId: codexCliAccountIdFor(
+					bestAccount,
+					bestAccount.accessToken,
+					probeIdTokenByIndex.get(bestIndex),
+				),
 				email: bestAccount.email,
 				accessToken: bestAccount.accessToken,
 				refreshToken: bestAccount.refreshToken,
@@ -365,7 +380,7 @@ export async function runBestCommand(
 				...(probeIdTokenByIndex.has(bestIndex)
 					? { idToken: probeIdTokenByIndex.get(bestIndex) }
 					: {}),
-			});
+			}, {account: bestAccount, current: () => storage.accounts[bestIndex] === bestAccount});
 			if (!alreadyBestSynced && !options.json) {
 				logWarn(
 					"Codex auth sync did not complete. Multi-auth routing will still use this account.",

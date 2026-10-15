@@ -18,7 +18,7 @@ function makeStallingResponse(): Response {
 	);
 }
 
-function makeIdleResponse(): Response {
+function makeIdleResponse(status = 429): Response {
 	return new Response(
 		new ReadableStream<Uint8Array>({
 			start() {
@@ -26,6 +26,7 @@ function makeIdleResponse(): Response {
 			},
 		}),
 		{
+			status,
 			headers: {
 				"content-type": "text/event-stream",
 			},
@@ -50,6 +51,19 @@ function makeSseResponse(payload: string): Response {
 }
 
 describe("stream failover", () => {
+	it.each(["stall", "error", "eof"])("never replays an accepted zero-output stream (%s)", async failure => {
+		vi.useFakeTimers();
+		const fallback = vi.fn(async () => makeSseResponse("data: duplicate\n\n"));
+		const initial = failure === "stall" ? makeIdleResponse(200) : new Response(new ReadableStream({
+			start(controller) { if (failure === "error") controller.error(Error("accepted stream lost")); else controller.close(); },
+		}));
+		const result = withStreamingFailover(initial, fallback, {stallTimeoutMs: 1000}).text();
+		const assertion = failure === "eof" ? expect(result).resolves.toBe("") : expect(result).rejects.toThrow();
+		await vi.advanceTimersByTimeAsync(1200);
+		await assertion;
+		expect(fallback).not.toHaveBeenCalled();
+	});
+
 	afterEach(() => {
 		vi.useRealTimers();
 	});
@@ -64,7 +78,7 @@ describe("stream failover", () => {
 		await expect(response.text()).resolves.toContain("data: ok");
 	});
 
-	it("switches to fallback stream when primary stalls", async () => {
+	it("switches to fallback after an explicit rejection with a stalled body", async () => {
 		vi.useFakeTimers();
 		const fallback = vi.fn(async () => makeSseResponse("data: second\n\n"));
 		const response = withStreamingFailover(makeIdleResponse(), fallback, {
@@ -346,5 +360,85 @@ describe("stream failover", () => {
 		const second = await reader?.read();
 		expect(new TextDecoder().decode(second?.value)).toBe("data: chunk-2\n\n");
 		await reader?.cancel();
+	});
+
+	it("normalizes non-finite maxFailovers instead of churning forever", async () => {
+		vi.useFakeTimers();
+		// NaN used to survive Math.max(0, Math.floor(NaN)) and bypass the
+		// failoverAttempt >= maxFailovers guard, producing unbounded churn.
+		for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+			const fallback = vi.fn(async () => makeIdleResponse());
+			const response = withStreamingFailover(
+				makeIdleResponse(),
+				fallback,
+				{ maxFailovers: bad, stallTimeoutMs: 10 },
+			);
+			const textPromise = response.text().catch(() => "failed");
+			await vi.advanceTimersByTimeAsync(60_000);
+			await textPromise;
+			// Default is 1 failover: one attempt, then the stream errors.
+			expect(fallback).toHaveBeenCalledTimes(1);
+		}
+	});
+
+	it("caps absurdly large maxFailovers at the hard bound", async () => {
+		vi.useFakeTimers();
+		const fallback = vi.fn(async () => makeIdleResponse());
+		const response = withStreamingFailover(makeIdleResponse(), fallback, {
+			maxFailovers: 1e9,
+			stallTimeoutMs: 10,
+		});
+		// The idle fixture never produces a chunk, so every failover attempt
+		// stalls and retries until the hard bound (32) is hit, then the stream
+		// rejects with the final stall error.
+		const textPromise = response.text();
+		const assertion = expect(textPromise).rejects.toThrow("SSE stream stalled");
+		await vi.advanceTimersByTimeAsync(300_000);
+		await assertion;
+		expect(fallback).toHaveBeenCalledTimes(32);
+	});
+
+	it("normalizes non-finite timeout options to their defaults", async () => {
+		vi.useFakeTimers();
+		// stallTimeoutMs=NaN used to flow through `??` and Math.floor into
+		// setTimeout(NaN) — a ~0ms delay that stalled instantly.
+		for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+			const fallback = vi.fn(async () => makeSseResponse("data: fallback\n\n"));
+			const response = withStreamingFailover(makeIdleResponse(), fallback, {
+				maxFailovers: 1,
+				stallTimeoutMs: bad,
+			});
+			const textPromise = response.text();
+			// Defaults: soft = min(45_000, 15_000) = 15_000ms, and the same read
+			// then gets the remaining 30_000ms of the 45_000ms hard window, so a
+			// stall can only fail over after ~45_000ms.
+			await vi.advanceTimersByTimeAsync(14_000);
+			expect(fallback).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(32_000);
+			await expect(textPromise).resolves.toContain("data: fallback");
+			expect(fallback).toHaveBeenCalledTimes(1);
+		}
+	});
+
+	it("caps oversized finite timeouts at the supported timer maximum", async () => {
+		vi.useFakeTimers();
+		// Node treats setTimeout delays above 2^31-1 (~24.8 days) as ~1ms, so an
+		// oversized-but-finite timeout would otherwise stall almost instantly
+		// and churn fallovers. The cap pins the delay to the supported maximum.
+		const fallback = vi.fn(async () => makeSseResponse("data: fallback\n\n"));
+		const response = withStreamingFailover(makeIdleResponse(), fallback, {
+			maxFailovers: 1,
+			softTimeoutMs: 3_000_000_000,
+			hardTimeoutMs: 4_000_000_000,
+		});
+		const textPromise = response.text();
+		// Well under the capped window: nothing may fire yet.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(fallback).not.toHaveBeenCalled();
+		// Advancing past 2_147_483_647ms fires the soft window once and the
+		// fallback stream takes over.
+		await vi.advanceTimersByTimeAsync(2_147_483_647);
+		await expect(textPromise).resolves.toContain("data: fallback");
+		expect(fallback).toHaveBeenCalledTimes(1);
 	});
 });

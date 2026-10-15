@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+// Transformation checks use a fixture prompt; prompt fetch/cache behavior has its own suites.
+vi.mock('../lib/prompts/host-codex-prompt.js', () => ({
+    getHostCodexPrompt: vi.fn().mockResolvedValue('You are a coding agent running in the Codex.'),
+}));
 import * as refreshQueueModule from '../lib/refresh-queue.js';
+import { PendingAuthSettlementError } from '../lib/storage/pending-auth.js';
 import {
     shouldRefreshToken,
     refreshAndUpdateToken,
@@ -179,7 +184,7 @@ describe('Fetch Helpers Module', () => {
 			expect(updated.expires).toBe(123);
 		});
 
-		it('throws retryable auth errors when auth persistence fails', async () => {
+		it('retains journaled credentials when auth persistence fails', async () => {
 			const auth: Auth = { type: 'oauth', access: 'old', refresh: 'oldr', expires: 0 };
 			const client = {
 				auth: {
@@ -198,11 +203,12 @@ describe('Fetch Helpers Module', () => {
 			const error = await refreshAndUpdateToken(auth, client).catch(
 				(err) => err as CodexAuthError,
 			);
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(true);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toMatchObject({code: 'EBUSY'});
+			expect(auth).toMatchObject({access: 'new', refresh: 'newr', expires: 123});
 		});
 
-		it('throws terminal auth errors when auth persistence fails permanently', async () => {
+		it('preserves permanent persistence failure without authentication refusal', async () => {
 			const auth: Auth = { type: 'oauth', access: 'old', refresh: 'oldr', expires: 0 };
 			const client = {
 				auth: {
@@ -221,8 +227,9 @@ describe('Fetch Helpers Module', () => {
 			const error = await refreshAndUpdateToken(auth, client).catch(
 				(err) => err as CodexAuthError,
 			);
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(false);
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			expect(error.cause).toMatchObject({code: 'EACCES'});
+			expect(auth).toMatchObject({access: 'new', refresh: 'newr', expires: 123});
 		});
 	});
 
@@ -767,7 +774,9 @@ describe('createEntitlementErrorResponse', () => {
 			expect(json.error.unsupported_model).toBe('gpt-5.3-codex');
 		});
 
-		it('flags fallback when gpt-5.3-codex returns unsupported-model entitlement error', () => {
+		it('no longer flags the legacy gpt-5.2-codex edge now that gpt-5.3-codex steps to its replacement', () => {
+			// The default chain row for retired gpt-5.3-codex is its replacement
+			// (gpt-5.6-sol), so the legacy gpt-5.3 -> gpt-5.2 edge is never live.
 			const shouldFallback = shouldFallbackToGpt52OnUnsupportedGpt53('gpt-5.3-codex', {
 				error: {
 					code: 'model_not_supported_with_chatgpt_account',
@@ -775,7 +784,7 @@ describe('createEntitlementErrorResponse', () => {
 				},
 			});
 
-			expect(shouldFallback).toBe(true);
+			expect(shouldFallback).toBe(false);
 		});
 
 		it('does not flag fallback for other models or errors', () => {
@@ -850,7 +859,7 @@ describe('createEntitlementErrorResponse', () => {
 			expect(info.unsupportedModel).toBe('gpt-5.3-codex');
 		});
 
-		it('resolves Spark fallback chain to current gpt-5.3-codex first', () => {
+		it('resolves retired Spark to its replacement, then walks that model row', () => {
 			const errorBody = {
 				error: {
 					code: 'model_not_supported_with_chatgpt_account',
@@ -866,57 +875,78 @@ describe('createEntitlementErrorResponse', () => {
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			});
-			expect(first).toBe('gpt-5.3-codex');
+			expect(first).toBe('gpt-5.6-sol');
 
 			const second = resolveUnsupportedCodexFallbackModel({
-				requestedModel: 'gpt-5.3-codex',
+				requestedModel: 'gpt-5.6-sol',
 				errorBody: {
 					error: {
 						code: 'model_not_supported_with_chatgpt_account',
 						message:
-							"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
+							"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
 					},
 				},
-				attemptedModels: ['gpt-5.3-codex-spark', 'gpt-5.3-codex', 'gpt-5-codex'],
+				attemptedModels: ['gpt-5.3-codex-spark', 'gpt-5.6-sol'],
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: true,
 			});
-			expect(second).toBe('gpt-5.2-codex');
+			expect(second).toBe('gpt-6-luna');
 		});
 
 		it('respects legacy gpt-5.3 -> gpt-5.2 toggle when disabled', () => {
+			const errorBody = {
+				error: {
+					code: 'model_not_supported_with_chatgpt_account',
+					message:
+						"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
+				},
+			};
+			// The default row no longer carries the legacy edge, so the toggle has
+			// nothing to suppress: the retired id steps to its replacement.
 			const canonicalFallback = resolveUnsupportedCodexFallbackModel({
 				requestedModel: 'gpt-5.3-codex',
-				errorBody: {
-					error: {
-						code: 'model_not_supported_with_chatgpt_account',
-						message:
-							"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
-					},
-				},
+				errorBody,
 				attemptedModels: ['gpt-5.3-codex'],
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: false,
 			});
-			expect(canonicalFallback).toBeUndefined();
+			expect(canonicalFallback).toBe('gpt-5.6-sol');
 
+			// A user chain that still lists the legacy edge has it suppressed.
 			const legacyEdgeFallback = resolveUnsupportedCodexFallbackModel({
 				requestedModel: 'gpt-5.3-codex',
-				errorBody: {
-					error: {
-						code: 'model_not_supported_with_chatgpt_account',
-						message:
-							"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
-					},
-				},
-				attemptedModels: ['gpt-5.3-codex', 'gpt-5-codex'],
+				errorBody,
+				attemptedModels: ['gpt-5.3-codex'],
 				fallbackOnUnsupportedCodexModel: true,
 				fallbackToGpt52OnUnsupportedGpt53: false,
+				customChain: { 'gpt-5.3-codex': ['gpt-5.2-codex'] },
 			});
 			expect(legacyEdgeFallback).toBeUndefined();
+
+			const skipsToNextTarget = resolveUnsupportedCodexFallbackModel({
+				requestedModel: 'gpt-5.3-codex',
+				errorBody,
+				attemptedModels: ['gpt-5.3-codex'],
+				fallbackOnUnsupportedCodexModel: true,
+				fallbackToGpt52OnUnsupportedGpt53: false,
+				customChain: { 'gpt-5.3-codex': ['gpt-5.2-codex', 'gpt-5.6-sol'] },
+			});
+			expect(skipsToNextTarget).toBe('gpt-5.6-sol');
+
+			// With the toggle on, the same user chain takes the legacy edge.
+			expect(
+				resolveUnsupportedCodexFallbackModel({
+					requestedModel: 'gpt-5.3-codex',
+					errorBody,
+					attemptedModels: ['gpt-5.3-codex'],
+					fallbackOnUnsupportedCodexModel: true,
+					fallbackToGpt52OnUnsupportedGpt53: true,
+					customChain: { 'gpt-5.3-codex': ['gpt-5.2-codex'] },
+				}),
+			).toBe('gpt-5.2-codex');
 		});
 
-		it('resolves GPT-5.5 fallback to GPT-5.4 after ChatGPT unsupported-model errors', () => {
+		it('steps retired GPT-5.5-era ids to their named replacements', () => {
 			const errorBody = {
 				error: {
 					code: 'model_not_supported_with_chatgpt_account',
@@ -933,7 +963,7 @@ describe('createEntitlementErrorResponse', () => {
 					fallbackOnUnsupportedCodexModel: true,
 					fallbackToGpt52OnUnsupportedGpt53: true,
 				}),
-			).toBe('gpt-5.4');
+			).toBe('gpt-6-sol');
 
 			expect(
 				resolveUnsupportedCodexFallbackModel({
@@ -949,7 +979,7 @@ describe('createEntitlementErrorResponse', () => {
 					fallbackOnUnsupportedCodexModel: true,
 					fallbackToGpt52OnUnsupportedGpt53: true,
 				}),
-			).toBe('gpt-5.4');
+			).toBe('gpt-6-astra');
 
 			expect(
 				resolveUnsupportedCodexFallbackModel({
@@ -964,10 +994,10 @@ describe('createEntitlementErrorResponse', () => {
 					fallbackOnUnsupportedCodexModel: true,
 					fallbackToGpt52OnUnsupportedGpt53: true,
 				}),
-			).toBe('gpt-5.4');
+			).toBe('gpt-6-sol');
 		});
 
-		it('resolves stale bare GPT-5 and deprecated Codex aliases to current documented models', () => {
+		it('resolves stale bare GPT-5 and retired Codex aliases to their replacements', () => {
 			expect(
 				resolveUnsupportedCodexFallbackModel({
 					requestedModel: 'gpt-5',
@@ -982,7 +1012,7 @@ describe('createEntitlementErrorResponse', () => {
 					fallbackOnUnsupportedCodexModel: true,
 					fallbackToGpt52OnUnsupportedGpt53: true,
 				}),
-			).toBe('gpt-5.5');
+			).toBe('gpt-5.6-sol');
 
 			expect(
 				resolveUnsupportedCodexFallbackModel({
@@ -998,7 +1028,7 @@ describe('createEntitlementErrorResponse', () => {
 					fallbackOnUnsupportedCodexModel: true,
 					fallbackToGpt52OnUnsupportedGpt53: true,
 				}),
-			).toBe('gpt-5.3-codex');
+			).toBe('gpt-5.6-terra');
 		});
 	});
 
@@ -1653,7 +1683,7 @@ describe('createEntitlementErrorResponse', () => {
 			it('transforms request when parsedBody is provided even if init.body is not a string', async () => {
 				const { transformRequestForCodex } = await import('../lib/request/fetch-helpers.js');
 				const parsedBody = {
-					model: 'gpt-5.3-codex',
+					model: 'gpt-5.6-sol',
 					input: [{ type: 'message', role: 'user', content: 'hi' }],
 				};
 				const result = await transformRequestForCodex(
@@ -1666,7 +1696,7 @@ describe('createEntitlementErrorResponse', () => {
 				);
 
 				expect(result).toBeDefined();
-				expect(result?.body.model).toBe('gpt-5.3-codex');
+				expect(result?.body.model).toBe('gpt-5.6-sol');
 				expect(typeof result?.updatedInit.body).toBe('string');
 			});
 
@@ -1771,7 +1801,7 @@ describe('createEntitlementErrorResponse', () => {
 
 		it('transforms request body successfully (lines 194-202 coverage)', async () => {
 			const { transformRequestForCodex } = await import('../lib/request/fetch-helpers.js');
-			const requestBody = { model: 'gpt-5.1', input: 'Hello' };
+			const requestBody = { model: 'gpt-5.5', input: 'Hello' };
 			const result = await transformRequestForCodex(
 				{ body: JSON.stringify(requestBody) },
 				'https://example.com',
@@ -1779,7 +1809,7 @@ describe('createEntitlementErrorResponse', () => {
 			);
 			expect(result).toBeDefined();
 			expect(result?.body).toBeDefined();
-			expect(result?.body.model).toBe('gpt-5.1');
+			expect(result?.body.model).toBe('gpt-6-sol');
 			expect(result?.updatedInit).toBeDefined();
 		});
 	describe("additional edge branches", () => {
@@ -1942,14 +1972,14 @@ describe('createEntitlementErrorResponse', () => {
 				{ global: {}, models: {} },
 				true,
 				{
-					model: "gpt-5.3-codex",
+					model: "gpt-5.6-sol",
 					input: [{ type: "message", role: "user", content: "hello" }],
 				},
 			);
 
 			expect(result).toBeDefined();
 			expect(typeof result?.updatedInit.body).toBe("string");
-			expect(result?.body.model).toBe("gpt-5.3-codex");
+			expect(result?.body.model).toBe("gpt-5.6-sol");
 		});
 
 		it("adds codex-multi-auth login hint for unauthorized top-level, trimmed, statusText, and fallback messages", async () => {

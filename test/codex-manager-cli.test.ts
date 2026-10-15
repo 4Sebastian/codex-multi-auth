@@ -1,4 +1,10 @@
+vi.mock("../lib/runtime/account-reset-credits.js", async original => ({...await original<typeof import("../lib/runtime/account-reset-credits.js")>(),refreshAndPrintResetCredits:vi.fn(async()=>{})}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { useAccountSourceFixtures, writeAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
+import { getFlaggedAccountsPath as getAuthorityFlaggedPath, getStoragePath as getAuthorityStoragePath } from "../lib/storage/file-paths.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import {
 	DEFAULT_MODEL,
@@ -125,6 +131,9 @@ vi.mock("../lib/auth/auth.js", () => ({
 		}
 	}),
 	sanitizeOAuthResponseBodyForLog: vi.fn((body: string) => body),
+	// syncSelectionToCodex resolves the auth.json id through token-utils,
+	// which decodes the access token; these fixtures carry no JWT claims.
+	decodeJWT: vi.fn(() => null),
 	REDIRECT_URI: "http://localhost:1455/auth/callback",
 	AUTH_REDIRECT: {
 		host: "localhost",
@@ -310,9 +319,10 @@ vi.mock("../lib/config.js", async () => {
 	};
 });
 
-vi.mock("../lib/quota-cache.js", async () =>
+vi.mock("../lib/quota-cache.js", async (importOriginal) =>
 	(await import("./helpers/cli-test-fixtures.js")).quotaCacheModuleMock(
 		quotaCacheMocks,
+		await importOriginal<typeof import("../lib/quota-cache.js")>(),
 	),
 );
 
@@ -464,6 +474,7 @@ function updateLastAccountStorageSnapshot(snapshot: unknown): void {
 		return;
 	}
 	const cloned = cloneValue(snapshot);
+	writeAccountSourceFixture(cloned);
 	lastAccountStorageSnapshot = cloned;
 	accountStorageState = cloneValue(cloned);
 }
@@ -472,6 +483,8 @@ function updateLastFlaggedStorageSnapshot(snapshot: unknown): void {
 	if (snapshot == null) {
 		return;
 	}
+	mkdirSync(dirname(getAuthorityStoragePath()), {recursive: true});
+	writeFileSync(getAuthorityFlaggedPath(getAuthorityStoragePath(), "openai-codex-flagged-accounts.json"), JSON.stringify(snapshot));
 	const cloned = cloneValue(snapshot);
 	lastFlaggedStorageSnapshot = cloned;
 	flaggedStorageState = cloneValue(cloned);
@@ -725,7 +738,12 @@ describe("codex manager cli commands", () => {
 	beforeEach(async () => {
 		vi.resetModules();
 		vi.clearAllMocks();
+		const { resetActiveAccountSyncMetaForTests } = await import(
+			"../lib/codex-manager/active-account-sync.js"
+		);
+		resetActiveAccountSyncMetaForTests();
 		storageMocks.loadAccounts.mockReset();
+		storageMocks.getStoragePath.mockImplementation(getAuthorityStoragePath);
 		storageMocks.loadFlaggedAccounts.mockReset();
 		storageMocks.saveAccounts.mockReset();
 		storageMocks.saveFlaggedAccounts.mockReset();
@@ -764,6 +782,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValue({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: {},
 			secondary: {},
 		});
@@ -775,10 +794,7 @@ describe("codex manager cli commands", () => {
 			byAccountId: {},
 			byEmail: {},
 		}));
-		storageMocks.loadFlaggedAccounts.mockResolvedValue({
-			version: 1,
-			accounts: [],
-		});
+		storageMocks.loadFlaggedAccounts.mockImplementation(async () => cloneValue(flaggedStorageState ?? {version: 1, accounts: []}));
 		lastAccountStorageSnapshot = null;
 		accountStorageState = null;
 		lastFlaggedStorageSnapshot = {
@@ -1860,7 +1876,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("does not mutate loaded quota cache when live forecast display save fails", async () => {
@@ -1940,7 +1956,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("persists the working quota cache for live forecast display mode", async () => {
@@ -2012,7 +2028,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		expect(
 			logSpy.mock.calls.some((call) =>
 				String(call[0]).includes("Best-account preview"),
@@ -3029,6 +3045,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-a-next",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -3142,10 +3159,15 @@ describe("codex manager cli commands", () => {
 			expect(refreshQueueMocks.queuedRefresh).toHaveBeenCalledTimes(1);
 			expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenCalledTimes(2);
 			expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledTimes(1);
+        const scoped = Object.values(quotaCacheMocks.saveQuotaCache.mock.calls[0]![0].byWorkspace ?? {});
+        expect(scoped).toHaveLength(2);
+        expect(scoped).toEqual(expect.arrayContaining([expect.objectContaining({primary:expect.objectContaining({usedPercent:20})}),expect.objectContaining({primary:expect.objectContaining({usedPercent:70})})]));
+
 			expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledWith({
+                byWorkspace: expect.any(Object),
 				byAccountId: {},
 				byEmail: {},
-			});
+			}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 			expect(storageMocks.saveAccounts).toHaveBeenCalledTimes(1);
 			expect(storageMocks.saveAccounts.mock.calls[0]?.[0]?.accounts?.[0]?.email).toBe(
 				"owner@example.com",
@@ -3153,7 +3175,7 @@ describe("codex manager cli commands", () => {
 			expect(codexCliWriterMocks.setCodexCliActiveSelection).toHaveBeenCalledTimes(1);
 			expect(
 				logSpy.mock.calls.some((call) =>
-					String(call[0]).includes("Result: 2 Codex available"),
+					String(call[0]).includes("Result: 0 Codex available | 2 signed in only"),
 				),
 			).toBe(true);
 		} finally {
@@ -3235,8 +3257,7 @@ describe("codex manager cli commands", () => {
 			if (accessToken === "access-alpha-refreshed") return "owner@example.com";
 			return undefined;
 		});
-		quotaProbeMocks.fetchCodexQuotaSnapshot
-			.mockResolvedValueOnce({
+		quotaProbeMocks.fetchCodexQuotaSnapshot.mockImplementation(async ({ accessToken }) => accessToken === "access-alpha-refreshed" ? {
 				status: 200,
 				model: "gpt-5-codex",
 				primary: {
@@ -3249,8 +3270,7 @@ describe("codex manager cli commands", () => {
 					windowMinutes: 10080,
 					resetAtMs: now + 2_000,
 				},
-			})
-			.mockResolvedValueOnce({
+			} : {
 				status: 200,
 				model: "gpt-5-codex",
 				primary: {
@@ -3271,7 +3291,12 @@ describe("codex manager cli commands", () => {
 
 			expect(exitCode).toBe(0);
 			expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledTimes(1);
+        const scoped = Object.values(quotaCacheMocks.saveQuotaCache.mock.calls[0]![0].byWorkspace ?? {});
+        expect(scoped).toHaveLength(2);
+        expect(scoped).toEqual(expect.arrayContaining([expect.objectContaining({primary:expect.objectContaining({usedPercent:25})}),expect.objectContaining({primary:expect.objectContaining({usedPercent:70})})]));
+
 			expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledWith({
+                byWorkspace: expect.any(Object),
 				byAccountId: {},
 				byEmail: {
 					"beta@example.com": {
@@ -3307,7 +3332,7 @@ describe("codex manager cli commands", () => {
 						},
 					},
 				},
-			});
+			}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		} finally {
 			extractAccountIdMock.mockReset();
 			extractAccountIdMock.mockImplementation(() => "acc_test");
@@ -3381,6 +3406,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValueOnce({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: {
 				usedPercent: 70,
 				windowMinutes: 300,
@@ -3431,6 +3457,7 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValueOnce({
 			status: 200,
 			model: DEFAULT_MODEL,
+			responseCompleted: true,
 			primary: { usedPercent: 70, windowMinutes: 300 },
 			secondary: { usedPercent: 10, windowMinutes: 10080, resetAtMs: 0 },
 		});
@@ -3563,7 +3590,11 @@ describe("codex manager cli commands", () => {
 			byEmail: {},
 		});
 		expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledTimes(1);
+        const scoped = Object.values(quotaCacheMocks.saveQuotaCache.mock.calls[0]![0].byWorkspace ?? {});
+        expect(scoped).toHaveLength(1);
+
 		expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledWith({
+                byWorkspace: expect.any(Object),
 			byAccountId: {
 				acc_live: {
 					updatedAt: expect.any(Number),
@@ -3583,7 +3614,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("runs fix apply mode and returns a switch recommendation", async () => {
@@ -3717,6 +3748,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Switched to best account 2"),
@@ -3867,6 +3899,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-next",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Switched to best account 2"),
@@ -4015,13 +4048,13 @@ describe("codex manager cli commands", () => {
 		quotaProbeMocks.fetchCodexQuotaSnapshot
 			.mockResolvedValueOnce({
 				status: 429,
-				model: "gpt-5-mini",
+				model: "gpt-5.6-terra",
 				primary: {},
 				secondary: {},
 			})
 			.mockResolvedValueOnce({
 				status: 200,
-				model: "gpt-5-mini",
+				model: "gpt-5.6-terra",
 				primary: {
 					usedPercent: 10,
 					windowMinutes: 300,
@@ -4040,18 +4073,18 @@ describe("codex manager cli commands", () => {
 			"auth",
 			"best",
 			"--live",
-			"--model=gpt-5-mini",
+			"--model=gpt-5.6-terra",
 		]);
 
 		expect(exitCode).toBe(0);
 		expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenCalledTimes(2);
 		expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenNthCalledWith(
 			1,
-			expect.objectContaining({ model: "gpt-5-mini" }),
+			expect.objectContaining({ model: "gpt-5.6-terra" }),
 		);
 		expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenNthCalledWith(
 			2,
-			expect.objectContaining({ model: "gpt-5-mini" }),
+			expect.objectContaining({ model: "gpt-5.6-terra" }),
 		);
 		expect(codexCliWriterMocks.setCodexCliActiveSelection).toHaveBeenCalledTimes(1);
 	});
@@ -4077,7 +4110,7 @@ describe("codex manager cli commands", () => {
 		});
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValueOnce({
 			status: 200,
-			model: "gpt-5.1",
+			model: "gpt-5.5",
 			primary: {
 				usedPercent: 10,
 				windowMinutes: 300,
@@ -4097,12 +4130,13 @@ describe("codex manager cli commands", () => {
 			"best",
 			"--live",
 			"--model",
-			"gpt-5.1",
+			"gpt-5.5",
 		]);
 
 		expect(exitCode).toBe(0);
+		// Retired gpt-5.5 is normalized to its replacement before the probe runs.
 		expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
-			expect.objectContaining({ model: "gpt-5.1" }),
+			expect.objectContaining({ model: "gpt-6-sol" }),
 		);
 		expect(storageMocks.saveAccounts).not.toHaveBeenCalled();
 		expect(codexCliWriterMocks.setCodexCliActiveSelection).not.toHaveBeenCalled();
@@ -4177,6 +4211,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(
 			logSpy.mock.calls.some((call) =>
@@ -4252,6 +4287,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-best-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
 			message: string;
@@ -4620,6 +4656,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-a-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		extractAccountIdMock.mockImplementation(() => "acc_test");
 	});
@@ -4700,6 +4737,7 @@ describe("codex manager cli commands", () => {
 				accessToken: "access-a",
 				refreshToken: "refresh-a",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -4761,6 +4799,7 @@ describe("codex manager cli commands", () => {
 				expiresAt: now + 3_600_000,
 				idToken: "id-a-next",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		extractAccountIdMock.mockImplementation(() => "acc_test");
 	});
@@ -5768,6 +5807,7 @@ describe("codex manager cli commands", () => {
 					accountId: "acc_restored",
 					email: "restored@example.com",
 				}),
+						  expect.objectContaining({account: expect.any(Object)}),
 			);
 			expect(logSpy).toHaveBeenCalledWith(
 				"Loaded last-good.json (2 accounts).",
@@ -6091,6 +6131,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_warn",
 				email: "warn@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(logSpy).toHaveBeenCalledWith(
 			expect.stringContaining("Codex auth sync did not complete"),
@@ -6872,6 +6913,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_manual",
 				email: "manual@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		expect(promptLoginModeMock).toHaveBeenCalledTimes(1);
 	});
@@ -6944,6 +6986,7 @@ describe("codex manager cli commands", () => {
 				accountId: "acc_selected",
 				email: "selected@example.com",
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 	});
 
@@ -7093,6 +7136,13 @@ describe("codex manager cli commands", () => {
 		vi.mocked(accountsModule.extractAccountEmail).mockImplementationOnce(
 			() => "user@example.com",
 		);
+		vi.mocked(accountsModule.getAccountIdCandidates).mockReturnValueOnce([
+			{
+				accountId: "workspace-beta",
+				source: "org",
+				label: "Workspace Beta [id:beta]",
+			},
+		]);
 		vi.mocked(accountsModule.getAccountIdCandidates).mockReturnValueOnce([
 			{
 				accountId: "workspace-beta",
@@ -7534,7 +7584,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("writes shared workspace quota cache entries by email without reusing bare accountId keys", async () => {
@@ -7649,7 +7699,7 @@ describe("codex manager cli commands", () => {
 					},
 				},
 			},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("writes multi-workspace quota cache entries by accountId when one email spans multiple workspaces", async () => {
@@ -7774,7 +7824,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("skips live probe when same-email workspaces still lack stored accountIds", async () => {
@@ -7984,7 +8034,7 @@ describe("codex manager cli commands", () => {
 					},
 				},
 				byEmail: {},
-			});
+			}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		} finally {
 			extractAccountIdMock.mockReset();
 			extractAccountIdMock.mockImplementation(() => "acc_test");
@@ -8214,6 +8264,7 @@ describe("codex manager cli commands", () => {
 				refreshToken: "refresh-b",
 				expiresAt: now + 3_600_000,
 			}),
+				  expect.objectContaining({account: expect.any(Object)}),
 		);
 		const syncCallOrder =
 			codexCliWriterMocks.setCodexCliActiveSelection.mock.invocationCallOrder[0];
@@ -10365,14 +10416,15 @@ describe("codex manager cli commands", () => {
 				};
 			};
 		};
+		// Retired gpt-5.4-mini runs on GPT-6 Luna, its named replacement.
 		expect(payload.modelSelection).toEqual({
 			requested: "gpt-5.4-mini",
-			normalized: "gpt-5.4-mini",
-			remapped: false,
+			normalized: "gpt-6-luna",
+			remapped: true,
 			promptFamily: "gpt-5.2",
 			capabilities: {
-				toolSearch: false,
-				computerUse: false,
+				toolSearch: true,
+				computerUse: true,
 				compaction: true,
 			},
 		});
@@ -10411,7 +10463,7 @@ describe("codex manager cli commands", () => {
 		});
 		quotaProbeMocks.fetchCodexQuotaSnapshot.mockResolvedValue({
 			status: 200,
-			model: "gpt-5.4-mini",
+			model: "gpt-6-luna",
 			primary: {
 				usedPercent: 10,
 				windowMinutes: 300,
@@ -10441,8 +10493,9 @@ describe("codex manager cli commands", () => {
 
 			expect(exitCode).toBe(0);
 			expect(quotaProbeMocks.fetchCodexQuotaSnapshot).toHaveBeenCalled();
+			// Retired gpt-5.4-mini-high resolves to its replacement, GPT-6 Luna.
 			for (const [request] of quotaProbeMocks.fetchCodexQuotaSnapshot.mock.calls) {
-				expect(request).toMatchObject({ model: "gpt-5.4-mini" });
+				expect(request).toMatchObject({ model: "gpt-6-luna" });
 			}
 		}
 
@@ -11263,6 +11316,7 @@ describe("codex manager cli commands", () => {
 				glyphMode: string;
 				palette: string;
 				accent: string;
+				colorMode: string;
 			} | null = null;
 			if (panel === "theme") {
 				const runtime = await import("../lib/ui/runtime.js");
@@ -11274,6 +11328,7 @@ describe("codex manager cli commands", () => {
 					glyphMode: snapshot.glyphMode,
 					palette: snapshot.palette,
 					accent: snapshot.accent,
+					colorMode: snapshot.colorMode,
 				};
 			}
 			setupInteractiveSettingsLogin(
@@ -11341,6 +11396,7 @@ describe("codex manager cli commands", () => {
 					glyphMode: restored.glyphMode,
 					palette: restored.palette,
 					accent: restored.accent,
+					colorMode: restored.colorMode,
 				}).toEqual(originalRuntimeTheme);
 			}
 		});
@@ -11805,7 +11861,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 	});
 
 	it("treats a quota cache save failure as a partial-success warning, not a hard failure", async () => {
@@ -11961,7 +12017,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		expect(
 			logSpy.mock.calls.some((call) =>
 				String(call[0]).includes("Auto-fix scan"),
@@ -12087,7 +12143,7 @@ describe("codex manager cli commands", () => {
 		expect(quotaCacheMocks.saveQuotaCache).toHaveBeenCalledWith({
 			byAccountId: {},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		expect(storageMocks.saveAccounts).toHaveBeenCalledTimes(1);
 		expect(storageMocks.saveAccounts.mock.calls[0]?.[0]?.accounts?.[0]?.email).toBe(
 			"owner@example.com",
@@ -12250,7 +12306,7 @@ describe("codex manager cli commands", () => {
 						},
 					},
 				},
-			});
+			}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 
 			const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
 				reports: Array<{ outcome: string }>;
@@ -12417,7 +12473,7 @@ describe("codex manager cli commands", () => {
 				},
 			},
 			byEmail: {},
-		});
+		}, expect.objectContaining({byAccountId: expect.any(Object), byEmail: expect.any(Object)}));
 		expect(storageMocks.saveAccounts).toHaveBeenCalledTimes(1);
 		expect(storageMocks.saveAccounts.mock.calls[0]?.[0]?.accounts?.[0]?.accountId).toBe(
 			"workspace-alpha",

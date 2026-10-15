@@ -83,14 +83,12 @@ afterEach(() => {
 });
 
 describe("createRotationProxyState", () => {
-	it("seeds the known-manager set and a zeroed status from the injected clock", () => {
+	it("seeds the active manager and a zeroed status from the injected clock", () => {
 		const init = stateInit();
 
 		const state = createRotationProxyState(init);
 
-		expect([...state.knownAccountManagers]).toEqual([
-			init.activeAccountManager,
-		]);
+		expect(state.activeAccountManager).toBe(init.activeAccountManager);
 		expect(state.status).toStrictEqual({
 			startedAt: NOW,
 			totalRequests: 0,
@@ -120,9 +118,7 @@ describe("recoverStaleRuntimeState", () => {
 
 		expect(result).toBe(reloaded);
 		expect(state.activeAccountManager).toBe(reloaded);
-		// The previous manager stays known so in-flight requests can finish.
-		expect(state.knownAccountManagers.has(previousManager)).toBe(true);
-		expect(state.knownAccountManagers.has(reloaded)).toBe(true);
+		expect(previousManager.getAccountCount()).toBe(1);
 		// The configured mutex mode carries over to the reloaded pool.
 		expect(reloaded.getRoutingMutexMode()).toBe("enabled");
 		expect(state.lastStaleRuntimeReloadAt).toBeGreaterThan(0);
@@ -132,6 +128,18 @@ describe("recoverStaleRuntimeState", () => {
 		expect(recordRuntimeReloadMock).toHaveBeenCalledExactlyOnceWith(
 			"pool-exhausted-no-account",
 		);
+	});
+
+	it("retains only the active inventory across repeated replacements", async () => {
+		const state = createRotationProxyState(stateInit());
+		for (let i = 1; i <= 20; i++) {
+			const next = new AccountManager(undefined, storageWith(i % 3 + 1));
+			loadFromDisk.mockResolvedValueOnce(next);
+			state.lastStaleRuntimeReloadAt = 0;
+			await recoverStaleRuntimeState(state);
+			const retained = Object.values(state).flatMap(value => value instanceof AccountManager ? [value] : value instanceof Set ? [...value].filter(item => item instanceof AccountManager) : []);
+			expect(retained).toEqual([next]);
+		}
 	});
 
 	it("dedupes within the 1s window and reloads again once it expires", async () => {

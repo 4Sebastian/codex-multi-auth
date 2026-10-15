@@ -8,7 +8,12 @@ import {
 	normalizeFailureDetail,
 	parseStructuredErrorMessage,
 	stringifyLogArgs,
+	stylePromptText,
 } from "../lib/codex-manager/formatters/text-style.js";
+import {
+	resetUiRuntimeOptions,
+	setUiRuntimeOptions,
+} from "../lib/ui/runtime.js";
 import {
 	formatAccountQuotaSummary,
 	formatCompactQuotaSnapshot,
@@ -122,6 +127,55 @@ describe("text-style formatters", () => {
 			'msg {"a":1} [object Object]',
 		);
 	});
+
+	it("stylePromptText omits the dim attribute on muted text in light mode", () => {
+		const stdoutDescriptor = Object.getOwnPropertyDescriptor(
+			process.stdout,
+			"isTTY",
+		);
+		const originalForceColor = process.env.FORCE_COLOR;
+		const originalColorMode = process.env.CODEX_TUI_COLOR_MODE;
+		Object.defineProperty(process.stdout, "isTTY", {
+			configurable: true,
+			value: true,
+		});
+		process.env.FORCE_COLOR = "1";
+		delete process.env.CODEX_TUI_COLOR_MODE;
+		try {
+			setUiRuntimeOptions({
+				v2Enabled: true,
+				colorProfile: "truecolor",
+				colorMode: "light",
+			});
+			const lightOut = stylePromptText("note", "muted");
+			expect(lightOut).toContain("\x1b[38;2;71;85;105m");
+			expect(lightOut).not.toContain("\x1b[2m");
+
+			setUiRuntimeOptions({
+				v2Enabled: true,
+				colorProfile: "truecolor",
+				colorMode: "dark",
+			});
+			expect(stylePromptText("note", "muted")).toContain("\x1b[2m");
+		} finally {
+			if (stdoutDescriptor) {
+				Object.defineProperty(process.stdout, "isTTY", stdoutDescriptor);
+			} else {
+				delete (process.stdout as { isTTY?: boolean }).isTTY;
+			}
+			if (originalForceColor === undefined) {
+				delete process.env.FORCE_COLOR;
+			} else {
+				process.env.FORCE_COLOR = originalForceColor;
+			}
+			if (originalColorMode === undefined) {
+				delete process.env.CODEX_TUI_COLOR_MODE;
+			} else {
+				process.env.CODEX_TUI_COLOR_MODE = originalColorMode;
+			}
+			resetUiRuntimeOptions();
+		}
+	});
 });
 
 describe("quota formatters", () => {
@@ -178,7 +232,8 @@ describe("compact quota reset timestamps", () => {
 		secondaryReset: number | undefined,
 	): CodexQuotaSnapshot =>
 		({
-			status: "ok",
+			status: 200,
+			responseCompleted: true,
 			planType: "plus",
 			model: "gpt-5.3-codex",
 			primary: {
@@ -191,7 +246,7 @@ describe("compact quota reset timestamps", () => {
 				windowMinutes: 10080,
 				resetAtMs: secondaryReset,
 			},
-		}) as unknown as CodexQuotaSnapshot;
+		});
 
 	it("formatQuotaResetAt uses local 24h time, adds the day when not today", () => {
 		expect(formatQuotaResetAt(SAME_DAY, NOW)).toBe(localTime(SAME_DAY));
@@ -294,6 +349,7 @@ describe("compact quota reset timestamps", () => {
 	it("does not restore quota text when both windows are uninformative", () => {
 		const allHidden = {
 			status: 200,
+			responseCompleted: true,
 			planType: "plus",
 			model: "gpt-5.3-codex",
 			primary: { usedPercent: 0 },

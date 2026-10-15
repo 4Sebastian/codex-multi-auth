@@ -1,3 +1,11 @@
+import { withRefreshCredentialRetention } from "../storage/pending-auth.js";
+import { subscriptionStatus, formatSubscriptionStatus } from "./formatters/subscription-status.js";
+import { getAccountPolicyKey, loadAccountPolicyStore } from "../account-policy.js";
+import { automaticCheckWorkspaceId } from "../runtime/automatic-account-checks.js";
+import { refreshAndPrintResetCredits } from "../runtime/account-reset-credits.js";
+import { mapWithConcurrency } from "../concurrency.js";
+import { withCheckProgress } from "../ui/check-progress.js";
+import { refreshAndPrintModelInventory } from "../runtime/model-discovery-status.js";
 import {
 	AUTH_INVALIDATION_MARKER,
 	extractAccountEmail,
@@ -5,6 +13,7 @@ import {
 	formatAccountLabel,
 	sanitizeEmail,
 } from "../accounts.js";
+import { codexCliAccountIdFor } from "../auth/token-utils.js";
 import { setCodexCliActiveSelection } from "../codex-cli/writer.js";
 import {
 	type DashboardDisplaySettings,
@@ -39,7 +48,7 @@ import {
 	cloneQuotaCacheData,
 	DEFAULT_LIVE_PROBE_MODEL,
 	pruneUnsafeQuotaEmailCacheEntry,
-	updateQuotaCacheForAccount,
+	updateQuotaCacheForWorkspace,
 } from "./quota-cache-helpers.js";
 
 function appendAuthInvalidationMarker(
@@ -52,6 +61,24 @@ function appendAuthInvalidationMarker(
 		: detail;
 }
 
+function recoverAccount(account: {
+	enabled?: boolean;
+	authInvalidatedAt?: number;
+	authInvalidationErrorCode?: string;
+}, probe?: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>>): boolean {
+	if (probe?.tokenInvalidated) {
+		account.authInvalidatedAt = Date.now();
+		account.authInvalidationErrorCode = "token_invalidated";
+		return true;
+	}
+	if (probe && (probe.responseCompleted !== true || probe.primingFailure)) return false;
+	const changed = account.enabled === false || account.authInvalidatedAt !== undefined || account.authInvalidationErrorCode !== undefined;
+	if (account.enabled === false) account.enabled = true;
+	delete account.authInvalidatedAt;
+	delete account.authInvalidationErrorCode;
+	return changed;
+}
+
 /**
  * Body of the `check` command, also reused by the login dashboard's quick
  * check / deep check actions. Moved verbatim out of lib/codex-manager.ts
@@ -59,7 +86,10 @@ function appendAuthInvalidationMarker(
  */
 export interface HealthCheckOptions {
 	forceRefresh?: boolean;
+	discoverModels?: boolean;
 	liveProbe?: boolean;
+	/** Explicit `check --prime` only: may start an unused subscription's quota windows. */
+	primeUnusedSubscription?: boolean;
 	model?: string;
 	display?: DashboardDisplaySettings;
 }
@@ -69,6 +99,7 @@ export async function runHealthCheck(
 ): Promise<void> {
 	const forceRefresh = options.forceRefresh === true;
 	const liveProbe = options.liveProbe === true;
+	const primeUnusedSubscription = options.primeUnusedSubscription === true;
 	const probeModel = options.model?.trim() || DEFAULT_LIVE_PROBE_MODEL;
 	const modelInspection = inspectRequestedModel(probeModel);
 	const display = options.display ?? DEFAULT_DASHBOARD_DISPLAY_SETTINGS;
@@ -79,6 +110,7 @@ export async function runHealthCheck(
 	const storage = await loadAccounts();
 	if (!storage || storage.accounts.length === 0) {
 		console.log("No accounts configured.");
+		if (options.discoverModels) await refreshAndPrintModelInventory(console.log);
 		return;
 	}
 	let quotaEmailFallbackState =
@@ -86,6 +118,8 @@ export async function runHealthCheck(
 			? buildQuotaEmailFallbackState(storage.accounts)
 			: null;
 
+	const policies = await loadAccountPolicyStore({strict:true}).catch(() => null);
+	const subscriptionLine = (account: Parameters<typeof subscriptionStatus>[0], snapshot: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>>) => formatSubscriptionStatus(subscriptionStatus(account, {...snapshot, updatedAt: snapshot.observedAt ?? Date.now()}, policies ? policies.accounts[getAccountPolicyKey(account)] ?? {} : undefined, Date.now()));
 	let changed = false;
 	let ok = 0;
 	let failed = 0;
@@ -94,6 +128,11 @@ export async function runHealthCheck(
 	let signedInOnly = 0;
 	const activeIndex = resolveActiveIndex(storage, "codex");
 	let activeAccountRefreshed = false;
+	const classifyProbe = (account: Parameters<typeof recoverAccount>[0], snapshot: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>>): void => {
+		if (snapshot.tokenInvalidated || account.authInvalidatedAt) failed += 1;
+		else if (snapshot.responseCompleted === true && !snapshot.primingFailure) codexAvailable += 1;
+		else signedInOnly += 1;
+	};
 	const now = Date.now();
 	console.log(
 		stylePromptText(
@@ -111,6 +150,27 @@ export async function runHealthCheck(
 			),
 		);
 	}
+ type ProbeOutcome = { ok: true; value: Awaited<ReturnType<typeof fetchCodexQuotaSnapshot>> } | { ok: false; error: unknown };
+ const quickProbes = new Map<number, ProbeOutcome>();
+ if (liveProbe && !forceRefresh) {
+  const candidates = storage.accounts.flatMap((account, index) => {
+   const accountId = automaticCheckWorkspaceId(account);
+   return hasUsableAccessToken(account, now) && account.accessToken && accountId
+    ? [{index,accountId,accessToken:account.accessToken}] : [];
+  });
+  if(candidates.length){
+   let completed = 0;
+   await withCheckProgress(() => `Checking account probes: ${completed}/${candidates.length}`, async () => {
+    await mapWithConcurrency(candidates, 3, async candidate => {
+     try {
+      const value = await fetchCodexQuotaSnapshot({primeUnusedSubscription,accountId:candidate.accountId,accessToken:candidate.accessToken,model:modelInspection.normalized});
+      quickProbes.set(candidate.index,{ok:true,value});
+     } catch(error) { quickProbes.set(candidate.index,{ok:false,error}); }
+     finally { completed++; }
+    });
+   }, console.log);
+  }
+ }
 	for (let i = 0; i < storage.accounts.length; i += 1) {
 		const account = storage.accounts[i];
 		if (!account) continue;
@@ -118,48 +178,45 @@ export async function runHealthCheck(
 		const labelText = stylePromptText(label, "accent");
 		const sessionLikelyValid = hasUsableAccessToken(account, now);
 		if (!forceRefresh && sessionLikelyValid) {
-			if (account.enabled === false) {
+			if (!liveProbe && !account.authInvalidatedAt && account.enabled === false) {
 				account.enabled = true;
 				changed = true;
-			}
-			if (i === activeIndex) {
-				activeAccountRefreshed = true;
 			}
 			let healthDetail = "signed in and working";
 			let healthTone: "success" | "warning" = "success";
 			if (liveProbe) {
 				const currentAccessToken = account.accessToken;
 				const probeAccountId = currentAccessToken
-					? (account.accountId ?? extractAccountId(currentAccessToken))
+					? automaticCheckWorkspaceId(account)
 					: undefined;
 				if (!probeAccountId || !currentAccessToken) {
 					warnings += 1;
-					signedInOnly += 1;
+					if (account.authInvalidatedAt) failed += 1;
+					else signedInOnly += 1;
 					healthTone = "warning";
 					healthDetail =
-						"signed in (live check skipped: missing account ID)";
+						"signed in (live check skipped: missing account ID or unavailable selected workspace)";
 				} else {
 					try {
-						const snapshot = await fetchCodexQuotaSnapshot({
+						const priorProbe = quickProbes.get(i);
+      if(priorProbe && !priorProbe.ok) throw priorProbe.error;
+      const snapshot = priorProbe?.ok ? priorProbe.value : await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: live probe`, () => fetchCodexQuotaSnapshot({primeUnusedSubscription,
 							accountId: probeAccountId,
 							accessToken: currentAccessToken,
 							model: modelInspection.normalized,
-						});
+						}), console.log);
 						if (workingQuotaCache) {
-							quotaCacheChanged =
-								updateQuotaCacheForAccount(
-									workingQuotaCache,
-									account,
-									snapshot,
-									storage.accounts,
-									quotaEmailFallbackState ?? undefined,
-								) || quotaCacheChanged;
+							updateQuotaCacheForWorkspace(workingQuotaCache, account, probeAccountId, snapshot, storage.accounts);
+							quotaCacheChanged = true;
 						}
-						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display);
-						codexAvailable += 1;
+						if (recoverAccount(account, snapshot)) changed = true;
+						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
+						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthTone = "warning"; warnings += 1; }
+						classifyProbe(account, snapshot);
 					} catch (error) {
 						warnings += 1;
-						signedInOnly += 1;
+						if (account.authInvalidatedAt) failed += 1;
+						else signedInOnly += 1;
 						healthTone = "warning";
 						if (isCodexUnavailableError(error)) {
 							healthDetail =
@@ -178,6 +235,7 @@ export async function runHealthCheck(
 				healthDetail += " (re-login suggested soon)";
 			}
 			healthDetail = appendAuthInvalidationMarker(account, healthDetail);
+			if (i === activeIndex && !account.authInvalidatedAt && account.enabled !== false) activeAccountRefreshed = true;
 			ok += 1;
 			if (display.showPerAccountRows) {
 				const healthMarker = healthTone === "success" ? "✓" : "!";
@@ -187,7 +245,7 @@ export async function runHealthCheck(
 			}
 			continue;
 		}
-		const result = await queuedRefresh(account.refreshToken);
+		const result = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: refreshing sign-in`, () => withRefreshCredentialRetention(account, () => queuedRefresh(account.refreshToken), () => storage.accounts.includes(account)), console.log);
 		if (result.type === "success") {
 			const tokenAccountId = extractAccountId(result.access);
 			const nextEmail = sanitizeEmail(
@@ -201,6 +259,8 @@ export async function runHealthCheck(
 			}
 			if (account.accessToken !== result.access) {
 				account.accessToken = result.access;
+				delete account.authInvalidatedAt;
+				delete account.authInvalidationErrorCode;
 				changed = true;
 			}
 			if (account.expiresAt !== result.expires) {
@@ -216,18 +276,7 @@ export async function runHealthCheck(
 				changed = true;
 				accountIdentityChanged = true;
 			}
-			if (account.enabled === false) {
-				account.enabled = true;
-				changed = true;
-			}
-			if (
-				typeof account.authInvalidatedAt === "number" ||
-				account.authInvalidationErrorCode !== undefined
-			) {
-				delete account.authInvalidatedAt;
-				delete account.authInvalidationErrorCode;
-				changed = true;
-			}
+			if (!liveProbe && recoverAccount(account)) changed = true;
 			if (accountIdentityChanged && liveProbe && workingQuotaCache) {
 				quotaEmailFallbackState = buildQuotaEmailFallbackState(
 					storage.accounts,
@@ -241,42 +290,37 @@ export async function runHealthCheck(
 					) || quotaCacheChanged;
 			}
 			account.lastUsed = Date.now();
-			if (i === activeIndex) {
-				activeAccountRefreshed = true;
-			}
 			ok += 1;
 			let healthyMessage = "working now";
 			let healthyTone: "success" | "warning" = "success";
 			if (liveProbe) {
-				const probeAccountId = account.accountId ?? tokenAccountId;
+				const probeAccountId = automaticCheckWorkspaceId(account);
 				if (!probeAccountId) {
 					warnings += 1;
-					signedInOnly += 1;
+					if (account.authInvalidatedAt) failed += 1;
+					else signedInOnly += 1;
 					healthyTone = "warning";
 					healthyMessage =
-						"signed in (live check skipped: missing account ID)";
+						"signed in (live check skipped: missing account ID or unavailable selected workspace)";
 				} else {
 					try {
-						const snapshot = await fetchCodexQuotaSnapshot({
+						const snapshot = await withCheckProgress(`Account ${i + 1}/${storage.accounts.length}: live probe`, () => fetchCodexQuotaSnapshot({primeUnusedSubscription,
 							accountId: probeAccountId,
 							accessToken: result.access,
 							model: modelInspection.normalized,
-						});
+						}), console.log);
 						if (workingQuotaCache) {
-							quotaCacheChanged =
-								updateQuotaCacheForAccount(
-									workingQuotaCache,
-									account,
-									snapshot,
-									storage.accounts,
-									quotaEmailFallbackState ?? undefined,
-								) || quotaCacheChanged;
+							updateQuotaCacheForWorkspace(workingQuotaCache, account, probeAccountId, snapshot, storage.accounts);
+							quotaCacheChanged = true;
 						}
-						healthyMessage = formatQuotaSnapshotForDashboard(snapshot, display);
-						codexAvailable += 1;
+						if (recoverAccount(account, snapshot)) changed = true;
+						healthyMessage = formatQuotaSnapshotForDashboard(snapshot, display) + " | " + subscriptionLine(account, snapshot);
+						if (snapshot.responseCompleted !== true || snapshot.primingFailure) { healthyTone = "warning"; warnings += 1; }
+						classifyProbe(account, snapshot);
 					} catch (error) {
 						warnings += 1;
-						signedInOnly += 1;
+						if (account.authInvalidatedAt) failed += 1;
+						else signedInOnly += 1;
 						healthyTone = "warning";
 						if (isCodexUnavailableError(error)) {
 							healthyMessage =
@@ -291,6 +335,7 @@ export async function runHealthCheck(
 					}
 				}
 			}
+			if (i === activeIndex && !account.authInvalidatedAt && account.enabled !== false) activeAccountRefreshed = true;
 			if (display.showPerAccountRows) {
 				healthyMessage = appendAuthInvalidationMarker(account, healthyMessage);
 				const healthyMarker = healthyTone === "success" ? "✓" : "!";
@@ -336,7 +381,7 @@ export async function runHealthCheck(
 	}
 	if (workingQuotaCache && quotaCacheChanged) {
 		try {
-			await saveQuotaCache(workingQuotaCache);
+			await saveQuotaCache(workingQuotaCache, quotaCache ?? undefined);
 		} catch (error) {
 			// Quota cache is a derived artifact; a transient Windows EBUSY/EPERM
 			// here must not abort the health check before account fixes commit.
@@ -358,12 +403,12 @@ export async function runHealthCheck(
 		const activeAccount = storage.accounts[activeIndex];
 		if (activeAccount) {
 			await setCodexCliActiveSelection({
-				accountId: activeAccount.accountId,
+				accountId: codexCliAccountIdFor(activeAccount, activeAccount.accessToken),
 				email: activeAccount.email,
 				accessToken: activeAccount.accessToken,
 				refreshToken: activeAccount.refreshToken,
 				expiresAt: activeAccount.expiresAt,
-			});
+			}, {account: activeAccount, current: () => storage.accounts[activeIndex] === activeAccount});
 		}
 	}
 
@@ -398,4 +443,10 @@ export async function runHealthCheck(
 					],
 		),
 	);
+	if (options.discoverModels) {
+  await refreshAndPrintResetCredits(console.log).catch(() => {
+   console.log("Reset-credit availability could not be refreshed; cached counts may be stale.");
+  });
+  await refreshAndPrintModelInventory(console.log);
+ }
 }

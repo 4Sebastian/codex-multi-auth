@@ -91,6 +91,25 @@ describe("extractUsageTokenCounts", () => {
 });
 
 describe("createUsageStreamScanner", () => {
+	it("observes multiline terminal frames split across CRLF chunks exactly once", () => {
+		const events: unknown[] = [];
+		const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => events.push(event)});
+		const raw = 'event: response.completed\r\ndata: {"type":"response.completed",\r\ndata: "response":{"usage":{"input_tokens":7}}}\r\n\r\n';
+		for (const byte of encoder.encode(raw)) scanner.push(Uint8Array.of(byte));
+		expect(scanner.result()?.inputTokens).toBe(7);
+		expect(scanner.result()?.inputTokens).toBe(7);
+		expect(events).toEqual([{type:"response.completed",response:{usage:{input_tokens:7}}}]);
+	});
+	it.each(["response.completed", "response.failed", "response.done"])("observes large chunked %s terminal metadata", type => {
+		const events: unknown[] = [];
+		const scanner = createUsageStreamScanner({contentType: "text/event-stream", onEvent: event => events.push(event)});
+		const event = {type, response: {id: "large", status: type === "response.failed" ? "failed" : "completed", output: [{type: "message", role: "assistant", content: [{type: "output_text", text: "x".repeat(2 * 1024 * 1024)}]}], usage: COMPLETED_USAGE, service_tier: "priority"}};
+		const bytes = encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+		for (let offset = 0; offset < bytes.length; offset += 8192) scanner.push(bytes.subarray(offset, offset + 8192));
+		expect(events).toEqual([event]);
+		expect(scanner.result()).toMatchObject({inputTokens: 1000, outputTokens: 300, reasoningTokens: 200, serviceTier: "priority"});
+	});
+
 	it("recovers the terminal usage from an SSE body", () => {
 		const scanner = createUsageStreamScanner({
 			contentType: "text/event-stream; charset=utf-8",
@@ -156,10 +175,9 @@ describe("createUsageStreamScanner", () => {
 
 	it("gives up rather than buffer an oversized non-streaming body", () => {
 		const scanner = createUsageStreamScanner({ contentType: "application/json" });
-		// 2 MiB of payload, over the 1 MiB retention cap.
-		const chunk = new Uint8Array(512 * 1024);
+		const chunk = new Uint8Array(1024 * 1024);
 		chunk.fill(0x20);
-		for (let i = 0; i < 4; i += 1) scanner.push(chunk);
+		for (let i = 0; i < 65; i += 1) scanner.push(chunk);
 
 		expect(scanner.result()).toBeNull();
 	});
@@ -169,4 +187,19 @@ describe("createUsageStreamScanner", () => {
 		expect(() => scanner.push(Uint8Array.of(0xff, 0xfe, 0x00))).not.toThrow();
 		expect(() => scanner.result()).not.toThrow();
 	});
+});
+
+it.each([false,true])("observes terminal events after an oversized SSE event (split=%s)",split=>{
+ const events:unknown[]=[];const scanner=createUsageStreamScanner({contentType:"text/event-stream",onEvent:event=>events.push(event)});
+ const encoder=new TextEncoder();const large='data: '+JSON.stringify({type:'response.output_item.done',data:'x'.repeat(65*1024*1024)})+'\n\n';
+ if(split){for(let i=0;i<large.length;i+=8192)scanner.push(encoder.encode(large.slice(i,i+8192)));}else scanner.push(encoder.encode(large));
+ const completed={type:'response.completed',response:{usage:{input_tokens:7,output_tokens:2}}};
+ scanner.push(encoder.encode('data: '+JSON.stringify(completed)+'\n\n'));
+ expect(scanner.result()?.inputTokens).toBe(7);expect(events).toEqual([completed]);
+});
+it.each(['\n','\r\n'])("keeps the terminal event when an oversized line ends at a %j chunk boundary",newline=>{
+ const events:unknown[]=[];const scanner=createUsageStreamScanner({contentType:'text/event-stream',onEvent:e=>events.push(e)});const encoder=new TextEncoder();
+ scanner.push(encoder.encode('data: '+JSON.stringify({type:'response.output_item.done',data:'x'.repeat(65*1024*1024)})+newline));
+ scanner.push(encoder.encode(newline+'data: '+JSON.stringify({type:'response.completed'})+newline+newline));
+ scanner.result();expect(events).toEqual([{type:'response.completed'}]);
 });

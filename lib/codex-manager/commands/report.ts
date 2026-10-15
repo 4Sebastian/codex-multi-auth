@@ -1,3 +1,4 @@
+import { withRefreshCredentialRetention } from "../../storage/pending-auth.js";
 import { promises as fs } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
@@ -39,6 +40,7 @@ import type { RuntimeObservabilitySnapshot } from "../../runtime/runtime-observa
 import type { QuotaCacheData } from "../../quota-cache.js";
 import type { TokenFailure, TokenResult } from "../../types.js";
 import { sleep } from "../../utils.js";
+import { shouldUpdateAccountIdFromToken } from "../../auth/token-utils.js";
 import { tempPathFor } from "../../temp-path.js";
 
 interface ReportCliOptions {
@@ -367,7 +369,7 @@ export async function runReportCommand(
 					);
 					continue;
 				}
-				const refreshResult = await deps.queuedRefresh(account.refreshToken);
+				const refreshResult = await withRefreshCredentialRetention(account, () => deps.queuedRefresh(account.refreshToken), () => storage.accounts.includes(account));
 				if (refreshResult.type !== "success") {
 					refreshFailures.set(i, {
 						...refreshResult,
@@ -397,7 +399,12 @@ export async function runReportCommand(
 				if (refreshedEmail) {
 					refreshPatch.email = refreshedEmail;
 				}
-				if (tokenDerivedAccountId) {
+				// Only a token-derived id follows the new token (as on every other
+				// refresh path); an explicit (manual) or org binding stays.
+				if (
+					tokenDerivedAccountId &&
+					shouldUpdateAccountIdFromToken(account.accountIdSource, account.accountId)
+				) {
 					refreshPatch.accountId = tokenDerivedAccountId;
 					refreshPatch.accountIdSource = "token";
 				}

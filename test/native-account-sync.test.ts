@@ -1,0 +1,308 @@
+import { describe, it, expect } from "vitest";
+import { AccountManager } from "../lib/accounts.js";
+import type { AccountStorageV3 } from "../lib/storage.js";
+import { isSameNativeAccount, syncNativeAccountCredentials } from "../lib/runtime/native-account-sync.js";
+import { workspaceModelScopes } from "../lib/runtime/workspace-model-scopes.js";
+const fixture = (): AccountStorageV3 => ({
+	version: 3,
+	activeIndex: 0,
+	accounts: [
+		{
+			email: "a@example.test",
+			accountId: "a",
+			refreshToken: "old-refresh",
+			accessToken: "old-access",
+			expiresAt: 2000,
+			addedAt: 1,
+			lastUsed: 1,
+			coolingDownUntil: 9999,
+			cooldownReason: "auth-failure",
+			rateLimitResetTimes: { codex: 99999 },
+		},
+	],
+});
+describe("native record generation matching", () => {
+	it.each([
+		{left: "R1", right: "R2", expected: false},
+		{left: " R1 ", right: "R1", expected: true},
+		{left: "R1", right: undefined, expected: true},
+		{left: undefined, right: "R1", expected: true},
+	])("matches explicit generations without losing legacy identity (%j)", ({left, right, expected}) => {
+		const identity = {accountId: "a", email: "a@example.test", refreshToken: "fixture"};
+		expect(isSameNativeAccount({...identity, recordId: left}, {...identity, recordId: right})).toBe(expected);
+	});
+
+	it("does not reconcile replacement credentials or workspace policy into a deleted record", () => {
+		const storage = fixture();
+		Object.assign(storage.accounts[0]!, {recordId: "R1", workspaces: [{id: "original", enabled: true}]});
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {recordId: "R2", accessToken: "replacement", refreshToken: "replacement-refresh",
+			workspaces: [{id: "replacement-workspace", enabled: true}]});
+		const manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({recordId: "R1", enabled: false, access: "old-access",
+			refreshToken: "old-refresh", workspaces: [{id: "original", enabled: true}]});
+	});
+
+	it("does not apply an old primary refusal to a retained refreshed credential", () => {
+		const storage = fixture();
+		storage.accounts[0]!.authInvalidatedAt = 5000;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		manager.updateFromAuth(account, {type: "oauth", access: account.access!, refresh: "new-refresh", expires: 3000});
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.refreshToken).toBe("new-refresh");
+		expect(account.authInvalidatedAt).toBeUndefined();
+	});
+	it("enforces a newly observed durable revocation against a memory-only recovery", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		manager.updateFromAuth(account, {type: "oauth", access: "new-access", refresh: "new-refresh", expires: 3000});
+		disk.accounts[0]!.authInvalidatedAt = 5000;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.access).toBe("new-access");
+		expect(account.authInvalidatedAt).toBe(5000);
+	});
+	it("keeps a stored record's authority across account and email changes", () => {
+		const storage = fixture();
+		storage.accounts[0]!.recordId = "R1";
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accountId: "new-account", email: "renamed@example.test", accessToken: "replacement"});
+		const manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({recordId: "R1", access: "replacement", enabled: true});
+	});
+});
+
+describe("native account credential reload", () => {
+	it.each(["auth-failure", "network-error", "rate-limit"] as const)("reconciles a newly persisted same-credential cooldown (%s)", reason => {
+		const storage = fixture(); delete storage.accounts[0]!.coolingDownUntil; delete storage.accounts[0]!.cooldownReason;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {coolingDownUntil: Date.now() + 60000, cooldownReason: reason});
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)).toMatchObject({coolingDownUntil: disk.accounts[0]!.coolingDownUntil, cooldownReason: reason});
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(false);
+	});
+	it("adopts durable quota observations and explicit clears without erasing concurrent local limits", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		account.rateLimitResetTimes = {...account.rateLimitResetTimes, "codex:local": 300000};
+		disk.accounts[0]!.rateLimitResetTimes = {codex: 200000, "codex:external": 400000};
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(account.rateLimitResetTimes).toEqual({codex: 200000, "codex:external": 400000, "codex:local": 300000});
+		disk.accounts[0]!.rateLimitResetTimes = {};
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.rateLimitResetTimes).toEqual({"codex:local": 300000});
+	});
+	it("honors a durable cooldown clear but retains a newer local cooldown", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		const account = manager.getAccountByIndex(0)!;
+		Object.assign(account, {coolingDownUntil: 200000, cooldownReason: "network-error"});
+		delete disk.accounts[0]!.coolingDownUntil; delete disk.accounts[0]!.cooldownReason;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account).toMatchObject({coolingDownUntil: 200000, cooldownReason: "network-error"});
+		const clean = new AccountManager(undefined, storage);
+		syncNativeAccountCredentials(clean, disk);
+		expect(clean.getAccountByIndex(0)?.coolingDownUntil).toBeUndefined();
+	});
+	it("adopts external workspace inventory and disablement without changing credentials", () => {
+		const storage=fixture();
+		storage.accounts[0]!.workspaces=[{id:"personal",enabled:true},{id:"business",enabled:true},{id:"removed",enabled:true}];
+		storage.accounts[0]!.currentWorkspaceIndex=0;
+		const manager=new AccountManager(undefined,storage), disk=structuredClone(storage);
+		disk.accounts[0]!.workspaces=[{id:"business",enabled:false},{id:"personal",enabled:true},{id:"new",enabled:true}];
+		disk.accounts[0]!.currentWorkspaceIndex=1;
+		expect(syncNativeAccountCredentials(manager,disk)).toBe(true);
+		const account=manager.getAccountByIndex(0)!;
+		expect(account.workspaces).toEqual(disk.accounts[0]!.workspaces);
+		expect(account.workspaces?.[account.currentWorkspaceIndex ?? 0]?.id).toBe("personal");
+		expect(workspaceModelScopes(account).filter(s=>s.routable).map(s=>s.accountId)).not.toContain("business");
+		expect(syncNativeAccountCredentials(manager,disk)).toBe(false);
+	});
+	it("keeps local health disablement when the external policy did not change", () => {
+		const storage=fixture(); storage.accounts[0]!.workspaces=[{id:"personal",enabled:true}];
+		const manager=new AccountManager(undefined,storage),disk=structuredClone(storage);
+		manager.disableWorkspace(manager.getAccountByIndex(0)!,"personal");
+		syncNativeAccountCredentials(manager,disk);
+		expect(manager.getAccountByIndex(0)!.workspaces?.[0]?.enabled).toBe(false);
+	});
+	it("does not re-enable explicitly disabled workspaces when re-enabling an account", () => {
+		const storage=fixture(); storage.accounts[0]!.enabled=false;
+		storage.accounts[0]!.workspaces=[{id:"personal",enabled:true},{id:"business",enabled:false}];
+		const manager=new AccountManager(undefined,storage);
+		manager.setAccountEnabled(0,true);
+		expect(manager.getAccountByIndex(0)!.workspaces?.[1]?.enabled).toBe(false);
+	});
+	it("adopts a CLI workspace preference even when tokens are unchanged", () => {
+		const storage=fixture();
+		storage.accounts[0]!.workspaces=[{id:"business",enabled:true},{id:"personal",enabled:true}];
+		storage.accounts[0]!.currentWorkspaceIndex=0;
+		const manager=new AccountManager(undefined,storage), disk=structuredClone(storage);
+		disk.accounts[0]!.currentWorkspaceIndex=1;
+		expect(syncNativeAccountCredentials(manager,disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)?.currentWorkspaceIndex).toBe(1);
+		expect(syncNativeAccountCredentials(manager,disk)).toBe(false);
+	});
+	it("adopts fresh login credentials and clears only obsolete auth cooldown", () => {
+		const storage = fixture(),
+			manager = new AccountManager(undefined, storage);
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {
+			accessToken: "new-access",
+			refreshToken: "new-refresh",
+			expiresAt: 3000,
+		});
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		const account = manager.getAccountByIndex(0)!;
+		expect(account.access).toBe("new-access");
+		expect(account.cooldownReason).toBeUndefined();
+		expect(account.rateLimitResetTimes.codex).toBe(99999);
+	});
+	it("preserves an unexpired auth refusal belonging to the adopted credential", () => {
+		const storage = fixture(), manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accessToken: "new-access", refreshToken: "new-refresh", coolingDownUntil: Date.now() + 60000});
+		syncNativeAccountCredentials(manager, disk);
+		expect(manager.getAccountByIndex(0)).toMatchObject({access: "new-access", refreshToken: "new-refresh", cooldownReason: "auth-failure", coolingDownUntil: disk.accounts[0]!.coolingDownUntil});
+	});
+	it("keeps cooldown for unchanged credentials but adopts an explicit shorter-lived replacement", () => {
+		const storage = fixture(),
+			manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, storage)).toBe(false);
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("auth-failure");
+		const disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, { accessToken: "older", expiresAt: 1000 });
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)!.access).toBe("older");
+	});
+	it("applies disablement without clearing quota cooldowns on token changes", () => {
+		const storage = fixture();
+		storage.accounts[0]!.cooldownReason = "network-error";
+		const manager = new AccountManager(undefined, storage),
+			disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {
+			enabled: false,
+			accessToken: "new",
+			expiresAt: 3000,
+		});
+		syncNativeAccountCredentials(manager, disk);
+		expect(manager.getAccountByIndex(0)!.enabled).toBe(false);
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("network-error");
+	});
+});
+
+it("removes a deleted access token even when a refresh token remains", () => {
+	const disk = fixture(), manager = new AccountManager(undefined, disk);
+	delete disk.accounts[0]!.accessToken;
+	expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+	expect(manager.getAccountByIndex(0)!.access).toBeUndefined();
+});
+
+it("adopts shortened expiry without requiring a token string change", () => {
+	const disk = fixture(), manager = new AccountManager(undefined, disk);
+	disk.accounts[0]!.expiresAt = 1;
+	expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+	expect(manager.getAccountByIndex(0)!.expires).toBe(1);
+});
+
+it("adopts explicit invalidation even when credentials have not changed", () => {
+	const storage = fixture(),
+		manager = new AccountManager(undefined, storage),
+		disk = structuredClone(storage);
+	disk.accounts[0]!.authInvalidatedAt = 1500;
+	disk.accounts[0]!.authInvalidationErrorCode = "token_revoked";
+	expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+	expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBe(1500);
+});
+
+it("matches preferences by account identity and workspace ID despite reordered lists",()=>{
+ const storage=fixture();
+ Object.assign(storage.accounts[0]!,{workspaces:[{id:"business",enabled:true},{id:"personal",enabled:false}],currentWorkspaceIndex:0});
+ storage.accounts.push({...structuredClone(storage.accounts[0]!),email:"b@example.test"});
+ const manager=new AccountManager(undefined,storage), disk=structuredClone(storage);
+ disk.accounts[0]!.workspaces!.reverse();
+ disk.accounts[0]!.currentWorkspaceIndex=0; // Personal moved to index 0 on disk.
+ disk.accounts.reverse();
+ expect(syncNativeAccountCredentials(manager,disk)).toBe(true);
+ expect(manager.getAccountByIndex(0)?.currentWorkspaceIndex).toBe(0);
+ expect(manager.getAccountByIndex(0)?.workspaces?.[0]?.id).toBe("personal");
+ expect(manager.getAccountByIndex(0)?.workspaces?.[0]?.enabled).toBe(false);
+ expect(manager.getAccountByIndex(1)?.currentWorkspaceIndex).toBe(0);
+});
+
+describe("native invalidation reconciliation", () => {
+	it("does not clear a current marker solely from JWT issuance time", () => {
+		const storage = fixture();
+		Object.assign(storage.accounts[0]!, {accessToken: `h.${Buffer.from(JSON.stringify({iat: 10})).toString("base64url")}.s`, authInvalidatedAt: 5000});
+		const manager = new AccountManager(undefined, storage);
+		syncNativeAccountCredentials(manager, structuredClone(storage));
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBe(5000);
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("auth-failure");
+		expect(manager.getAccountByIndex(0)!.rateLimitResetTimes.codex).toBe(99999);
+	});
+	it("adopts a successful probe clear without changing credentials", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		delete disk.accounts[0]!.authInvalidatedAt;
+		expect(syncNativeAccountCredentials(manager, disk)).toBe(true);
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBeUndefined();
+	});
+	it("preserves a newer concurrent invalidation and local disablement", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage), account = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(account, "token_invalidated", 2000);
+		manager.setAccountEnabled(0, false);
+		delete disk.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, disk);
+		expect(account.authInvalidatedAt).toBe(2000);
+		expect(account.enabled).toBe(false);
+		expect(account.cooldownReason).toBe("auth-failure");
+	});
+	it("preserves a same-millisecond local invalidation across repeated stale reads and a probe clear", () => {
+		const storage = fixture(); storage.accounts[0]!.authInvalidatedAt = 1500;
+		const manager = new AccountManager(undefined, storage), account = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(account, "token_invalidated", 1500);
+		for (let read = 0; read < 2; read++) syncNativeAccountCredentials(manager, structuredClone(storage));
+		const cleared = structuredClone(storage); delete cleared.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, cleared);
+		expect(account.authInvalidatedAt).toBe(1500);
+		expect(account.authInvalidationErrorCode).toBe("token_invalidated");
+		expect(account.cooldownReason).toBe("auth-failure");
+	});
+	it("preserves a quota cooldown when a re-login supersedes invalidation", () => {
+		const storage = fixture(); Object.assign(storage.accounts[0]!, {authInvalidatedAt: 1500, cooldownReason: "network-error"});
+		const manager = new AccountManager(undefined, storage), disk = structuredClone(storage);
+		Object.assign(disk.accounts[0]!, {accessToken: "new-access", refreshToken: "new-refresh"});
+		delete disk.accounts[0]!.authInvalidatedAt;
+		syncNativeAccountCredentials(manager, disk);
+		expect(manager.getAccountByIndex(0)!.authInvalidatedAt).toBeUndefined();
+		expect(manager.getAccountByIndex(0)!.cooldownReason).toBe("network-error");
+	});
+});
+
+describe("native account identity", () => {
+	it("matches a stored email that differs only in case and leaves the account alone", () => {
+		const storage = fixture();
+		storage.accounts[0]!.email = "A@Example.test";
+		const manager = new AccountManager(undefined, storage);
+		expect(syncNativeAccountCredentials(manager, structuredClone(storage))).toBe(false);
+		expect(manager.getAccountByIndex(0)?.enabled).not.toBe(false);
+	});
+});
+
+describe("identity-less native accounts", () => {
+	it("does not bind two accounts without accountId or email to the same disk row", () => {
+		const row = (n: number) => ({ refreshToken: `refresh-${n}`, accessToken: `access-${n}`, expiresAt: 2000, addedAt: n, lastUsed: n });
+		const storage: AccountStorageV3 = { version: 3, activeIndex: 0, accounts: [row(1), row(2)] };
+		const manager = new AccountManager(undefined, structuredClone(storage));
+		const disk = structuredClone(storage);
+		disk.accounts.reverse();
+		disk.accounts[0]!.accessToken = "rotated-2";
+		disk.accounts[1]!.accessToken = "rotated-1";
+		syncNativeAccountCredentials(manager, disk);
+		const byRefresh = new Map(manager.getAccountsSnapshot().map((a) => [a.refreshToken, a]));
+		expect(byRefresh.get("refresh-1")?.access).toBe("rotated-1");
+		expect(byRefresh.get("refresh-2")?.access).toBe("rotated-2");
+		expect(manager.getAccountsSnapshot().every((a) => a.enabled !== false)).toBe(true);
+	});
+});

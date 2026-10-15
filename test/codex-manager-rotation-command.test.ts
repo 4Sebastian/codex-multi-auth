@@ -1138,3 +1138,56 @@ describe("codex-multi-auth rotation command", () => {
 		});
 	});
 });
+
+describe("native bind CLI", () => {
+    it("preserves an explicitly recorded custom provider through reset", async () => {
+        const {deps,bindCodexAppMock}=createDeps({storage:createStorage(Date.now())});
+        const status=(await bindCodexAppMock()).status;
+        if(!status.state)throw Error("Missing fixture state");
+        status.state.nativeOpenai=false; deps.getCodexAppBindStatus=async()=>status; bindCodexAppMock.mockClear();
+        expect(await runRotationCommand(["reset-runtime"],deps)).toBe(0);
+        expect(bindCodexAppMock).toHaveBeenCalledWith({nativeOpenai:false});
+    });
+
+	it("preserves native mode and reference account through runtime reset", async () => {
+		const { deps, bindCodexAppMock } = createDeps({ storage: createStorage(Date.now()) });
+		const status = (await bindCodexAppMock()).status;
+		if (!status.state) throw Error("Missing fixture state");
+		status.state.nativeOpenai = true;
+		status.state.catalogAccount = { email: "reference@example.com", accountId: "reference" };
+		deps.getCodexAppBindStatus = async () => status;
+		bindCodexAppMock.mockClear();
+		expect(await runRotationCommand(["reset-runtime"], deps)).toBe(0);
+		expect(bindCodexAppMock).toHaveBeenCalledWith({ nativeOpenai: true, catalogAccount: status.state.catalogAccount });
+	});
+
+	it("selects native mode and resolves a catalog reference to stable identity", async () => {
+		const { deps, bindCodexAppMock } = createDeps({ storage: createStorage(Date.now()) });
+		expect(await runRotationCommand(["bind-app", "--native", "--catalog-account", "2"], deps)).toBe(0);
+		expect(bindCodexAppMock).toHaveBeenCalledWith({ nativeOpenai: true, catalogAccount: { email: "second@example.com", accountId: "acc_second" } });
+	});
+	it.each([["--catalog-account", "2"], ["--native", "--catalog-account", "1"], ["--native", "--custom-provider"], ["--native", "--catalog-account", "2abc"]].map(flags => ({ flags })))("rejects invalid bind selection $flags before mutation", async ({ flags }) => {
+		const { deps, bindCodexAppMock } = createDeps({ storage: createStorage(Date.now()) }); expect(await runRotationCommand(["bind-app", ...flags], deps)).toBe(1); expect(bindCodexAppMock).not.toHaveBeenCalled();
+	});
+	it("supports explicit return to the custom provider", async () => {
+		const { deps, bindCodexAppMock } = createDeps({ storage: createStorage(Date.now()) }); expect(await runRotationCommand(["bind-app", "--custom-provider"], deps)).toBe(0); expect(bindCodexAppMock).toHaveBeenCalledWith({ nativeOpenai: false });
+	});
+});
+
+describe("catalog reference shared storage",()=>{
+ it.each(["/projects/example", "C:\\projects\\example"])("restores project scope %s",async initial=>{
+  const {deps,bindCodexAppMock}=createDeps({storage:createStorage(Date.now())});
+  let scope:string|null=initial;
+  deps.getStoragePath=()=>scope; deps.setStoragePath=value=>{scope=value;};
+  deps.loadAccounts=async()=>{expect(scope).toBeNull(); await Promise.resolve(); expect(scope).toBeNull(); return createStorage(Date.now());};
+  expect(await runRotationCommand(["bind-app","--native","--catalog-account","2"],deps)).toBe(0);
+  expect(scope).toBe(initial); expect(bindCodexAppMock).toHaveBeenCalled();
+ });
+ it("restores project scope on a failed catalog account read",async()=>{
+  const {deps}=createDeps({storage:createStorage(Date.now())}); let scope:string|null="/projects/example";
+  deps.getStoragePath=()=>scope;deps.setStoragePath=value=>{scope=value;};
+  deps.loadAccounts=async()=>{throw Error("read failed");};
+  await expect(runRotationCommand(["bind-app","--native","--catalog-account","2"],deps)).rejects.toThrow("read failed");
+  expect(scope).toBe("/projects/example");
+ });
+});

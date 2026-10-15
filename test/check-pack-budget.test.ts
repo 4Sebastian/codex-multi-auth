@@ -100,6 +100,7 @@ describe("validatePackMetadata", () => {
 					"dist/index.js",
 					"assets/logo.svg",
 					"config/default.json",
+					"skills/codex-auth-setup/SKILL.md",
 					"scripts/codex.js",
 					"vendor/codex-ai-plugin/index.js",
 					"README.md",
@@ -107,6 +108,25 @@ describe("validatePackMetadata", () => {
 				],
 			}),
 		).toThrow(/vendor\/codex-ai-sdk/);
+	});
+
+	it("rejects packages missing the skills directory declared by plugin.json", () => {
+		expect(() =>
+			validatePackMetadata({
+				packageSize: 123,
+				paths: [
+					".codex-plugin/plugin.json",
+					"dist/index.js",
+					"assets/logo.svg",
+					"config/default.json",
+					"scripts/codex.js",
+					"vendor/codex-ai-plugin/index.js",
+					"vendor/codex-ai-sdk/index.js",
+					"README.md",
+					"LICENSE",
+				],
+			}),
+		).toThrow(/skills\//);
 	});
 
 	it("rejects packages missing the Codex plugin image manifest", () => {
@@ -183,6 +203,7 @@ describe("runPackBudgetCheck", () => {
 								{ path: "dist/index.js" },
 								{ path: "assets/logo.svg" },
 								{ path: "config/default.json" },
+								{ path: "skills/codex-auth-setup/SKILL.md" },
 								{ path: "scripts/codex.js" },
 								{ path: "vendor/codex-ai-plugin/index.js" },
 								{ path: "vendor/codex-ai-sdk/index.js" },
@@ -194,7 +215,9 @@ describe("runPackBudgetCheck", () => {
 				})),
 				log,
 			}),
-		).resolves.toBe("Pack budget ok: 321 bytes across 9 files");
-		expect(log).toHaveBeenCalledWith("Pack budget ok: 321 bytes across 9 files");
+		).resolves.toBe("Pack budget ok: 321 bytes across 10 files");
+		expect(log).toHaveBeenCalledWith(
+			"Pack budget ok: 321 bytes across 10 files",
+		);
 	});
 });

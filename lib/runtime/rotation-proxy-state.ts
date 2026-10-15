@@ -1,3 +1,13 @@
+import type { NativeAccountSnapshot } from "./native-account-storage.js";
+import type { DispatchAuthorization } from "./responses-websocket.js";
+import type { QuotaCacheData, QuotaCacheEntry } from "../quota-cache.js";
+import type {RuntimeCapabilityFailures} from "./runtime-capability-failures.js";
+import type {RouteModel} from "../model-route-policy.js";
+import type {ModelInventory} from "./model-discovery-status.js";
+import type { ApiModelCapabilities } from "./api-model-capabilities.js";
+import type { ApiModelRuntime } from "./api-model-runtime.js";
+import type { ApiRouteCredential } from "../api-route-store.js";
+import type { AccountModelCatalog } from "./account-model-catalog.js";
 import { AccountManager } from "../accounts.js";
 import type { ContextBudgetGuard } from "../context-budget-guard.js";
 import type { PreemptiveQuotaScheduler } from "../preemptive-quota-scheduler.js";
@@ -16,10 +26,17 @@ import type { SessionAffinityStore } from "../session-affinity.js";
  * @internal
  */
 export interface RotationProxyStateInit {
+	nativeOpenai?: boolean;
+	readNativeAccountStorage?: () => Promise<NativeAccountSnapshot>;
+	readApiRoutes?: () => Promise<ApiRouteCredential[]>;
+	readSubscriptionQuota?: () => Promise<QuotaCacheData | null>;
+	catalogAccount?: { email: string; accountId: string; };
 	activeAccountManager: AccountManager;
 	routingMutexMode: "enabled" | "legacy";
 	schedulingStrategy: "hybrid" | "sequential";
 	fetchImpl: typeof fetch;
+	webSocketRequestSent?: () => boolean;
+	withDispatchAuthorization?: (authorize: DispatchAuthorization, operation: () => Promise<Response>) => Promise<Response>;
 	upstreamBaseUrl: string;
 	clientApiKey: string;
 	now: () => number;
@@ -62,8 +79,21 @@ export interface RotationProxyStateInit {
  * @internal
  */
 export interface RotationProxyState extends RotationProxyStateInit {
-	readonly knownAccountManagers: Set<AccountManager>;
 	readonly status: RuntimeRotationProxyStatus;
+	modelCatalog?: AccountModelCatalog;
+	modelCatalogs?: Map<string, AccountModelCatalog>;
+	defaultCatalogClientVersion?: Promise<string>;
+    catalogBackoff?: Map<string, number>;
+    /** Short-lived per-request file reads (quota cache, reset credits), keyed by source. */
+    readCache?: Map<string, { at: number; value: Promise<unknown> }>;
+ capabilityFailures?: RuntimeCapabilityFailures;
+	apiModelRuntime?: ApiModelRuntime;
+ apiModelCapabilities?:ApiModelCapabilities;
+	catalogEtag?: string;
+ catalogOAuthModels?:RouteModel[];
+ catalogApiRoutes?:ApiRouteCredential[];
+ catalogInventory?:ModelInventory;
+ subscriptionQuotaObservations?: Map<string, QuotaCacheEntry>;
 	readonly threadGoalFallbacks: Map<string, string | null>;
 	lastGlobalAccountIndex: number | null;
 	lastGlobalSwitchAt: number;
@@ -79,7 +109,6 @@ export function createRotationProxyState(
 ): RotationProxyState {
 	return {
 		...init,
-		knownAccountManagers: new Set<AccountManager>([init.activeAccountManager]),
 		status: {
 			startedAt: init.now(),
 			totalRequests: 0,
@@ -141,7 +170,6 @@ export async function recoverStaleRuntimeState(
 		// (full-pool exhaustion), so the extra synchronous write is cheap.
 		await reloaded.flushPendingSave();
 		state.activeAccountManager = reloaded;
-		state.knownAccountManagers.add(reloaded);
 		state.lastStaleRuntimeReloadAt = Date.now();
 		recordRuntimeReload("pool-exhausted-no-account");
 		return reloaded;

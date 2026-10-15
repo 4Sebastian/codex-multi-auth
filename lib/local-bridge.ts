@@ -231,11 +231,14 @@ export async function startLocalBridge(
 	}
 	const app = new Hono();
 
+	// Deliberately minimal payload: /health is reachable without a bearer (it is
+	// the liveness probe), so it must not echo runtimeBaseUrl back — that value
+	// describes where the bridge forwards local client tokens and is internal
+	// routing detail, not something to hand unauthenticated callers.
 	app.get("/health", (context) =>
 		context.json({
 			ok: true,
 			service: "codex-multi-auth-local-bridge",
-			runtimeBaseUrl,
 		}),
 	);
 

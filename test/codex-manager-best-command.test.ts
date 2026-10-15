@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { useAccountSourceFixtures, withAccountSourceFixture } from "./helpers/account-source-fixture.js";
+useAccountSourceFixtures();
 import {
 	type BestCliOptions,
 	type BestCommandDeps,
@@ -40,7 +42,7 @@ function createStorage(
 }
 
 function createDeps(overrides: Partial<BestCommandDeps> = {}): BestCommandDeps {
-	return {
+	const deps: BestCommandDeps = {
 		setStoragePath: vi.fn(),
 		loadAccounts: vi.fn(async () => createStorage()),
 		saveAccounts: vi.fn(async () => undefined),
@@ -106,6 +108,7 @@ function createDeps(overrides: Partial<BestCommandDeps> = {}): BestCommandDeps {
 		getNow: vi.fn(() => 1_000),
 		...overrides,
 	};
+	return {...deps, loadAccounts: vi.fn(withAccountSourceFixture(deps.loadAccounts))};
 }
 
 describe("runBestCommand", () => {
@@ -509,5 +512,96 @@ describe("runBestCommand", () => {
 		};
 		expect(payload.probeErrors?.some((e) => e.includes("rate limited; retry later"))).toBe(true);
 		expect(jsonCall).not.toContain("sk-secret");
+	});
+});
+
+describe("runBestCommand with a Codex CLI mirror", () => {
+	it("syncs the mirror id when the current best account is refreshed", async () => {
+		const storage = createStorage([
+			createAccount({
+				accountId: "ws-team",
+				accountIdSource: "manual",
+				codexCliMirror: { forAccountId: "ws-team", accountId: "ws-authorized" },
+				expiresAt: 0,
+			}),
+		]);
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => storage),
+			parseBestArgs: vi.fn(() => ({
+				ok: true,
+				options: {
+					live: true,
+					json: true,
+					model: "gpt-5-codex",
+					modelProvided: false,
+				} satisfies BestCliOptions,
+			})),
+			hasUsableAccessToken: vi.fn(() => false),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-best-next",
+				refresh: "refresh-best-next",
+				expires: Date.now() + 120_000,
+				idToken: "id-token",
+			})),
+			// No claim: best's refresh then keeps the saved explicit id.
+			extractAccountId: vi.fn(() => undefined),
+			extractAccountEmail: vi.fn(() => "best@example.com"),
+		});
+
+		expect(await runBestCommand(["--live"], deps)).toBe(0);
+
+		expect(deps.setCodexCliActiveSelection).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
+	});
+});
+
+// A refresh may only move a token-derived id: an explicit (manual) binding
+// has to survive a token whose claim names another workspace, exactly as on
+// every other refresh path.
+describe("runBestCommand refresh keeps explicit bindings", () => {
+	it("keeps a manual id and source across a refresh and syncs codexCliAccountIdFor's id", async () => {
+		const storage = createStorage([
+			createAccount({
+				accountId: "ws-team",
+				accountIdSource: "manual",
+				codexCliMirror: { forAccountId: "ws-team", accountId: "ws-authorized" },
+				expiresAt: 0,
+			}),
+		]);
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => storage),
+			parseBestArgs: vi.fn(() => ({
+				ok: true,
+				options: {
+					live: true,
+					json: true,
+					model: "gpt-5-codex",
+					modelProvided: false,
+				} satisfies BestCliOptions,
+			})),
+			hasUsableAccessToken: vi.fn(() => false),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-best-next",
+				refresh: "refresh-best-next",
+				expires: Date.now() + 120_000,
+				idToken: "id-token",
+			})),
+			extractAccountId: vi.fn(() => "ws-token-claim"),
+			extractAccountEmail: vi.fn(() => "best@example.com"),
+		});
+
+		expect(await runBestCommand(["--live"], deps)).toBe(0);
+
+		expect(storage.accounts[0]).toMatchObject({
+			accountId: "ws-team",
+			accountIdSource: "manual",
+		});
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({ accountId: "ws-team" }),
+		);
+		expect(deps.setCodexCliActiveSelection).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ accountId: "ws-authorized" }), expect.objectContaining({account: expect.any(Object)}));
 	});
 });

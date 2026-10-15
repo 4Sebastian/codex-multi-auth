@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 import {
 	AccountManager,
 	extractAccountEmail,
@@ -18,9 +22,10 @@ import {
 	resetTrackers,
 	DEFAULT_TOKEN_BUCKET_CONFIG,
 } from "../lib/rotation.js";
-import { CodexAuthError } from "../lib/errors.js";
+import { PendingAuthSettlementError } from "../lib/storage/pending-auth.js";
 import {
 	clearCircuitBreakers,
+	type CircuitAdmissionReceipt,
 	DEFAULT_CIRCUIT_BREAKER_CONFIG,
 	getCircuitBreaker,
 } from "../lib/circuit-breaker.js";
@@ -45,10 +50,22 @@ vi.mock("../lib/storage.js", async (importOriginal) => {
 	};
 });
 
+let managedSourceDirectory: string;
+function writeManagedFixtureSource(manager: AccountManager): void {
+	const path = manager.resolveSelectionStoragePath();
+	if (path !== join(managedSourceDirectory, "accounts.json")) throw Error("Expected owned unit fixture source");
+	const storage: AccountStorageV3 = {
+		version: 3, activeIndex: 0,
+		accounts: manager.getAccountsSnapshot().map(account => ({...account, accessToken: account.access, expiresAt: account.expires})),
+	};
+	writeFileSync(path, JSON.stringify(storage));
+}
+
 beforeEach(async () => {
+	managedSourceDirectory = mkdtempSync(join(tmpdir(), "managed-accounts-unit-"));
 	resetTrackers();
 	setStoragePathState({
-		currentStoragePath: null,
+		currentStoragePath: join(managedSourceDirectory, "accounts.json"),
 		currentLegacyProjectStoragePath: null,
 		currentLegacyWorktreeStoragePath: null,
 		currentProjectRoot: null,
@@ -74,7 +91,8 @@ beforeEach(async () => {
 	});
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await removeWithRetry(managedSourceDirectory, {recursive: true, force: true});
 	setStoragePathState({
 		currentStoragePath: null,
 		currentLegacyProjectStoragePath: null,
@@ -369,8 +387,8 @@ describe("AccountManager", () => {
 		expect(account.enabled).toBe(true);
 		expect(manager.hasEnabledWorkspaces(account)).toBe(true);
 		expect(manager.getEnabledWorkspaceCount(account)).toBe(2);
-		expect(account.currentWorkspaceIndex).toBe(0);
-		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-1");
+		expect(account.currentWorkspaceIndex).toBe(1);
+		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-2");
 		expect(account.workspaces).toEqual([
 			{
 				id: "workspace-1",
@@ -382,7 +400,7 @@ describe("AccountManager", () => {
 		]);
 	});
 
-	it("re-enabling an exhausted account without a default workspace resets to the first workspace", () => {
+	it("re-enabling an exhausted account without a default preserves the selected workspace", () => {
 		const now = Date.now();
 		const stored = {
 			version: 3 as const,
@@ -419,8 +437,8 @@ describe("AccountManager", () => {
 			throw new Error("account should exist");
 		}
 
-		expect(account.currentWorkspaceIndex).toBe(0);
-		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-1");
+		expect(account.currentWorkspaceIndex).toBe(1);
+		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-2");
 		expect(account.workspaces).toEqual([
 			{ id: "workspace-1", name: "Workspace 1", enabled: true },
 			{ id: "workspace-2", name: "Workspace 2", enabled: true },
@@ -1014,6 +1032,14 @@ describe("AccountManager", () => {
 		expect(selected?.index).toBe(0);
 	});
 
+	it("uses the committed cursor to break equal hybrid scores within one clock tick", () => {
+		const now = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const manager = new AccountManager(undefined, {version: 3, activeIndex: 0, accounts: Array.from({length: 3}, (_, i) => ({refreshToken: `tie-${i}`, addedAt: now, lastUsed: now}))});
+		const selected = Array.from({length: 9}, () => manager.getCurrentOrNextForFamilyHybrid("codex", undefined, {pidOffsetEnabled: false})?.index);
+		expect(selected).toEqual([0, 1, 2, 0, 1, 2, 0, 1, 2]);
+	});
+
 	describe("removeAccount", () => {
 		it("removes an account and updates indices", () => {
 			const now = Date.now();
@@ -1046,8 +1072,7 @@ describe("AccountManager", () => {
 		});
 
 		// Regression (accounts-02): removing an account must clear its identity-keyed
-		// health/token state so a later re-add of the same identity starts fresh
-		// instead of inheriting the old penalty.
+		// health and circuit state so a later re-add starts fresh.
 		it("clears identity-keyed health state when an account is removed", () => {
 			const now = Date.now();
 			const stored = {
@@ -1068,18 +1093,11 @@ describe("AccountManager", () => {
 			const identityKey = getRuntimeTrackerKey(target!);
 			expect(identityKey).toBe("account:acc_stable");
 
-			// accounts-02 (extended): consume a token and open the breaker BEFORE the
-			// health failures (an open breaker would otherwise block consumeToken), so
-			// the regression fails if removeAccount stops clearing token buckets
-			// (lib/rotation.ts clearAccountKey) or stale circuit breakers
-			// (lib/circuit-breaker.ts). Use a LIVE reference for these mutations.
+			// Record attributable failures while closed, then verify removal clears
+			// both independently keyed health and circuit state.
+			for (let i = 0; i < 5; i++) manager.recordFailure(target!, "codex");
 			const liveStable = manager.getAccountByIndex(0);
 			expect(liveStable?.accountId).toBe("acc_stable");
-			expect(manager.consumeToken(liveStable!, "codex")).toBe(true);
-			const tokenTracker = getTokenTracker();
-			expect(tokenTracker.getTokens(identityKey, "codex")).toBeLessThan(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 			const breakerKey = getAccountIdentityKey(liveStable!)!;
 			const breaker = getCircuitBreaker(breakerKey);
 			breaker.recordFailure();
@@ -1087,9 +1105,7 @@ describe("AccountManager", () => {
 			breaker.recordFailure();
 			expect(breaker.getState()).toBe("open");
 
-			// Drive the stable account's health score down via repeated failures.
-			// recordFailure keys health by quotaKey = family ("codex").
-			for (let i = 0; i < 5; i++) manager.recordFailure(target!, "codex");
+			// The same submitted identity owns its health history.
 			const penalized = getHealthTracker().getScore(identityKey, "codex");
 			expect(penalized).toBeLessThan(100);
 
@@ -1105,11 +1121,6 @@ describe("AccountManager", () => {
 			expect(afterRemoval).toBe(100);
 			expect(afterRemoval).toBeGreaterThan(penalized);
 
-			// Token bucket reset: a fresh lookup for the same identity reports the
-			// full default capacity (the consumed token did not carry over).
-			expect(tokenTracker.getTokens(identityKey, "codex")).toBe(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 			// Circuit breaker reset: a fresh breaker for the same identity is closed.
 			expect(getCircuitBreaker(breakerKey).getState()).toBe("closed");
 		});
@@ -1142,13 +1153,8 @@ describe("AccountManager", () => {
 
 			const account = manager.getAccountByIndex(0)!;
 			const healthTracker = getHealthTracker();
-			const tokenTracker = getTokenTracker();
 
-			// Pin + capture the stable tracker key BEFORE enrichment. consumeToken
-			// calls getRuntimeTrackerKey internally, which pins _runtimeTrackerKey.
-			// Consume the token FIRST: the recordFailure loop below opens the circuit
-			// breaker, which would otherwise block consumeToken.
-			expect(manager.consumeToken(account, "codex")).toBe(true);
+			// Pin + capture the stable tracker key before identity enrichment.
 			const stableTrackerKey = getRuntimeTrackerKey(account);
 			expect(stableTrackerKey).toBe("email:stale@example.com");
 
@@ -1156,9 +1162,6 @@ describe("AccountManager", () => {
 			for (let i = 0; i < 5; i++) manager.recordFailure(account, "codex");
 			const penalizedScore = healthTracker.getScore(stableTrackerKey, "codex");
 			expect(penalizedScore).toBeLessThan(100);
-			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBeLessThan(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 
 			// Enrich identity so the account gains an accountId. The pinned tracker
 			// key stays "email:stale@example.com", but the RECOMPUTED identity key
@@ -1186,13 +1189,9 @@ describe("AccountManager", () => {
 			// Remove the (live) account. Cleanup must clear the STABLE tracker key.
 			expect(manager.removeAccount(account)).toBe(true);
 
-			// Under the buggy code (clear only the recomputed identity key), the
-			// stale entries under the stable key survive: getScore < 100 and
-			// getTokens < max. The fix clears the stable key, so both reset.
+			// Under the buggy code (clearing only the recomputed identity key), the
+			// stale entry under the stable key survives with a score below 100.
 			expect(healthTracker.getScore(stableTrackerKey, "codex")).toBe(100);
-			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBe(
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
 		});
 
 		it("returns false when removing non-existent account", () => {
@@ -1630,7 +1629,7 @@ describe("AccountManager", () => {
 			["negative", -1],
 			["NaN", Number.NaN],
 			["infinity", Number.POSITIVE_INFINITY],
-		] as const)("does not treat %s as an auth invalidation", (_label, timestamp) => {
+		] as const)("denies authentication with a malformed %s invalidation marker", (_label, timestamp) => {
 			const now = Date.now();
 			const manager = new AccountManager(undefined, {
 				version: 3 as const,
@@ -1647,7 +1646,7 @@ describe("AccountManager", () => {
 			const account = manager.getCurrentAccount();
 			if (!account) throw new Error("account missing");
 
-			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
 		});
 
 		it("treats a positive finite timestamp as an auth invalidation", () => {
@@ -1958,6 +1957,7 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			const updated = await manager.commitRefreshedAuth(account, refreshedAuth);
 
 			expect(updated).toBe(account);
@@ -2046,6 +2046,7 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			await manager.commitRefreshedAuth(accountA, refreshedAuth);
 		});
 
@@ -2103,12 +2104,33 @@ describe("AccountManager", () => {
 				},
 			);
 
+			writeManagedFixtureSource(manager);
 			await manager.commitRefreshedAuth(account, refreshedAuth);
 
 			expect(account.accountId).toBe("matching-account-id");
 		});
 
-		it("propagates storage write failure as retryable CodexAuthError", async () => {
+		it.each([
+			["ELOCKED", "Storage is busy with another live writer; retry shortly."],
+			["EACCES", "Failed to save accounts: access denied"],
+		])("keeps the rotated credential live when the storage transaction fails with %s", async (code, message) => {
+			const { withAccountStorageTransaction } = await import("../lib/storage.js");
+			// ELOCKED: another writer held the file lock past its wait; EACCES: the
+			// Windows temp write still failed after retries (wrapped StorageError).
+			vi.mocked(withAccountStorageTransaction).mockRejectedValueOnce(Object.assign(new Error(message), { code }));
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "old-refresh", accessToken: "old-access", expiresAt: now, addedAt: now, lastUsed: now }],
+			} as any);
+			const account = manager.getAccountByIndex(0)!;
+			writeManagedFixtureSource(manager);
+			await expect(manager.commitRefreshedAuth(account, { type: "oauth", access: "header.payload.signature", refresh: "new-refresh", expires: now + 3_600_000 })).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, durability: "journal"});
+			expect(account.refreshToken).toBe("new-refresh");
+		});
+
+		it("keeps the rotated credential live when the storage write stays locked", async () => {
 			const { withAccountStorageTransaction } = await import(
 				"../lib/storage.js"
 			);
@@ -2119,7 +2141,9 @@ describe("AccountManager", () => {
 				Object.assign(new Error("EBUSY"), { code: "EBUSY" }),
 			);
 
-			const now = Date.now();
+			const storageModule = await import("../lib/storage.js");
+            const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
+            const now = Date.now();
 			const stored = {
 				version: 3 as const,
 				activeIndex: 0,
@@ -2142,25 +2166,26 @@ describe("AccountManager", () => {
 				expires: now + 3_600_000,
 			};
 
-			const error = await manager
-				.commitRefreshedAuth(account, refreshedAuth)
-				.catch((err) => err as CodexAuthError);
+			// The refresh already spent old-refresh upstream; dropping new-refresh
+			// would force a re-login, so it is kept (and journaled) for a later save.
+			writeManagedFixtureSource(manager);
+			await expect(manager.commitRefreshedAuth(account, refreshedAuth)).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code: "EBUSY"}, durability: "journal"});
 
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(true);
-			expect(account.refreshToken).toBe("old-refresh");
+			expect(account.refreshToken).toBe("new-refresh");
+            const { resolveAccountRecordId } = await import("../lib/accounts.js");
+            expect(journal).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({recordId: resolveAccountRecordId(stored.accounts[0]!)}));
+            journal.mockRestore();
 		});
 
-		it("propagates non-transient storage write failure as terminal CodexAuthError", async () => {
+		it("propagates non-transient publication failure without authentication refusal or losing rotated credentials", async () => {
 			const { withAccountStorageTransaction } = await import(
 				"../lib/storage.js"
 			);
 			const mockWithAccountStorageTransaction = vi.mocked(
 				withAccountStorageTransaction,
 			);
-			mockWithAccountStorageTransaction.mockRejectedValueOnce(
-				Object.assign(new Error("EACCES"), { code: "EACCES" }),
-			);
+			const cause = Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+			mockWithAccountStorageTransaction.mockRejectedValueOnce(cause);
 
 			const now = Date.now();
 			const stored = {
@@ -2185,13 +2210,19 @@ describe("AccountManager", () => {
 				expires: now + 3_600_000,
 			};
 
+			writeManagedFixtureSource(manager);
 			const error = await manager
 				.commitRefreshedAuth(account, refreshedAuth)
-				.catch((err) => err as CodexAuthError);
+				.catch((err: unknown) => err);
 
-			expect(error).toBeInstanceOf(CodexAuthError);
-			expect(error.retryable).toBe(false);
-			expect(account.refreshToken).toBe("old-refresh");
+			expect(error).toBeInstanceOf(PendingAuthSettlementError);
+			if (!(error instanceof PendingAuthSettlementError)) throw new Error("Expected a credential publication error");
+			expect(error.cause).toBe(cause);
+			expect(error.durability).toBe("unverified");
+			expect(error.result.refresh).toBe(refreshedAuth.refresh);
+			expect(account.refreshToken).toBe(refreshedAuth.refresh);
+			expect(account.access).toBe(refreshedAuth.access);
+			expect(account.expires).toBe(refreshedAuth.expires);
 		});
 
 		it("prevents debounced saves from writing stale auth during refresh persistence", async () => {
@@ -2270,6 +2301,7 @@ describe("AccountManager", () => {
 					return result;
 				});
 
+				writeManagedFixtureSource(manager);
 				const commitPromise = manager.commitRefreshedAuth(
 					account,
 					refreshedAuth,
@@ -2504,7 +2536,7 @@ describe("AccountManager", () => {
 			expect(savedData?.accounts[0]?.rateLimitResetTimes).toBeDefined();
 		});
 
-		it("omits malformed auth invalidation markers from routine saves", async () => {
+		it("preserves malformed auth invalidation markers through routine saves", async () => {
 			const { saveAccounts } = await import("../lib/storage.js");
 			const mockSaveAccounts = vi.mocked(saveAccounts);
 			const now = Date.now();
@@ -2525,6 +2557,97 @@ describe("AccountManager", () => {
 			await manager.saveToDisk();
 
 			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount?.authInvalidatedAt).toBe(0);
+			expect(savedAccount?.authInvalidationErrorCode).toBe("oauth_token_revoked");
+		});
+
+		it("preserves persisted current-generation invalidation despite issuer clock skew", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const now = Date.now();
+			const payload = Buffer.from(
+				JSON.stringify({ iat: Math.floor((now + 60_000) / 1_000) }),
+			).toString("base64url");
+			const manager = new AccountManager(undefined, {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "refreshed-token",
+						accessToken: `header.${payload}.signature`,
+						expiresAt: now + 3_600_000,
+						addedAt: now - 60_000,
+						lastUsed: now,
+						authInvalidatedAt: now,
+						authInvalidationErrorCode: "token_revoked",
+					},
+				],
+			});
+			const account = manager.getAccountByIndex(0);
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount?.authInvalidatedAt).toBe(now);
+			expect(savedAccount?.authInvalidationErrorCode).toBe("token_revoked");
+		});
+
+		it("does not resurrect invalidation after another process refreshes credentials", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const now = Date.now();
+			const initialStorage: AccountStorageV3 = {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						email: "shared@example.com",
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now + 60_000,
+						addedAt: now - 60_000,
+						lastUsed: now,
+						authInvalidatedAt: now,
+						authInvalidationErrorCode: "token_revoked",
+					},
+				],
+			};
+			const refreshedOnDisk: AccountStorageV3 = {
+				...structuredClone(initialStorage),
+				accounts: [
+					{
+						...initialStorage.accounts[0]!,
+						refreshToken: "new-refresh",
+						accessToken: "new-access",
+						expiresAt: now + 3_600_000,
+						authInvalidatedAt: undefined,
+						authInvalidationErrorCode: undefined,
+					},
+				],
+			};
+			mockWithAccountStorageTransaction.mockImplementationOnce(async (handler) => {
+				const persist = async (storage: AccountStorageV3) => {
+					await mockSaveAccounts(storage);
+				};
+				return handler(structuredClone(refreshedOnDisk), persist);
+			});
+			const manager = new AccountManager(undefined, initialStorage);
+
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount).toMatchObject({
+				refreshToken: "new-refresh",
+				accessToken: "new-access",
+				expiresAt: now + 3_600_000,
+			});
 			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
 			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
 		});
@@ -3926,8 +4049,10 @@ describe("AccountManager", () => {
 				vi.advanceTimersByTime(
 					DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1,
 				);
-				expect(manager.consumeToken(account, "codex")).toBe(true);
-				manager.recordSuccess(account, "codex");
+				let admission: CircuitAdmissionReceipt | undefined;
+				expect(manager.consumeToken(account, "codex", undefined, {onAdmission: receipt => {admission = receipt;}})).toBe(true);
+				expect(admission).toBeDefined();
+				expect(manager.recordSuccess(account, "codex", undefined, admission)).toBe(true);
 				expect(breaker.getState()).toBe("closed");
 			} finally {
 				vi.useRealTimers();
@@ -4039,7 +4164,7 @@ describe("AccountManager", () => {
 			expect(mockSaveAccounts).not.toHaveBeenCalled();
 		});
 
-		it("recordRateLimit updates health and drains token bucket", () => {
+		it("recordRateLimit updates health without creating a local request limit", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4058,7 +4183,7 @@ describe("AccountManager", () => {
 			const score = healthTracker.getScore(trackerKey, "codex:gpt-5.1");
 			const tokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
 			expect(score).toBeLessThan(100);
-			expect(tokens).toBeLessThan(50);
+			expect(tokens).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 		});
 
 		it("recordRateLimit uses family-only quotaKey when model is undefined", () => {
@@ -4190,7 +4315,7 @@ describe("AccountManager", () => {
 			expect(score).toBeLessThan(100);
 		});
 
-		it("consumeToken returns true and consumes from token bucket", () => {
+		it("admits sustained concurrent requests without a local token-bucket cap", async () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4204,11 +4329,15 @@ describe("AccountManager", () => {
 			const trackerKey = getRuntimeAccountIdentityKey(account)!;
 
 			const initialTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
-			const result = manager.consumeToken(account, "codex", "gpt-5.1");
+			const results = await Promise.all(
+				Array.from({ length: 100 }, async () =>
+					manager.consumeToken(account, "codex", "gpt-5.1"),
+				),
+			);
 			const afterTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
 
-			expect(result).toBe(true);
-			expect(afterTokens).toBeLessThan(initialTokens);
+			expect(results).toEqual(Array.from({ length: 100 }, () => true));
+			expect(afterTokens).toBe(initialTokens);
 		});
 
 		it("consumeToken uses family-only quotaKey when model is undefined", () => {
@@ -4227,7 +4356,7 @@ describe("AccountManager", () => {
 			expect(result).toBe(true);
 		});
 
-		it("can bypass an exhausted pool bucket without bypassing circuit admission", () => {
+		it("ignores legacy token-bucket state without bypassing circuit admission", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4252,41 +4381,14 @@ describe("AccountManager", () => {
 				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
 			);
 
+			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(true);
+			manager.recordFailure(account, "codex", "gpt-5.1");
+			manager.recordFailure(account, "codex", "gpt-5.1");
+			manager.recordFailure(account, "codex", "gpt-5.1");
 			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(false);
-			const tryConsumeSpy = vi.spyOn(tokenTracker, "tryConsume");
-			const refundTokenSpy = vi.spyOn(tokenTracker, "refundToken");
-			try {
-				expect(
-					manager.consumeToken(account, "codex", "gpt-5.1", {
-						bypassTokenBucket: true,
-					}),
-				).toBe(true);
-				expect(tryConsumeSpy).not.toHaveBeenCalled();
-				expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBeLessThan(1);
-
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				manager.recordFailure(account, "codex", "gpt-5.1");
-				expect(
-					manager.consumeToken(account, "codex", "gpt-5.1", {
-						bypassTokenBucket: true,
-					}),
-				).toBe(false);
-				// A rejected bypass must not refund another request's bucket token.
-				expect(tryConsumeSpy).not.toHaveBeenCalled();
-				expect(refundTokenSpy).not.toHaveBeenCalled();
-				expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBeLessThan(1);
-			} finally {
-				tryConsumeSpy.mockRestore();
-				refundTokenSpy.mockRestore();
-			}
 		});
 
-		it("names the admission gate that actually rejected the request", () => {
-			// `account_skip_reasons` is written from this verdict. Re-deriving it
-			// afterwards with getManagedAccountRuntimeSkipReason reports the FIRST
-			// blocker on the account instead of the gate that rejected, so a drained
-			// bucket on a cooling-down account came back as the cooldown.
+		it("reports circuit-breaker admission failures directly", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4302,53 +4404,20 @@ describe("AccountManager", () => {
 			};
 			const manager = new AccountManager(undefined, stored);
 			const account = manager.getCurrentAccount()!;
-			const tokenTracker = getTokenTracker();
-			const trackerKey = getRuntimeTrackerKey(account);
-			const quotaKey = "codex:gpt-5.1";
 
 			expect(manager.consumeTokenWithReason(account, "codex", "gpt-5.1")).toEqual({
 				ok: true,
 			});
-
-			tokenTracker.drain(
-				trackerKey,
-				quotaKey,
-				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
-			);
-			// A cooldown on the same account must not be reported in place of the
-			// bucket: the bucket is what rejected.
-			manager.markAccountCoolingDown(account, 60_000, "server-error");
-			expect(manager.consumeTokenWithReason(account, "codex", "gpt-5.1")).toEqual({
-				ok: false,
-				reason: "token-exhausted",
-			});
-			// Contrast: re-deriving the reason from account state answers with the
-			// cooldown, which is NOT what rejected this call. That substitution is
-			// exactly the mis-attribution consumeTokenWithReason exists to avoid.
-			expect(
-				manager.getManagedAccountRuntimeSkipReason(account, "codex", "gpt-5.1"),
-			).toBe("cooling-down:server-error");
-
-			// With the bucket bypassed the only gate left is circuit admission, so a
-			// rejection there is reported as such and never as an exhausted bucket.
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			manager.recordFailure(account, "codex", "gpt-5.1");
 			expect(
-				manager.consumeTokenWithReason(account, "codex", "gpt-5.1", {
-					bypassTokenBucket: true,
-				}),
+				manager.consumeTokenWithReason(account, "codex", "gpt-5.1"),
 			).toEqual({ ok: false, reason: "circuit-open" });
-
-			// consumeToken stays the boolean face of the same evaluation.
-			expect(
-				manager.consumeToken(account, "codex", "gpt-5.1", {
-					bypassTokenBucket: true,
-				}),
-			).toBe(false);
+			expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(false);
 		});
 
-		it("consumeToken returns false and refunds the token when the circuit is open", () => {
+		it("consumeToken returns false without changing legacy token state when the circuit is open", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4377,7 +4446,7 @@ describe("AccountManager", () => {
 			expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(initialTokens);
 		});
 
-		it("consumeToken returns false and refunds when the half-open slot is exhausted", () => {
+		it("consumeToken returns false without changing legacy token state when the half-open slot is exhausted", () => {
 			vi.useFakeTimers();
 			vi.setSystemTime(new Date(0));
 
@@ -4412,9 +4481,7 @@ describe("AccountManager", () => {
 
 				expect(manager.consumeToken(account, "codex")).toBe(true);
 				expect(manager.consumeToken(account, "codex")).toBe(false);
-				expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(
-					initialTokens - 1,
-				);
+				expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(initialTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4456,7 +4523,7 @@ describe("AccountManager", () => {
 				);
 				expect(
 					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
-				).toBeLessThan(50);
+				).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4524,7 +4591,7 @@ describe("AccountManager", () => {
 				);
 				expect(
 					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
-				).toBeLessThan(50);
+				).toBe(DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -4572,8 +4639,8 @@ describe("AccountManager", () => {
 			expect(healthTracker.getScore(trackerKey, "codex:gpt-5.1")).toBeLessThan(
 				100,
 			);
-			expect(tokenTracker.getTokens(trackerKey, "codex:gpt-5.1")).toBeLessThan(
-				50,
+			expect(tokenTracker.getTokens(trackerKey, "codex:gpt-5.1")).toBe(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
 			);
 		});
 	});
@@ -5039,4 +5106,191 @@ describe("AccountManager", () => {
 			expect(afterUnblock?.index).toBe(1);
 		});
 	});
+});
+
+describe("commit and retryable rescue ordering", () => {
+	it.each(["ELOCKED", "EBUSY", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "disable", "rotate", "remove"].map(mutation => ({code, mutation}))))("rescues credential lineage before transaction entry %j", async ({code, mutation}) => {
+		const storageModule = await import("../lib/storage.js");
+		const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
+		const manager = new AccountManager(undefined, {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]});
+		const account = manager.getAccountByIndex(0)!;
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {entered = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async () => {entered(); await gate; throw Object.assign(Error("load blocked"), {code});});
+		writeManagedFixtureSource(manager);
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		void refreshing.catch(() => undefined);
+		try {
+			await ready;
+			if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else if (mutation === "disable") manager.setAccountEnabled(0, false);
+			else if (mutation === "rotate") manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000});
+			else manager.removeAccount(account);
+			release();
+			if (mutation === "remove") {await expect(refreshing).rejects.toThrow(); expect(journal).not.toHaveBeenCalled(); return;}
+			await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, result: {refresh: "fixture-attempted-refresh"}});
+			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-old");
+			expect(journal).not.toHaveBeenCalled();
+			if (mutation === "invalidate") expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (mutation === "disable") expect(account.enabled).toBe(false);
+		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
+	});
+	it.each(["invalidate", "disable", "rotate"])("keeps newer live authority when transaction acquisition succeeds (%s)", async mutation => {
+		const storageModule = await import("../lib/storage.js");
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1}]};
+		const manager = new AccountManager(undefined, structuredClone(disk)), account = manager.getAccountByIndex(0)!;
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;}), ready = new Promise<void>(resolve => {entered = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => {entered(); await gate; return handler(structuredClone(disk), async next => {disk = structuredClone(next);});});
+		writeManagedFixtureSource(manager);
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		try {
+			await ready;
+			if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else if (mutation === "disable") manager.setAccountEnabled(0, false);
+			else {manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000}); disk.accounts[0]!.enabled = false;}
+			release(); await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION", cause: {code: "ESTALE"}});
+			expect(disk.accounts[0]?.refreshToken).toBe("fixture-old");
+			expect(account.refreshToken).toBe(mutation === "rotate" ? "fixture-newest-refresh" : "fixture-old");
+			if (mutation === "invalidate") expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (mutation === "disable") expect(account.enabled).toBe(false);
+			if (mutation === "rotate") expect(disk.accounts[0]?.enabled).toBe(false);
+		} finally {release(); await refreshing.catch(() => undefined);}
+	});
+
+	it.each(["EACCES", "EBUSY", "EPERM", "ELOCKED", "EACCOUNTSUNREADABLE"].flatMap(code => ["invalidate", "rotate", "disable"].map(mutation => ({code, mutation}))))("retains live authorization during retryable rescue %j", async ({code, mutation}) => {
+		const storageModule = await import("../lib/storage.js");
+		const journal = vi.spyOn(storageModule, "recordPendingAuth").mockImplementation(async (_path, auth) => auth);
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-old", accessToken: "fixture-old-access", expiresAt: Date.now() + 3600000, enabled: true, addedAt: 1, lastUsed: 1}]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		const account = manager.getAccountByIndex(0)!;
+		let release!: () => void, writing!: () => void;
+		const gate = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {writing = resolve;});
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementationOnce(async handler => handler(structuredClone(disk), async () => {writing(); await gate; throw Object.assign(Error("write blocked"), {code});}));
+		writeManagedFixtureSource(manager);
+		const refreshing = manager.commitRefreshedAuth(account, {type: "oauth", access: "fixture-attempted", refresh: "fixture-attempted-refresh", expires: Date.now() + 7200000});
+		try {
+			await ready;
+			if (mutation === "rotate") manager.updateFromAuth(account, {type: "oauth", access: "fixture-newest", refresh: "fixture-newest-refresh", expires: Date.now() + 10800000});
+			else if (mutation === "invalidate") {manager.markAuthInvalidated(account, "token_invalidated", 1500); manager.markAccountCoolingDown(account, 60000, "auth-failure");}
+			else {manager.setAccountEnabled(0, false); disk.accounts[0]!.enabled = false;}
+			release(); await expect(refreshing).rejects.toMatchObject({code: "EPENDINGAUTHSETTLEMENT", cause: {code}, result: {refresh: "fixture-attempted-refresh"}});
+			expect(journal).not.toHaveBeenCalled();
+			if (mutation === "rotate") expect(account.access).toBe("fixture-newest");
+			else {
+				if (mutation === "invalidate") {
+					expect(account).toMatchObject({authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+					expect(account).toMatchObject({access: "fixture-attempted", authInvalidationErrorCode: "token_invalidated"});
+				} else {
+					expect(account.enabled).toBe(false);
+					expect(account.refreshToken).toBe("fixture-attempted-refresh");
+				}
+			}
+			vi.mocked(storageModule.withAccountStorageTransaction).mockImplementation(async handler => handler(structuredClone(disk), async saved => {disk = structuredClone(saved);}));
+			await manager.saveToDisk(true);
+			const restarted = new AccountManager(undefined, disk).getAccountByIndex(0)!;
+			expect(restarted.access).toBe(account.access);
+			expect(restarted.authInvalidatedAt).toBe(account.authInvalidatedAt);
+			expect(restarted.enabled).toBe(account.enabled);
+		} finally {release(); await refreshing.catch(() => undefined); await manager.flushPendingSave(); journal.mockRestore();}
+	});
+
+	it("orders runtime-conflict commits after snapshots captured while writing", async () => {
+		const storageModule = await import("../lib/storage.js");
+		const disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [{recordId: "first", accountId: "first", refreshToken: "fixture-first", accessToken: "fixture-access", authInvalidatedAt: 1500, addedAt: 1, lastUsed: 1, accountLabel: "Before"}]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		manager.getAccountByIndex(0)!.accountLabel = "Local"; disk.accounts[0]!.accountLabel = "External";
+		let capturedAt = 0;
+		vi.mocked(storageModule.withAccountStorageTransaction).mockImplementation(async handler => handler(disk, async () => {capturedAt = performance.now(); await Promise.resolve();}));
+		await manager.saveToDisk(true);
+		expect(manager.isNativeSnapshotCurrent(manager.getAccountByIndex(0)!, capturedAt)).toBe(false);
+	});
+});
+
+describe("committed authorization observations", () => {
+	it.each(["save", "refresh"].flatMap(mode => [false, true].map(failed => ({mode, failed}))))("preserves newer credential invalidation during awaited persistence %j", async ({mode, failed}) => {
+		let disk: AccountStorageV3 = {version: 3, activeIndex: 0, accounts: [
+			{recordId: "first", accountId: "first", refreshToken: "first-refresh", accessToken: "first-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1, enabled: true},
+			{recordId: "second", accountId: "second", refreshToken: "second-refresh", accessToken: "second-access", expiresAt: Date.now() + 3600000, addedAt: 2, lastUsed: 2, enabled: true},
+		]};
+		const manager = new AccountManager(undefined, structuredClone(disk));
+		disk.accounts[0]!.enabled = false;
+		let release!: () => void, prepared!: () => void;
+		const barrier = new Promise<void>(resolve => {release = resolve;});
+		const ready = new Promise<void>(resolve => {prepared = resolve;});
+		const {withAccountStorageTransaction} = await import("../lib/storage.js");
+		vi.mocked(withAccountStorageTransaction).mockImplementation(async handler => handler(structuredClone(disk), async committed => {
+			prepared(); await barrier;
+			if (failed) throw Object.assign(Error("write rejected"), {code: "EINVAL"});
+			disk = structuredClone(committed);
+		}));
+		const account = manager.getAccountByIndex(1)!;
+		writeManagedFixtureSource(manager);
+		const saving = mode === "save" ? manager.saveToDisk() : manager.commitRefreshedAuth(account, {type: "oauth", access: "rotated-once", refresh: "rotated-once-refresh", expires: Date.now() + 7200000});
+		void saving.catch(() => undefined);
+		try {
+			await ready;
+			manager.updateFromAuth(account, {type: "oauth", access: "rotated-twice", refresh: "rotated-twice-refresh", expires: Date.now() + 10800000});
+			manager.markAuthInvalidated(account, "token_invalidated", 1500);
+			manager.markAccountCoolingDown(account, 60000, "auth-failure");
+			release();
+			if (failed) await expect(saving).rejects.toThrow();
+			else if (mode === "refresh") await expect(saving).rejects.toMatchObject({code: "EPENDINGAUTHADMISSION"});
+			else await saving;
+			expect(account).toMatchObject({access: "rotated-twice", refreshToken: "rotated-twice-refresh", authInvalidatedAt: 1500, cooldownReason: "auth-failure"});
+			if (!failed) {
+				expect(manager.getAccountByIndex(0)?.enabled).toBe(false);
+				await manager.saveToDisk();
+				expect(disk.accounts[1]).toMatchObject({accessToken: "rotated-twice", authInvalidatedAt: 1500});
+			}
+		} finally {release(); await saving.catch(() => undefined);}
+	});
+});
+
+describe("workspace preference persistence", () => {
+	it("preserves external additions, deletions and workspace exclusions across repeated daemon saves", async () => {
+		const initial:AccountStorageV3={version:3,activeIndex:0,accounts:[{recordId:"first",accountId:"first",refreshToken:"fixture-first",addedAt:1,lastUsed:1,workspaces:[{id:"personal",enabled:true},{id:"business",enabled:true}]},{recordId:"removed",accountId:"removed",refreshToken:"fixture-removed",addedAt:2,lastUsed:2}]};
+		const manager=new AccountManager(undefined,initial);
+		let disk=structuredClone(initial);
+		disk.accounts[0]!.workspaces![1]!.enabled=false;
+		disk.accounts.splice(1,1,{recordId:"added",accountId:"added",refreshToken:"fixture-added",addedAt:3,lastUsed:3});
+		const {withAccountStorageTransaction}=await import("../lib/storage.js");
+		vi.mocked(withAccountStorageTransaction).mockImplementation(async handler=>handler(structuredClone(disk),async next=>{disk=structuredClone(next);}));
+		manager.getAccountByIndex(0)!.lastUsed=50;
+		await manager.saveToDisk();
+		await manager.saveToDisk();
+		expect(disk.accounts.map(a=>a.recordId)).toEqual(["first","added"]);
+		expect(disk.accounts[0]!.lastUsed).toBe(50);
+		expect(disk.accounts[0]!.workspaces![1]!.enabled).toBe(false);
+	});
+ it.each(["save", "refresh"])("keeps a newer CLI preference during %s", async mode => {
+  const initial:AccountStorageV3={version:3,activeIndex:0,accounts:[{accountId:"a",email:"test@example.test",refreshToken:"old",addedAt:1,lastUsed:1,currentWorkspaceIndex:0,workspaces:[{id:"business",enabled:true},{id:"personal",enabled:true}]}]};
+  const manager=new AccountManager(undefined,structuredClone(initial));
+  let disk=structuredClone(initial); disk.accounts[0]!.currentWorkspaceIndex=1;
+  const {withAccountStorageTransaction}=await import("../lib/storage.js");
+  vi.mocked(withAccountStorageTransaction).mockImplementation(async handler=>handler(structuredClone(disk),async next=>{disk=structuredClone(next);}));
+  const account=manager.getAccountByIndex(0)!;
+  manager.disableWorkspace(account,"business");
+  writeManagedFixtureSource(manager);
+  if(mode==="refresh") await manager.commitRefreshedAuth(account,{type:"oauth",access:"new",refresh:"new-refresh",expires:Date.now()+60_000});
+  else await manager.saveToDisk();
+  expect(disk.accounts[0]!.currentWorkspaceIndex).toBe(1);
+  expect(account.currentWorkspaceIndex).toBe(1);
+  expect(disk.accounts[0]!.workspaces?.[0]?.enabled).toBe(false);
+  await manager.saveToDisk();
+  expect(disk.accounts[0]!.currentWorkspaceIndex).toBe(1);
+ });
+ it("still persists local legacy workspace rotation when disk preference has not changed",async()=>{
+  let disk:AccountStorageV3={version:3,activeIndex:0,accounts:[{accountId:"a",refreshToken:"old",addedAt:1,lastUsed:1,currentWorkspaceIndex:0,workspaces:[{id:"one",enabled:true},{id:"two",enabled:true}]}]};
+  const manager=new AccountManager(undefined,structuredClone(disk));
+  const {withAccountStorageTransaction}=await import("../lib/storage.js");
+  vi.mocked(withAccountStorageTransaction).mockImplementation(async handler=>handler(structuredClone(disk),async next=>{disk=structuredClone(next);}));
+  manager.rotateToNextWorkspace(manager.getAccountByIndex(0)!);
+  await manager.saveToDisk();
+  expect(disk.accounts[0]!.currentWorkspaceIndex).toBe(1);
+  await manager.saveToDisk();
+  expect(disk.accounts[0]!.currentWorkspaceIndex).toBe(1);
+ });
 });
