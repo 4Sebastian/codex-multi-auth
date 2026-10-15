@@ -398,20 +398,29 @@ export function isWorkspaceDisabledError(
                 .map((token) => token.trim())
                 .filter((token) => token.length > 0);
 
-		const disabledPatterns = [
-				/workspace.*(?:disabled|expired|deactivated|terminated)/i,
-				/account\s+(?:has\s+been|is)\s+(?:disabled|expired|deactivated|terminated|closed)/i,
-				/(?:workspace|org(?:anization)?).*no longer.*(?:active|available|valid)/i,
-				/(?:workspace|org(?:anization)?).*has been.*(?:disabled|expired|closed)/i,
-				/workspace.*(?:access|subscription).*expired/i,
-				/org(?:anization)?.*(?:disabled|expired|inactive)/i,
+		if (/account\s+(?:has\s+been|is)\s+(?:disabled|expired|deactivated|terminated|closed)/i.test(haystack)) {
+			return true;
+		}
+		const disabledPhrases = [
+			[/workspace/, /disabled|expired|deactivated|terminated/],
+			[/workspace|org(?:anization)?/, /no longer/, /active|available|valid/],
+			[/workspace|org(?:anization)?/, /has been/, /disabled|expired|closed/],
+			[/workspace/, /access|subscription/, /expired/],
+			[/org(?:anization)?/, /disabled|expired|inactive/],
 		];
-
-        for (const pattern of disabledPatterns) {
-                if (pattern.test(haystack)) {
-                        return true;
-                }
-        }
+		// Search each phrase once in order; repeated remote text must not backtrack.
+		for (const line of haystack.split(/[\r\n\u2028\u2029]/)) {
+			for (const phrases of disabledPhrases) {
+				let remaining = line;
+				let matched = true;
+				for (const phrase of phrases) {
+					const match = phrase.exec(remaining);
+					if (!match) { matched = false; break; }
+					remaining = remaining.slice(match.index + match[0].length);
+				}
+				if (matched) return true;
+			}
+		}
 
         const workspaceErrorCodes = new Set([
                 "workspace_disabled",
